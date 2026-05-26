@@ -1,7 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::materializer::Materializer;
 use crate::scope::{is_safe_path, path_in_scope};
-use eventsource_client::{Client as SseClient, Error as SseError, SSE};
+use eventsource_client::{Client, Error as SseError, SSE};
 use futures::TryStreamExt;
 use serde::Deserialize;
 use std::time::Duration;
