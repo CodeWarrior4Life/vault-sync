@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "vault-sync-daemon",
+  "productName": "Nexus Vault Sync",
   "version": "0.1.0",
   "identifier": "com.lattice.vault-sync",
   "build": {
@@ -10,9 +10,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "vault-sync-daemon",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Pair with Nexus",
+        "width": 480,
+        "height": 360,
+        "visible": false
       }
     ],
     "security": {
@@ -21,7 +23,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi", "dmg", "deb", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -29,5 +31,15 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJDNkJBQTNCMUUwQTBFNjgKUldSb0Rnb2VPNnBydkZQbkoycm1UcXpzZ2hwNk02a245SGxZN3F6cENXdExMakU2RTZCc3htMUcK",
+      "endpoints": [
+        "https://nexus.obsidian-inc.com/admin/api/vault-sync/releases/{{target}}-{{arch}}/latest"
+      ],
+      "dialog": false
+    }
   }
 }

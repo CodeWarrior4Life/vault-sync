@@ -17,6 +17,9 @@ dist-ssr/
 target/
 src-tauri/target/
 
+# Tauri signing keys (defensive — key is in ~/.tauri/ outside repo, not here)
+*.key
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
