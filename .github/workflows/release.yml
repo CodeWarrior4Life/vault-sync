@@ -3,6 +3,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write  # needed by softprops/action-gh-release to create + upload assets
+
 jobs:
   build:
     strategy:
