@@ -218,3 +218,69 @@ async fn reconnects_with_last_event_id() {
 async fn sse_503_with_retry_after_honored() {
     // Placeholder — see ignore reason above.
 }
+
+// ---------------------------------------------------------------------------
+// Test 5: CF-S470-T22-401-fastfail — 401 (token revoked) propagates as fatal
+//         error and the consumer exits without retrying.
+//
+// Without the fast-fail fix, the SSE consumer would treat 401 the same as a
+// 503 backoff and keep reconnecting with a token the server has already
+// rejected — burning Nexus rate-limit and never recovering.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sse_401_fast_fails_without_retry() {
+    let mut srv = Server::new_async().await;
+    let vault = TempDir::new().unwrap();
+
+    // 401 with expect(1): mockito asserts at drop that the endpoint was hit
+    // exactly once — i.e. no reconnect attempt was made.
+    let _m_events = srv
+        .mock("GET", "/api/sync/events")
+        .with_status(401)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":"token revoked"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let consumer = make_consumer(&srv.url(), &vault);
+    let (_tx, rx) = watch::channel(false);
+
+    // Generous 3 s timeout — fast-fail should land in <100 ms post-fix.
+    // Pre-fix, the consumer would backoff (1 s → 2 s → 4 s …) and still be
+    // running after 3 s with multiple mock hits, blowing the expect(1) check.
+    let result = tokio::time::timeout(Duration::from_secs(3), consumer.run(None, rx)).await;
+
+    match result {
+        Ok(Ok(())) => panic!("consumer should not have completed cleanly on 401"),
+        Ok(Err(_)) => {} // expected — 401 propagated as fatal
+        Err(_) => panic!("consumer did not fast-fail on 401; still running after 3s"),
+    }
+}
+
+#[tokio::test]
+async fn sse_403_fast_fails_without_retry() {
+    let mut srv = Server::new_async().await;
+    let vault = TempDir::new().unwrap();
+
+    let _m_events = srv
+        .mock("GET", "/api/sync/events")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":"forbidden"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let consumer = make_consumer(&srv.url(), &vault);
+    let (_tx, rx) = watch::channel(false);
+
+    let result = tokio::time::timeout(Duration::from_secs(3), consumer.run(None, rx)).await;
+
+    match result {
+        Ok(Ok(())) => panic!("consumer should not have completed cleanly on 403"),
+        Ok(Err(_)) => {} // expected — 403 propagated as fatal
+        Err(_) => panic!("consumer did not fast-fail on 403; still running after 3s"),
+    }
+}

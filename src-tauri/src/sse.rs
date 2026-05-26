@@ -75,8 +75,16 @@ impl SseConsumer {
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
-                Err(SseError::UnexpectedResponse(resp, _body)) => {
-                    // Check for 503 Retry-After
+                Err(SseError::UnexpectedResponse(resp, body)) => {
+                    let status = resp.status();
+                    // CF-S470-T22-401-fastfail: auth-failures are not transient —
+                    // retrying with the same token cannot recover. Propagate as fatal
+                    // so the daemon surfaces the failure (tray red + user re-pair).
+                    if status == 401 || status == 403 {
+                        error!(status = status, "SSE auth failure; not retrying");
+                        return Err(SseError::UnexpectedResponse(resp, body).into());
+                    }
+                    // Otherwise (5xx etc.) treat as transient and back off.
                     let retry_secs = resp
                         .get_header_value("retry-after")
                         .ok()
@@ -84,7 +92,7 @@ impl SseConsumer {
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(backoff.as_secs());
                     warn!(
-                        status = resp.status(),
+                        status = status,
                         retry_after = retry_secs,
                         "SSE server error; backing off"
                     );
