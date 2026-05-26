@@ -42,15 +42,18 @@ if [ ! -f "$SIG" ]; then
   exit 0
 fi
 
-# .sig is a minisign signature file — already base64-ish text. The Nexus
-# endpoint accepts it as-is. xxd was the old hex-encode path; the server-
-# side schema now expects the raw signature contents.
-SIG_BODY=$(cat "$SIG")
+# Nexus upload schema requires the signature as a hex-encoded string
+# (`bytes.fromhex(...)` on the server). The .sig file itself is plaintext
+# (minisign untrusted-comment + base64), so we hex-encode the WHOLE file
+# (newlines + comments + payload) before sending. Original implementation
+# used `xxd -p` which isn't on stock GHA macOS images; python3 is on all
+# four GHA runner images so we use it as the portable hex encoder.
+SIG_HEX=$(python3 -c "import sys; print(open(sys.argv[1],'rb').read().hex())" "$SIG")
 
 curl -fSs -X POST \
   -H "Authorization: Bearer $NEXUS_CI_TOKEN" \
   -F "version=${VERSION#v}" \
-  -F "signature=${SIG_BODY}" \
+  -F "signature=${SIG_HEX}" \
   -F "binary=@${BUNDLE}" \
   "https://nexus.obsidian-inc.com/admin/api/vault-sync/releases/${PLATFORM}/upload"
 echo
