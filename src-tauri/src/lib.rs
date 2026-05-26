@@ -2,6 +2,7 @@ pub mod api_client;
 pub mod config;
 pub mod keyring;
 pub mod materializer;
+pub mod pairing;
 pub mod scope;
 pub mod sse;
 
@@ -15,7 +16,7 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, pairing::pair])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
