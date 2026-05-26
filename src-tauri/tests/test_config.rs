@@ -1,6 +1,6 @@
-use vault_sync_daemon::config::{Config, ConfigError};
-use tempfile::TempDir;
 use std::path::PathBuf;
+use tempfile::TempDir;
+use vault_sync_daemon::config::{Config, ConfigError};
 
 #[test]
 fn save_then_load_round_trips() {

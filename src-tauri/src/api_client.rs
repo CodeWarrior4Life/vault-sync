@@ -50,46 +50,62 @@ impl ApiClient {
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(4)
             .build()?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), token: token.to_string(), http })
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            http,
+        })
     }
 
     pub async fn health(&self) -> Result<HealthSnapshot, ApiError> {
-        let resp = self.http
+        let resp = self
+            .http
             .get(format!("{}/api/sync/health", self.base_url))
             .bearer_auth(&self.token)
-            .send().await?;
+            .send()
+            .await?;
         match resp.status() {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::SERVICE_UNAVAILABLE => {
-                let retry = resp.headers().get("retry-after")
+                let retry = resp
+                    .headers()
+                    .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(60);
-                Err(ApiError::RateLimited { retry_after_secs: retry })
+                Err(ApiError::RateLimited {
+                    retry_after_secs: retry,
+                })
             }
             s => Err(ApiError::Server(s.as_u16())),
         }
     }
 
     pub async fn fetch_note(&self, path: &str) -> Result<NotePayload, ApiError> {
-        let resp = self.http
+        let resp = self
+            .http
             .get(format!("{}/api/sync/note", self.base_url))
             .query(&[("path", path)])
             .bearer_auth(&self.token)
-            .send().await?;
+            .send()
+            .await?;
         match resp.status() {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound(path.to_string())),
             StatusCode::SERVICE_UNAVAILABLE => {
-                let retry = resp.headers().get("retry-after")
+                let retry = resp
+                    .headers()
+                    .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(60);
-                Err(ApiError::RateLimited { retry_after_secs: retry })
+                Err(ApiError::RateLimited {
+                    retry_after_secs: retry,
+                })
             }
             s => Err(ApiError::Server(s.as_u16())),
         }

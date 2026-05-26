@@ -1,4 +1,4 @@
-use vault_sync_daemon::keyring::{set_token, get_token, delete_token, preflight};
+use vault_sync_daemon::keyring::{delete_token, get_token, preflight, set_token};
 
 #[test]
 fn set_then_get_round_trips() {
@@ -17,10 +17,14 @@ fn get_missing_returns_none() {
 fn preflight_returns_ok_or_specific_error() {
     match preflight() {
         Ok(()) => {}
+        #[allow(unused_variables)]
         Err(e) => {
             #[cfg(target_os = "linux")]
-            assert!(e.to_string().to_lowercase().contains("secret"),
-                "Linux preflight error must mention libsecret/Secret Service: {}", e);
+            assert!(
+                e.to_string().to_lowercase().contains("secret"),
+                "Linux preflight error must mention libsecret/Secret Service: {}",
+                e
+            );
         }
     }
 }

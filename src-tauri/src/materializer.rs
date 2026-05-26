@@ -47,14 +47,21 @@ pub struct Materializer {
 impl Materializer {
     pub fn new(vault_root: PathBuf, shadow_path: Option<String>, mode: MaterializerMode) -> Self {
         let shadow_subdir = shadow_path.unwrap_or_else(|| ".lattice-sync/shadow/".to_string());
-        Self { vault_root, shadow_subdir, mode }
+        Self {
+            vault_root,
+            shadow_subdir,
+            mode,
+        }
     }
 
     pub fn write(&self, payload: &NotePayload) -> Result<(), MaterializerError> {
         match self.mode {
             MaterializerMode::Live => return Err(MaterializerError::NotYetImplemented),
             MaterializerMode::Disabled => {
-                info!("materializer_mode=disabled; skipping write for {}", payload.path);
+                info!(
+                    "materializer_mode=disabled; skipping write for {}",
+                    payload.path
+                );
                 return Ok(());
             }
             MaterializerMode::Shadow => {}
@@ -62,12 +69,20 @@ impl Materializer {
         if !is_safe_path(&payload.path) {
             return Err(MaterializerError::PathTraversal(payload.path.clone()));
         }
-        let target = self.vault_root.join(&self.shadow_subdir).join(&payload.path);
+        let target = self
+            .vault_root
+            .join(&self.shadow_subdir)
+            .join(&payload.path);
         // Path-traversal final canonicalization check
-        let canonical_vault = self.vault_root.canonicalize().unwrap_or_else(|_| self.vault_root.clone());
+        let canonical_vault = self
+            .vault_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.vault_root.clone());
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
-            let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+            let canonical_parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
             if !canonical_parent.starts_with(&canonical_vault) {
                 return Err(MaterializerError::PathTraversal(payload.path.clone()));
             }
@@ -106,9 +121,10 @@ impl Materializer {
             return Ok(());
         }
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let renamed = target.with_file_name(
-            format!("{}.deleted-{ts}", target.file_name().unwrap().to_string_lossy())
-        );
+        let renamed = target.with_file_name(format!(
+            "{}.deleted-{ts}",
+            target.file_name().unwrap().to_string_lossy()
+        ));
         fs::rename(&target, &renamed)?;
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())

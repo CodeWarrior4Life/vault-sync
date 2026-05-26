@@ -1,6 +1,6 @@
-use vault_sync_daemon::materializer::{Materializer, MaterializerError, MaterializerMode};
-use vault_sync_daemon::api_client::NotePayload;
 use tempfile::TempDir;
+use vault_sync_daemon::api_client::NotePayload;
+use vault_sync_daemon::materializer::{Materializer, MaterializerError, MaterializerMode};
 
 fn sha256_hex(s: &str) -> String {
     use sha2::Digest;
@@ -12,7 +12,9 @@ fn payload(path: &str, body: &str) -> NotePayload {
         path: path.into(),
         frontmatter: serde_json::json!({"title": "Test", "tags": ["a", "b"]}),
         body: body.into(),
-        sha256: sha256_hex(&format!("---\ntitle: Test\ntags:\n  - a\n  - b\n---\n\n{body}")),
+        sha256: sha256_hex(&format!(
+            "---\ntitle: Test\ntags:\n  - a\n  - b\n---\n\n{body}"
+        )),
         modified: "2026-05-25T00:00:00Z".into(),
         file_mtime: None,
     }
@@ -21,9 +23,14 @@ fn payload(path: &str, body: &str) -> NotePayload {
 #[test]
 fn write_creates_file_with_frontmatter() {
     let vault = TempDir::new().unwrap();
-    let m = Materializer::new(vault.path().to_path_buf(), Some(".lattice-sync/shadow/".into()), MaterializerMode::Shadow);
+    let m = Materializer::new(
+        vault.path().to_path_buf(),
+        Some(".lattice-sync/shadow/".into()),
+        MaterializerMode::Shadow,
+    );
     m.write(&payload("foo.md", "hello")).unwrap();
-    let written = std::fs::read_to_string(vault.path().join(".lattice-sync/shadow/foo.md")).unwrap();
+    let written =
+        std::fs::read_to_string(vault.path().join(".lattice-sync/shadow/foo.md")).unwrap();
     assert!(written.contains("title: Test"));
     assert!(written.contains("hello"));
 }
@@ -39,14 +46,20 @@ fn write_rejects_path_traversal() {
     let vault = TempDir::new().unwrap();
     let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Shadow);
     let np = payload("../escape.md", "x");
-    assert!(matches!(m.write(&np), Err(MaterializerError::PathTraversal(_))));
+    assert!(matches!(
+        m.write(&np),
+        Err(MaterializerError::PathTraversal(_))
+    ));
 }
 
 #[test]
 fn write_refuses_live_mode_in_e2() {
     let vault = TempDir::new().unwrap();
     let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Live);
-    assert!(matches!(m.write(&payload("foo.md", "x")), Err(MaterializerError::NotYetImplemented)));
+    assert!(matches!(
+        m.write(&payload("foo.md", "x")),
+        Err(MaterializerError::NotYetImplemented)
+    ));
 }
 
 #[test]
@@ -60,9 +73,14 @@ fn delete_renames_to_deleted_ts() {
     // Original is gone, .deleted-<ts> exists
     let shadow_dir = vault.path().join(".lattice-sync/shadow/");
     assert!(!shadow_dir.join("foo.md").exists());
-    let entries: Vec<_> = std::fs::read_dir(&shadow_dir).unwrap()
+    let entries: Vec<_> = std::fs::read_dir(&shadow_dir)
+        .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("foo.md.deleted-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("foo.md.deleted-")
+        })
         .collect();
     assert_eq!(entries.len(), 1, "expected one .deleted-* file");
 }

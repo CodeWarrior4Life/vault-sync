@@ -11,13 +11,18 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open_vault = MenuItemBuilder::with_id("open-vault", "Open Vault").build(app)?;
     let pause = MenuItemBuilder::with_id("pause", "Pause Sync").build(app)?;
     let resync = MenuItemBuilder::with_id("resync", "Force Resync").build(app)?;
-    let open_admin =
-        MenuItemBuilder::with_id("open-admin", "Open Admin in Browser").build(app)?;
+    let open_admin = MenuItemBuilder::with_id("open-admin", "Open Admin in Browser").build(app)?;
     let about = MenuItemBuilder::with_id("about", "About...").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app)
         .items(&[
-            &status, &open_vault, &pause, &resync, &open_admin, &about, &quit,
+            &status,
+            &open_vault,
+            &pause,
+            &resync,
+            &open_admin,
+            &about,
+            &quit,
         ])
         .build()?;
     TrayIconBuilder::new()

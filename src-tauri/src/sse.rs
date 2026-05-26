@@ -11,10 +11,10 @@ use tracing::{debug, error, warn};
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    op: String,          // INSERT | UPDATE | DELETE
+    op: String, // INSERT | UPDATE | DELETE
     path: String,
     #[allow(dead_code)]
-    phase: String,       // lint_pending | lint_complete | enrichment_complete
+    phase: String, // lint_pending | lint_complete | enrichment_complete
     #[serde(default)]
     #[allow(dead_code)]
     lsn: Option<String>,
@@ -104,10 +104,7 @@ impl SseConsumer {
         Ok(())
     }
 
-    async fn run_one_session(
-        &self,
-        last_event_id: &mut Option<String>,
-    ) -> Result<(), SseError> {
+    async fn run_one_session(&self, last_event_id: &mut Option<String>) -> Result<(), SseError> {
         let url = format!("{}/api/sync/events", self.nexus_url);
         let mut builder = eventsource_client::ClientBuilder::for_url(&url)?
             .header("Authorization", &format!("Bearer {}", self.token))?;

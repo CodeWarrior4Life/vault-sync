@@ -22,9 +22,13 @@ fn make_consumer(base_url: &str, vault_root: &TempDir) -> SseConsumer {
     SseConsumer::new(
         base_url.to_string(),
         "vsk_test".to_string(),
-        vec![],  // empty roots = accept everything
+        vec![], // empty roots = accept everything
         vec![],
-        Materializer::new(vault_root.path().to_path_buf(), None, MaterializerMode::Shadow),
+        Materializer::new(
+            vault_root.path().to_path_buf(),
+            None,
+            MaterializerMode::Shadow,
+        ),
     )
     .unwrap()
 }
@@ -90,11 +94,17 @@ async fn consumes_enrichment_complete_skips_lint_events() {
 
     // enrichment_complete path should be on disk
     let shadow = vault.path().join(".lattice-sync/shadow/Notes/hello.md");
-    assert!(shadow.exists(), "enrichment_complete payload should land in shadow tree");
+    assert!(
+        shadow.exists(),
+        "enrichment_complete payload should land in shadow tree"
+    );
 
     // lint_complete path should NOT be on disk
     let lint_shadow = vault.path().join(".lattice-sync/shadow/Notes/skip.md");
-    assert!(!lint_shadow.exists(), "lint_complete payload must not land in shadow tree");
+    assert!(
+        !lint_shadow.exists(),
+        "lint_complete payload must not land in shadow tree"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +137,7 @@ async fn path_traversal_rejected_in_envelope() {
     // so we'd see a hit if the guard fails.
     let _m_note = srv
         .mock("GET", "/api/sync/note")
-        .expect(0)  // assert NEVER called
+        .expect(0) // assert NEVER called
         .create_async()
         .await;
 
@@ -140,7 +150,10 @@ async fn path_traversal_rejected_in_envelope() {
         && std::fs::read_dir(&shadow_root)
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
-    assert!(!shadow_has_files, "no file should be written for a path-traversal envelope");
+    assert!(
+        !shadow_has_files,
+        "no file should be written for a path-traversal envelope"
+    );
 }
 
 // ---------------------------------------------------------------------------
