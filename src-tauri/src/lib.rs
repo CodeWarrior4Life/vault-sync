@@ -5,6 +5,7 @@ pub mod materializer;
 pub mod pairing;
 pub mod scope;
 pub mod sse;
+pub mod tray;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
