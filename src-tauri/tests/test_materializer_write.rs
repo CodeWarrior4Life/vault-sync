@@ -39,14 +39,14 @@ fn write_rejects_path_traversal() {
     let vault = TempDir::new().unwrap();
     let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Shadow);
     let np = payload("../escape.md", "x");
-    matches!(m.write(&np), Err(MaterializerError::PathTraversal(_)));
+    assert!(matches!(m.write(&np), Err(MaterializerError::PathTraversal(_))));
 }
 
 #[test]
 fn write_refuses_live_mode_in_e2() {
     let vault = TempDir::new().unwrap();
     let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Live);
-    matches!(m.write(&payload("foo.md", "x")), Err(MaterializerError::NotYetImplemented));
+    assert!(matches!(m.write(&payload("foo.md", "x")), Err(MaterializerError::NotYetImplemented)));
 }
 
 #[test]
