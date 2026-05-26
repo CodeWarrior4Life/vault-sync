@@ -62,7 +62,13 @@ impl ApiClient {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
-            s if s.is_server_error() => Err(ApiError::Server(s.as_u16())),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                let retry = resp.headers().get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(60);
+                Err(ApiError::RateLimited { retry_after_secs: retry })
+            }
             s => Err(ApiError::Server(s.as_u16())),
         }
     }

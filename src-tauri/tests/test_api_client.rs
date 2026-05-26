@@ -1,4 +1,4 @@
-use vault_sync_daemon::api_client::{ApiClient, ApiError, NotePayload};
+use vault_sync_daemon::api_client::{ApiClient, ApiError};
 use mockito::Server;
 
 #[tokio::test]
@@ -19,7 +19,7 @@ async fn health_401_returns_auth_error() {
     let mut srv = Server::new_async().await;
     let _m = srv.mock("GET", "/api/sync/health").with_status(401).create_async().await;
     let client = ApiClient::new(&srv.url(), "vsk_bad").unwrap();
-    matches!(client.health().await, Err(ApiError::Unauthorized));
+    assert!(matches!(client.health().await, Err(ApiError::Unauthorized)));
 }
 
 #[tokio::test]
@@ -32,4 +32,16 @@ async fn body_fetch_returns_envelope() {
     let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
     let np = client.fetch_note("foo.md").await.unwrap();
     assert_eq!(np.body, "hello");
+}
+
+#[tokio::test]
+async fn health_503_returns_rate_limited() {
+    let mut srv = Server::new_async().await;
+    let _m = srv.mock("GET", "/api/sync/health")
+        .with_status(503)
+        .with_header("retry-after", "30")
+        .create_async().await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client.health().await.unwrap_err();
+    assert!(matches!(err, ApiError::RateLimited { retry_after_secs: 30 }));
 }
