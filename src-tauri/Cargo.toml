@@ -39,6 +39,9 @@ anyhow = "1"
 # bundling here so cargo check passes after a single edit)
 dirs = "5"
 toml = "0.8"
+serde_yaml = "0.9"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 mockito = "1"

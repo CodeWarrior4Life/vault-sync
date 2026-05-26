@@ -1,6 +1,7 @@
 pub mod api_client;
 pub mod config;
 pub mod keyring;
+pub mod materializer;
 pub mod scope;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
