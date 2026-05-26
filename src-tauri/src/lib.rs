@@ -28,14 +28,99 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![pairing::pair])
         .setup(|app| {
             tray::build_tray(app.handle())?;
-            // If config exists → start SSE consumer; else → show pairing window
-            if config::default_config_path().exists() {
-                // TODO T29: spawn sse consumer task
+
+            // S471 fix: macOS → menu-bar-only (no dock icon).
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::ActivationPolicy;
+                let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+            }
+
+            let cfg_path = config::default_config_path();
+            if cfg_path.exists() {
+                // S471 fix: actually spawn the SSE consumer when paired.
+                // v0.1.0 left this as a TODO; daemon launched but never synced.
+                spawn_sse_consumer(app.handle().clone(), cfg_path);
             } else {
-                // show wizard window (already configured in tauri.conf.json)
+                // S471 fix: actually SHOW the pair-wizard window on first run.
+                // The window is created `visible: false` in tauri.conf.json so
+                // without an explicit show() the user sees nothing.
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
             }
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Boot the SSE consumer from a saved config + keyring token. Runs on the
+/// Tauri async runtime so it doesn't block app startup.
+fn spawn_sse_consumer(app: tauri::AppHandle, cfg_path: std::path::PathBuf) {
+    let _ = app; // reserved for future tray-status signaling
+    tauri::async_runtime::spawn(async move {
+        let cfg = match config::Config::load_from(&cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("config load failed: {e}");
+                return;
+            }
+        };
+        let token = match keyring::get_token(&cfg.subscriber_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                tracing::error!(
+                    "no keyring token for subscriber_id={}; re-pair required",
+                    cfg.subscriber_id
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!("keyring read failed: {e}");
+                return;
+            }
+        };
+        let api = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("api client init failed: {e}");
+                return;
+            }
+        };
+        let snap = match api.health().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("api health failed: {e}");
+                return;
+            }
+        };
+        let materializer = materializer::Materializer::new(
+            cfg.vault_root.clone(),
+            snap.shadow_path.clone(),
+            materializer::MaterializerMode::from_str(&snap.materializer_mode),
+        );
+        let consumer = match sse::SseConsumer::new(
+            cfg.nexus_url.clone(),
+            token,
+            snap.scope_roots,
+            snap.scope_excludes,
+            materializer,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("sse consumer init failed: {e}");
+                return;
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tracing::info!(
+            "starting SSE consumer for subscriber_id={}",
+            cfg.subscriber_id
+        );
+        if let Err(e) = consumer.run(cfg.last_event_id, shutdown_rx).await {
+            tracing::error!("SSE consumer exited with error: {e}");
+        }
+    });
 }
