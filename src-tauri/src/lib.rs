@@ -3,6 +3,7 @@ pub mod config;
 pub mod keyring;
 pub mod materializer;
 pub mod scope;
+pub mod sse;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]

@@ -5475,6 +5475,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "eventsource-client",
+ "futures",
  "hex",
  "keyring",
  "mockito",
