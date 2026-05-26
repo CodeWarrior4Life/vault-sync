@@ -2,6 +2,10 @@ use vault_sync_daemon::keyring::{delete_token, get_token, preflight, set_token};
 
 #[test]
 fn set_then_get_round_trips() {
+    if preflight().is_err() {
+        eprintln!("skipping: keyring backend unavailable on this host");
+        return;
+    }
     let sid = "test-subscriber-1";
     set_token(sid, "vsk_test_abc").unwrap();
     assert_eq!(get_token(sid).unwrap(), Some("vsk_test_abc".to_string()));
@@ -10,6 +14,10 @@ fn set_then_get_round_trips() {
 
 #[test]
 fn get_missing_returns_none() {
+    if preflight().is_err() {
+        eprintln!("skipping: keyring backend unavailable on this host");
+        return;
+    }
     assert_eq!(get_token("nonexistent-sid").unwrap(), None);
 }
 
