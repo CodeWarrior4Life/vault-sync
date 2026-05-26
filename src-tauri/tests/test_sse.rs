@@ -1,16 +1,14 @@
 /// T22 — SSE consumer tests
 ///
 /// Strategy: spin up a mockito server that serves a finite SSE body (one or more events then
-/// EOF). Feed the server URL to SseConsumer::new, then drive consumer.run() for a short window
-/// (300 ms) before sending a shutdown signal. Assert materializer side-effects (or absence of
-/// side-effects) on the temp-directory shadow tree.
+/// EOF). Feed the server URL to SseConsumer::new, then drive consumer.run() until the expected
+/// side-effects appear (positive tests) or after a generous fixed wait (negative tests).
 ///
 /// Tests 1 and 2 pass.  Tests 3 and 4 are #[ignore] — see TODO comments.
 use mockito::Server;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::watch;
-use tokio::time::timeout;
 use vault_sync_daemon::materializer::{Materializer, MaterializerMode};
 use vault_sync_daemon::sse::SseConsumer;
 
@@ -33,13 +31,29 @@ fn make_consumer(base_url: &str, vault_root: &TempDir) -> SseConsumer {
     .unwrap()
 }
 
-/// Run the consumer until shutdown or 400 ms, whichever comes first.
-/// Sends shutdown before returning.
-async fn run_consumer_briefly(consumer: &SseConsumer) {
+/// Spawn the consumer in the background.
+/// Returns the join handle and a shutdown sender; send `true` (or drop) to stop the task.
+fn spawn_consumer(
+    consumer: SseConsumer,
+) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
-    let _ = timeout(Duration::from_millis(400), consumer.run(None, rx)).await;
-    // Signal shutdown in case run() is still looping (reconnect backoff).
-    let _ = tx.send(true);
+    let handle = tokio::spawn(async move {
+        let _ = consumer.run(None, rx).await;
+    });
+    (handle, tx)
+}
+
+/// Poll `path` for existence up to `timeout`, checking every 50 ms.
+/// Returns `true` if the path appeared within the deadline, `false` otherwise.
+async fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -90,13 +104,19 @@ async fn consumes_enrichment_complete_skips_lint_events() {
         .await;
 
     let consumer = make_consumer(&srv.url(), &vault);
-    run_consumer_briefly(&consumer).await;
+    let (handle, tx) = spawn_consumer(consumer);
 
-    // enrichment_complete path should be on disk
+    // Poll for the expected output file for up to 5 s (CI-safe).
     let shadow = vault.path().join(".lattice-sync/shadow/Notes/hello.md");
+    let landed = wait_for_path(&shadow, Duration::from_secs(5)).await;
+
+    // Signal shutdown and wait for the consumer task to exit.
+    let _ = tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
     assert!(
-        shadow.exists(),
-        "enrichment_complete payload should land in shadow tree"
+        landed,
+        "enrichment_complete payload should land in shadow tree (timed out after 5s)"
     );
 
     // lint_complete path should NOT be on disk
@@ -142,7 +162,14 @@ async fn path_traversal_rejected_in_envelope() {
         .await;
 
     let consumer = make_consumer(&srv.url(), &vault);
-    run_consumer_briefly(&consumer).await;
+    let (handle, tx) = spawn_consumer(consumer);
+
+    // Fixed wait: give the consumer time to receive + reject the envelope before
+    // the negative assertion fires. 2 s is generous enough for CI slowness.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let _ = tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 
     // The shadow dir should be completely empty (no file created for the malicious path).
     let shadow_root = vault.path().join(".lattice-sync/shadow");
