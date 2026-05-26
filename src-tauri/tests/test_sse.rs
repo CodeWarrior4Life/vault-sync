@@ -33,9 +33,7 @@ fn make_consumer(base_url: &str, vault_root: &TempDir) -> SseConsumer {
 
 /// Spawn the consumer in the background.
 /// Returns the join handle and a shutdown sender; send `true` (or drop) to stop the task.
-fn spawn_consumer(
-    consumer: SseConsumer,
-) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
+fn spawn_consumer(consumer: SseConsumer) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         let _ = consumer.run(None, rx).await;
