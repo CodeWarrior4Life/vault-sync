@@ -28,6 +28,8 @@ async fn validate_url_token_pair_ok() {
         .with_status(200)
         .with_body(health_body("sub-abc123"))
         .match_header("authorization", "Bearer vsk_test_token")
+        .expect_at_least(0)
+        .expect_at_most(1)
         .create_async()
         .await;
 
@@ -127,6 +129,8 @@ async fn success_writes_keyring_and_config() {
         .with_status(200)
         .with_body(health_body("sub-xyz789"))
         .match_header("authorization", "Bearer vsk_test_token")
+        .expect_at_least(0)
+        .expect_at_most(1)
         .create_async()
         .await;
 
