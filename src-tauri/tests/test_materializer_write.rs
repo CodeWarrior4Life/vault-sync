@@ -48,3 +48,29 @@ fn write_refuses_live_mode_in_e2() {
     let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Live);
     matches!(m.write(&payload("foo.md", "x")), Err(MaterializerError::NotYetImplemented));
 }
+
+#[test]
+fn delete_renames_to_deleted_ts() {
+    let vault = TempDir::new().unwrap();
+    let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Shadow);
+    // First write a file
+    m.write(&payload("foo.md", "x")).unwrap();
+    // Now delete it
+    m.soft_delete("foo.md").unwrap();
+    // Original is gone, .deleted-<ts> exists
+    let shadow_dir = vault.path().join(".lattice-sync/shadow/");
+    assert!(!shadow_dir.join("foo.md").exists());
+    let entries: Vec<_> = std::fs::read_dir(&shadow_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("foo.md.deleted-"))
+        .collect();
+    assert_eq!(entries.len(), 1, "expected one .deleted-* file");
+}
+
+#[test]
+fn delete_nothing_to_delete_is_not_error() {
+    let vault = TempDir::new().unwrap();
+    let m = Materializer::new(vault.path().to_path_buf(), None, MaterializerMode::Shadow);
+    // No prior write
+    assert!(m.soft_delete("never-existed.md").is_ok());
+}
