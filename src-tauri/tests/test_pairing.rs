@@ -94,9 +94,14 @@ async fn pair_401_yields_auth_error() {
 /// DNS / network failure must yield an error whose message contains "network" or "connect" or similar.
 #[tokio::test]
 async fn dns_failure_yields_network_error() {
-    // Port 1 is guaranteed unreachable (OS drops connection immediately on Windows/Linux/macOS).
+    // 127.0.0.1:1 — localhost, port 1. Nothing listens; OS yields immediate
+    // ECONNREFUSED on every platform (no SYN-ACK round trip → no timeout wait).
+    // 0.0.0.0 was ambiguous on macOS (kernel rewrites + multi-interface enum →
+    // 60 s hang under headless CI); 192.0.2.1 (RFC 5737 TEST-NET-1) goes through
+    // OS connect timeout (~21 s). Using loopback:1 gives sub-second completion
+    // and still satisfies the "network/connect/refused" error-message contract.
     let tmp = TempDir::new().unwrap();
-    let (input, config_path) = make_input("http://0.0.0.0:1", &tmp);
+    let (input, config_path) = make_input("http://127.0.0.1:1", &tmp);
 
     let result = pair_inner(input, config_path).await;
 

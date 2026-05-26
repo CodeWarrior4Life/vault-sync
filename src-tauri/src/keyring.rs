@@ -1,7 +1,14 @@
 use keyring::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 const SERVICE: &str = "nexus-vault-sync";
+
+/// Per-process monotonic counter so each `preflight()` call uses a unique
+/// probe key. Avoids parallel-test races on macOS keychain where concurrent
+/// `set_password()` writes to the same key serialise on app-approval and
+/// time out under headless CI (S471 substrate finding).
+static PREFLIGHT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum KeyringError {
@@ -40,7 +47,9 @@ pub fn delete_token(subscriber_id: &str) -> Result<(), KeyringError> {
 /// without libsecret/Secret Service, returns an error with actionable guidance
 /// for the pairing wizard.
 pub fn preflight() -> Result<(), KeyringError> {
-    let probe = "preflight.probe";
+    let n = PREFLIGHT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe_owned = format!("preflight.probe.{}.{}", std::process::id(), n);
+    let probe = probe_owned.as_str();
     let value = "ok";
     let e = entry(probe)?;
     e.set_password(value).map_err(|err| {
