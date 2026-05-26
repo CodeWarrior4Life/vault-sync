@@ -1,25 +1,49 @@
 [package]
 name = "vault-sync-daemon"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "vault_sync_daemon_lib"
+name = "vault_sync_daemon"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2.0", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2.0"
+tauri-plugin-updater = "2.0"
+tauri-plugin-store = "2.0"
+tauri-plugin-single-instance = "2.0"
+tauri-plugin-shell = "2.0"
+tauri-plugin-dialog = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+eventsource-client = "0.13"
+keyring = "3"
+yaml-rust2 = "0.10"
+notify = { version = "7", optional = true }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+# T17 needs these too (plan added them as a "and-also" at the end of T17;
+# bundling here so cargo check passes after a single edit)
+dirs = "5"
+toml = "0.8"
 
+[dev-dependencies]
+mockito = "1"
+rstest = "0.23"
+
+[features]
+default = []
+fs_watcher = ["notify"]  # for Phase F; not active in E2
