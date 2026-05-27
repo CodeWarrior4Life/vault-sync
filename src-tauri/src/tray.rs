@@ -17,10 +17,22 @@ use tracing::{info, warn};
 /// as a near-invisible smudge once macOS template-scales it down to status-
 /// bar height). Source: src-tauri/icons/32x32.png.
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/32x32.png");
-/// v0.3.1: dimmed variant (alpha halved) used by the animation task to
-/// pulse the tray icon while the daemon is connecting or running
-/// verify-and-repair. Generated from 32x32.png; see commit notes.
-const TRAY_ICON_DIM_BYTES: &[u8] = include_bytes!("../icons/32x32-dim.png");
+/// v0.3.3: 8-frame "bright band sweeps top -> bottom" animation. The icon
+/// is a yellow-to-blue gradient; the bright band moves along the gradient
+/// so the result reads as a wave undulating from yellow to blue (and
+/// implicitly wraps back to the top via the cyclic frame index). Generated
+/// programmatically from 32x32.png by halving alpha proportional to the
+/// distance from each frame's band center.
+const TRAY_ICON_ANIM_BYTES: [&[u8]; 8] = [
+    include_bytes!("../icons/32x32-anim-0.png"),
+    include_bytes!("../icons/32x32-anim-1.png"),
+    include_bytes!("../icons/32x32-anim-2.png"),
+    include_bytes!("../icons/32x32-anim-3.png"),
+    include_bytes!("../icons/32x32-anim-4.png"),
+    include_bytes!("../icons/32x32-anim-5.png"),
+    include_bytes!("../icons/32x32-anim-6.png"),
+    include_bytes!("../icons/32x32-anim-7.png"),
+];
 
 /// Stable id for the tray icon so handlers (e.g. the verify-repair arm) can
 /// look it up via `app.tray_by_id` and flip the tooltip synchronously without
@@ -401,14 +413,14 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         }
     });
 
-    // v0.3.1: gentle icon pulse while the daemon is "busy" -- either
+    // v0.3.3: gentle icon undulation while the daemon is "busy" -- either
     // Starting/Connecting/Reconnecting OR an owner-invoked verify-and-repair
-    // is running. Toggles between the normal 32x32 icon and a 50%-alpha dim
-    // variant every 800ms. Idle when status is Connected/Paused and
-    // verify_in_progress is false. Cyril S476 verbatim:
-    //     "i think the icon should animate gently while it is indexing.
-    //      .i think that's what its still doing often times when i'm first
-    //      running the verify & repair."
+    // is running. Cycles through 8 pre-generated frames at 150ms each so the
+    // bright band sweeps top -> bottom (yellow -> blue along the icon's own
+    // gradient) and wraps back. Idle when settled; restores the full-
+    // strength normal icon on the transition out. Cyril S476 verbatim:
+    //     "animation should move from the yellow end to the blue end
+    //      undulating instead of just flashing."
     tauri::async_runtime::spawn(async move {
         use crate::tray_state::ConnectionStatus;
         let normal_icon = match Image::from_bytes(TRAY_ICON_BYTES) {
@@ -418,17 +430,25 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 return;
             }
         };
-        let dim_icon = match Image::from_bytes(TRAY_ICON_DIM_BYTES) {
-            Ok(i) => i,
-            Err(e) => {
-                warn!("tray anim: failed to load dim icon ({e}); animation disabled");
-                return;
-            }
-        };
-        let mut phase_dim = false;
+        let frames: Vec<Image> = TRAY_ICON_ANIM_BYTES
+            .iter()
+            .filter_map(|b| Image::from_bytes(b).ok())
+            .collect();
+        if frames.len() != TRAY_ICON_ANIM_BYTES.len() {
+            warn!(
+                "tray anim: only loaded {}/{} frames; animation will be choppy",
+                frames.len(),
+                TRAY_ICON_ANIM_BYTES.len()
+            );
+        }
+        if frames.is_empty() {
+            warn!("tray anim: no frames loaded; animation disabled");
+            return;
+        }
+        let mut frame_idx: usize = 0;
         let mut was_animating = false;
         loop {
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             let animate = match anim_state.read() {
                 Ok(s) => {
                     s.verify_in_progress
@@ -442,18 +462,14 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 Err(_) => false,
             };
             if animate {
-                phase_dim = !phase_dim;
-                let next = if phase_dim {
-                    dim_icon.clone()
-                } else {
-                    normal_icon.clone()
-                };
+                let next = frames[frame_idx % frames.len()].clone();
                 let _ = tray_for_anim.set_icon(Some(next));
+                frame_idx = frame_idx.wrapping_add(1);
                 was_animating = true;
             } else if was_animating {
-                // Settled — restore the full-strength icon exactly once.
+                // Settled -- restore the full-strength icon exactly once.
                 let _ = tray_for_anim.set_icon(Some(normal_icon.clone()));
-                phase_dim = false;
+                frame_idx = 0;
                 was_animating = false;
             }
         }

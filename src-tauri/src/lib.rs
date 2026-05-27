@@ -99,6 +99,24 @@ pub fn run() {
                     let _ = w.set_focus();
                 }
             }
+
+            // v0.3.3: intercept the main window's close button so it HIDES
+            // instead of destroying the window. Default Tauri behavior on
+            // Windows is to terminate the whole app when the last window
+            // closes -- which killed the daemon every time Cyril hit the X
+            // on the wizard. The daemon is tray-resident; window lifecycle
+            // must not control daemon lifecycle. Cyril S476 verbatim:
+            //     "closing the settings window closed the app"
+            if let Some(win) = app.get_webview_window("main") {
+                let win_for_handler = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win_for_handler.hide();
+                    }
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())
