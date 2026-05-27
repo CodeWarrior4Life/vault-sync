@@ -27,6 +27,12 @@ pub struct PairingInput {
     /// with v0.1.x clients still POSTing the old field name.
     #[serde(alias = "vault_root")]
     pub vaults_root: PathBuf,
+    /// v0.3.2: optional mode override. If `Some(...)`, the wizard called
+    /// the picker -- daemon PATCHes `/api/sync/subscribers/me` after the
+    /// legacy pair flow to flip the server-side row. `None` leaves the
+    /// existing server-side mode untouched (back-compat).
+    #[serde(default)]
+    pub materializer_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,10 +67,27 @@ pub async fn pair_inner(
         last_event_id: None,
     };
     cfg.save_to(&config_path)?;
+
+    // v0.3.2: if the wizard sent a mode preference, push it to the server
+    // via the subscriber self-PATCH endpoint. Failure here is non-fatal --
+    // the pair itself succeeded; the user just doesn't get the mode they
+    // asked for and a warning surfaces in the result.
+    let final_mode = if let Some(requested) = input.materializer_mode.as_deref() {
+        match client.patch_self_subscriber(Some(requested)).await {
+            Ok(state) => state.materializer_mode,
+            Err(e) => {
+                tracing::warn!("patch_self_subscriber failed: {e} -- server mode unchanged");
+                snap.materializer_mode
+            }
+        }
+    } else {
+        snap.materializer_mode
+    };
+
     Ok(PairingSuccess {
         subscriber_id: snap.subscriber_id,
         scope_roots: snap.scope_roots,
-        materializer_mode: snap.materializer_mode,
+        materializer_mode: final_mode,
     })
 }
 

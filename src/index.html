@@ -52,12 +52,36 @@
           </div>
           <p class="hint">
             Parent directory holding your Obsidian vaults (e.g.
-            <code>D:\Vaults</code> or <code>~/Vaults</code>). Daemon writes
-            shadow tree to <code>&lt;root&gt;/&lt;vault-name&gt;/.lattice-sync/shadow/</code>
-            for each vault Nexus knows about. Substrate files
+            <code>D:\Vaults</code> or <code>~/Vaults</code>). Substrate files
             (00_VAULT.md, Family.md, Mission.md, 02_Projects/Protocols/, _project/,
             _rapport/people/) are RASP-fenced — daemon never writes them.
           </p>
+        </div>
+
+        <div class="field">
+          <label>Sync Mode</label>
+          <div class="mode-options">
+            <label class="mode-option">
+              <input type="radio" name="materializer-mode" value="shadow" checked />
+              <span class="mode-title">Shadow</span>
+              <span class="mode-desc">Server pushes land in a sidecar tree at
+              <code>&lt;root&gt;/&lt;vault&gt;/.lattice-sync/shadow/</code>. Your real
+              vault is untouched. Use this for first-pair testing.</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="materializer-mode" value="live" />
+              <span class="mode-title">Live</span>
+              <span class="mode-desc">Server pushes write directly into your
+              real vault tree. Two-way sync. Only flip after Shadow has
+              proven clean.</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="materializer-mode" value="disabled" />
+              <span class="mode-title">Disabled</span>
+              <span class="mode-desc">Daemon connects but writes nothing.
+              Push-only-from-this-host scenarios.</span>
+            </label>
+          </div>
         </div>
 
         <button type="submit" id="pair-btn">Pair</button>

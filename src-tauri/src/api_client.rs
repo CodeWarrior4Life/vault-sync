@@ -33,6 +33,17 @@ pub struct HealthSnapshot {
     pub shadow_path: Option<String>,
 }
 
+/// v0.3.2: response shape from `PATCH /api/sync/subscribers/me`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubscriberSelfState {
+    pub ok: bool,
+    pub subscriber_id: String,
+    pub materializer_mode: String,
+    pub shadow_path: Option<String>,
+    pub scope_roots: Vec<String>,
+    pub scope_excludes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotePayload {
     pub path: String,
@@ -302,6 +313,34 @@ impl ApiClient {
                     retry_after_secs: retry,
                 })
             }
+            s => Err(ApiError::Server(s.as_u16())),
+        }
+    }
+
+    /// v0.3.2: PATCH /api/sync/subscribers/me to mutate the caller's OWN
+    /// materializer_mode (or other self-configurable fields the server
+    /// allows). Per-subscriber bearer auth; only mutates the row tied to
+    /// the bearer presented. Used by the pairing wizard's mode picker.
+    pub async fn patch_self_subscriber(
+        &self,
+        materializer_mode: Option<&str>,
+    ) -> Result<SubscriberSelfState, ApiError> {
+        let body = serde_json::json!({
+            "materializer_mode": materializer_mode,
+        });
+        let resp = self
+            .http
+            .patch(format!("{}/api/sync/subscribers/me", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(resp.json().await?),
+            StatusCode::BAD_REQUEST => Err(ApiError::Server(400)),
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
+            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             s => Err(ApiError::Server(s.as_u16())),
         }
     }

@@ -57,6 +57,24 @@ function describeScopeRoots(roots) {
       note.id = "active-pairing-note";
       note.innerHTML = "✓ Already paired with " + (cfg && cfg.nexus_url ? cfg.nexus_url : "your Nexus") + ". Edit fields to re-pair or pair with a different server.";
       form.insertBefore(note, form.firstChild);
+
+      // v0.3.2: pre-select the current materializer_mode radio so the
+      // user sees the live state instead of an always-defaults-to-shadow
+      // form. Fetch directly from the server's /api/sync/health (which
+      // returns the subscriber row's current mode).
+      try {
+        const r = await fetch(cfg.nexus_url.replace(/\/$/, "") + "/api/sync/health", {
+          headers: { Authorization: "Bearer " + tok },
+        });
+        if (r.ok) {
+          const h = await r.json();
+          const mode = (h && h.materializer_mode) || "shadow";
+          const radio = document.querySelector('input[name="materializer-mode"][value="' + mode + '"]');
+          if (radio) radio.checked = true;
+        }
+      } catch (_e) {
+        // Network / health failure — leave the default-checked radio alone.
+      }
     }
   } catch (_e) {
     // First-run / no config — leave form blank.
@@ -148,11 +166,13 @@ form.addEventListener("submit", async (e) => {
   pairBtn.textContent = "Pairing…";
 
   try {
+    const selectedMode = document.querySelector('input[name="materializer-mode"]:checked');
     const result = await invoke("pair", {
       input: {
         nexus_url: nexusUrlEl.value.trim(),
         token: tokenEl.value.trim(),
         vaults_root: vaultRootEl.value.trim(),
+        materializer_mode: selectedMode ? selectedMode.value : null,
       },
     });
 
