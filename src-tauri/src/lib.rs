@@ -6,6 +6,7 @@ pub mod pairing;
 pub mod scope;
 pub mod sse;
 pub mod tray;
+pub mod tray_state;
 
 use tauri::Manager;
 
@@ -27,26 +28,28 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![pairing::pair])
         .setup(|app| {
-            // S471 v0.1.2 fix: on macOS, set Accessory BEFORE registering the
-            // tray icon. Reversed order (build_tray then Accessory) orphans
-            // the status item — tray slot stays present but renders nothing.
             #[cfg(target_os = "macos")]
             {
                 use tauri::ActivationPolicy;
                 let _ = app.set_activation_policy(ActivationPolicy::Accessory);
             }
 
-            tray::build_tray(app.handle())?;
-
             let cfg_path = config::default_config_path();
+            let shared_state = {
+                let (sub, url, root) = match config::Config::load_from(&cfg_path) {
+                    Ok(c) => (c.subscriber_id, c.nexus_url, c.vault_root),
+                    Err(_) => (String::new(), String::new(), std::path::PathBuf::new()),
+                };
+                std::sync::Arc::new(std::sync::RwLock::new(tray_state::TrayState::new(
+                    sub, url, root,
+                )))
+            };
+
+            tray::build_tray(app.handle(), shared_state.clone())?;
+
             if cfg_path.exists() {
-                // S471 fix: actually spawn the SSE consumer when paired.
-                // v0.1.0 left this as a TODO; daemon launched but never synced.
-                spawn_sse_consumer(app.handle().clone(), cfg_path);
+                spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
             } else {
-                // S471 fix: actually SHOW the pair-wizard window on first run.
-                // The window is created `visible: false` in tauri.conf.json so
-                // without an explicit show() the user sees nothing.
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
@@ -60,8 +63,12 @@ pub fn run() {
 
 /// Boot the SSE consumer from a saved config + keyring token. Runs on the
 /// Tauri async runtime so it doesn't block app startup.
-fn spawn_sse_consumer(app: tauri::AppHandle, cfg_path: std::path::PathBuf) {
-    let _ = app; // reserved for future tray-status signaling
+fn spawn_sse_consumer(
+    app: tauri::AppHandle,
+    cfg_path: std::path::PathBuf,
+    tray_state: tray_state::SharedTrayState,
+) {
+    let _ = app;
     tauri::async_runtime::spawn(async move {
         let cfg = match config::Config::load_from(&cfg_path) {
             Ok(c) => c,
@@ -110,7 +117,7 @@ fn spawn_sse_consumer(app: tauri::AppHandle, cfg_path: std::path::PathBuf) {
             snap.scope_excludes,
             materializer,
         ) {
-            Ok(c) => c,
+            Ok(c) => c.with_tray_state(tray_state),
             Err(e) => {
                 tracing::error!("sse consumer init failed: {e}");
                 return;

@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
 use crate::materializer::Materializer;
 use crate::scope::{is_safe_path, path_in_scope};
+use crate::tray_state::{ConnectionStatus, SharedTrayState};
 use eventsource_client::{Client, Error as SseError, SSE};
 use futures::TryStreamExt;
 use serde::Deserialize;
@@ -27,6 +28,7 @@ pub struct SseConsumer {
     scope_excludes: Vec<String>,
     api: ApiClient,
     materializer: Materializer,
+    tray_state: Option<SharedTrayState>,
 }
 
 impl SseConsumer {
@@ -45,7 +47,37 @@ impl SseConsumer {
             scope_excludes,
             api,
             materializer,
+            tray_state: None,
         })
+    }
+
+    pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
+        self.tray_state = Some(state);
+        self
+    }
+
+    fn ts_set(&self, status: ConnectionStatus) {
+        if let Some(s) = &self.tray_state {
+            if let Ok(mut st) = s.write() {
+                st.set_status(status);
+            }
+        }
+    }
+
+    fn ts_event(&self) {
+        if let Some(s) = &self.tray_state {
+            if let Ok(mut st) = s.write() {
+                st.record_event();
+            }
+        }
+    }
+
+    fn ts_err(&self, status: ConnectionStatus, msg: String) {
+        if let Some(s) = &self.tray_state {
+            if let Ok(mut st) = s.write() {
+                st.set_error(status, msg);
+            }
+        }
     }
 
     pub async fn run(
@@ -54,6 +86,7 @@ impl SseConsumer {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut backoff = Duration::from_secs(1);
+        self.ts_set(ConnectionStatus::Connecting);
         loop {
             if *shutdown.borrow() {
                 break;
@@ -61,6 +94,7 @@ impl SseConsumer {
             match self.run_one_session(&mut last_event_id).await {
                 Ok(()) => {
                     backoff = Duration::from_secs(1);
+                    self.ts_set(ConnectionStatus::Reconnecting);
                 }
                 Err(SseError::StreamClosed)
                 | Err(SseError::Eof)
@@ -68,7 +102,7 @@ impl SseConsumer {
                 | Err(SseError::TimedOut)
                 | Err(SseError::HttpStream(_)) => {
                     warn!("SSE disconnected; reconnecting in {:?}", backoff);
-                    // Respect shutdown during backoff sleep
+                    self.ts_set(ConnectionStatus::Reconnecting);
                     tokio::select! {
                         _ = sleep(backoff) => {}
                         _ = shutdown.changed() => { break; }
@@ -77,14 +111,14 @@ impl SseConsumer {
                 }
                 Err(SseError::UnexpectedResponse(resp, body)) => {
                     let status = resp.status();
-                    // CF-S470-T22-401-fastfail: auth-failures are not transient —
-                    // retrying with the same token cannot recover. Propagate as fatal
-                    // so the daemon surfaces the failure (tray red + user re-pair).
                     if status == 401 || status == 403 {
                         error!(status = status, "SSE auth failure; not retrying");
+                        self.ts_err(
+                            ConnectionStatus::AuthFailed,
+                            format!("token rejected (HTTP {status})"),
+                        );
                         return Err(SseError::UnexpectedResponse(resp, body).into());
                     }
-                    // Otherwise (5xx etc.) treat as transient and back off.
                     let retry_secs = resp
                         .get_header_value("retry-after")
                         .ok()
@@ -96,6 +130,10 @@ impl SseConsumer {
                         retry_after = retry_secs,
                         "SSE server error; backing off"
                     );
+                    self.ts_err(
+                        ConnectionStatus::Reconnecting,
+                        format!("HTTP {status}, retry in {retry_secs}s"),
+                    );
                     let wait = Duration::from_secs(retry_secs);
                     tokio::select! {
                         _ = sleep(wait) => {}
@@ -105,6 +143,7 @@ impl SseConsumer {
                 }
                 Err(e) => {
                     error!("SSE fatal: {e}");
+                    self.ts_err(ConnectionStatus::Error, e.to_string());
                     return Err(e.into());
                 }
             }
@@ -125,12 +164,14 @@ impl SseConsumer {
             match event {
                 SSE::Connected(_) => {
                     debug!("SSE connected");
+                    self.ts_set(ConnectionStatus::Connected);
                 }
                 SSE::Event(ev) => {
                     if ev.event_type != "enrichment_complete" {
                         debug!("intermediate event observed: {}", ev.event_type);
                         continue;
                     }
+                    self.ts_event();
                     let env: Envelope = match serde_json::from_str(&ev.data) {
                         Ok(e) => e,
                         Err(e) => {
