@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- S471 v0.1.6: mark app as agent (menu-bar daemon, no dock icon).
+       Runtime app.set_activation_policy(Accessory) wasn't sticking on
+       macOS 26 — static Info.plist key is the canonical way. -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>
