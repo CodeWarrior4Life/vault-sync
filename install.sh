@@ -77,8 +77,12 @@ case "$OS" in
   Darwin)
     log "stripping quarantine + mounting dmg…"
     xattr -dr com.apple.quarantine "$TMP/$FILE" 2>/dev/null || true
-    MOUNT=$(hdiutil attach "$TMP/$FILE" -nobrowse | awk '/\/Volumes\// { sub(/^[^/]*/, "", $0); sub(/^[ \t]+/, "", $0); print; exit }')
-    [ -d "$MOUNT" ] || die "dmg did not mount: $MOUNT"
+    # hdiutil attach output: tab-separated columns. Last column is mount path
+    # when present. Grep the line that has /Volumes/ then tail-cut to extract.
+    MOUNT_LINE=$(hdiutil attach "$TMP/$FILE" -nobrowse | grep -F '/Volumes/' | tail -1)
+    MOUNT="${MOUNT_LINE#*	/Volumes/}"
+    MOUNT="/Volumes/${MOUNT}"
+    [ -d "$MOUNT" ] || die "dmg did not mount as expected: '$MOUNT' (from line: '$MOUNT_LINE')"
     APP_SRC="$MOUNT/$APP_DISPLAY.app"
     APP_DST="/Applications/$APP_DISPLAY.app"
     log "removing prior install (if any) + copying to /Applications…"
