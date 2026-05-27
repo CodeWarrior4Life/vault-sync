@@ -2,13 +2,16 @@ pub mod api_client;
 pub mod config;
 pub mod keyring;
 pub mod materializer;
+pub mod obsidian_plugin_detect;
 pub mod pairing;
 pub mod scope;
 pub mod sse;
+pub mod token_store;
 pub mod tray;
 pub mod tray_state;
 
 use tauri::Manager;
+use tauri_plugin_updater::UpdaterExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -47,6 +50,12 @@ pub fn run() {
 
             tray::build_tray(app.handle(), shared_state.clone())?;
 
+            // v0.1.4: silent auto-update check on startup. Uses the pubkey +
+            // endpoints declared in tauri.conf.json. Runs detached so a slow
+            // /admin/api/vault-sync/releases/<platform>/latest doesn't block
+            // SSE startup. Failures log only — never block the daemon.
+            spawn_updater_check(app.handle().clone());
+
             if cfg_path.exists() {
                 spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
             } else {
@@ -59,6 +68,37 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Check for a daemon update from the Nexus-served release endpoint. If
+/// available, download + install in the background. v0.1.4 ships silent
+/// auto-update by default; a future version can promote to "prompt first".
+fn spawn_updater_check(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let updater = match app.updater() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("updater init failed: {e}");
+                return;
+            }
+        };
+        match updater.check().await {
+            Ok(Some(update)) => {
+                tracing::info!(
+                    "update available: {} -> {}; downloading",
+                    env!("CARGO_PKG_VERSION"),
+                    update.version
+                );
+                if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+                    tracing::warn!("update download_and_install failed: {e}");
+                } else {
+                    tracing::info!("update installed; will apply on next launch");
+                }
+            }
+            Ok(None) => tracing::debug!("no update available"),
+            Err(e) => tracing::warn!("update check failed: {e}"),
+        }
+    });
 }
 
 /// Boot the SSE consumer from a saved config + keyring token. Runs on the
@@ -77,20 +117,30 @@ fn spawn_sse_consumer(
                 return;
             }
         };
-        let token = match keyring::get_token(&cfg.subscriber_id) {
+        let token = match token_store::load(&cfg.subscriber_id) {
             Ok(Some(t)) => t,
             Ok(None) => {
                 tracing::error!(
-                    "no keyring token for subscriber_id={}; re-pair required",
+                    "no token in keyring or file fallback for subscriber_id={}; re-pair required",
                     cfg.subscriber_id
                 );
                 return;
             }
             Err(e) => {
-                tracing::error!("keyring read failed: {e}");
+                tracing::error!("token_store read failed: {e}");
                 return;
             }
         };
+
+        // v0.1.4: scan vault for conflicting Obsidian plugins (legacy
+        // lattice-sync, vault-sync, etc.) and disable them in
+        // community-plugins.json before SSE starts materializing. Two sync
+        // engines on the same vault would race. Result logged + included in
+        // tray notification on next refresh.
+        let detect = obsidian_plugin_detect::detect_and_disable(&cfg.vault_root);
+        if let Some(line) = obsidian_plugin_detect::summary_line(&detect) {
+            tracing::info!("{line}");
+        }
         let api = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
             Ok(a) => a,
             Err(e) => {

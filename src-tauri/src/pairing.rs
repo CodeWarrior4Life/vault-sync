@@ -1,6 +1,7 @@
 use crate::api_client::{ApiClient, ApiError, HealthSnapshot};
 use crate::config::{default_config_path, Config, ConfigError};
-use crate::keyring::{self, KeyringError};
+use crate::keyring::KeyringError;
+use crate::token_store::{self, TokenStoreError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -9,6 +10,8 @@ use thiserror::Error;
 pub enum PairingError {
     #[error("keyring unavailable: {0}")]
     KeyringUnavailable(#[from] KeyringError),
+    #[error("token persistence failed: {0}")]
+    TokenStore(#[from] TokenStoreError),
     #[error("api error: {0}")]
     Api(#[from] ApiError),
     #[error("config error: {0}")]
@@ -34,10 +37,13 @@ pub async fn pair_inner(
     input: PairingInput,
     config_path: PathBuf,
 ) -> Result<PairingSuccess, PairingError> {
-    keyring::preflight()?;
+    // v0.1.4: skip keyring preflight here — token_store::store handles
+    // keyring failure transparently by falling back to a 0600 file. Pairing
+    // succeeds on Linux-no-secret-service and SSH-installed-Mac alike.
     let client = ApiClient::new(&input.nexus_url, &input.token)?;
     let snap: HealthSnapshot = client.health().await?;
-    keyring::set_token(&snap.subscriber_id, &input.token)?;
+    let backend = token_store::store(&snap.subscriber_id, &input.token)?;
+    tracing::info!("token persisted via {backend} backend");
     let cfg = Config {
         nexus_url: input.nexus_url,
         subscriber_id: snap.subscriber_id.clone(),
