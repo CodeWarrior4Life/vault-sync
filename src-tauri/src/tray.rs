@@ -1,16 +1,25 @@
 use crate::tray_state::SharedTrayState;
 use std::time::Duration;
 use tauri::{
+    image::Image,
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder},
     tray::TrayIconBuilder,
     AppHandle, Manager, Wry,
 };
 use tauri_plugin_shell::ShellExt;
+use tracing::{info, warn};
+
+/// 32×32 RGBA PNG embedded at compile time so the tray icon doesn't depend
+/// on `default_window_icon()` (which resolves to the large .icns and renders
+/// as a near-invisible smudge once macOS template-scales it down to status-
+/// bar height). Source: src-tauri/icons/32x32.png.
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/32x32.png");
 
 /// Build the tray icon + menu, wire handlers to actual functionality, and
 /// spawn a background task that refreshes the visible status line every 2 s
 /// from the SharedTrayState that the SSE consumer writes to.
 pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> {
+    info!("build_tray: entry");
     let status_item = MenuItemBuilder::with_id("status", "Status: starting…")
         .enabled(false)
         .build(app)?;
@@ -44,19 +53,32 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let handler_state = state.clone();
     let refresh_state = state.clone();
 
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon (used for tray)".into()))?;
+    let icon = match Image::from_bytes(TRAY_ICON_BYTES) {
+        Ok(i) => {
+            info!(
+                "build_tray: tray icon loaded from embedded 32x32 PNG ({} bytes)",
+                TRAY_ICON_BYTES.len()
+            );
+            i
+        }
+        Err(e) => {
+            warn!(
+                "build_tray: embedded PNG load failed ({e}); falling back to default_window_icon"
+            );
+            app.default_window_icon().cloned().ok_or_else(|| {
+                tauri::Error::AssetNotFound("default window icon (tray fallback)".into())
+            })?
+        }
+    };
 
+    // v0.1.5: dropping icon_as_template(true) — the dedicated 32×32 colored
+    // PNG renders as a small color icon in the menu bar (visible) instead of
+    // the previous template-scaled-down-from-.icns which Cyril reported as
+    // entirely invisible on macOS 26.4.
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .icon(icon)
         .tooltip("Nexus Vault Sync");
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder.icon_as_template(true);
-    }
     builder = builder.on_menu_event(move |app, event| {
         let st = handler_state.clone();
         match event.id.as_ref() {
@@ -92,6 +114,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         }
     });
     builder.build(app)?;
+    info!("build_tray: TrayIcon registered + menu attached");
 
     // Background refresher: poll SharedTrayState every 2s and update the
     // top three (status / activity / last_error) menu items in place.
