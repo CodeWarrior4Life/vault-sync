@@ -113,9 +113,11 @@ listen("verify-error", (event) => {
 
 document.querySelector("#vr-close-btn").addEventListener("click", () => {
   verifyPanel.classList.add("hidden");
+  form.classList.remove("hidden");
 });
 document.querySelector("#vr-error-close-btn").addEventListener("click", () => {
   verifyPanel.classList.add("hidden");
+  form.classList.remove("hidden");
 });
 
 function showStatus(msg, isError) {

@@ -17,6 +17,10 @@ use tracing::{info, warn};
 /// as a near-invisible smudge once macOS template-scales it down to status-
 /// bar height). Source: src-tauri/icons/32x32.png.
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/32x32.png");
+/// v0.3.1: dimmed variant (alpha halved) used by the animation task to
+/// pulse the tray icon while the daemon is connecting or running
+/// verify-and-repair. Generated from 32x32.png; see commit notes.
+const TRAY_ICON_DIM_BYTES: &[u8] = include_bytes!("../icons/32x32-dim.png");
 
 /// Stable id for the tray icon so handlers (e.g. the verify-repair arm) can
 /// look it up via `app.tray_by_id` and flip the tooltip synchronously without
@@ -266,6 +270,8 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     // Wrap the TrayIcon so the refresher task can set_tooltip on it.
     let tray_arc: Arc<TrayIcon<Wry>> = Arc::new(tray);
     let tray_for_refresh = tray_arc.clone();
+    let tray_for_anim = tray_arc.clone();
+    let anim_state = state.clone();
 
     // Background refresher: poll SharedTrayState every 2s and update menu
     // items + tray tooltip. Mandate §9 AG13 requires the surface updates
@@ -391,6 +397,64 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
             if tooltip != prev_tooltip {
                 let _ = tray_for_refresh.set_tooltip(Some(&tooltip));
                 prev_tooltip = tooltip;
+            }
+        }
+    });
+
+    // v0.3.1: gentle icon pulse while the daemon is "busy" -- either
+    // Starting/Connecting/Reconnecting OR an owner-invoked verify-and-repair
+    // is running. Toggles between the normal 32x32 icon and a 50%-alpha dim
+    // variant every 800ms. Idle when status is Connected/Paused and
+    // verify_in_progress is false. Cyril S476 verbatim:
+    //     "i think the icon should animate gently while it is indexing.
+    //      .i think that's what its still doing often times when i'm first
+    //      running the verify & repair."
+    tauri::async_runtime::spawn(async move {
+        use crate::tray_state::ConnectionStatus;
+        let normal_icon = match Image::from_bytes(TRAY_ICON_BYTES) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("tray anim: failed to load normal icon ({e}); animation disabled");
+                return;
+            }
+        };
+        let dim_icon = match Image::from_bytes(TRAY_ICON_DIM_BYTES) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("tray anim: failed to load dim icon ({e}); animation disabled");
+                return;
+            }
+        };
+        let mut phase_dim = false;
+        let mut was_animating = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let animate = match anim_state.read() {
+                Ok(s) => {
+                    s.verify_in_progress
+                        || matches!(
+                            s.status,
+                            ConnectionStatus::Starting
+                                | ConnectionStatus::Connecting
+                                | ConnectionStatus::Reconnecting
+                        )
+                }
+                Err(_) => false,
+            };
+            if animate {
+                phase_dim = !phase_dim;
+                let next = if phase_dim {
+                    dim_icon.clone()
+                } else {
+                    normal_icon.clone()
+                };
+                let _ = tray_for_anim.set_icon(Some(next));
+                was_animating = true;
+            } else if was_animating {
+                // Settled — restore the full-strength icon exactly once.
+                let _ = tray_for_anim.set_icon(Some(normal_icon.clone()));
+                phase_dim = false;
+                was_animating = false;
             }
         }
     });

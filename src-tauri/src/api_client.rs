@@ -269,11 +269,22 @@ impl ApiClient {
         &self,
         req: &ReconcileRequest<'_>,
     ) -> Result<ReconcileResponse, ApiError> {
+        // v0.3.1: per-call timeout override. The client default (30s) is
+        // sized for small request/response pairs (health, single push) and
+        // blew up on the first real reconcile against a 6k+ note vault:
+        // the SERVER returned a 28k-entry plan (Reconciliation plan: 28152
+        // push, 0 pull, 0 identical -- container log 2026-05-27 16:37:44),
+        // but reqwest's 30s wall-clock fired while reading the response
+        // body, so the daemon surfaced "network error: error sending request"
+        // even though the server logged 200 OK. 300s gives initial-pair on
+        // a multi-tens-of-thousands-of-files vault plenty of room without
+        // hanging forever on a truly stuck request.
         let resp = self
             .http
             .post(format!("{}/api/sync/reconcile", self.base_url))
             .bearer_auth(&self.token)
             .json(req)
+            .timeout(Duration::from_secs(300))
             .send()
             .await?;
         match resp.status() {
