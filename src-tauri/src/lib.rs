@@ -27,14 +27,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![pairing::pair])
         .setup(|app| {
-            tray::build_tray(app.handle())?;
-
-            // S471 fix: macOS → menu-bar-only (no dock icon).
+            // S471 v0.1.2 fix: on macOS, set Accessory BEFORE registering the
+            // tray icon. Reversed order (build_tray then Accessory) orphans
+            // the status item — tray slot stays present but renders nothing.
             #[cfg(target_os = "macos")]
             {
                 use tauri::ActivationPolicy;
                 let _ = app.set_activation_policy(ActivationPolicy::Accessory);
             }
+
+            tray::build_tray(app.handle())?;
 
             let cfg_path = config::default_config_path();
             if cfg_path.exists() {
