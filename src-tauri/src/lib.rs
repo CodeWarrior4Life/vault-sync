@@ -30,7 +30,10 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![pairing::pair])
+        .invoke_handler(tauri::generate_handler![
+            pairing::pair,
+            pairing::load_current_config
+        ])
         .setup(|app| {
             // v0.1.6: set_activation_policy returns () on macOS (infallible).
             // The static LSUIElement=true in Info.plist is the canonical

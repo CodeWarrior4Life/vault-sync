@@ -67,6 +67,29 @@ pub async fn pair(input: PairingInput) -> Result<PairingSuccess, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Serialize)]
+pub struct CurrentConfig {
+    pub nexus_url: String,
+    pub vault_root: String,
+    pub subscriber_id: String,
+}
+
+/// v0.1.8: expose the on-disk config to the wizard so Settings… opens a
+/// pre-populated form instead of an empty one. Returns None when no config
+/// exists (first-run). The token is NOT returned — wizard always asks the
+/// user to re-paste it (security + simpler than worrying about the file
+/// fallback vs keyring case).
+#[tauri::command]
+pub fn load_current_config() -> Option<CurrentConfig> {
+    let path = default_config_path();
+    let cfg = Config::load_from(&path).ok()?;
+    Some(CurrentConfig {
+        nexus_url: cfg.nexus_url,
+        vault_root: cfg.vault_root.to_string_lossy().to_string(),
+        subscriber_id: cfg.subscriber_id,
+    })
+}
+
 fn detect_platform() -> String {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "windows-x86_64",

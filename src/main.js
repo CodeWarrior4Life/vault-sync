@@ -13,6 +13,21 @@ const resultSubscriberIdEl = document.querySelector("#result-subscriber-id");
 const resultModeEl = document.querySelector("#result-mode");
 const resultScopeRootsEl = document.querySelector("#result-scope-roots");
 
+// v0.1.8: pre-populate Nexus URL + Vault Root from existing config (if any)
+// so Settings… opens a usable form instead of a blank one. Token field is
+// intentionally NOT pre-filled — user re-pastes for security.
+(async () => {
+  try {
+    const cfg = await invoke("load_current_config");
+    if (cfg) {
+      if (cfg.nexus_url) nexusUrlEl.value = cfg.nexus_url;
+      if (cfg.vault_root) vaultRootEl.value = cfg.vault_root;
+    }
+  } catch (_e) {
+    // First-run / no config — leave form blank.
+  }
+})();
+
 function showStatus(msg, isError) {
   statusEl.textContent = msg;
   statusEl.className = "status" + (isError ? " error" : " info");

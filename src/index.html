@@ -38,18 +38,23 @@
         </div>
 
         <div class="field">
-          <label for="vault-root">Vault Root Path</label>
+          <label for="vault-root">Vaults Root Path</label>
           <div class="row-input">
             <input
               id="vault-root"
               type="text"
-              placeholder="/path/to/your/vault"
+              placeholder="/path/to/your/vaults"
               required
               autocomplete="off"
               spellcheck="false"
             />
             <button type="button" id="browse-btn">Browse…</button>
           </div>
+          <p class="hint">
+            v0.1.8 syncs your Mainframe vault here. Multi-vault sync (one
+            daemon → many Obsidian vaults under this root) lands in v0.2.0
+            once the Nexus side ingests per-vault sources.
+          </p>
         </div>
 
         <button type="submit" id="pair-btn">Pair</button>
