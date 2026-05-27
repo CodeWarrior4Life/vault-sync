@@ -32,10 +32,11 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
 
     let open_vault = MenuItemBuilder::with_id("open-vault", "Open Vault Folder").build(app)?;
     let open_admin = MenuItemBuilder::with_id("open-admin", "Open Admin in Browser").build(app)?;
-    let pause = MenuItemBuilder::with_id("pause", "Pause Sync (coming v0.1.4)")
+    let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
+    let pause = MenuItemBuilder::with_id("pause", "Pause Sync (coming v0.1.8)")
         .enabled(false)
         .build(app)?;
-    let resync = MenuItemBuilder::with_id("resync", "Force Resync (coming v0.1.4)")
+    let resync = MenuItemBuilder::with_id("resync", "Force Resync (coming v0.1.8)")
         .enabled(false)
         .build(app)?;
     let about = MenuItemBuilder::with_id("about", "About…").build(app)?;
@@ -44,7 +45,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let menu: Menu<Wry> = MenuBuilder::new(app)
         .items(&[&status_item, &activity_item, &last_error_item])
         .separator()
-        .items(&[&open_vault, &open_admin, &pause, &resync])
+        .items(&[&open_vault, &open_admin, &settings, &pause, &resync])
         .separator()
         .items(&[&about, &quit])
         .build()?;
@@ -99,6 +100,15 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     drop(s);
                     #[allow(deprecated)]
                     let _ = app.shell().open(url, None);
+                }
+            }
+            "settings" => {
+                // v0.1.7: re-open the pair-wizard window for re-config
+                // (change vault path / token / nexus URL). Same window,
+                // just shown on demand instead of only-on-first-run.
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
                 }
             }
             "about" => {

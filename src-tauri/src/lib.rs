@@ -2,6 +2,7 @@ pub mod api_client;
 pub mod config;
 pub mod keyring;
 pub mod materializer;
+pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
 pub mod pairing;
 pub mod scope;
@@ -136,14 +137,31 @@ fn spawn_sse_consumer(
             }
         };
 
-        // v0.1.4: scan vault for conflicting Obsidian plugins (legacy
-        // lattice-sync, vault-sync, etc.) and disable them in
-        // community-plugins.json before SSE starts materializing. Two sync
-        // engines on the same vault would race. Result logged + included in
-        // tray notification on next refresh.
-        let detect = obsidian_plugin_detect::detect_and_disable(&cfg.vault_root);
-        if let Some(line) = obsidian_plugin_detect::summary_line(&detect) {
-            tracing::info!("{line}");
+        // v0.1.4: scan vault for conflicting Obsidian plugins and disable
+        // them in community-plugins.json before SSE starts materializing.
+        // v0.1.7: scan ALL known Obsidian vaults (not just the configured
+        // one) — Cyril's setup has Mainframe at D:\Vaults\Mainframe with
+        // nexus-sync enabled there but other vaults under D:\Vaults\ may
+        // also have the conflict. Discover via Obsidian's obsidian.json
+        // registry.
+        {
+            let mut vaults_to_scan: Vec<std::path::PathBuf> =
+                obsidian_install_detect::find_known_vaults();
+            // The configured vault may not be in obsidian.json yet (fresh
+            // install scenario) — include it explicitly.
+            if !vaults_to_scan.iter().any(|p| p == &cfg.vault_root) {
+                vaults_to_scan.push(cfg.vault_root.clone());
+            }
+            tracing::info!(
+                "scanning {} obsidian vault(s) for conflicting plugins",
+                vaults_to_scan.len()
+            );
+            for vault in &vaults_to_scan {
+                let detect = obsidian_plugin_detect::detect_and_disable(vault);
+                if let Some(line) = obsidian_plugin_detect::summary_line(&detect) {
+                    tracing::info!("[{}] {line}", vault.display());
+                }
+            }
         }
         let api = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
             Ok(a) => a,

@@ -13,12 +13,23 @@ use tracing::{info, warn};
 
 /// Known plugin IDs that conflict with the vault-sync daemon. Add to this
 /// list when we ship a new conflicting plugin or rename an existing one.
+///
+/// Two classes of conflict:
+///   1. Old Lattice/Nexus sync plugins — superseded by this daemon.
+///   2. Generic Obsidian sync plugins (livesync etc.) — would compete for
+///      the same vault file writes, producing dueling-writers races.
 const CONFLICTING_PLUGIN_IDS: &[&str] = &[
+    // Lattice/Nexus lineage
     "lattice-sync",
     "vault-sync",
+    "nexus-sync",
+    "nexus-tools",
     "obsidian-nexus-sync",
     "nexus-vault-sync",
     "obsidian-vault-sync",
+    // Generic third-party Obsidian sync plugins
+    "obsidian-livesync",
+    "remotely-save",
 ];
 
 #[derive(Debug, Default)]
