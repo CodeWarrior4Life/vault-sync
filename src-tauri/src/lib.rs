@@ -31,16 +31,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![pairing::pair])
         .setup(|app| {
-            // v0.1.6: log the result of set_activation_policy so a future
-            // dock-icon regression surfaces in the trace (was swallowed
-            // before, masking real failures on macOS 26).
+            // v0.1.6: set_activation_policy returns () on macOS (infallible).
+            // The static LSUIElement=true in Info.plist is the canonical
+            // path; this is defense-in-depth.
             #[cfg(target_os = "macos")]
             {
                 use tauri::ActivationPolicy;
-                match app.set_activation_policy(ActivationPolicy::Accessory) {
-                    Ok(()) => tracing::info!("set_activation_policy(Accessory) OK"),
-                    Err(e) => tracing::warn!("set_activation_policy(Accessory) failed: {e}"),
-                }
+                app.set_activation_policy(ActivationPolicy::Accessory);
+                tracing::info!("set_activation_policy(Accessory) invoked");
             }
 
             let cfg_path = config::default_config_path();
