@@ -72,6 +72,29 @@
         <p>Scope roots: <span id="result-scope-roots"></span></p>
         <p class="note">You can close this window — the daemon is running in the system tray.</p>
       </div>
+
+      <div id="verify-panel" class="hidden">
+        <h2>Verify &amp; Repair</h2>
+        <div id="verify-loading">
+          <p class="spinner-line"><span class="spinner"></span> Verifying vault… scanning every file and comparing against the server. This can take a little while on large vaults.</p>
+        </div>
+        <div id="verify-results" class="hidden">
+          <table class="report">
+            <tr><td>Scanned</td><td><strong id="vr-scanned">0</strong></td></tr>
+            <tr><td>In sync</td><td><strong id="vr-insync">0</strong></td></tr>
+            <tr><td>Will upload (local only / changed)</td><td><strong id="vr-push">0</strong></td></tr>
+            <tr><td>Server has, local missing</td><td><strong id="vr-pull">0</strong></td></tr>
+            <tr><td>Substrate refused (RASP-protected)</td><td><strong id="vr-substrate">0</strong></td></tr>
+            <tr><td>Elapsed</td><td><strong id="vr-elapsed">0</strong></td></tr>
+          </table>
+          <p class="note" id="vr-note"></p>
+          <button type="button" id="vr-close-btn">Close</button>
+        </div>
+        <div id="verify-error" class="hidden">
+          <p class="status error" id="vr-error-msg"></p>
+          <button type="button" id="vr-error-close-btn">Close</button>
+        </div>
+      </div>
     </main>
   </body>
 </html>

@@ -9,10 +9,17 @@
 //! Concurrency model: `Arc<RwLock<TrayState>>`. Writers hold the lock for
 //! microseconds at a time; the poller holds it just long enough to clone the
 //! fields it needs. No async lock so the SSE hot path stays sync.
+//!
+//! v0.3 (Wave 3 mandate §4.1 + §9 AG5 + AG13) adds telemetry fields for the
+//! new push / file_watcher / safety-valve modules. All new fields default to
+//! 0 / false and are additive — pre-v0.3 callers of TrayState::new() keep
+//! working unchanged.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
+
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -55,6 +62,39 @@ pub struct TrayState {
     pub subscriber_id: String,
     pub nexus_url: String,
     pub vault_root: PathBuf,
+
+    // ---- v0.3 push / watcher / safety telemetry (mandate §4.1 + §9 AG5/AG13) ----
+    /// Current push_journal queue depth (un-acked events).
+    pub uploads_pending: usize,
+    /// Monotonic counter of successfully accepted server pushes.
+    pub uploads_sent: u64,
+    /// Monotonic counter of push failures (network exhaustion + 5xx). Does
+    /// NOT include 409 conflicts or auth/skip outcomes.
+    pub uploads_failed: u64,
+    /// Time of the last attempted push (Sent or Failed).
+    pub uploads_last_at: Option<DateTime<Utc>>,
+    /// Total file_watcher events that were filtered out (any reason).
+    pub events_filtered: u64,
+    /// file_watcher events dropped by the RASP substrate fence.
+    pub events_dropped_substrate: u64,
+    /// file_watcher events dropped by the extension allow-list.
+    pub events_dropped_extension: u64,
+    /// file_watcher events dropped by hardcoded or user exclude rules.
+    pub events_dropped_excludes: u64,
+    /// Number of `*.conflict-from-<dev>-<lsn>.md` files currently in the vault.
+    pub conflict_unresolved: usize,
+    /// Total post-write integrity-check failures (byte mismatch or parse fail).
+    pub integrity_failures: u64,
+    /// True iff `<vault>/redflag.md` is present — sync is HALTED.
+    pub redflag_tripped: bool,
+    /// True iff the DeleteBurstDetector is currently Paused.
+    pub delete_burst_paused: bool,
+    /// True while an owner-invoked "Verify and repair all files" sweep is
+    /// running. Set true the instant the tray menu item is clicked (before the
+    /// walk+hash+reconcile await) and false when it completes. Drives the
+    /// immediate "⟳ Verifying vault…" tooltip so the owner gets instant
+    /// feedback instead of staring at a stale tooltip for ~16s.
+    pub verify_in_progress: bool,
 }
 
 impl TrayState {
@@ -67,6 +107,19 @@ impl TrayState {
             subscriber_id,
             nexus_url,
             vault_root,
+            uploads_pending: 0,
+            uploads_sent: 0,
+            uploads_failed: 0,
+            uploads_last_at: None,
+            events_filtered: 0,
+            events_dropped_substrate: 0,
+            events_dropped_extension: 0,
+            events_dropped_excludes: 0,
+            conflict_unresolved: 0,
+            integrity_failures: 0,
+            redflag_tripped: false,
+            delete_burst_paused: false,
+            verify_in_progress: false,
         }
     }
 
@@ -86,6 +139,61 @@ impl TrayState {
     pub fn set_error(&mut self, status: ConnectionStatus, msg: String) {
         self.status = status;
         self.last_error = Some(msg);
+    }
+
+    // ---------------- v0.3 setters / counters ----------------
+
+    pub fn set_uploads_pending(&mut self, n: usize) {
+        self.uploads_pending = n;
+    }
+
+    pub fn inc_uploads_sent(&mut self) {
+        self.uploads_sent = self.uploads_sent.saturating_add(1);
+        self.uploads_last_at = Some(Utc::now());
+    }
+
+    pub fn inc_uploads_failed(&mut self) {
+        self.uploads_failed = self.uploads_failed.saturating_add(1);
+        self.uploads_last_at = Some(Utc::now());
+    }
+
+    pub fn inc_events_filtered(&mut self) {
+        self.events_filtered = self.events_filtered.saturating_add(1);
+    }
+
+    pub fn inc_events_dropped_substrate(&mut self) {
+        self.events_dropped_substrate = self.events_dropped_substrate.saturating_add(1);
+        self.inc_events_filtered();
+    }
+
+    pub fn inc_events_dropped_extension(&mut self) {
+        self.events_dropped_extension = self.events_dropped_extension.saturating_add(1);
+        self.inc_events_filtered();
+    }
+
+    pub fn inc_events_dropped_excludes(&mut self) {
+        self.events_dropped_excludes = self.events_dropped_excludes.saturating_add(1);
+        self.inc_events_filtered();
+    }
+
+    pub fn set_conflict_unresolved(&mut self, n: usize) {
+        self.conflict_unresolved = n;
+    }
+
+    pub fn inc_integrity_failures(&mut self) {
+        self.integrity_failures = self.integrity_failures.saturating_add(1);
+    }
+
+    pub fn set_redflag_tripped(&mut self, tripped: bool) {
+        self.redflag_tripped = tripped;
+    }
+
+    pub fn set_delete_burst_paused(&mut self, paused: bool) {
+        self.delete_burst_paused = paused;
+    }
+
+    pub fn set_verify_in_progress(&mut self, in_progress: bool) {
+        self.verify_in_progress = in_progress;
     }
 
     /// One-line status string for the tray menu's top item.
@@ -122,3 +230,82 @@ fn format_staleness(d: std::time::Duration) -> String {
 }
 
 pub type SharedTrayState = Arc<RwLock<TrayState>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> TrayState {
+        TrayState::new(
+            "sub-test".to_string(),
+            "https://example".to_string(),
+            PathBuf::from("/tmp/vault"),
+        )
+    }
+
+    #[test]
+    fn default_state_has_zero_counters() {
+        let s = fresh();
+        assert_eq!(s.uploads_pending, 0);
+        assert_eq!(s.uploads_sent, 0);
+        assert_eq!(s.uploads_failed, 0);
+        assert!(s.uploads_last_at.is_none());
+        assert_eq!(s.events_filtered, 0);
+        assert_eq!(s.events_dropped_substrate, 0);
+        assert_eq!(s.events_dropped_extension, 0);
+        assert_eq!(s.events_dropped_excludes, 0);
+        assert_eq!(s.conflict_unresolved, 0);
+        assert_eq!(s.integrity_failures, 0);
+        assert!(!s.redflag_tripped);
+        assert!(!s.delete_burst_paused);
+    }
+
+    #[test]
+    fn inc_uploads_sent_increments() {
+        let mut s = fresh();
+        s.inc_uploads_sent();
+        s.inc_uploads_sent();
+        assert_eq!(s.uploads_sent, 2);
+        assert!(s.uploads_last_at.is_some());
+    }
+
+    #[test]
+    fn inc_uploads_failed_increments_and_stamps_last_at() {
+        let mut s = fresh();
+        s.inc_uploads_failed();
+        assert_eq!(s.uploads_failed, 1);
+        assert!(s.uploads_last_at.is_some());
+    }
+
+    #[test]
+    fn dropped_substrate_also_bumps_filtered_total() {
+        let mut s = fresh();
+        s.inc_events_dropped_substrate();
+        s.inc_events_dropped_extension();
+        s.inc_events_dropped_excludes();
+        assert_eq!(s.events_dropped_substrate, 1);
+        assert_eq!(s.events_dropped_extension, 1);
+        assert_eq!(s.events_dropped_excludes, 1);
+        assert_eq!(s.events_filtered, 3);
+    }
+
+    #[test]
+    fn set_redflag_tripped_persists() {
+        let mut s = fresh();
+        s.set_redflag_tripped(true);
+        assert!(s.redflag_tripped);
+        s.set_redflag_tripped(false);
+        assert!(!s.redflag_tripped);
+    }
+
+    #[test]
+    fn set_conflict_unresolved_and_delete_burst_persist() {
+        let mut s = fresh();
+        s.set_conflict_unresolved(7);
+        s.set_delete_burst_paused(true);
+        s.set_uploads_pending(3);
+        assert_eq!(s.conflict_unresolved, 7);
+        assert!(s.delete_burst_paused);
+        assert_eq!(s.uploads_pending, 3);
+    }
+}

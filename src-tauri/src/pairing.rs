@@ -95,6 +95,17 @@ pub fn load_current_config() -> Option<CurrentConfig> {
     })
 }
 
+/// v0.3: return the currently-stored bearer token (keyring → file fallback)
+/// so the Settings UI can pre-fill the field. Cyril verbatim S473:
+/// *"its not truly persisted unless it shows up as filled in the UI"*.
+/// Returns None if no token is found for the configured subscriber_id.
+#[tauri::command]
+pub fn load_current_token() -> Option<String> {
+    let path = default_config_path();
+    let cfg = Config::load_from(&path).ok()?;
+    token_store::load(&cfg.subscriber_id).ok().flatten()
+}
+
 fn detect_platform() -> String {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "windows-x86_64",
