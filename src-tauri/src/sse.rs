@@ -10,9 +10,21 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
+fn default_op() -> String {
+    "UPSERT".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    op: String, // INSERT | UPDATE | DELETE
+    /// INSERT | UPDATE | DELETE | (server's catchup path omits this field —
+    /// default UPSERT so the daemon doesn't silently drop catchup envelopes
+    /// when reconnecting after a network blip. Root cause of S476's
+    /// "shadow materializer never writes" symptom: serde was rejecting
+    /// every catchup payload with `missing field op` before reaching the
+    /// materializer, and stderr logs go to /dev/null on Windows GUI subsystem
+    /// so the failures were invisible.)
+    #[serde(default = "default_op")]
+    op: String,
     path: String,
     #[allow(dead_code)]
     phase: String, // lint_pending | lint_complete | enrichment_complete

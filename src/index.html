@@ -54,7 +54,10 @@
             Parent directory holding your Obsidian vaults (e.g.
             <code>D:\Vaults</code> or <code>~/Vaults</code>). Substrate files
             (00_VAULT.md, Family.md, Mission.md, 02_Projects/Protocols/, _project/,
-            _rapport/people/) are RASP-fenced — daemon never writes them.
+            _rapport/people/) are RASP-fenced — daemon never writes them. In
+            Shadow mode, server pushes are cached internally
+            (<code>%LOCALAPPDATA%\Nexus\.lattice-runtime\&lt;subscriber&gt;\shadow\</code>);
+            in Live mode they land directly in your vault tree.
           </p>
         </div>
 
