@@ -51,9 +51,12 @@
             <button type="button" id="browse-btn">Browse…</button>
           </div>
           <p class="hint">
-            v0.1.8 syncs your Mainframe vault here. Multi-vault sync (one
-            daemon → many Obsidian vaults under this root) lands in v0.2.0
-            once the Nexus side ingests per-vault sources.
+            Parent directory holding your Obsidian vaults (e.g.
+            <code>D:\Vaults</code> or <code>~/Vaults</code>). Daemon writes
+            shadow tree to <code>&lt;root&gt;/&lt;vault-name&gt;/.lattice-sync/shadow/</code>
+            for each vault Nexus knows about. Substrate files
+            (00_VAULT.md, Family.md, Mission.md, 02_Projects/Protocols/, _project/,
+            _rapport/people/) are RASP-fenced — daemon never writes them.
           </p>
         </div>
 

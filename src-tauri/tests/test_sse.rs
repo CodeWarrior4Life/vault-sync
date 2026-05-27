@@ -16,14 +16,16 @@ use vault_sync_daemon::sse::SseConsumer;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_consumer(base_url: &str, vault_root: &TempDir) -> SseConsumer {
+fn make_consumer(base_url: &str, vaults_root: &TempDir) -> SseConsumer {
+    std::fs::create_dir_all(vaults_root.path().join("Mainframe")).unwrap();
     SseConsumer::new(
         base_url.to_string(),
         "vsk_test".to_string(),
         vec![], // empty roots = accept everything
         vec![],
         Materializer::new(
-            vault_root.path().to_path_buf(),
+            vaults_root.path().to_path_buf(),
+            "Mainframe".to_string(),
             None,
             MaterializerMode::Shadow,
         ),
@@ -105,7 +107,10 @@ async fn consumes_enrichment_complete_skips_lint_events() {
     let (handle, tx) = spawn_consumer(consumer);
 
     // Poll for the expected output file for up to 5 s (CI-safe).
-    let shadow = vault.path().join(".lattice-sync/shadow/Notes/hello.md");
+    // v0.2.0: materializer writes under <vaults_root>/<vault_name>/<shadow>/
+    let shadow = vault
+        .path()
+        .join("Mainframe/.lattice-sync/shadow/Notes/hello.md");
     let landed = wait_for_path(&shadow, Duration::from_secs(5)).await;
 
     // Signal shutdown and wait for the consumer task to exit.
@@ -118,7 +123,9 @@ async fn consumes_enrichment_complete_skips_lint_events() {
     );
 
     // lint_complete path should NOT be on disk
-    let lint_shadow = vault.path().join(".lattice-sync/shadow/Notes/skip.md");
+    let lint_shadow = vault
+        .path()
+        .join("Mainframe/.lattice-sync/shadow/Notes/skip.md");
     assert!(
         !lint_shadow.exists(),
         "lint_complete payload must not land in shadow tree"
@@ -170,7 +177,7 @@ async fn path_traversal_rejected_in_envelope() {
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 
     // The shadow dir should be completely empty (no file created for the malicious path).
-    let shadow_root = vault.path().join(".lattice-sync/shadow");
+    let shadow_root = vault.path().join("Mainframe/.lattice-sync/shadow");
     let shadow_has_files = shadow_root.exists()
         && std::fs::read_dir(&shadow_root)
             .map(|mut d| d.next().is_some())

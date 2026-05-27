@@ -21,7 +21,7 @@ const resultScopeRootsEl = document.querySelector("#result-scope-roots");
     const cfg = await invoke("load_current_config");
     if (cfg) {
       if (cfg.nexus_url) nexusUrlEl.value = cfg.nexus_url;
-      if (cfg.vault_root) vaultRootEl.value = cfg.vault_root;
+      if (cfg.vaults_root) vaultRootEl.value = cfg.vaults_root;
     }
   } catch (_e) {
     // First-run / no config — leave form blank.
@@ -60,7 +60,7 @@ form.addEventListener("submit", async (e) => {
       input: {
         nexus_url: nexusUrlEl.value.trim(),
         token: tokenEl.value.trim(),
-        vault_root: vaultRootEl.value.trim(),
+        vaults_root: vaultRootEl.value.trim(),
       },
     });
 

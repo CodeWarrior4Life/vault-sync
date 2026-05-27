@@ -1,4 +1,5 @@
 use crate::api_client::NotePayload;
+use crate::rasp_fence::is_substrate_path;
 use crate::scope::is_safe_path;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -30,6 +31,8 @@ impl MaterializerMode {
 pub enum MaterializerError {
     #[error("path traversal rejected: {0}")]
     PathTraversal(String),
+    #[error("RASP substrate path refused (read-only by daemon): {0}")]
+    SubstrateRefuse(String),
     #[error("materializer_mode=live not yet implemented in E2 (F adds atomic-write to live tree)")]
     NotYetImplemented,
     #[error("io error: {0}")]
@@ -38,20 +41,38 @@ pub enum MaterializerError {
     ShaMismatch { expected: String, actual: String },
 }
 
+/// v0.2.0: materializer holds `vaults_root` (parent dir, e.g. `D:\Vaults`)
+/// and the specific `vault_name` it writes to (e.g. `"Mainframe"`). Target
+/// path for an event with vault-relative `payload.path` becomes
+/// `<vaults_root>/<vault_name>/<shadow_subdir>/<payload.path>`. Per-vault
+/// boundary is enforced via canonical-path check against
+/// `<vaults_root>/<vault_name>`.
 pub struct Materializer {
-    vault_root: PathBuf,
+    vaults_root: PathBuf,
+    vault_name: String,
     shadow_subdir: String,
     mode: MaterializerMode,
 }
 
 impl Materializer {
-    pub fn new(vault_root: PathBuf, shadow_path: Option<String>, mode: MaterializerMode) -> Self {
+    pub fn new(
+        vaults_root: PathBuf,
+        vault_name: String,
+        shadow_path: Option<String>,
+        mode: MaterializerMode,
+    ) -> Self {
         let shadow_subdir = shadow_path.unwrap_or_else(|| ".lattice-sync/shadow/".to_string());
         Self {
-            vault_root,
+            vaults_root,
+            vault_name,
             shadow_subdir,
             mode,
         }
+    }
+
+    /// `<vaults_root>/<vault_name>` — the per-vault tree this materializer writes within.
+    fn vault_dir(&self) -> PathBuf {
+        self.vaults_root.join(&self.vault_name)
     }
 
     pub fn write(&self, payload: &NotePayload) -> Result<(), MaterializerError> {
@@ -69,15 +90,20 @@ impl Materializer {
         if !is_safe_path(&payload.path) {
             return Err(MaterializerError::PathTraversal(payload.path.clone()));
         }
+        // v0.2.0: RASP substrate fence — refuse to materialize any path that
+        // matches a substrate-layer pattern (00_VAULT.md / Family.md /
+        // Mission.md / 02_Projects/Protocols/** / _project/** /
+        // _rapport/people/**). Logged + Err, no file written.
+        if is_substrate_path(&payload.path) {
+            return Err(MaterializerError::SubstrateRefuse(payload.path.clone()));
+        }
         let target = self
-            .vault_root
+            .vault_dir()
             .join(&self.shadow_subdir)
             .join(&payload.path);
         // Path-traversal final canonicalization check
-        let canonical_vault = self
-            .vault_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.vault_root.clone());
+        let vault_dir = self.vault_dir();
+        let canonical_vault = vault_dir.canonicalize().unwrap_or(vault_dir);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
             let canonical_parent = parent
@@ -111,11 +137,14 @@ impl Materializer {
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
         }
+        if is_substrate_path(path) {
+            return Err(MaterializerError::SubstrateRefuse(path.into()));
+        }
         if matches!(self.mode, MaterializerMode::Disabled) {
             info!("materializer disabled; skipping delete for {}", path);
             return Ok(());
         }
-        let target = self.vault_root.join(&self.shadow_subdir).join(path);
+        let target = self.vault_dir().join(&self.shadow_subdir).join(path);
         if !target.exists() {
             info!("soft_delete: nothing to delete at {}", path);
             return Ok(());

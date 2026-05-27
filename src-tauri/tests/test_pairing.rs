@@ -8,7 +8,7 @@ fn make_input(nexus_url: &str, tmp: &TempDir) -> (PairingInput, PathBuf) {
     let input = PairingInput {
         nexus_url: nexus_url.to_string(),
         token: "vsk_test_token".to_string(),
-        vault_root: tmp.path().join("vault"),
+        vaults_root: tmp.path().join("vault"),
     };
     (input, config_path)
 }
@@ -144,7 +144,7 @@ async fn success_writes_keyring_and_config() {
     let input = PairingInput {
         nexus_url: srv.url(),
         token: "vsk_test_token".to_string(),
-        vault_root: tmp.path().join("vault"),
+        vaults_root: tmp.path().join("vault"),
     };
 
     // Check keyring preflight first; if unavailable, skip the keyring assertion.

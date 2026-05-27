@@ -9,7 +9,8 @@ fn save_then_load_round_trips() {
     let cfg = Config {
         nexus_url: "https://nexus.obsidian-inc.com".to_string(),
         subscriber_id: "test-sid".to_string(),
-        vault_root: PathBuf::from("/home/user/vault"),
+        vaults_root: PathBuf::from("/home/user/vault"),
+        vault_name: "Mainframe".to_string(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: "linux-x86_64".to_string(),
         last_event_id: None,
@@ -33,7 +34,8 @@ fn path_handles_unicode_filenames() {
     let cfg = Config {
         nexus_url: "https://nexus.obsidian-inc.com".to_string(),
         subscriber_id: "sid-😀".to_string(),
-        vault_root: PathBuf::from("/home/usér/váult"),
+        vaults_root: PathBuf::from("/home/usér/váult"),
+        vault_name: "Mainframe".to_string(),
         daemon_version: "0.1.0".to_string(),
         daemon_platform: "linux-x86_64".to_string(),
         last_event_id: None,

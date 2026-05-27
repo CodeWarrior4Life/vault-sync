@@ -22,7 +22,11 @@ pub enum PairingError {
 pub struct PairingInput {
     pub nexus_url: String,
     pub token: String,
-    pub vault_root: PathBuf,
+    /// v0.2.0: PARENT directory of one-or-more Obsidian vaults
+    /// (e.g. `D:\Vaults`). Aliased to legacy `vault_root` for back-compat
+    /// with v0.1.x clients still POSTing the old field name.
+    #[serde(alias = "vault_root")]
+    pub vaults_root: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +51,11 @@ pub async fn pair_inner(
     let cfg = Config {
         nexus_url: input.nexus_url,
         subscriber_id: snap.subscriber_id.clone(),
-        vault_root: input.vault_root,
+        vaults_root: input.vaults_root,
+        // v0.2.0: vault_name hardcoded to "Mainframe" — only vault Nexus
+        // currently knows server-side. Multi-vault routing comes when
+        // events carry their own vault_id.
+        vault_name: "Mainframe".to_string(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: detect_platform(),
         last_event_id: None,
@@ -70,22 +78,19 @@ pub async fn pair(input: PairingInput) -> Result<PairingSuccess, String> {
 #[derive(Debug, Serialize)]
 pub struct CurrentConfig {
     pub nexus_url: String,
-    pub vault_root: String,
+    pub vaults_root: String,
+    pub vault_name: String,
     pub subscriber_id: String,
 }
 
-/// v0.1.8: expose the on-disk config to the wizard so Settings… opens a
-/// pre-populated form instead of an empty one. Returns None when no config
-/// exists (first-run). The token is NOT returned — wizard always asks the
-/// user to re-paste it (security + simpler than worrying about the file
-/// fallback vs keyring case).
 #[tauri::command]
 pub fn load_current_config() -> Option<CurrentConfig> {
     let path = default_config_path();
     let cfg = Config::load_from(&path).ok()?;
     Some(CurrentConfig {
         nexus_url: cfg.nexus_url,
-        vault_root: cfg.vault_root.to_string_lossy().to_string(),
+        vaults_root: cfg.vaults_root.to_string_lossy().to_string(),
+        vault_name: cfg.vault_name,
         subscriber_id: cfg.subscriber_id,
     })
 }

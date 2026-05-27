@@ -19,11 +19,29 @@ pub enum ConfigError {
 pub struct Config {
     pub nexus_url: String,
     pub subscriber_id: String,
-    pub vault_root: PathBuf,
+    /// v0.2.0: PARENT directory holding one or more Obsidian vaults (e.g.
+    /// `D:\Vaults`). Materializer routes to `<vaults_root>/<vault_name>/.../`.
+    /// Back-compat: if `vaults_root` is missing but legacy `vault_root` is
+    /// present in the on-disk file, the deserializer accepts the legacy
+    /// field and the daemon derives `vaults_root` = parent + `vault_name` =
+    /// basename at load time.
+    #[serde(alias = "vault_root")]
+    pub vaults_root: PathBuf,
+    /// v0.2.0: name of THIS subscriber's vault under `vaults_root`. Today
+    /// hardcoded to "Mainframe" since that's the only vault Nexus knows
+    /// about server-side. Future multi-vault server-side will let each
+    /// subscriber/event carry its own vault_id and the daemon will route
+    /// per-vault.
+    #[serde(default = "default_vault_name")]
+    pub vault_name: String,
     pub daemon_version: String,
     pub daemon_platform: String,
     #[serde(default)]
     pub last_event_id: Option<String>,
+}
+
+fn default_vault_name() -> String {
+    "Mainframe".to_string()
 }
 
 impl Config {

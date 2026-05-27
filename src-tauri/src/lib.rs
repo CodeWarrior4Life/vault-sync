@@ -5,6 +5,7 @@ pub mod materializer;
 pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
 pub mod pairing;
+pub mod rasp_fence;
 pub mod scope;
 pub mod sse;
 pub mod token_store;
@@ -47,12 +48,16 @@ pub fn run() {
 
             let cfg_path = config::default_config_path();
             let shared_state = {
-                let (sub, url, root) = match config::Config::load_from(&cfg_path) {
-                    Ok(c) => (c.subscriber_id, c.nexus_url, c.vault_root),
+                let (sub, url, vault_dir) = match config::Config::load_from(&cfg_path) {
+                    Ok(c) => (
+                        c.subscriber_id,
+                        c.nexus_url,
+                        c.vaults_root.join(&c.vault_name),
+                    ),
                     Err(_) => (String::new(), String::new(), std::path::PathBuf::new()),
                 };
                 std::sync::Arc::new(std::sync::RwLock::new(tray_state::TrayState::new(
-                    sub, url, root,
+                    sub, url, vault_dir,
                 )))
             };
 
@@ -152,8 +157,9 @@ fn spawn_sse_consumer(
                 obsidian_install_detect::find_known_vaults();
             // The configured vault may not be in obsidian.json yet (fresh
             // install scenario) — include it explicitly.
-            if !vaults_to_scan.iter().any(|p| p == &cfg.vault_root) {
-                vaults_to_scan.push(cfg.vault_root.clone());
+            let configured_vault = cfg.vaults_root.join(&cfg.vault_name);
+            if !vaults_to_scan.iter().any(|p| p == &configured_vault) {
+                vaults_to_scan.push(configured_vault);
             }
             tracing::info!(
                 "scanning {} obsidian vault(s) for conflicting plugins",
@@ -181,7 +187,8 @@ fn spawn_sse_consumer(
             }
         };
         let materializer = materializer::Materializer::new(
-            cfg.vault_root.clone(),
+            cfg.vaults_root.clone(),
+            cfg.vault_name.clone(),
             snap.shadow_path.clone(),
             materializer::MaterializerMode::from_str(&snap.materializer_mode),
         );
