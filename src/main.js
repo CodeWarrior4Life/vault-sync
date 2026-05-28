@@ -12,7 +12,21 @@ const statusEl = document.querySelector("#status");
 const successPanel = document.querySelector("#success-panel");
 const resultSubscriberIdEl = document.querySelector("#result-subscriber-id");
 const resultModeEl = document.querySelector("#result-mode");
-const resultScopeRootsEl = document.querySelector("#result-scope-roots");
+const resultVaultsRootEl = document.querySelector("#result-vaults-root");
+const resultDetectedVaultsEl = document.querySelector("#result-detected-vaults");
+const closeBtn = document.querySelector("#close-btn");
+const editSettingsBtn = document.querySelector("#edit-settings-btn");
+
+// S477 §3.2: cache the current paired config for the Edit Settings restore
+// path. Populated after a successful pair (or on startup if a config is
+// already on disk). Shape: { nexusUrl, vaultsRoot, mode, subscriberId }.
+window.__currentPairedConfig = null;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
 
 // v0.3 copy helpers: replace internal jargon with user-facing meaning.
 function describeMode(mode) {
@@ -33,6 +47,36 @@ function describeScopeRoots(roots) {
     return "Everything in the vault (no folder restriction)";
   }
   return roots.join(", ");
+}
+
+// S477 §3.2: render the Paired panel from a current-config snapshot. Calls
+// the Tauri `list_vault_folders` command to surface detected Obsidian vaults
+// under the configured root.
+async function populatePairedPanel({ subscriberId, vaultsRoot, mode }) {
+  resultSubscriberIdEl.textContent = subscriberId || "—";
+  resultVaultsRootEl.textContent = vaultsRoot || "—";
+  resultModeEl.textContent = describeMode(mode);
+
+  if (!vaultsRoot) {
+    resultDetectedVaultsEl.textContent = "—";
+    return;
+  }
+
+  try {
+    const folders = await invoke("list_vault_folders", { vaultsRoot });
+    const detected = (folders || []).filter((f) => f.has_obsidian);
+    if (detected.length === 0) {
+      resultDetectedVaultsEl.innerHTML =
+        "<em>(no Obsidian vaults detected — daemon will still sync loose files)</em>";
+    } else {
+      resultDetectedVaultsEl.innerHTML = detected
+        .map((f) => `<code>${escapeHtml(f.name)}</code>`)
+        .join(", ");
+    }
+  } catch (e) {
+    resultDetectedVaultsEl.textContent =
+      "(error enumerating: " + (e && e.message ? e.message : String(e)) + ")";
+  }
 }
 
 // v0.3 — true persistence means the field is FILLED in the UI on reopen.
@@ -62,18 +106,33 @@ function describeScopeRoots(roots) {
       // user sees the live state instead of an always-defaults-to-shadow
       // form. Fetch directly from the server's /api/sync/health (which
       // returns the subscriber row's current mode).
+      let liveMode = null;
       try {
         const r = await fetch(cfg.nexus_url.replace(/\/$/, "") + "/api/sync/health", {
           headers: { Authorization: "Bearer " + tok },
         });
         if (r.ok) {
           const h = await r.json();
-          const mode = (h && h.materializer_mode) || "shadow";
+          liveMode = (h && h.materializer_mode) || null;
+          const mode = liveMode || "shadow";
           const radio = document.querySelector('input[name="materializer-mode"][value="' + mode + '"]');
           if (radio) radio.checked = true;
         }
       } catch (_e) {
         // Network / health failure — leave the default-checked radio alone.
+      }
+
+      // S477 §3.2: cache the current paired config so the Edit Settings
+      // button on the Paired panel (after a re-pair OR after the user
+      // navigates to the Paired panel via tray) has the prior state to
+      // restore. Subscriber_id comes from load_current_config.
+      if (cfg && cfg.subscriber_id) {
+        window.__currentPairedConfig = {
+          nexusUrl: cfg.nexus_url || "",
+          vaultsRoot: cfg.vaults_root || "",
+          mode: liveMode || "shadow",
+          subscriberId: cfg.subscriber_id,
+        };
       }
     }
   } catch (_e) {
@@ -165,26 +224,111 @@ form.addEventListener("submit", async (e) => {
   pairBtn.disabled = true;
   pairBtn.textContent = "Pairing…";
 
-  try {
-    const selectedMode = document.querySelector('input[name="materializer-mode"]:checked');
-    const result = await invoke("pair", {
-      input: {
-        nexus_url: nexusUrlEl.value.trim(),
-        token: tokenEl.value.trim(),
-        vaults_root: vaultRootEl.value.trim(),
-        materializer_mode: selectedMode ? selectedMode.value : null,
-      },
-    });
+  const nexusUrl = nexusUrlEl.value.trim();
+  const token = tokenEl.value.trim();
+  const vaultsRoot = vaultRootEl.value.trim();
+  const selectedMode = document.querySelector('input[name="materializer-mode"]:checked');
+  const mode = selectedMode ? selectedMode.value : null;
 
-    // Show success panel, hide form.
-    form.classList.add("hidden");
-    resultSubscriberIdEl.textContent = result.subscriber_id;
-    resultModeEl.textContent = describeMode(result.materializer_mode);
-    resultScopeRootsEl.textContent = describeScopeRoots(result.scope_roots);
-    successPanel.classList.remove("hidden");
+  const isEdit = !!window.__currentPairedConfig;
+  const tokenProvided = token.length > 0;
+
+  try {
+    if (isEdit && !tokenProvided) {
+      // S477 §3.2: edit-mode without token rotation — PATCH existing subscriber.
+      // This call is currently a stub (returns Err) pending Phase F server
+      // coordination. The error is surfaced to the user verbatim.
+      await invoke("patch_self_subscriber", {
+        nexusUrl,
+        newVaultsRoot: vaultsRoot,
+        newMode: mode,
+      });
+      // On success (post-Phase-F): refresh cache + re-render Paired panel.
+      window.__currentPairedConfig.nexusUrl = nexusUrl;
+      window.__currentPairedConfig.vaultsRoot = vaultsRoot;
+      window.__currentPairedConfig.mode = mode;
+      form.classList.add("hidden");
+      successPanel.classList.remove("hidden");
+      await populatePairedPanel({
+        subscriberId: window.__currentPairedConfig.subscriberId,
+        vaultsRoot,
+        mode,
+      });
+      pairBtn.disabled = false;
+      pairBtn.textContent = "Pair";
+    } else {
+      // Fresh pair OR token rotation: full POST.
+      const result = await invoke("pair", {
+        input: {
+          nexus_url: nexusUrl,
+          token,
+          vaults_root: vaultsRoot,
+          materializer_mode: mode,
+        },
+      });
+
+      // Cache for subsequent Edit Settings restores.
+      window.__currentPairedConfig = {
+        nexusUrl,
+        vaultsRoot,
+        mode: result.materializer_mode || mode,
+        subscriberId: result.subscriber_id,
+      };
+
+      // Show success panel, hide form.
+      form.classList.add("hidden");
+      successPanel.classList.remove("hidden");
+      await populatePairedPanel({
+        subscriberId: result.subscriber_id,
+        vaultsRoot,
+        mode: result.materializer_mode || mode,
+      });
+    }
   } catch (err) {
     showStatus("Pairing failed: " + err, true);
     pairBtn.disabled = false;
     pairBtn.textContent = "Pair";
   }
+});
+
+// S477 §3.2: Close button hides the wizard window. Daemon keeps running
+// in the tray; window can be reopened via tray menu / second-launch.
+closeBtn.addEventListener("click", async () => {
+  try {
+    const w = window.__TAURI__.window || window.__TAURI__.webviewWindow;
+    if (w && typeof w.getCurrentWindow === "function") {
+      await w.getCurrentWindow().hide();
+    } else if (w && typeof w.getCurrent === "function") {
+      await w.getCurrent().hide();
+    } else {
+      // Final fallback: best-effort window.close (may be intercepted by the
+      // existing close-handler that hides instead of quits).
+      window.close();
+    }
+  } catch (e) {
+    showStatus("Could not hide window: " + e, true);
+  }
+});
+
+// S477 §3.2: Edit Settings restores the pair-form with current values
+// pre-filled. Token stays blank so the user can either leave it (PATCH
+// path) or paste a new one (re-pair path).
+editSettingsBtn.addEventListener("click", () => {
+  const cfg = window.__currentPairedConfig;
+  if (cfg) {
+    if (cfg.nexusUrl) nexusUrlEl.value = cfg.nexusUrl;
+    if (cfg.vaultsRoot) vaultRootEl.value = cfg.vaultsRoot;
+    tokenEl.value = "";
+    if (cfg.mode) {
+      const modeRadio = document.querySelector(
+        'input[name="materializer-mode"][value="' + cfg.mode + '"]'
+      );
+      if (modeRadio) modeRadio.checked = true;
+    }
+  }
+  hideStatus();
+  pairBtn.disabled = false;
+  pairBtn.textContent = "Save";
+  successPanel.classList.add("hidden");
+  form.classList.remove("hidden");
 });

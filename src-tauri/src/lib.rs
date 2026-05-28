@@ -1,5 +1,6 @@
 pub mod api_client;
 pub mod commands;
+pub mod commands_vaults;
 pub mod config;
 pub mod conflict_stash;
 pub mod file_watcher;
@@ -23,6 +24,13 @@ pub mod verify_repair;
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 
+/// S477 §3.2: enumerate immediate subdirectories of `vaults_root` for the
+/// wizard's Paired panel detected-vaults list. Pure stdlib + platform-agnostic.
+#[tauri::command]
+fn list_vault_folders(vaults_root: String) -> Vec<commands_vaults::VaultFolderInfo> {
+    commands_vaults::list_vault_folders_impl(std::path::Path::new(&vaults_root))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -41,10 +49,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             pairing::pair,
+            pairing::patch_self_subscriber,
             pairing::load_current_config,
             pairing::load_current_token,
             commands::verify_repair_run,
-            commands::list_conflicts
+            commands::list_conflicts,
+            list_vault_folders
         ])
         .setup(|app| {
             // v0.1.6: set_activation_policy returns () on macOS (infallible).

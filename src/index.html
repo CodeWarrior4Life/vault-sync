@@ -94,10 +94,45 @@
 
       <div id="success-panel" class="hidden">
         <h2>Paired!</h2>
-        <p>Subscriber: <strong id="result-subscriber-id"></strong></p>
-        <p>Mode: <strong id="result-mode"></strong></p>
-        <p>Scope roots: <span id="result-scope-roots"></span></p>
-        <p class="note">You can close this window — the daemon is running in the system tray.</p>
+        <dl class="paired-meta">
+          <dt>Vaults root</dt>
+          <dd><code id="result-vaults-root">—</code></dd>
+
+          <dt>Detected vaults</dt>
+          <dd id="result-detected-vaults">—</dd>
+
+          <dt>Mode</dt>
+          <dd id="result-mode">—</dd>
+
+          <dt>Subscriber</dt>
+          <dd><code id="result-subscriber-id">—</code></dd>
+        </dl>
+
+        <p class="cross-machine-note">
+          ⚠ <strong>Cross-machine sync:</strong> other machines syncing the
+          same content must use the same vault folder name (e.g.
+          <code>Mainframe</code>) under their own <code>vaults_root</code>.
+          Different folder names produce forked content on the server.
+        </p>
+
+        <details class="tray-help">
+          <summary>Can't see the tray icon on macOS?</summary>
+          <p>
+            macOS hides menu-bar items that don't fit, especially on notched
+            displays. Use a menu-bar manager to keep the Vault Sync icon
+            visible:
+          </p>
+          <ul>
+            <li><a href="https://github.com/jordanbaird/Ice" target="_blank" rel="noopener">Ice</a> — free, open source, notch-aware</li>
+            <li><a href="https://github.com/dwarvesf/hidden" target="_blank" rel="noopener">Hidden Bar</a> — free, open source, simpler</li>
+            <li><a href="https://www.macbartender.com/" target="_blank" rel="noopener">Bartender</a> — commercial, feature-rich</li>
+          </ul>
+        </details>
+
+        <div class="paired-actions">
+          <button type="button" id="edit-settings-btn">Edit Settings</button>
+          <button type="button" id="close-btn">Close</button>
+        </div>
       </div>
 
       <div id="verify-panel" class="hidden">

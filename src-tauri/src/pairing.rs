@@ -112,6 +112,32 @@ pub fn load_current_config() -> Option<CurrentConfig> {
     })
 }
 
+/// S477 §3.2 (Phase B): Tauri-exposed PATCH for the Paired-page "Edit
+/// Settings" flow when the user re-submits the form WITHOUT rotating the
+/// token. The frontend calls this with the new vaults_root + new mode.
+///
+/// **STUB**: full implementation (load token + ApiClient + PATCH
+/// `/api/sync/subscribers/me` with vaults_root + materializer_mode + persist
+/// the updated config locally) is parked for Phase F coordination. The
+/// server-side PATCH endpoint currently only accepts `materializer_mode`,
+/// so plumbing `vaults_root` through requires a coordinated server change.
+/// Until that lands, surface a structured error to the user so the wizard
+/// can show "Edit Settings not yet wired — re-pair with token to change
+/// vault root or mode."
+///
+/// TODO(s477-phase-f): wire ApiClient::patch_self_subscriber, extend server
+/// PATCH schema to accept vaults_root, persist updated Config to disk, emit
+/// a 're-pair' equivalent event so the daemon picks up the new root.
+#[tauri::command]
+pub async fn patch_self_subscriber(
+    nexus_url: String,
+    new_vaults_root: String,
+    new_mode: String,
+) -> Result<(), String> {
+    let _ = (nexus_url, new_vaults_root, new_mode);
+    Err("PATCH not yet implemented (S477 Phase F coordination pending — re-pair with a token to change settings).".to_string())
+}
+
 /// v0.3: return the currently-stored bearer token (keyring → file fallback)
 /// so the Settings UI can pre-fill the field. Cyril verbatim S473:
 /// *"its not truly persisted unless it shows up as filled in the UI"*.
