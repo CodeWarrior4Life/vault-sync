@@ -28,9 +28,15 @@ struct Envelope {
     path: String,
     #[allow(dead_code)]
     phase: String, // lint_pending | lint_complete | enrichment_complete
+    /// v0.3.5: accept lsn as either int OR string. Server cache_writer now
+    /// stringifies via str(...) but the PG trigger function (notify_vault_
+    /// note_change) emits via `txid_current()` which is BIGINT, and any
+    /// other future emitter could choose either format. `Value` accepts
+    /// anything serde-deserializable; we don't actually use lsn anywhere
+    /// in the daemon's hot path, just thread it through.
     #[serde(default)]
     #[allow(dead_code)]
-    lsn: Option<String>,
+    lsn: Option<serde_json::Value>,
 }
 
 pub struct SseConsumer {

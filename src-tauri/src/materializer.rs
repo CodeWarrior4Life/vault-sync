@@ -625,6 +625,20 @@ fn strip_yaml_fields(fm_block: &str, fields: &[String]) -> String {
 }
 
 fn serialize_with_frontmatter(payload: &NotePayload) -> String {
+    // S476 v0.3.5: omit the `---\n...\n---\n` block when frontmatter is
+    // missing or empty. Before this fix every shadow file got a useless
+    // `---\n{}\n---\n` preamble (the server returns `frontmatter: {}` for
+    // notes without YAML front-matter, and serde_yaml renders that as
+    // `{}\n` -> wrapped in fences it became junk-frontmatter noise at the
+    // top of every file).
+    let is_empty = match &payload.frontmatter {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(m) => m.is_empty(),
+        _ => false,
+    };
+    if is_empty {
+        return payload.body.clone();
+    }
     let fm_yaml = serde_yaml::to_string(&payload.frontmatter).unwrap_or_default();
     format!("---\n{fm_yaml}---\n\n{}", payload.body)
 }

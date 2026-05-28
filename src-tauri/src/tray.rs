@@ -413,14 +413,18 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         }
     });
 
-    // v0.3.3: gentle icon undulation while the daemon is "busy" -- either
-    // Starting/Connecting/Reconnecting OR an owner-invoked verify-and-repair
-    // is running. Cycles through 8 pre-generated frames at 150ms each so the
-    // bright band sweeps top -> bottom (yellow -> blue along the icon's own
-    // gradient) and wraps back. Idle when settled; restores the full-
-    // strength normal icon on the transition out. Cyril S476 verbatim:
-    //     "animation should move from the yellow end to the blue end
-    //      undulating instead of just flashing."
+    // v0.3.5: gentle icon undulation while the daemon is "busy" -- this
+    // covers ANY active sync work, not just verify/connection states.
+    // Triggers:
+    //   - verify_in_progress (owner-invoked Verify & Repair sweep)
+    //   - connection states Starting / Connecting / Reconnecting
+    //   - uploads_pending > 0 (push direction has queued work)
+    //   - last_event_at within the last 3 seconds (pull direction just
+    //     received a fanout event; animation reads as "syncing in")
+    // Cycles 8 frames at 150ms so the bright band sweeps top -> bottom
+    // along the icon's yellow -> blue gradient and wraps. Cyril S476:
+    //     "the animation should start/stop whenever sync'ing is
+    //      occuring too"
     tauri::async_runtime::spawn(async move {
         use crate::tray_state::ConnectionStatus;
         let normal_icon = match Image::from_bytes(TRAY_ICON_BYTES) {
@@ -445,19 +449,26 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
             warn!("tray anim: no frames loaded; animation disabled");
             return;
         }
+        const RECENT_EVENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
         let mut frame_idx: usize = 0;
         let mut was_animating = false;
         loop {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let animate = match anim_state.read() {
                 Ok(s) => {
-                    s.verify_in_progress
-                        || matches!(
-                            s.status,
-                            ConnectionStatus::Starting
-                                | ConnectionStatus::Connecting
-                                | ConnectionStatus::Reconnecting
-                        )
+                    let connecting = matches!(
+                        s.status,
+                        ConnectionStatus::Starting
+                            | ConnectionStatus::Connecting
+                            | ConnectionStatus::Reconnecting
+                    );
+                    let pushing = s.uploads_pending > 0;
+                    let pulling = s
+                        .last_event_at
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|e| e < RECENT_EVENT_WINDOW)
+                        .unwrap_or(false);
+                    s.verify_in_progress || connecting || pushing || pulling
                 }
                 Err(_) => false,
             };
