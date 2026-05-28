@@ -59,12 +59,13 @@ pub fn run() {
 
             let cfg_path = config::default_config_path();
             let shared_state = {
+                // S477: display the configured vaults_root verbatim (the
+                // watch root), NOT vaults_root + vault_name. The daemon
+                // watches the entire vaults_root and the wizard surfaces
+                // that scope so users can see what's actually being
+                // synced.
                 let (sub, url, vault_dir) = match config::Config::load_from(&cfg_path) {
-                    Ok(c) => (
-                        c.subscriber_id,
-                        c.nexus_url,
-                        c.vaults_root.join(&c.vault_name),
-                    ),
+                    Ok(c) => (c.subscriber_id, c.nexus_url, c.vaults_root.clone()),
                     Err(_) => (String::new(), String::new(), std::path::PathBuf::new()),
                 };
                 std::sync::Arc::new(std::sync::RwLock::new(tray_state::TrayState::new(
@@ -171,11 +172,12 @@ fn spawn_sse_consumer(
             }
         };
 
-        // v0.3 — redflag.md circuit breaker (mandate §3). Inspect the
-        // vault root for `redflag.md`. If present, abort SSE startup and
-        // spawn the periodic monitor so the tray flag clears when the
-        // file is removed (owner must restart daemon to resume sync).
-        let vault_root = cfg.vaults_root.join(&cfg.vault_name);
+        // v0.3 — redflag.md circuit breaker (mandate §3). S477: check the
+        // full vaults_root (the daemon's watch root), not vaults_root +
+        // vault_name. A `redflag.md` placed at the vaults_root level is
+        // a kill switch covering every vault under it; per-vault
+        // emergency stops are a future refinement.
+        let vault_root = cfg.vaults_root.clone();
         let gate = redflag::RedflagGate::new(vault_root.clone());
         match gate.check() {
             redflag::RedflagStatus::Tripped { path, .. } => {
@@ -229,11 +231,19 @@ fn spawn_sse_consumer(
         {
             let mut vaults_to_scan: Vec<std::path::PathBuf> =
                 obsidian_install_detect::find_known_vaults();
-            // The configured vault may not be in obsidian.json yet (fresh
-            // install scenario) — include it explicitly.
-            let configured_vault = cfg.vaults_root.join(&cfg.vault_name);
-            if !vaults_to_scan.iter().any(|p| p == &configured_vault) {
-                vaults_to_scan.push(configured_vault);
+            // S477: enumerate every immediate subdirectory of `vaults_root`
+            // that looks like an Obsidian vault (has a `.obsidian/` dir).
+            // Adds any vaults Obsidian's registry hasn't seen yet (fresh
+            // install, or non-default registry locations).
+            if let Ok(entries) = std::fs::read_dir(&cfg.vaults_root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() && p.join(".obsidian").is_dir() {
+                        if !vaults_to_scan.iter().any(|q| q == &p) {
+                            vaults_to_scan.push(p);
+                        }
+                    }
+                }
             }
             tracing::info!(
                 "scanning {} obsidian vault(s) for conflicting plugins",
@@ -422,7 +432,13 @@ fn spawn_push_pipeline(
         }
     };
 
-    let vault_root = cfg.vaults_root.join(&cfg.vault_name);
+    // S477: the watch + push root is the configured `vaults_root`,
+    // verbatim. Do NOT join `vault_name` — `vaults_root` is the
+    // appointed sync root and can contain multiple vault folders.
+    // The watcher emits paths relative to `vaults_root` (so the
+    // vault folder name becomes the first segment of the pushed
+    // path), and the server handles per-vault namespacing.
+    let vault_root = cfg.vaults_root.clone();
 
     // --- push_client: journal → server drain loop ---
     let api_for_push = match api_client::ApiClient::new(&cfg.nexus_url, &token) {

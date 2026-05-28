@@ -155,6 +155,14 @@ impl Default for MaterializerConfig {
 /// v0.3.0 materializer.  In addition to the v0.2 fields (`vaults_root`,
 /// `vault_name`, `shadow_subdir`), it now holds:
 ///
+/// Note (S477): the daemon now treats `vaults_root` as the actual watch +
+/// materialize root. `vault_name` is retained on the struct for API
+/// back-compat but is not used to constrain runtime paths — incoming
+/// payloads carry the vault folder as the first segment of their relative
+/// path, so live mode writes to `<vaults_root>/<rel>` directly, allowing
+/// multiple vaults to coexist under one `vaults_root`.
+///
+///
 /// - `workspace_root` — the per-host daemon state dir
 ///   (e.g. `%LocalAppData%\Nexus`). Shadow-mode writes go under
 ///   `<workspace_root>/.lattice-runtime/<subscriber_slug>/shadow/<path>`,
@@ -259,10 +267,11 @@ impl Materializer {
         self.last_conflict_refresh_ms
             .store(now_ms, Ordering::Relaxed);
 
-        // Stash scan-root mirrors `write()`: live-mode uses the vault tree,
+        // Stash scan-root mirrors `write()`: live-mode uses the configured
+        // vaults_root (which can contain multiple vaults — all scanned),
         // shadow-mode uses the shadow tree.
         let scan_root = match self.mode {
-            MaterializerMode::Live => self.vault_dir(),
+            MaterializerMode::Live => self.vaults_root.clone(),
             _ => self.shadow_root(),
         };
         let stasher = ConflictStash::new(scan_root, self.config.conflict_policy);
@@ -278,12 +287,6 @@ impl Materializer {
         }
     }
 
-    /// `<vaults_root>/<vault_name>` — the per-vault tree the daemon writes
-    /// within (live mode) or canonicalizes against (shadow mode safety check).
-    fn vault_dir(&self) -> PathBuf {
-        self.vaults_root.join(&self.vault_name)
-    }
-
     /// `<workspace_root>/.lattice-runtime/<subscriber_slug>/shadow/` — the
     /// per-subscriber shadow tree (mandate §1 row 13: daemon state OUT of
     /// vault).
@@ -296,10 +299,13 @@ impl Materializer {
             .join(&self.shadow_subdir)
     }
 
-    /// Target path for a payload, depending on mode.
+    /// Target path for a payload, depending on mode. `rel` is expected to
+    /// be relative to `vaults_root` (i.e. the vault folder is its first
+    /// segment), so live mode joins straight onto `vaults_root` and
+    /// shadow mode onto the per-subscriber shadow tree.
     fn target_for(&self, rel: &str) -> PathBuf {
         match self.mode {
-            MaterializerMode::Live => self.vault_dir().join(rel),
+            MaterializerMode::Live => self.vaults_root.join(rel),
             MaterializerMode::Shadow => self.shadow_root().join(rel),
             // Disabled: target unused, but provide a sensible placeholder.
             MaterializerMode::Disabled => self.shadow_root().join(rel),
@@ -309,7 +315,7 @@ impl Materializer {
     /// Convenience: live-vault path for a relative file (used by callers
     /// who need to compute the live target before write — e.g. tests).
     pub fn live_path_for(&self, rel: &str) -> PathBuf {
-        self.vault_dir().join(rel)
+        self.vaults_root.join(rel)
     }
 
     /// Public main entry — writes a payload into vault (live) or shadow tree.
@@ -365,11 +371,12 @@ impl Materializer {
                     let should_stash = class == ConflictClass::D
                         || self.config.conflict_policy != ConflictPolicy::ServerWins;
                     if should_stash {
-                        // Stash root: live-mode uses vault_dir (matches the
-                        // canonical path), shadow-mode uses shadow_root so
-                        // stash sits next to the shadow file.
+                        // Stash root: live-mode uses vaults_root (the watch
+                        // root) so stashes sit next to the canonical file
+                        // regardless of which vault under vaults_root holds
+                        // it; shadow-mode uses shadow_root.
                         let stash_root = match self.mode {
-                            MaterializerMode::Live => self.vault_dir(),
+                            MaterializerMode::Live => self.vaults_root.clone(),
                             _ => self.shadow_root(),
                         };
                         let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
@@ -472,7 +479,7 @@ impl Materializer {
     /// path-traversal sanity check.
     fn canonical_root_for_mode(&self) -> PathBuf {
         let raw_root = match self.mode {
-            MaterializerMode::Live => self.vault_dir(),
+            MaterializerMode::Live => self.vaults_root.clone(),
             _ => self.shadow_root(),
         };
         // Ensure the root exists so canonicalize() succeeds.
@@ -683,12 +690,24 @@ mod tests {
         hex::encode(Sha256::digest(s.as_bytes()))
     }
 
+    /// Test helper: builds a NotePayload with the path namespaced under
+    /// the test VAULT folder. Per S477, NotePayload.path is relative to
+    /// `vaults_root`, so the vault folder is the first segment. Callers
+    /// keep passing intra-vault relatives ("01_Inbox/foo.md") and this
+    /// helper prepends VAULT exactly once. Paths starting with "../"
+    /// (traversal-attempt tests) are passed through unmodified so the
+    /// path-safety check sees the raw escape attempt.
     fn payload(path: &str, body: &str) -> NotePayload {
+        let prefixed = if path.starts_with("../") || path.starts_with(&format!("{VAULT}/")) {
+            path.to_string()
+        } else {
+            format!("{VAULT}/{path}")
+        };
         let fm = serde_json::json!({"title": "Test", "tags": ["a", "b"]});
         let fm_yaml = serde_yaml::to_string(&fm).unwrap_or_default();
         let serialized = format!("---\n{fm_yaml}---\n\n{body}");
         NotePayload {
-            path: path.into(),
+            path: prefixed,
             frontmatter: fm,
             body: body.into(),
             sha256: sha256_hex(&serialized),
@@ -727,11 +746,15 @@ mod tests {
     fn shadow_mode_writes_to_workspace_runtime_not_vault() {
         let (vaults, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         let out = m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
+        // S477: payload paths now include the vault folder as the first
+        // segment, so the shadow tree mirrors that prefix.
         let expected = ws
             .path()
             .join(".lattice-runtime")
             .join(SLUG)
-            .join("shadow/01_Inbox/foo.md");
+            .join("shadow")
+            .join(VAULT)
+            .join("01_Inbox/foo.md");
         match out {
             MaterializeOutcome::Wrote { path } => assert_eq!(path, expected),
             other => panic!("expected Wrote, got {other:?}"),
@@ -841,7 +864,8 @@ mod tests {
         let fm_yaml = serde_yaml::to_string(&fm).unwrap();
         let serialized = format!("---\n{fm_yaml}---\n\nbody-text");
         let p = NotePayload {
-            path: "01_Inbox/n.md".into(),
+            // S477: payload path is vaults-root-relative (vault folder first).
+            path: format!("{VAULT}/01_Inbox/n.md"),
             frontmatter: fm,
             body: "body-text".into(),
             sha256: sha256_hex(&serialized),
@@ -960,7 +984,9 @@ mod tests {
     fn existing_atomic_persist_preserved_no_tmp_leftover() {
         let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
-        let dir = m.live_path_for("01_Inbox/foo.md");
+        // S477: live_path_for takes a vaults-root-relative path (vault
+        // folder first segment), matching the materializer's contract.
+        let dir = m.live_path_for(&format!("{VAULT}/01_Inbox/foo.md"));
         let parent = dir.parent().unwrap();
         let entries: Vec<String> = std::fs::read_dir(parent)
             .unwrap()
@@ -1002,11 +1028,14 @@ mod tests {
     fn write_creates_file_with_frontmatter() {
         let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
+        // S477: shadow tree mirrors the vault-folder-first path shape.
         let written = std::fs::read_to_string(
             ws.path()
                 .join(".lattice-runtime")
                 .join(SLUG)
-                .join("shadow/01_Inbox/foo.md"),
+                .join("shadow")
+                .join(VAULT)
+                .join("01_Inbox/foo.md"),
         )
         .unwrap();
         assert!(written.contains("title: Test"));
@@ -1027,12 +1056,15 @@ mod tests {
     fn delete_renames_to_deleted_ts() {
         let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
-        m.soft_delete("01_Inbox/foo.md").unwrap();
+        // S477: soft_delete takes vaults-root-relative paths, same as write().
+        m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md")).unwrap();
         let shadow_dir = ws
             .path()
             .join(".lattice-runtime")
             .join(SLUG)
-            .join("shadow/01_Inbox/");
+            .join("shadow")
+            .join(VAULT)
+            .join("01_Inbox");
         assert!(!shadow_dir.join("foo.md").exists());
         let entries: Vec<_> = std::fs::read_dir(&shadow_dir)
             .unwrap()

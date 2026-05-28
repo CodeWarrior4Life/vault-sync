@@ -111,28 +111,52 @@ fn basename(path: &str) -> &str {
     }
 }
 
-/// Classify the given vault-relative path against the RASP fence.
+/// Strip the first path segment if there are at least two segments. This
+/// is the S477 "after optional vault folder prefix" view: incoming paths
+/// now include the vault folder as their first segment
+/// (`Mainframe/02_Projects/Protocols/foo.md`), so substrate rules anchored
+/// at the vault root (`02_Projects/Protocols/`) must be matched against
+/// both the path as-given and the path with its first segment removed.
+fn after_first_segment(path: &str) -> Option<&str> {
+    path.find('/').map(|i| &path[i + 1..])
+}
+
+/// Classify the given vault-relative-or-vaults-root-relative path against
+/// the RASP fence. Substrate rules are anchored at the vault root; with
+/// S477 the path may carry an extra vault folder as its leading segment
+/// (`Mainframe/...`), so each rule is checked against the path as-given
+/// AND against the path with its first segment stripped.
 pub fn classify_path(path: &str) -> PathClassification {
     let normalized = normalize(path);
+    let stripped = after_first_segment(&normalized);
+    let candidates: &[&str] = match stripped {
+        Some(s) => &[normalized.as_str(), s],
+        None => &[normalized.as_str()],
+    };
     for rule in SUBSTRATE_PATH_RULES {
-        match rule {
-            SubstrateRule::ExactSuffix(s) => {
-                // Case-insensitive basename compare for pointer-class files.
-                let bn = basename(&normalized);
-                if bn.eq_ignore_ascii_case(s) {
-                    return PathClassification::Substrate { rule: rule.label() };
+        for candidate in candidates {
+            match rule {
+                SubstrateRule::ExactSuffix(s) => {
+                    // Case-insensitive basename compare for pointer-class
+                    // files. Basename-match is prefix-invariant so the
+                    // stripped variant is redundant here but kept for
+                    // uniformity (cheap).
+                    let bn = basename(candidate);
+                    if bn.eq_ignore_ascii_case(s) {
+                        return PathClassification::Substrate { rule: rule.label() };
+                    }
                 }
-            }
-            SubstrateRule::PathPrefix(p) => {
-                if normalized.starts_with(p) {
-                    return PathClassification::Substrate { rule: rule.label() };
+                SubstrateRule::PathPrefix(p) => {
+                    if candidate.starts_with(p) {
+                        return PathClassification::Substrate { rule: rule.label() };
+                    }
                 }
-            }
-            SubstrateRule::ScopedSuffix(prefix, filename) => {
-                if normalized.starts_with(prefix)
-                    && basename(&normalized).eq_ignore_ascii_case(filename)
-                {
-                    return PathClassification::Substrate { rule: rule.label() };
+                SubstrateRule::ScopedSuffix(prefix, filename) => {
+                    if candidate.starts_with(prefix)
+                        && basename(candidate).eq_ignore_ascii_case(filename)
+                    {
+                        return PathClassification::Substrate { rule: rule.label() };
+                    }
                 }
             }
         }
