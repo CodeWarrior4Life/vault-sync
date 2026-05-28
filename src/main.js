@@ -188,6 +188,27 @@ listen("verify-error", (event) => {
   verifyPanel.classList.remove("hidden");
 });
 
+// S477 §3.5 (v0.3.7): Linux inotify watch-limit detection. Daemon emits this
+// event when `notify::ErrorKind::MaxFilesWatch` trips during FileWatcher
+// start (i.e. the kernel rejected our recursive watch because the per-user
+// inotify limit was already exhausted). Payload is the current sysctl value
+// read from /proc/sys/fs/inotify/max_user_watches (0 if unreadable).
+listen("inotify_limit_exceeded", (event) => {
+  const banner = document.querySelector("#inotify-banner");
+  if (!banner) return;
+  const current = event && event.payload;
+  const strong = banner.querySelector("strong");
+  if (strong) {
+    if (typeof current === "number" && current > 0) {
+      strong.textContent =
+        "Linux inotify watch limit exceeded (current=" + current + ").";
+    } else {
+      strong.textContent = "Linux inotify watch limit exceeded.";
+    }
+  }
+  banner.classList.remove("hidden");
+});
+
 document.querySelector("#vr-close-btn").addEventListener("click", () => {
   verifyPanel.classList.add("hidden");
   form.classList.remove("hidden");

@@ -9,6 +9,16 @@
   </head>
   <body>
     <main class="container">
+      <!-- S477 §3.5 (v0.3.7): Linux inotify watch-limit warning. Unhidden by
+           main.js when the daemon emits the `inotify_limit_exceeded` event. -->
+      <div id="inotify-banner" class="banner banner-warning hidden">
+        <strong>Linux inotify watch limit exceeded.</strong>
+        Daemon cannot watch your vault. Run:
+        <pre><code>sudo sysctl -w fs.inotify.max_user_watches=524288</code></pre>
+        and add <code>fs.inotify.max_user_watches=524288</code> to
+        <code>/etc/sysctl.conf</code> to persist across reboots.
+      </div>
+
       <h1>Vault Sync Setup</h1>
       <p class="subtitle">Connect this device to your Nexus instance.</p>
 

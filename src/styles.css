@@ -291,11 +291,44 @@ table.report td:last-child { text-align: right; }
   flex: 1;
 }
 
+/* S477 §3.5 (v0.3.7): warning banner for Linux inotify watch-limit
+   exhaustion. Surfaced top-of-page so the user sees the sysctl one-liner
+   regardless of which panel (form / paired / verify) is currently visible. */
+.banner {
+  padding: 0.75em 1em;
+  margin: 0 0 1em 0;
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+.banner-warning {
+  background: rgba(255, 70, 70, 0.15);
+  border-left: 3px solid #f44;
+  color: #b22;
+}
+.banner pre {
+  background: rgba(0, 0, 0, 0.08);
+  padding: 0.4em 0.6em;
+  border-radius: 2px;
+  margin: 0.4em 0;
+  overflow-x: auto;
+  font-size: 0.85em;
+}
+.banner code {
+  font-size: 0.9em;
+}
+
 @media (prefers-color-scheme: dark) {
   .paired-meta dt {
     color: #aaa;
   }
   .tray-help summary {
     color: #85c1e9;
+  }
+  .banner-warning {
+    color: #fdd;
+  }
+  .banner pre {
+    background: rgba(0, 0, 0, 0.35);
   }
 }

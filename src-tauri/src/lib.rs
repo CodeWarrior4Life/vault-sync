@@ -21,7 +21,7 @@ pub mod tray;
 pub mod tray_state;
 pub mod verify_repair;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -614,6 +614,27 @@ fn spawn_push_pipeline(
                 cfg.subscriber_id
             );
             Some(handle)
+        }
+        Err(file_watcher::FileWatcherError::InotifyLimitExceeded { current }) => {
+            // S477 §3.5 (v0.3.7): Linux inotify watch-limit exhaustion. Surface
+            // a structured Tauri event to the wizard so it can render the
+            // sysctl-one-liner banner. Also log + OS-notify so the user sees
+            // the failure even if the wizard window is closed.
+            tracing::error!(
+                "push pipeline: inotify watch limit exceeded (current={current}); raise fs.inotify.max_user_watches"
+            );
+            if let Err(emit_err) = app.emit("inotify_limit_exceeded", current) {
+                tracing::warn!("failed to emit inotify_limit_exceeded event: {emit_err}");
+            }
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!(
+                    "Linux inotify watch limit exceeded (current={current}). \
+                     Run: sudo sysctl -w fs.inotify.max_user_watches=524288"
+                ),
+            );
+            None
         }
         Err(e) => {
             tracing::error!("push pipeline: file_watcher start failed: {e}; push_client running but no local-edit detection");

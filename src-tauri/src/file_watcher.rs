@@ -140,6 +140,27 @@ pub enum FileWatcherError {
     Io(#[from] std::io::Error),
     #[error("notify: {0}")]
     Notify(#[from] notify::Error),
+    /// S477 §3.5 (v0.3.7): Linux-only — inotify per-user watch limit exceeded.
+    /// The kernel rejected `inotify_add_watch` with `ENOSPC` while attempting
+    /// to register the recursive vault watch. `current` is the value read from
+    /// `/proc/sys/fs/inotify/max_user_watches` (0 if the file could not be
+    /// read). User remedy: raise the limit via `sudo sysctl -w
+    /// fs.inotify.max_user_watches=524288` (and persist via /etc/sysctl.conf).
+    #[error("inotify watch limit exceeded (current={current}); raise fs.inotify.max_user_watches")]
+    InotifyLimitExceeded { current: u64 },
+}
+
+/// S477 §3.5 (v0.3.7): Linux-only helper that reads the current per-user
+/// inotify watch limit from procfs. Returns None if procfs is unreadable
+/// (e.g. running inside a sandbox that hides /proc) or if the value is not
+/// a parseable integer.
+#[cfg(target_os = "linux")]
+fn read_inotify_limit() -> Option<u64> {
+    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub struct FileWatcher {
@@ -513,9 +534,30 @@ impl FileWatcher {
             let _ = tx.send(res);
         })?;
 
-        debouncer
-            .watcher()
-            .watch(&self.vault_root, RecursiveMode::Recursive)?;
+        // S477 §3.5 (v0.3.7): on Linux, catch inotify watch-limit exhaustion
+        // (`notify::ErrorKind::MaxFilesWatch`) and surface as a structured
+        // `InotifyLimitExceeded` variant so the wizard can render a banner
+        // with the sysctl one-liner. Non-Linux platforms preserve the prior
+        // behavior via `?`-propagation.
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(&self.vault_root, RecursiveMode::Recursive)
+            {
+                if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
+                    let current = read_inotify_limit().unwrap_or(0);
+                    return Err(FileWatcherError::InotifyLimitExceeded { current });
+                }
+                return Err(FileWatcherError::Notify(e));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            debouncer
+                .watcher()
+                .watch(&self.vault_root, RecursiveMode::Recursive)?;
+        }
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1336,5 +1378,55 @@ mod tests {
         assert_eq!(s.events_dropped_excludes, 1);
         // events_filtered is the sum (each dropped event bumps the rollup).
         assert_eq!(s.events_filtered, 3);
+    }
+
+    // ---------- S477 §3.5 inotify-limit detection (Linux-only) ----------
+
+    #[test]
+    fn inotify_limit_exceeded_error_renders_user_facing_message() {
+        // Pure Display assertion — no Linux-syscall dependency. The error
+        // variant must render with the canonical "inotify watch limit"
+        // phrase so log scrapers + wizard-side message templates can match.
+        let err = FileWatcherError::InotifyLimitExceeded { current: 8 };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("inotify watch limit"),
+            "error must mention 'inotify watch limit'; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("current=8"),
+            "error must include the current limit; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("fs.inotify.max_user_watches"),
+            "error must point user at sysctl knob; got: {rendered}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn inotify_limit_exceeded_surfaces_structured_error() {
+        // Local-only repro: drop fs.inotify.max_user_watches to a tiny value
+        // (`sudo sysctl -w fs.inotify.max_user_watches=8`), seed a directory
+        // with more entries than the limit, and verify FileWatcher::start()
+        // returns InotifyLimitExceeded with the live limit attached.
+        //
+        // Run with: `sudo sysctl -w fs.inotify.max_user_watches=8 \
+        //   && cargo test --lib inotify_limit_exceeded_surfaces -- --ignored`
+        //
+        // Skipped on CI: requires root + a low sysctl value, both unsafe to
+        // set in shared runners.
+        let dir = TempDir::new().unwrap();
+        for i in 0..64 {
+            std::fs::create_dir_all(dir.path().join(format!("sub{i}"))).unwrap();
+        }
+        let w = make_watcher(&dir, vec![], vec![]);
+        match w.start() {
+            Err(FileWatcherError::InotifyLimitExceeded { current }) => {
+                assert!(current > 0, "expected non-zero current limit, got {current}");
+            }
+            other => panic!("expected InotifyLimitExceeded, got {other:?}"),
+        }
     }
 }
