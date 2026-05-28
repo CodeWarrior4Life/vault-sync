@@ -111,8 +111,9 @@ pub struct PushClient {
     journal: Arc<Mutex<PushJournal>>,
     device_id: String,
     config: PushClientConfig,
-    /// Absolute path to `<vaults_root>/<vault_name>`. Used to resolve a
-    /// `PushEvent.path` (forward-slash, vault-relative) to an on-disk file so
+    /// Absolute path to the configured `vaults_root`. Used to resolve a
+    /// `PushEvent.path` (forward-slash, relative to vaults_root with the
+    /// vault folder as its first segment per S477) to an on-disk file so
     /// `content_bytes: None` (lazy) events can be read at drain time.
     vault_root: PathBuf,
     /// Optional tray telemetry sink (mandate §9 AG13). If set, the client

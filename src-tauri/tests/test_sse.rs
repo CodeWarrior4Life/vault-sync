@@ -25,7 +25,6 @@ fn make_consumer(base_url: &str, vaults_root: &TempDir) -> SseConsumer {
         vec![],
         Materializer::new(
             vaults_root.path().to_path_buf(),
-            "Mainframe".to_string(),
             None,
             MaterializerMode::Shadow,
             vaults_root.path().to_path_buf(),
@@ -110,7 +109,9 @@ async fn consumes_enrichment_complete_skips_lint_events() {
     let (handle, tx) = spawn_consumer(consumer);
 
     // Poll for the expected output file for up to 5 s (CI-safe).
-    // v0.2.0: materializer writes under <vaults_root>/<vault_name>/<shadow>/
+    // S477 v0.3.7: materializer writes shadow-mode notes under
+    // <workspace_root>/.lattice-runtime/<subscriber>/shadow/<rel>; here the
+    // workspace_root is the same tempdir as vaults_root for test convenience.
     let shadow = vault
         .path()
         .join(".lattice-runtime/test-subscriber/shadow/Notes/hello.md");

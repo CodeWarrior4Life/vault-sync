@@ -16,7 +16,6 @@ fn mk(vaults_tmp: &TempDir, workspace_tmp: &TempDir, mode: MaterializerMode) -> 
     std::fs::create_dir_all(vaults_tmp.path().join(VAULT)).unwrap();
     Materializer::new(
         vaults_tmp.path().to_path_buf(),
-        VAULT.to_string(),
         Some("shadow/".into()),
         mode,
         workspace_tmp.path().to_path_buf(),

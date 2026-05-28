@@ -152,16 +152,15 @@ impl Default for MaterializerConfig {
     }
 }
 
-/// v0.3.0 materializer.  In addition to the v0.2 fields (`vaults_root`,
-/// `vault_name`, `shadow_subdir`), it now holds:
+/// v0.3.0 materializer.  Holds the runtime fields needed to write notes
+/// into either live or shadow mode:
 ///
-/// Note (S477): the daemon now treats `vaults_root` as the actual watch +
-/// materialize root. `vault_name` is retained on the struct for API
-/// back-compat but is not used to constrain runtime paths — incoming
-/// payloads carry the vault folder as the first segment of their relative
-/// path, so live mode writes to `<vaults_root>/<rel>` directly, allowing
-/// multiple vaults to coexist under one `vaults_root`.
-///
+/// Note (S477): the daemon treats `vaults_root` as the actual watch +
+/// materialize root. Incoming payloads carry the vault folder as the
+/// first segment of their relative path, so live mode writes to
+/// `<vaults_root>/<rel>` directly, allowing multiple vaults to coexist
+/// under one `vaults_root`. The v0.2.0 `vault_name` field is gone as of
+/// v0.3.7 — see config.rs for the legacy-tolerant load path.
 ///
 /// - `workspace_root` — the per-host daemon state dir
 ///   (e.g. `%LocalAppData%\Nexus`). Shadow-mode writes go under
@@ -172,7 +171,6 @@ impl Default for MaterializerConfig {
 /// - `config` — feature flags (integrity, conflict policy, ...).
 pub struct Materializer {
     vaults_root: PathBuf,
-    vault_name: String,
     shadow_subdir: String,
     mode: MaterializerMode,
     workspace_root: PathBuf,
@@ -194,7 +192,6 @@ impl Clone for Materializer {
     fn clone(&self) -> Self {
         Self {
             vaults_root: self.vaults_root.clone(),
-            vault_name: self.vault_name.clone(),
             shadow_subdir: self.shadow_subdir.clone(),
             mode: self.mode,
             workspace_root: self.workspace_root.clone(),
@@ -215,7 +212,6 @@ impl Materializer {
     /// recommended defaults (integrity ON, ServerWins).
     pub fn new(
         vaults_root: PathBuf,
-        vault_name: String,
         shadow_path: Option<String>,
         mode: MaterializerMode,
         workspace_root: PathBuf,
@@ -225,7 +221,6 @@ impl Materializer {
         let shadow_subdir = shadow_path.unwrap_or_else(|| "shadow/".to_string());
         Self {
             vaults_root,
-            vault_name,
             shadow_subdir,
             mode,
             workspace_root,
@@ -669,7 +664,6 @@ mod tests {
         std::fs::create_dir_all(vaults_tmp.path().join(VAULT)).unwrap();
         let m = Materializer::new(
             vaults_tmp.path().to_path_buf(),
-            VAULT.to_string(),
             Some("shadow/".to_string()),
             mode,
             ws_tmp.path().to_path_buf(),

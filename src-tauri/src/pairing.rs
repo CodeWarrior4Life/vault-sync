@@ -58,10 +58,6 @@ pub async fn pair_inner(
         nexus_url: input.nexus_url,
         subscriber_id: snap.subscriber_id.clone(),
         vaults_root: input.vaults_root,
-        // v0.2.0: vault_name hardcoded to "Mainframe" — only vault Nexus
-        // currently knows server-side. Multi-vault routing comes when
-        // events carry their own vault_id.
-        vault_name: "Mainframe".to_string(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: detect_platform(),
         last_event_id: None,
@@ -102,7 +98,6 @@ pub async fn pair(input: PairingInput) -> Result<PairingSuccess, String> {
 pub struct CurrentConfig {
     pub nexus_url: String,
     pub vaults_root: String,
-    pub vault_name: String,
     pub subscriber_id: String,
 }
 
@@ -113,7 +108,6 @@ pub fn load_current_config() -> Option<CurrentConfig> {
     Some(CurrentConfig {
         nexus_url: cfg.nexus_url,
         vaults_root: cfg.vaults_root.to_string_lossy().to_string(),
-        vault_name: cfg.vault_name,
         subscriber_id: cfg.subscriber_id,
     })
 }

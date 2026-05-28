@@ -20,28 +20,23 @@ pub struct Config {
     pub nexus_url: String,
     pub subscriber_id: String,
     /// v0.2.0: PARENT directory holding one or more Obsidian vaults (e.g.
-    /// `D:\Vaults`). Materializer routes to `<vaults_root>/<vault_name>/.../`.
+    /// `D:\Vaults`). Post-S477, this IS the daemon's watch + materialize
+    /// root; the vault folder name becomes the first segment of every
+    /// payload path (no per-config vault_name needed).
+    ///
     /// Back-compat: if `vaults_root` is missing but legacy `vault_root` is
     /// present in the on-disk file, the deserializer accepts the legacy
-    /// field and the daemon derives `vaults_root` = parent + `vault_name` =
-    /// basename at load time.
+    /// field via the alias below.
+    ///
+    /// Legacy `vault_name` field (v0.2.0 – v0.3.6) is silently ignored on
+    /// load — serde tolerates unknown TOML keys by default, so existing
+    /// configs continue to deserialize without manual migration.
     #[serde(alias = "vault_root")]
     pub vaults_root: PathBuf,
-    /// v0.2.0: name of THIS subscriber's vault under `vaults_root`. Today
-    /// hardcoded to "Mainframe" since that's the only vault Nexus knows
-    /// about server-side. Future multi-vault server-side will let each
-    /// subscriber/event carry its own vault_id and the daemon will route
-    /// per-vault.
-    #[serde(default = "default_vault_name")]
-    pub vault_name: String,
     pub daemon_version: String,
     pub daemon_platform: String,
     #[serde(default)]
     pub last_event_id: Option<String>,
-}
-
-fn default_vault_name() -> String {
-    "Mainframe".to_string()
 }
 
 impl Config {
@@ -60,6 +55,42 @@ impl Config {
         let s = toml::to_string_pretty(self)?;
         fs::write(path, s)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_loads_legacy_vault_name_field_without_error() {
+        let toml_str = r#"
+nexus_url = "https://example.com"
+subscriber_id = "abc-123"
+vaults_root = "/Users/test/Vaults"
+vault_name = "Mainframe"
+daemon_version = "0.3.6"
+daemon_platform = "macos-aarch64"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("legacy config must load");
+        assert_eq!(cfg.vaults_root, PathBuf::from("/Users/test/Vaults"));
+    }
+
+    #[test]
+    fn config_save_omits_vault_name_field() {
+        let cfg = Config {
+            nexus_url: "https://x".into(),
+            subscriber_id: "s".into(),
+            vaults_root: PathBuf::from("/v"),
+            daemon_version: "0.3.7".into(),
+            daemon_platform: "macos-aarch64".into(),
+            last_event_id: None,
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !serialized.contains("vault_name"),
+            "vault_name must not appear in saved config; got: {serialized}"
+        );
     }
 }
 

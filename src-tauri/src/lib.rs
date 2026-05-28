@@ -282,7 +282,6 @@ fn spawn_sse_consumer(
         };
         let materializer = materializer::Materializer::new(
             cfg.vaults_root.clone(),
-            cfg.vault_name.clone(),
             snap.shadow_path.clone(),
             materializer::MaterializerMode::from_str(&snap.materializer_mode),
             workspace_root,

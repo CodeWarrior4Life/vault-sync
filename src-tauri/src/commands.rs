@@ -66,7 +66,10 @@ pub(crate) fn build_verify_repair(
     let journal = PushJournal::open(&journal_path).map_err(|e| e.to_string())?;
     let journal_arc = Arc::new(Mutex::new(journal));
 
-    let vault_root = cfg.vaults_root.join(&cfg.vault_name);
+    // S477: post-watch-root-fix, `vaults_root` IS the verify-repair root.
+    // The vault folder is encoded as the first segment of each path; we
+    // no longer join a per-config `vault_name`.
+    let vault_root = cfg.vaults_root.clone();
     let vr = VerifyRepair::new(
         vault_root,
         api_arc,
@@ -159,7 +162,9 @@ pub async fn list_conflicts() -> Result<Vec<ConflictEntry>, String> {
     let cfg_path = config::default_config_path();
     let cfg =
         config::Config::load_from(&cfg_path).map_err(|e| format!("config load failed: {e}"))?;
-    let vault_root = cfg.vaults_root.join(&cfg.vault_name);
+    // S477: list_conflicts scans the entire `vaults_root` — the vault folder
+    // is the first segment of each ConflictEntry.path.
+    let vault_root = cfg.vaults_root.clone();
     list_conflicts_in(&vault_root)
 }
 
@@ -245,12 +250,14 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn make_config(server_url: &str, vaults_root: PathBuf, vault_name: &str) -> Config {
+    fn make_config(server_url: &str, vaults_root: PathBuf, _vault_name: &str) -> Config {
+        // _vault_name retained as a parameter so call sites stay readable
+        // (they pass the vault folder name they just created on disk) but
+        // is no longer stored on Config post-S477.
         Config {
             nexus_url: server_url.to_string(),
             subscriber_id: "sub-test".to_string(),
             vaults_root,
-            vault_name: vault_name.to_string(),
             daemon_version: "0.3.0-test".to_string(),
             daemon_platform: "test".to_string(),
             last_event_id: None,
@@ -314,7 +321,10 @@ mod tests {
             build_verify_repair(&cfg, "vsk_test", workspace.path().to_path_buf()).unwrap();
         let m = vr.build_local_manifest().unwrap();
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].path, "a.md");
+        // S477: vault_root is vaults_root verbatim, so the manifest entry
+        // for a file at vaults_root/TestVault/a.md surfaces with the vault
+        // folder as its first path segment.
+        assert_eq!(m[0].path, "TestVault/a.md");
 
         let journal_path = push_journal_path(workspace.path(), &cfg.subscriber_id);
         assert!(journal_path.parent().unwrap().is_dir());
