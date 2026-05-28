@@ -47,6 +47,13 @@ pub struct SseConsumer {
     api: ApiClient,
     materializer: Materializer,
     tray_state: Option<SharedTrayState>,
+    /// S477 v0.3.8 (A): disk path where `last_event_id` is persisted after
+    /// every successful SSE event. Loaded on daemon startup; written on
+    /// each event with non-empty `ev.id`. Closes the catchup-on-restart
+    /// gap that silently drops every event emitted while the daemon was
+    /// down. Atomic write (tmp + rename) to avoid mid-write corruption.
+    /// `None` => no persistence (back-compat for unit tests).
+    last_event_id_path: Option<std::path::PathBuf>,
 }
 
 impl SseConsumer {
@@ -66,12 +73,63 @@ impl SseConsumer {
             api,
             materializer,
             tray_state: None,
+            last_event_id_path: None,
         })
     }
 
     pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
         self.tray_state = Some(state);
         self
+    }
+
+    /// S477 v0.3.8 (A): wire the on-disk persistence path for last_event_id.
+    /// Caller (lib.rs spawn_sse_consumer) computes the path under the
+    /// workspace runtime dir + subscriber_id so per-subscriber persistence
+    /// is namespaced cleanly.
+    pub fn with_last_event_id_path(mut self, p: std::path::PathBuf) -> Self {
+        self.last_event_id_path = Some(p);
+        self
+    }
+
+    /// Atomic-write the given id to disk (tmp + rename). Failure is logged
+    /// + swallowed — losing one event's persistence is not worth crashing
+    /// the SSE loop. The next event will re-persist over the same file.
+    fn persist_last_event_id(&self, id: &str) {
+        let Some(path) = &self.last_event_id_path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(error = %e, "last_event_id: create_dir_all failed");
+            return;
+        }
+        let tmp = parent.join(format!(".last_event_id.tmp.{}", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, id.as_bytes()) {
+            warn!(error = %e, "last_event_id: tmp write failed");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(error = %e, "last_event_id: rename failed");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// S477 v0.3.8 (A): read the persisted last_event_id from disk. Caller
+    /// uses this on daemon startup to resume from the right point so the
+    /// server's catchup-on-reconnect replays only events emitted while
+    /// the daemon was down (per sync_routes_p1.py event_stream catchup).
+    /// Returns None if the file is absent, empty, or unreadable — any of
+    /// which is "first run" semantics.
+    pub fn load_last_event_id(path: &std::path::Path) -> Option<String> {
+        let s = std::fs::read_to_string(path).ok()?;
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 
     fn ts_set(&self, status: ConnectionStatus) {
@@ -221,6 +279,11 @@ impl SseConsumer {
                     }
                     if let Some(id) = ev.id {
                         if !id.is_empty() {
+                            // S477 v0.3.8 (A): persist to disk BEFORE updating
+                            // the in-memory copy so a crash between persist and
+                            // assign re-replays one event (idempotent — better
+                            // than skipping one).
+                            self.persist_last_event_id(&id);
                             *last_event_id = Some(id);
                         }
                     }

@@ -3,6 +3,32 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
+/// S477 v0.3.8 (B): User-Agent + (C): daemon_version reporting helpers.
+///
+/// Single source of truth for "what version + platform am I" — used by both
+/// the HTTP `User-Agent` header on every API call (so server logs stamp
+/// every request with daemon version + host platform) AND by the daemon's
+/// startup self-PATCH to `/api/sync/subscribers/me` (so the
+/// `vault_subscribers` row carries the same values for admin observability).
+pub fn daemon_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+pub fn daemon_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "windows-x86_64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        _ => "unknown",
+    }
+}
+
+pub fn user_agent_string() -> String {
+    format!("lattice-vault-sync/{}/{}", daemon_version(), daemon_platform())
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("unauthorized — token rejected")]
@@ -204,7 +230,7 @@ impl ApiClient {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(4)
-            .user_agent("lattice-vault-sync/0.3.0")
+            .user_agent(user_agent_string())
             .build()?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -334,6 +360,37 @@ impl ApiClient {
             .bearer_auth(&self.token)
             .json(&body)
             .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(resp.json().await?),
+            StatusCode::BAD_REQUEST => Err(ApiError::Server(400)),
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
+            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+            s => Err(ApiError::Server(s.as_u16())),
+        }
+    }
+
+    /// S477 v0.3.8 (C): PATCH /api/sync/subscribers/me with the running
+    /// daemon's version + platform. Fires on every daemon startup so the
+    /// `vault_subscribers.daemon_version` + `daemon_platform` columns
+    /// always reflect what's actually running -- not whatever was set at
+    /// first-pair time and never updated. Pairs with (B): User-Agent on
+    /// every API call also stamps version + platform, so server logs +
+    /// admin DB query both agree on the answer to "what version is this
+    /// host running?". Fire-and-forget contract: failure is non-fatal
+    /// (caller logs + continues).
+    pub async fn patch_self_version(&self) -> Result<SubscriberSelfState, ApiError> {
+        let body = serde_json::json!({
+            "daemon_version": daemon_version(),
+            "daemon_platform": daemon_platform(),
+        });
+        let resp = self
+            .http
+            .patch(format!("{}/api/sync/subscribers/me", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(15))
             .send()
             .await?;
         match resp.status() {

@@ -322,6 +322,19 @@ fn spawn_sse_consumer(
                 return;
             }
         };
+
+        // S477 v0.3.8 (C): self-report daemon_version + daemon_platform to
+        // the server on every startup. Pairs with (B) User-Agent stamping
+        // so server logs + admin DB query both agree on "what version is
+        // this host running?". Fire-and-forget — failure is non-fatal.
+        match api.patch_self_version().await {
+            Ok(_) => tracing::info!(
+                version = api_client::daemon_version(),
+                platform = api_client::daemon_platform(),
+                "reported daemon_version + daemon_platform to /api/sync/subscribers/me"
+            ),
+            Err(e) => tracing::warn!("daemon_version self-report failed: {e}"),
+        }
         // v0.3: daemon state OUT of vault (mandate §1 row 13). Workspace
         // root defaults to LocalAppData/Nexus (or platform equivalent);
         // falls back to home dir / temp_dir if data_local_dir() is None.
@@ -389,6 +402,29 @@ fn spawn_sse_consumer(
             tray_state.clone(),
         );
 
+        // S477 v0.3.8 (A): per-subscriber on-disk path for last_event_id
+        // persistence. Lives alongside the push_journal under the workspace
+        // runtime dir, namespaced by subscriber_id so multi-subscriber
+        // hosts don't collide.
+        let last_event_id_path = commands::resolve_workspace_root()
+            .join(".lattice-runtime")
+            .join(&cfg.subscriber_id)
+            .join("sync-state")
+            .join("last_event_id");
+        // Load on startup so catchup-on-reconnect actually fires server-side.
+        // The Config.last_event_id field is preserved as a back-compat
+        // fallback (older daemons may have populated it via the legacy code
+        // path); disk-persisted value takes precedence.
+        let resumed_id = sse::SseConsumer::load_last_event_id(&last_event_id_path)
+            .or(cfg.last_event_id.clone());
+        if let Some(rid) = &resumed_id {
+            tracing::info!(
+                last_event_id = %rid,
+                path = %last_event_id_path.display(),
+                "resuming SSE from persisted last_event_id"
+            );
+        }
+
         let consumer = match sse::SseConsumer::new(
             cfg.nexus_url.clone(),
             token,
@@ -396,7 +432,9 @@ fn spawn_sse_consumer(
             snap.scope_excludes,
             materializer,
         ) {
-            Ok(c) => c.with_tray_state(tray_state),
+            Ok(c) => c
+                .with_tray_state(tray_state)
+                .with_last_event_id_path(last_event_id_path),
             Err(e) => {
                 tracing::error!("sse consumer init failed: {e}");
                 return;
@@ -410,7 +448,7 @@ fn spawn_sse_consumer(
         // `consumer.run()` awaits forever (it loops reconnecting on the SSE
         // long-poll). `_watch_handle` is held across this await, so the OS
         // watcher + its background task stay alive for the daemon's lifetime.
-        if let Err(e) = consumer.run(cfg.last_event_id, shutdown_rx).await {
+        if let Err(e) = consumer.run(resumed_id, shutdown_rx).await {
             tracing::error!("SSE consumer exited with error: {e}");
         }
         // Keep the watch handle bound until the task actually unwinds (only
