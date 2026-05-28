@@ -22,7 +22,28 @@ pub mod tray_state;
 pub mod verify_repair;
 
 use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
+
+/// S477 §3.3 (v0.3.7): single entry point for sending OS-level notifications
+/// (NSUserNotification on macOS, toast on Windows, libnotify on Linux) via
+/// `tauri-plugin-notification`. Used for the four key user-visible events:
+/// first successful pair, redflag tripped, push pipeline init failure, and
+/// re-pair-needed (no token).
+///
+/// Failures (no permission, daemon backend down) are logged at WARN and
+/// swallowed -- a missing notification must NEVER take the daemon down.
+pub fn notify_user(app: &tauri::AppHandle, title: &str, body: &str) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        tracing::warn!("notification failed (title={title:?}): {e}");
+    }
+}
 
 /// S477 §3.2: enumerate immediate subdirectories of `vaults_root` for the
 /// wizard's Paired panel detected-vaults list. Pure stdlib + platform-agnostic.
@@ -35,9 +56,15 @@ fn list_vault_folders(vaults_root: String) -> Vec<commands_vaults::VaultFolderIn
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            let _ = app
-                .get_webview_window("main")
-                .map(|w: tauri::WebviewWindow| w.set_focus());
+            // S477 §3.3 (v0.3.7): second-launch "find-me" path -- raise the
+            // wizard if it's hidden or minimized, then focus it. Without
+            // .show() + .unminimize() the user clicking the dock/.app a
+            // second time sees nothing happen.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -47,6 +74,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             pairing::pair,
             pairing::patch_self_subscriber,
@@ -172,7 +200,6 @@ fn spawn_sse_consumer(
     cfg_path: std::path::PathBuf,
     tray_state: tray_state::SharedTrayState,
 ) {
-    let _ = app;
     tauri::async_runtime::spawn(async move {
         let cfg = match config::Config::load_from(&cfg_path) {
             Ok(c) => c,
@@ -198,6 +225,14 @@ fn spawn_sse_consumer(
                 if let Ok(mut s) = tray_state.write() {
                     s.set_redflag_tripped(true);
                 }
+                // S477 §3.3 (v0.3.7): surface to the user via OS notification
+                // so they understand sync is paused (the tray-only daemon
+                // would otherwise be silent).
+                notify_user(
+                    &app,
+                    "Vault Sync paused",
+                    "redflag.md detected at your vaults root — sync paused until removed.",
+                );
                 // Do NOT start SSE consumer or push pipeline. The 60s
                 // monitor task will clear the flag if/when the file is
                 // removed (recovery requires a daemon restart in v0.3.0).
@@ -222,6 +257,13 @@ fn spawn_sse_consumer(
                 tracing::error!(
                     "no token in keyring or file fallback for subscriber_id={}; re-pair required",
                     cfg.subscriber_id
+                );
+                // S477 §3.3 (v0.3.7): surface to the user -- the daemon
+                // cannot start sync until the user re-pairs via the wizard.
+                notify_user(
+                    &app,
+                    "Vault Sync needs re-pairing",
+                    "Open the wizard to re-pair this device.",
                 );
                 return;
             }
@@ -339,6 +381,7 @@ fn spawn_sse_consumer(
         // sites open the identical push_journal.jsonl file.
         let workspace_root_for_journal = commands::resolve_workspace_root();
         let _watch_handle = spawn_push_pipeline(
+            &app,
             &cfg,
             workspace_root_for_journal,
             watch_scope_roots,
@@ -406,6 +449,7 @@ fn spawn_sse_consumer(
 /// one-poll-interval (≤5s) latency before verify_repair's enqueued pushes
 /// upload.
 fn spawn_push_pipeline(
+    app: &tauri::AppHandle,
     cfg: &config::Config,
     workspace_root: std::path::PathBuf,
     scope_roots: Vec<String>,
@@ -418,6 +462,11 @@ fn spawn_push_pipeline(
         Ok(Some(t)) => t,
         _ => {
             tracing::error!("push pipeline: token unavailable; not starting push side");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                "Authentication token unavailable; not starting push side.",
+            );
             return None;
         }
     };
@@ -430,6 +479,11 @@ fn spawn_push_pipeline(
                 "push pipeline: create_dir_all({}) failed: {e}; not starting push side",
                 parent.display()
             );
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("create_dir_all({}) failed: {e}", parent.display()),
+            );
             return None;
         }
     }
@@ -437,6 +491,11 @@ fn spawn_push_pipeline(
         Ok(j) => Arc::new(tokio::sync::Mutex::new(j)),
         Err(e) => {
             tracing::error!("push pipeline: journal open failed: {e}; not starting push side");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("journal open failed: {e}"),
+            );
             return None;
         }
     };
@@ -454,6 +513,11 @@ fn spawn_push_pipeline(
         Ok(a) => Arc::new(a),
         Err(e) => {
             tracing::error!("push pipeline: api client init failed: {e}; not starting push side");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("api client init failed: {e}"),
+            );
             return None;
         }
     };
@@ -506,6 +570,11 @@ fn spawn_push_pipeline(
             tracing::error!(
                 "push pipeline: watcher journal open failed: {e}; push_client running but no local-edit detection"
             );
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("watcher journal open failed: {e}"),
+            );
             return None;
         }
     };
@@ -530,6 +599,11 @@ fn spawn_push_pipeline(
         Ok(w) => w.with_tray_state(tray_state),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("file_watcher init failed: {e}"),
+            );
             return None;
         }
     };
@@ -543,6 +617,11 @@ fn spawn_push_pipeline(
         }
         Err(e) => {
             tracing::error!("push pipeline: file_watcher start failed: {e}; push_client running but no local-edit detection");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("file_watcher start failed: {e}"),
+            );
             None
         }
     }

@@ -16,6 +16,16 @@ use tracing::{info, warn};
 /// on `default_window_icon()` (which resolves to the large .icns and renders
 /// as a near-invisible smudge once macOS template-scales it down to status-
 /// bar height). Source: src-tauri/icons/32x32.png.
+///
+/// S477 §3.3 (v0.3.7): macOS gets a TIGHTER 22×22 variant — macOS scales the
+/// 32×32 down to fit the menu-bar height (~22px on notched displays), eating
+/// nearly half the icon's effective pixels to transparent padding. The 22×22
+/// variant renders at native resolution with no scale-down padding loss.
+/// Other platforms keep the 32×32 (Windows + Linux render at native size).
+#[cfg(target_os = "macos")]
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray-macos-tight.png");
+
+#[cfg(not(target_os = "macos"))]
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/32x32.png");
 /// v0.3.3: 8-frame "bright band sweeps top -> bottom" animation. The icon
 /// is a yellow-to-blue gradient; the bright band moves along the gradient
@@ -108,7 +118,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let icon = match Image::from_bytes(TRAY_ICON_BYTES) {
         Ok(i) => {
             info!(
-                "build_tray: tray icon loaded from embedded 32x32 PNG ({} bytes)",
+                "build_tray: tray icon loaded from embedded PNG ({} bytes)",
                 TRAY_ICON_BYTES.len()
             );
             i

@@ -88,10 +88,22 @@ pub async fn pair_inner(
 }
 
 #[tauri::command]
-pub async fn pair(input: PairingInput) -> Result<PairingSuccess, String> {
-    pair_inner(input, default_config_path())
+pub async fn pair(
+    app: tauri::AppHandle,
+    input: PairingInput,
+) -> Result<PairingSuccess, String> {
+    let result = pair_inner(input, default_config_path())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // S477 §3.3 (v0.3.7): notify on first successful pair so the user knows
+    // the tray-only daemon is running -- the wizard window will hide on
+    // close and they need to be able to find the tray icon.
+    crate::notify_user(
+        &app,
+        "Vault Sync is running",
+        "Look for the icon in your menu bar near the notch.",
+    );
+    Ok(result)
 }
 
 #[derive(Debug, Serialize)]
