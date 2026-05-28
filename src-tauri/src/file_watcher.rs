@@ -49,8 +49,20 @@ use crate::redflag::DeleteBurstDetector;
 use crate::tray_state::SharedTrayState;
 
 /// Hardcoded directory excludes — applied regardless of user config.
-/// Match against the forward-slash vault-relative path with prefix semantics.
-const HARDCODED_EXCLUDES: &[&str] = &[".obsidian/", ".lattice-sync/", ".trash/"];
+/// Match against the forward-slash vault-relative path. A path matches if it
+/// either starts with the prefix (root-level) or contains `/<prefix>` (nested).
+const HARDCODED_EXCLUDES: &[&str] = &[
+    ".obsidian/",
+    ".lattice-sync/",
+    ".trash/",
+    "._/", // S477: convention for organized machine-local trees
+];
+
+/// Path-segment prefix matches. If ANY segment of the path (basename of any
+/// ancestor or the file itself) starts with one of these, the path drops.
+/// Lattice-wide convention per S477: `.%` marks files/folders as machine-local
+/// — not synced, generated + maintained per-machine.
+const HARDCODED_BASENAME_PREFIXES: &[&str] = &[".%"];
 
 /// Default allowed text extensions (lowercase, no leading dot).
 pub const DEFAULT_ALLOWED_EXTENSIONS: &[&str] = &["md"];
@@ -244,13 +256,29 @@ impl FileWatcher {
             return FilterDecision::DropOutOfScope { path: norm };
         }
 
-        // (2) Hardcoded excludes (defense-in-depth).
+        // (2) Hardcoded excludes (defense-in-depth). Match prefix at root OR
+        // any nested `/<prefix>` segment so e.g. `Mainframe/._/state.json`
+        // drops the same way `._/state.json` would.
         for ex in HARDCODED_EXCLUDES {
-            if norm.starts_with(ex) {
+            if norm.starts_with(ex) || norm.contains(&format!("/{ex}")) {
                 return FilterDecision::DropExclude {
                     path: norm,
                     exclude_rule: (*ex).to_string(),
                 };
+            }
+        }
+
+        // (2b) Hardcoded basename prefixes (Lattice-wide machine-local
+        // convention per S477). If ANY path segment starts with one of these
+        // prefixes, the whole path is machine-local.
+        for segment in norm.split('/') {
+            for prefix in HARDCODED_BASENAME_PREFIXES {
+                if segment.starts_with(prefix) {
+                    return FilterDecision::DropExclude {
+                        path: norm,
+                        exclude_rule: format!("hardcoded-basename:{prefix}"),
+                    };
+                }
             }
         }
 
@@ -853,6 +881,71 @@ mod tests {
                 assert_eq!(exclude_rule, ".trash/");
             }
             other => panic!("expected DropExclude, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn underscore_dot_folder_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created("._/cache.json");
+        match w.classify(&evt) {
+            FilterDecision::DropExclude { exclude_rule, .. } => {
+                assert!(
+                    exclude_rule.contains("._/"),
+                    "expected ._/ rule, got {exclude_rule}"
+                );
+            }
+            other => panic!("expected DropExclude for ._/cache.json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn underscore_dot_folder_excluded_at_any_depth() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created("Mainframe/._/state.json");
+        match w.classify(&evt) {
+            FilterDecision::DropExclude { .. } => {}
+            other => panic!("expected DropExclude for nested ._/, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dot_percent_file_at_root_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created(".%scratch.md");
+        match w.classify(&evt) {
+            FilterDecision::DropExclude { exclude_rule, .. } => {
+                assert!(
+                    exclude_rule.contains(".%"),
+                    "expected .% rule, got {exclude_rule}"
+                );
+            }
+            other => panic!("expected DropExclude, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dot_percent_file_nested_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created("02_Projects/.%draft.md");
+        match w.classify(&evt) {
+            FilterDecision::DropExclude { .. } => {}
+            other => panic!("expected DropExclude, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dot_percent_folder_and_children_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created("Mainframe/.%cache/index.md");
+        match w.classify(&evt) {
+            FilterDecision::DropExclude { .. } => {}
+            other => panic!("expected DropExclude for path under .% folder, got {other:?}"),
         }
     }
 
