@@ -86,6 +86,10 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         MenuItemBuilder::with_id("conflicts", "Conflicts unresolved: 0").build(app)?;
     let verify_repair_item =
         MenuItemBuilder::with_id("verify-repair", "Verify and repair all files…").build(app)?;
+    // S477 v0.3.8 (D): periodic reconciliation backstop telemetry.
+    let recon_item = MenuItemBuilder::with_id("recon-status", "Reconciliation: (no pass yet)")
+        .enabled(false)
+        .build(app)?;
     // Conditional safety-valve items — present in the menu but blank-text
     // when the underlying state is clear. (Tauri's menu doesn't support
     // clean post-build append/remove, so we render presence via the label.)
@@ -102,7 +106,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let menu: Menu<Wry> = MenuBuilder::new(app)
         .items(&[&status_item, &activity_item, &last_error_item])
         .separator()
-        .items(&[&pending_item, &conflicts_item, &verify_repair_item])
+        .items(&[&pending_item, &conflicts_item, &recon_item, &verify_repair_item])
         .separator()
         .items(&[&redflag_item, &delete_burst_item])
         .separator()
@@ -307,6 +311,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         let mut prev_conflicts = String::new();
         let mut prev_redflag = String::new();
         let mut prev_burst = String::new();
+        let mut prev_recon = String::new();
         let mut prev_tooltip = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -340,6 +345,23 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     } else {
                         String::new()
                     };
+                    // S477 v0.3.8 (D): recon-backstop tray line.
+                    // "Reconciliation: ⟳ in progress" while a pass runs;
+                    // "Reconciliation: pulled N, pushed M (last Xs ago)" otherwise;
+                    // "Reconciliation: (no pass yet)" until the first sweep completes.
+                    let recon = if s.recon_in_progress {
+                        "Reconciliation: ⟳ in progress".to_string()
+                    } else if let Some(at) = s.last_recon_at {
+                        let elapsed = (chrono::Utc::now() - at).num_seconds().max(0) as u64;
+                        format!(
+                            "Reconciliation: pulled {}, pushed {} (last {} ago)",
+                            s.recon_pulls_total,
+                            s.recon_pushes_total,
+                            format_staleness(Duration::from_secs(elapsed))
+                        )
+                    } else {
+                        "Reconciliation: (no pass yet)".to_string()
+                    };
                     let tooltip = build_tooltip(&s);
                     Some((
                         s.status.label().to_string(),
@@ -349,6 +371,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                         conflicts,
                         redflag,
                         burst,
+                        recon,
                         tooltip,
                     ))
                 }
@@ -362,6 +385,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 conflicts_line,
                 redflag_line,
                 burst_line,
+                recon_line,
                 tooltip,
             )) = snapshot
             else {
@@ -415,6 +439,12 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     let _ = item.set_text(&burst_line);
                 }
                 prev_burst = burst_line;
+            }
+            if recon_line != prev_recon {
+                if let Some(item) = handles.as_deref().and_then(|h| h.recon.as_ref()) {
+                    let _ = item.set_text(&recon_line);
+                }
+                prev_recon = recon_line;
             }
             if tooltip != prev_tooltip {
                 let _ = tray_for_refresh.set_tooltip(Some(&tooltip));
@@ -507,6 +537,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         conflicts: Some(conflicts_item),
         redflag: Some(redflag_item),
         delete_burst: Some(delete_burst_item),
+        recon: Some(recon_item),
     });
     // Hold the verify_repair item alive (the menu already retains it but
     // we keep this binding to make the intent explicit — Tauri's MenuItem
@@ -529,6 +560,8 @@ struct TrayMenuHandles {
     conflicts: Option<MenuItem<Wry>>,
     redflag: Option<MenuItem<Wry>>,
     delete_burst: Option<MenuItem<Wry>>,
+    /// S477 v0.3.8 (D): "Reconciliation: pulled N, pushed M, last Xs ago"
+    recon: Option<MenuItem<Wry>>,
 }
 
 fn format_staleness(d: Duration) -> String {

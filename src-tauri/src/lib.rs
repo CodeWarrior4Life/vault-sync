@@ -13,6 +13,7 @@ pub mod pairing;
 pub mod push_client;
 pub mod push_journal;
 pub mod rasp_fence;
+pub mod reconciliation;
 pub mod redflag;
 pub mod scope;
 pub mod sse;
@@ -590,6 +591,32 @@ fn spawn_push_pipeline(
         push_client.run_loop(push_shutdown_rx).await;
         tracing::warn!("push_client.run_loop returned (unexpected for a forever loop)");
     });
+
+    // --- S477 v0.3.8 (D) reconciliation backstop ---
+    // Periodic background sweep that diffs local vs server (via the same
+    // VerifyRepair machinery the owner-invoked tray menu uses) and
+    // queues pushes / logs pulls to close any systemic drift. Honors
+    // VAULT_SYNC_DISABLE_RECON kill switch + VAULT_SYNC_RECON_INTERVAL_SECS
+    // cadence override. Shares the push_client's journal handle so any
+    // pushes it queues are picked up by the drain loop above.
+    // Non-fatal on api-client init failure — just skip the backstop;
+    // push pipeline + file_watcher carry on.
+    match api_client::ApiClient::new(&cfg.nexus_url, &token) {
+        Ok(recon_api) => {
+            let _recon_task = reconciliation::spawn_reconciliation_task(
+                vault_root.clone(),
+                Arc::new(recon_api),
+                journal.clone(),
+                cfg.subscriber_id.clone(),
+                tray_state.clone(),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "reconciliation: api client init failed: {e}; backstop not spawned"
+            );
+        }
+    }
 
     // --- file_watcher: local FS edits → journal ---
     // SUBSTRATE NOTE: FileWatcher requires `Arc<std::sync::Mutex<PushJournal>>`

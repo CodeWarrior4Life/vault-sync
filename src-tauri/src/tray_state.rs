@@ -95,6 +95,19 @@ pub struct TrayState {
     /// immediate "⟳ Verifying vault…" tooltip so the owner gets instant
     /// feedback instead of staring at a stale tooltip for ~16s.
     pub verify_in_progress: bool,
+    /// S477 v0.3.8 (D): periodic reconciliation backstop counters. Each
+    /// background sweep updates these from its returned `VerifyRepairReport`
+    /// so the tray can surface drift telemetry without exposing the full
+    /// report shape. Pulls = server-only paths the sweep saw (SSE consumer
+    /// materializes those). Pushes = local-only / hash-mismatch paths the
+    /// sweep queued for upload via the shared push_journal.
+    pub recon_pulls_total: u64,
+    pub recon_pushes_total: u64,
+    pub last_recon_at: Option<DateTime<Utc>>,
+    /// True while a periodic reconciliation pass is in flight. Distinct from
+    /// `verify_in_progress` (which is owner-invoked); the recon-sweep is the
+    /// background-task variant.
+    pub recon_in_progress: bool,
 }
 
 impl TrayState {
@@ -120,6 +133,10 @@ impl TrayState {
             redflag_tripped: false,
             delete_burst_paused: false,
             verify_in_progress: false,
+            recon_pulls_total: 0,
+            recon_pushes_total: 0,
+            last_recon_at: None,
+            recon_in_progress: false,
         }
     }
 
@@ -194,6 +211,20 @@ impl TrayState {
 
     pub fn set_verify_in_progress(&mut self, in_progress: bool) {
         self.verify_in_progress = in_progress;
+    }
+
+    /// S477 v0.3.8 (D): recon-task setters. `note_recon_pass` is the
+    /// single entry point a completed pass calls — folds the report's
+    /// add_count (pulls) + modify_count (pushes) into the running totals
+    /// and stamps `last_recon_at` to now.
+    pub fn set_recon_in_progress(&mut self, in_progress: bool) {
+        self.recon_in_progress = in_progress;
+    }
+
+    pub fn note_recon_pass(&mut self, pulls: u64, pushes: u64) {
+        self.recon_pulls_total = self.recon_pulls_total.saturating_add(pulls);
+        self.recon_pushes_total = self.recon_pushes_total.saturating_add(pushes);
+        self.last_recon_at = Some(Utc::now());
     }
 
     /// One-line status string for the tray menu's top item.
