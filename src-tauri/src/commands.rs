@@ -66,10 +66,11 @@ pub(crate) fn build_verify_repair(
     let journal = PushJournal::open(&journal_path).map_err(|e| e.to_string())?;
     let journal_arc = Arc::new(Mutex::new(journal));
 
-    // S477: post-watch-root-fix, `vaults_root` IS the verify-repair root.
-    // The vault folder is encoded as the first segment of each path; we
-    // no longer join a per-config `vault_name`.
-    let vault_root = cfg.vaults_root.clone();
+    // v0.3.9 Option A: verify-repair walks the SINGLE vault root so its
+    // reconcile manifest keys are BARE, matching push + server canonical.
+    // If missed, verify_repair would walk the parent and re-emit prefixed
+    // reconcile manifest entries, reintroducing the namespace bug.
+    let vault_root = crate::effective_vault_root(cfg)?;
     let vr = VerifyRepair::new(
         vault_root,
         api_arc,
@@ -250,15 +251,15 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn make_config(server_url: &str, vaults_root: PathBuf, _vault_name: &str) -> Config {
-        // _vault_name retained as a parameter so call sites stay readable
-        // (they pass the vault folder name they just created on disk) but
-        // is no longer stored on Config post-S477.
+    fn make_config(server_url: &str, vaults_root: PathBuf, vault_name: &str) -> Config {
+        // v0.3.9 Option A: vault_name is stored on Config; the verify-repair
+        // root is vaults_root.join(vault_name).
         Config {
             nexus_url: server_url.to_string(),
             subscriber_id: "sub-test".to_string(),
             vaults_root,
-            daemon_version: "0.3.0-test".to_string(),
+            vault_name: vault_name.to_string(),
+            daemon_version: "0.3.9-test".to_string(),
             daemon_platform: "test".to_string(),
             last_event_id: None,
         }
@@ -321,10 +322,14 @@ mod tests {
             build_verify_repair(&cfg, "vsk_test", workspace.path().to_path_buf()).unwrap();
         let m = vr.build_local_manifest().unwrap();
         assert_eq!(m.len(), 1);
-        // S477: vault_root is vaults_root verbatim, so the manifest entry
-        // for a file at vaults_root/TestVault/a.md surfaces with the vault
-        // folder as its first path segment.
-        assert_eq!(m[0].path, "TestVault/a.md");
+        // v0.3.9 Option A: vault_root = vaults_root/vault_name, so the manifest
+        // key for vaults_root/TestVault/a.md is BARE ("a.md"), no prefix.
+        assert_eq!(m[0].path, "a.md");
+        assert!(
+            !m[0].path.starts_with("TestVault/"),
+            "manifest must NOT carry the vault-folder prefix; got {:?}",
+            m[0].path
+        );
 
         let journal_path = push_journal_path(workspace.path(), &cfg.subscriber_id);
         assert!(journal_path.parent().unwrap().is_dir());
