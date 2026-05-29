@@ -179,8 +179,11 @@ pub fn is_substrate_path(path: &str) -> bool {
 /// - **AppleDouble files** — any basename that starts with `._` (e.g.
 ///   `._note.md`, `dir/._x.md`). These are macOS extended-attribute sidecar
 ///   files that cause duplicate messes on non-HFS+ filesystems.
-/// - **`.DS_Store`** — macOS folder metadata, exact basename match (case-
-///   sensitive per macOS convention).
+/// - **`.DS_Store` / `Thumbs.db`** — OS folder metadata, exact basename match.
+/// - **V9 substrate dirs** — `.obsidian`, `.trash`, `.git`, `node_modules`,
+///   `.cody-tmp`, `__pycache__`, `.lattice-sync`, `.lattice-runtime`, matched
+///   as an exact segment at any depth (the server rejects these with HTTP 400).
+/// - **Junk extensions** — `*.pyc`, `*.swp`, `*.tmp`.
 ///
 /// Carve-out — `.nx-*` machine-namespace segments (e.g. `.nx-trinity/`,
 /// `.nx-morpheus/`) are NOT junk. The `._` prefix requires a literal
@@ -188,6 +191,25 @@ pub fn is_substrate_path(path: &str) -> bool {
 /// distinct and is never matched by the AppleDouble check. This is verified
 /// by the `includes_nx_host_namespace` test.
 pub fn is_junk_path(path: &str) -> bool {
+    // V9 baseline substrate dirs the server rejects (HTTP 400) and that must
+    // never be pushed. Exact segment match at ANY depth (e.g. the nested
+    // `02_Projects/.obsidian/workspace.json`). S481: these regressed off the
+    // push walk, causing a 400 retry-storm.
+    const JUNK_DIRS: &[&str] = &[
+        ".obsidian",
+        ".trash",
+        ".git",
+        "node_modules",
+        ".cody-tmp",
+        "__pycache__",
+        ".lattice-sync",
+        ".lattice-runtime",
+    ];
+    // Junk basenames (exact, case-sensitive).
+    const JUNK_BASENAMES: &[&str] = &[".DS_Store", "Thumbs.db"];
+    // Junk file extensions (suffix match on the segment).
+    const JUNK_EXTS: &[&str] = &[".pyc", ".swp", ".tmp"];
+
     let normalized = normalize(path);
     for segment in normalized.split('/') {
         if segment.is_empty() {
@@ -197,8 +219,17 @@ pub fn is_junk_path(path: &str) -> bool {
         if segment.starts_with("._") {
             return true;
         }
-        // .DS_Store: exact basename (case-sensitive)
-        if segment == ".DS_Store" {
+        // exact junk basenames (.DS_Store, Thumbs.db)
+        if JUNK_BASENAMES.contains(&segment) {
+            return true;
+        }
+        // V9 substrate dirs — exact segment match, so `.nx-*` machine
+        // namespaces are unaffected (only literal substrate dir names match).
+        if JUNK_DIRS.contains(&segment) {
+            return true;
+        }
+        // junk extensions (*.pyc / *.swp / *.tmp)
+        if JUNK_EXTS.iter().any(|e| segment.ends_with(e)) {
             return true;
         }
     }
@@ -438,6 +469,39 @@ mod tests {
             is_junk_path("02_Projects/Nexus/.DS_Store"),
             ".DS_Store deep nested should be junk"
         );
+    }
+
+    #[test]
+    fn excludes_v9_substrate_dirs_at_any_depth() {
+        // S481: server rejects these with HTTP 400; daemon must exclude them.
+        for p in [
+            ".obsidian/workspace.json",
+            "02_Projects/.obsidian/x.json",
+            ".obsidian/plugins/foo/main.js",
+            ".trash/old.md",
+            "02_Projects/Nexus/.trash/x.md",
+            ".git/config",
+            "node_modules/pkg/index.js",
+            ".cody-tmp/scratch.md",
+            "sub/__pycache__/x.pyc",
+            ".lattice-sync/shadow/x.md",
+            ".lattice-runtime/uuid/state",
+            "dir/Thumbs.db",
+            "x.pyc",
+            "note.md.swp",
+            "build.tmp",
+        ] {
+            assert!(is_junk_path(p), "{p} should be junk (V9 substrate)");
+        }
+        // Real notes + .nx-* machine namespaces must still sync.
+        for p in [
+            "02_Projects/Nexus/note.md",
+            "01_Notes/x.md",
+            ".nx-trinity/build/out.bin",
+            "02_Projects/.nx-morpheus/build/x.md",
+        ] {
+            assert!(!is_junk_path(p), "{p} must NOT be junk (should sync)");
+        }
     }
 
     #[test]

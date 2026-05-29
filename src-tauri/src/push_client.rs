@@ -87,6 +87,13 @@ pub enum SkipReason {
     /// A lazy (content_bytes: None) event whose file no longer exists at
     /// drain time — deleted since enqueue. No-op; ack so it doesn't wedge.
     FileVanished,
+    /// Server rejected the push with HTTP 400 (e.g. path excluded by the V9
+    /// baseline scope filter). A 400 is a PERMANENT reject — skip + ack, never
+    /// retry (S481: previously retry-stormed). Defense-in-depth: the fence
+    /// (`is_junk_path`) should already keep these from being enqueued.
+    ServerRejected {
+        status: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +399,15 @@ impl PushClient {
                     return PushOutcome::Failed(FailureReason::ConflictUnrecoverable {
                         expected_hash,
                     });
+                }
+                // HTTP 400 = permanent reject (e.g. path excluded by V9 baseline
+                // scope filter). Skip + ack so it never retry-storms (S481).
+                Err(ApiError::Server(400)) => {
+                    tracing::info!(
+                        path = %evt.path,
+                        "push rejected HTTP 400 (permanent) — skip + ack, no retry"
+                    );
+                    return PushOutcome::Skipped(SkipReason::ServerRejected { status: 400 });
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
