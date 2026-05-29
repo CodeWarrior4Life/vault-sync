@@ -654,23 +654,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    const VAULT: &str = "Mainframe";
     const SLUG: &str = "subscriber-test";
 
-    /// (vaults_root_tmp, workspace_tmp, materializer)
+    /// (vault_root_tmp, workspace_tmp, materializer)
+    ///
+    /// v0.3.9 Option A: the daemon re-anchors its root to
+    /// `vaults_root.join(vault_name)`, so in these tests the materializer's
+    /// root IS the vault root and every payload path is BARE (vault-relative).
+    /// `vault_tmp.path()` therefore stands in for `<vaults_root>/<vault_name>`.
     fn mk(mode: MaterializerMode, cfg: MaterializerConfig) -> (TempDir, TempDir, Materializer) {
-        let vaults_tmp = TempDir::new().unwrap();
+        let vault_tmp = TempDir::new().unwrap();
         let ws_tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(vaults_tmp.path().join(VAULT)).unwrap();
         let m = Materializer::new(
-            vaults_tmp.path().to_path_buf(),
+            vault_tmp.path().to_path_buf(),
             Some("shadow/".to_string()),
             mode,
             ws_tmp.path().to_path_buf(),
             SLUG.to_string(),
             cfg,
         );
-        (vaults_tmp, ws_tmp, m)
+        (vault_tmp, ws_tmp, m)
     }
 
     fn default_cfg() -> MaterializerConfig {
@@ -684,24 +687,18 @@ mod tests {
         hex::encode(Sha256::digest(s.as_bytes()))
     }
 
-    /// Test helper: builds a NotePayload with the path namespaced under
-    /// the test VAULT folder. Per S477, NotePayload.path is relative to
-    /// `vaults_root`, so the vault folder is the first segment. Callers
-    /// keep passing intra-vault relatives ("01_Inbox/foo.md") and this
-    /// helper prepends VAULT exactly once. Paths starting with "../"
-    /// (traversal-attempt tests) are passed through unmodified so the
-    /// path-safety check sees the raw escape attempt.
+    /// Test helper: builds a NotePayload with a BARE (vault-relative) path.
+    /// v0.3.9 Option A: NotePayload.path is relative to the daemon's single
+    /// vault root, so callers pass intra-vault relatives ("01_Inbox/foo.md")
+    /// verbatim — no vault-folder prefix. Paths starting with "../"
+    /// (traversal-attempt tests) are passed through so the path-safety check
+    /// sees the raw escape attempt.
     fn payload(path: &str, body: &str) -> NotePayload {
-        let prefixed = if path.starts_with("../") || path.starts_with(&format!("{VAULT}/")) {
-            path.to_string()
-        } else {
-            format!("{VAULT}/{path}")
-        };
         let fm = serde_json::json!({"title": "Test", "tags": ["a", "b"]});
         let fm_yaml = serde_yaml::to_string(&fm).unwrap_or_default();
         let serialized = format!("---\n{fm_yaml}---\n\n{body}");
         NotePayload {
-            path: prefixed,
+            path: path.to_string(),
             frontmatter: fm,
             body: body.into(),
             sha256: sha256_hex(&serialized),
@@ -722,7 +719,7 @@ mod tests {
     fn live_mode_writes_to_vault_path_not_shadow() {
         let (vaults, ws, m) = mk(MaterializerMode::Live, default_cfg());
         let out = m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
-        let expected = vaults.path().join(VAULT).join("01_Inbox/foo.md");
+        let expected = vaults.path().join("01_Inbox/foo.md");
         match out {
             MaterializeOutcome::Wrote { path } => assert_eq!(path, expected),
             other => panic!("expected Wrote, got {other:?}"),
@@ -747,14 +744,13 @@ mod tests {
             .join(".lattice-runtime")
             .join(SLUG)
             .join("shadow")
-            .join(VAULT)
             .join("01_Inbox/foo.md");
         match out {
             MaterializeOutcome::Wrote { path } => assert_eq!(path, expected),
             other => panic!("expected Wrote, got {other:?}"),
         }
         assert!(expected.exists());
-        let vault_target = vaults.path().join(VAULT).join("01_Inbox/foo.md");
+        let vault_target = vaults.path().join("01_Inbox/foo.md");
         assert!(!vault_target.exists());
     }
 
@@ -763,7 +759,7 @@ mod tests {
         let (vaults, _ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
         let shadow_root_canonical = m.shadow_root().canonicalize().unwrap();
-        let vault_root_canonical = vaults.path().join(VAULT).canonicalize().unwrap();
+        let vault_root_canonical = vaults.path().canonicalize().unwrap();
         assert!(
             !shadow_root_canonical.starts_with(&vault_root_canonical),
             "shadow={} should not be inside vault={}",
@@ -777,7 +773,7 @@ mod tests {
         let (vaults, ws, m) = mk(MaterializerMode::Disabled, default_cfg());
         let out = m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
         assert_eq!(out, MaterializeOutcome::Skipped(SkipReason::DisabledMode));
-        assert!(!vaults.path().join(VAULT).join("01_Inbox/foo.md").exists());
+        assert!(!vaults.path().join("01_Inbox/foo.md").exists());
         assert!(!ws
             .path()
             .join(".lattice-runtime")
@@ -821,7 +817,7 @@ mod tests {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let p = payload("01_Inbox/foo.md", "hello");
         m.write(&p).unwrap();
-        let target = vaults.path().join(VAULT).join("01_Inbox/foo.md");
+        let target = vaults.path().join("01_Inbox/foo.md");
         let mtime_before = std::fs::metadata(&target).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let out = m.write(&p).unwrap();
@@ -839,7 +835,7 @@ mod tests {
     #[test]
     fn frontmatter_only_rewrite_treated_as_identical() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
-        let target = vaults.path().join(VAULT).join("01_Inbox/n.md");
+        let target = vaults.path().join("01_Inbox/n.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         // Local file: same key set as canonical except `updated: 2026-05-01`.
         // To make this test order-stable across serde_yaml versions, build
@@ -859,7 +855,7 @@ mod tests {
         let serialized = format!("---\n{fm_yaml}---\n\nbody-text");
         let p = NotePayload {
             // S477: payload path is vaults-root-relative (vault folder first).
-            path: format!("{VAULT}/01_Inbox/n.md"),
+            path: "01_Inbox/n.md".to_string(),
             frontmatter: fm,
             body: "body-text".into(),
             sha256: sha256_hex(&serialized),
@@ -878,7 +874,7 @@ mod tests {
     #[test]
     fn stash_written_for_conflict_class_d() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
-        let target = vaults.path().join(VAULT).join("02_Projects/Credentials.md");
+        let target = vaults.path().join("02_Projects/Credentials.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "local-secrets-version").unwrap();
         let p = payload("02_Projects/Credentials.md", "server-canonical-secrets");
@@ -898,7 +894,7 @@ mod tests {
     #[test]
     fn stash_not_written_for_class_c_under_server_wins() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
-        let target = vaults.path().join(VAULT).join("02_Projects/Foo/normal.md");
+        let target = vaults.path().join("02_Projects/Foo/normal.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "old-local").unwrap();
         let p = payload("02_Projects/Foo/normal.md", "server-canonical");
@@ -932,7 +928,7 @@ mod tests {
             MaterializeOutcome::IntegrityFailed {
                 path, expected_sha, ..
             } => {
-                assert_eq!(path, vaults.path().join(VAULT).join("01_Inbox/foo.md"));
+                assert_eq!(path, vaults.path().join("01_Inbox/foo.md"));
                 assert_eq!(expected_sha, p.sha256);
                 assert!(path.exists(), "integrity-failed file must remain on disk");
             }
@@ -951,7 +947,7 @@ mod tests {
         let out = m.write(&p).unwrap();
         match out {
             MaterializeOutcome::Wrote { path } => {
-                assert_eq!(path, vaults.path().join(VAULT).join("01_Inbox/foo.md"));
+                assert_eq!(path, vaults.path().join("01_Inbox/foo.md"));
                 assert!(path.exists());
             }
             other => panic!("expected Wrote (integrity disabled), got {other:?}"),
@@ -964,7 +960,7 @@ mod tests {
     fn parent_dirs_created() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let out = m.write(&payload("a/b/c/d.md", "deep")).unwrap();
-        let expected = vaults.path().join(VAULT).join("a/b/c/d.md");
+        let expected = vaults.path().join("a/b/c/d.md");
         assert_eq!(
             out,
             MaterializeOutcome::Wrote {
@@ -980,7 +976,7 @@ mod tests {
         m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
         // S477: live_path_for takes a vaults-root-relative path (vault
         // folder first segment), matching the materializer's contract.
-        let dir = m.live_path_for(&format!("{VAULT}/01_Inbox/foo.md"));
+        let dir = m.live_path_for("01_Inbox/foo.md");
         let parent = dir.parent().unwrap();
         let entries: Vec<String> = std::fs::read_dir(parent)
             .unwrap()
@@ -998,7 +994,7 @@ mod tests {
     #[test]
     fn atomic_write_no_partial_visible() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
-        let target = vaults.path().join(VAULT).join("loop/x.md");
+        let target = vaults.path().join("loop/x.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         for i in 0..100 {
             let body = format!("iteration-{i}");
@@ -1028,7 +1024,6 @@ mod tests {
                 .join(".lattice-runtime")
                 .join(SLUG)
                 .join("shadow")
-                .join(VAULT)
                 .join("01_Inbox/foo.md"),
         )
         .unwrap();
@@ -1051,13 +1046,12 @@ mod tests {
         let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
         // S477: soft_delete takes vaults-root-relative paths, same as write().
-        m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md")).unwrap();
+        m.soft_delete("01_Inbox/foo.md").unwrap();
         let shadow_dir = ws
             .path()
             .join(".lattice-runtime")
             .join(SLUG)
             .join("shadow")
-            .join(VAULT)
             .join("01_Inbox");
         assert!(!shadow_dir.join("foo.md").exists());
         let entries: Vec<_> = std::fs::read_dir(&shadow_dir)
@@ -1138,7 +1132,7 @@ mod tests {
         let (vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let tray = make_shared_tray();
         let m = m_base.with_tray_state(tray.clone());
-        let vault_dir = vaults.path().join(VAULT);
+        let vault_dir = vaults.path().to_path_buf();
         std::fs::create_dir_all(vault_dir.join("01_Inbox")).unwrap();
         // Three conflict-stash siblings, varied subpaths.
         std::fs::write(
@@ -1160,11 +1154,53 @@ mod tests {
     #[test]
     fn refresh_with_no_tray_state_is_noop() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
-        let vault_dir = vaults.path().join(VAULT);
+        let vault_dir = vaults.path().to_path_buf();
         std::fs::create_dir_all(&vault_dir).unwrap();
         std::fs::write(vault_dir.join("a.conflict-from-d-1.md"), "x").unwrap();
         // Must not panic, must not touch any tray (there is none).
         m.refresh_conflict_count_into_tray();
         m.refresh_conflict_count_into_tray();
+    }
+
+    // ---- S479 ADDENDUM E1: CP437↔UTF-8 mojibake regression guard ----------
+
+    /// PERMANENT GUARD (S479 ADDENDUM, Task E1 → guard-test-only). The legacy
+    /// duplicate-filename bug (`…`→`ΓÇª`, `'`→`ΓÇÖ`, `🚨`→`≡ƒÜ¿`) came from a
+    /// shared Windows ingest-layer filename writer decoding UTF-8 bytes as the
+    /// CP437 OEM console codepage. The daemon's materializer was AUDITED CLEAN
+    /// (it uses `std::fs`/`OsStr` which are UTF-16/UTF-8 native on Windows),
+    /// so there is no boundary to fix here. This test PINS that property: a
+    /// note whose name carries non-ASCII punctuation + an emoji materializes
+    /// to disk with a byte-identical UTF-8 filename — never CP437-mangled — so
+    /// any future refactor that introduces an OEM-decode boundary fails loudly.
+    #[test]
+    fn materialize_preserves_unicode_filename_bytes_not_cp437() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        // Non-ASCII punctuation (… ' – " ") + emoji (🚨) — the exact mojibake
+        // class from the S479 worklist.
+        let name = "Probe … 'q' – \u{201C}d\u{201D} 🚨.md";
+        let rel = format!("01_Inbox/{name}");
+        let out = m.write(&payload(&rel, "hello")).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "expected Wrote, got {out:?}"
+        );
+
+        // Read the name back off disk via read_dir and assert byte-identical
+        // UTF-8 — NOT the CP437-mangled twin (which would contain "ΓÇ" runs).
+        let dir = vaults.path().join("01_Inbox");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == name),
+            "on-disk filename must be byte-identical UTF-8; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("ΓÇ") || n.contains("≡ƒ")),
+            "CP437 mojibake detected on disk: {names:?}"
+        );
     }
 }
