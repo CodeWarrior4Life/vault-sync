@@ -6,6 +6,7 @@ const form = document.querySelector("#pairing-form");
 const nexusUrlEl = document.querySelector("#nexus-url");
 const tokenEl = document.querySelector("#token");
 const vaultRootEl = document.querySelector("#vault-root");
+const vaultNameEl = document.querySelector("#vault-name");
 const browseBtn = document.querySelector("#browse-btn");
 const pairBtn = document.querySelector("#pair-btn");
 const statusEl = document.querySelector("#status");
@@ -79,6 +80,35 @@ async function populatePairedPanel({ subscriberId, vaultsRoot, mode }) {
   }
 }
 
+// v0.3.9 (Option A): populate the Vault Folder dropdown from the folders
+// detected under the chosen Vaults Root. Prefer folders that contain an
+// `.obsidian/` dir. Preserves a current selection when re-rendering.
+async function populateVaultNameSelect(vaultsRoot, currentName) {
+  if (!vaultNameEl) return;
+  const keep = currentName != null ? currentName : vaultNameEl.value;
+  // Reset to just the auto-detect option.
+  vaultNameEl.innerHTML =
+    '<option value="">(auto-detect single Obsidian vault)</option>';
+  if (!vaultsRoot) return;
+  try {
+    const folders = await invoke("list_vault_folders", { vaultsRoot });
+    // Obsidian vaults first, then the rest, each alphabetical.
+    const sorted = (folders || []).slice().sort((a, b) => {
+      if (!!a.has_obsidian !== !!b.has_obsidian) return a.has_obsidian ? -1 : 1;
+      return String(a.name).localeCompare(String(b.name));
+    });
+    for (const f of sorted) {
+      const opt = document.createElement("option");
+      opt.value = f.name;
+      opt.textContent = f.has_obsidian ? f.name + " (Obsidian)" : f.name;
+      vaultNameEl.appendChild(opt);
+    }
+    if (keep) vaultNameEl.value = keep;
+  } catch (_e) {
+    // Enumeration failure — leave only the auto-detect option.
+  }
+}
+
 // v0.3 — true persistence means the field is FILLED in the UI on reopen.
 // Pre-populate nexus_url, vaults_root AND the bearer token from disk so
 // the user sees their active pairing state immediately.
@@ -88,6 +118,8 @@ async function populatePairedPanel({ subscriberId, vaultsRoot, mode }) {
     if (cfg) {
       if (cfg.nexus_url) nexusUrlEl.value = cfg.nexus_url;
       if (cfg.vaults_root) vaultRootEl.value = cfg.vaults_root;
+      // v0.3.9: populate + pre-select the vault folder dropdown.
+      await populateVaultNameSelect(cfg.vaults_root, cfg.vault_name);
     }
     const tok = await invoke("load_current_token");
     if (tok) {
@@ -130,6 +162,7 @@ async function populatePairedPanel({ subscriberId, vaultsRoot, mode }) {
         window.__currentPairedConfig = {
           nexusUrl: cfg.nexus_url || "",
           vaultsRoot: cfg.vaults_root || "",
+          vaultName: cfg.vault_name || "",
           mode: liveMode || "shadow",
           subscriberId: cfg.subscriber_id,
         };
@@ -233,6 +266,8 @@ browseBtn.addEventListener("click", async () => {
     const selected = await open({ directory: true, multiple: false, title: "Select Vault Root" });
     if (selected) {
       vaultRootEl.value = selected;
+      // v0.3.9: refresh the vault folder dropdown for the newly chosen root.
+      await populateVaultNameSelect(selected, "");
     }
   } catch (e) {
     showStatus("Could not open folder picker: " + e, true);
@@ -248,6 +283,7 @@ form.addEventListener("submit", async (e) => {
   const nexusUrl = nexusUrlEl.value.trim();
   const token = tokenEl.value.trim();
   const vaultsRoot = vaultRootEl.value.trim();
+  const vaultName = vaultNameEl ? vaultNameEl.value.trim() : "";
   const selectedMode = document.querySelector('input[name="materializer-mode"]:checked');
   const mode = selectedMode ? selectedMode.value : null;
 
@@ -284,6 +320,7 @@ form.addEventListener("submit", async (e) => {
           nexus_url: nexusUrl,
           token,
           vaults_root: vaultsRoot,
+          vault_name: vaultName,
           materializer_mode: mode,
         },
       });
@@ -292,6 +329,7 @@ form.addEventListener("submit", async (e) => {
       window.__currentPairedConfig = {
         nexusUrl,
         vaultsRoot,
+        vaultName,
         mode: result.materializer_mode || mode,
         subscriberId: result.subscriber_id,
       };
@@ -339,6 +377,8 @@ editSettingsBtn.addEventListener("click", () => {
   if (cfg) {
     if (cfg.nexusUrl) nexusUrlEl.value = cfg.nexusUrl;
     if (cfg.vaultsRoot) vaultRootEl.value = cfg.vaultsRoot;
+    // v0.3.9: refresh + pre-select the vault folder dropdown.
+    populateVaultNameSelect(cfg.vaultsRoot, cfg.vaultName || "");
     tokenEl.value = "";
     if (cfg.mode) {
       const modeRadio = document.querySelector(

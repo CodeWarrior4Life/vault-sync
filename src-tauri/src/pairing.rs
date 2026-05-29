@@ -27,6 +27,11 @@ pub struct PairingInput {
     /// with v0.1.x clients still POSTing the old field name.
     #[serde(alias = "vault_root")]
     pub vaults_root: PathBuf,
+    /// v0.3.9 (Option A): the chosen vault folder name under `vaults_root`,
+    /// supplied by the wizard folder picker. If empty, the daemon infers a
+    /// single `.obsidian`-bearing subdir at startup (lib.rs::effective_vault_root).
+    #[serde(default)]
+    pub vault_name: String,
     /// v0.3.2: optional mode override. If `Some(...)`, the wizard called
     /// the picker -- daemon PATCHes `/api/sync/subscribers/me` after the
     /// legacy pair flow to flip the server-side row. `None` leaves the
@@ -58,6 +63,7 @@ pub async fn pair_inner(
         nexus_url: input.nexus_url,
         subscriber_id: snap.subscriber_id.clone(),
         vaults_root: input.vaults_root,
+        vault_name: input.vault_name,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: detect_platform(),
         last_event_id: None,
@@ -110,6 +116,9 @@ pub async fn pair(
 pub struct CurrentConfig {
     pub nexus_url: String,
     pub vaults_root: String,
+    /// v0.3.9 (Option A): the chosen vault folder name (may be empty for
+    /// pre-v0.3.9 configs awaiting re-pair).
+    pub vault_name: String,
     pub subscriber_id: String,
 }
 
@@ -120,6 +129,7 @@ pub fn load_current_config() -> Option<CurrentConfig> {
     Some(CurrentConfig {
         nexus_url: cfg.nexus_url,
         vaults_root: cfg.vaults_root.to_string_lossy().to_string(),
+        vault_name: cfg.vault_name,
         subscriber_id: cfg.subscriber_id,
     })
 }
@@ -170,4 +180,83 @@ fn detect_platform() -> String {
         (o, a) => Box::leak(format!("{o}-{a}").into_boxed_str()),
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    /// Stand up a mock `/api/sync/health` returning a minimal HealthSnapshot
+    /// with a unique subscriber_id so the token_store file fallback does not
+    /// collide between test runs.
+    async fn mock_health_server(subscriber_id: &str) -> mockito::ServerGuard {
+        let mut srv = Server::new_async().await;
+        let body = format!(
+            r#"{{"subscriber_id":"{subscriber_id}","scope_roots":[],"scope_excludes":[],"materializer_mode":"shadow","shadow_path":null}}"#
+        );
+        srv.mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        srv
+    }
+
+    #[tokio::test]
+    async fn pair_inner_persists_vault_name() {
+        let subscriber_id = format!("sub-vn-{}", uuid_like());
+        let server = mock_health_server(&subscriber_id).await;
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("config.toml");
+
+        let input = PairingInput {
+            nexus_url: server.url(),
+            token: "vsk_test".into(),
+            vaults_root: PathBuf::from("/Vaults"),
+            vault_name: "Mainframe".into(),
+            materializer_mode: None,
+        };
+        let out = pair_inner(input, cfg_path.clone()).await.unwrap();
+        assert_eq!(out.subscriber_id, subscriber_id);
+
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert_eq!(saved.vault_name, "Mainframe");
+        assert_eq!(saved.vaults_root, PathBuf::from("/Vaults"));
+
+        // Clean up the token-store file fallback this test may have written.
+        let _ = token_store::delete(&subscriber_id);
+    }
+
+    #[tokio::test]
+    async fn pair_inner_defaults_vault_name_empty_when_omitted() {
+        // A PairingInput deserialized from a wizard that omits vault_name
+        // (serde default) must persist an empty vault_name without error.
+        let subscriber_id = format!("sub-vn-empty-{}", uuid_like());
+        let server = mock_health_server(&subscriber_id).await;
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("config.toml");
+
+        let json = format!(
+            r#"{{"nexus_url":"{}","token":"vsk_test","vaults_root":"/Vaults"}}"#,
+            server.url()
+        );
+        let input: PairingInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(input.vault_name, "", "serde default must yield empty");
+
+        let _ = pair_inner(input, cfg_path.clone()).await.unwrap();
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert_eq!(saved.vault_name, "");
+        let _ = token_store::delete(&subscriber_id);
+    }
+
+    fn uuid_like() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{nanos:x}")
+    }
 }

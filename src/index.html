@@ -72,6 +72,20 @@
         </div>
 
         <div class="field">
+          <label for="vault-name">Vault Folder</label>
+          <select id="vault-name">
+            <option value="">(auto-detect single Obsidian vault)</option>
+          </select>
+          <p class="hint">
+            v0.3.9: the single Obsidian vault folder under your Vaults Root that
+            this device syncs (e.g. <code>Mainframe</code>). Server notes are
+            stored vault-relative; the daemon maps them into this folder. Leave
+            on auto-detect only if exactly one <code>.obsidian</code> vault
+            exists under the root.
+          </p>
+        </div>
+
+        <div class="field">
           <label>Sync Mode</label>
           <div class="mode-options">
             <label class="mode-option">
