@@ -554,6 +554,33 @@ impl VerifyRepair {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// B4 (Nexus Sync): pure helper that derives the ordered list of
+/// `(root_path, subscriber_id)` pairs to reconcile, one per sync root.
+///
+/// * `root.subscriber_id` non-empty → use it (the root has its own registered
+///   subscriber).
+/// * Empty → fall back to `fallback_subscriber_id` (the top-level
+///   `Config.subscriber_id`; matches back-compat behaviour in lib.rs).
+///
+/// Returns an empty Vec when `sync_roots` is empty. Callers iterate the
+/// returned pairs, constructing one `VerifyRepair` per entry.
+pub fn roots_to_reconcile_pairs(
+    sync_roots: &[crate::config::SyncRoot],
+    fallback_subscriber_id: &str,
+) -> Vec<(PathBuf, String)> {
+    sync_roots
+        .iter()
+        .map(|root| {
+            let sub_id = if !root.subscriber_id.is_empty() {
+                root.subscriber_id.clone()
+            } else {
+                fallback_subscriber_id.to_string()
+            };
+            (root.path.clone(), sub_id)
+        })
+        .collect()
+}
+
 fn path_to_forward_slash(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
@@ -1090,5 +1117,97 @@ mod tests {
             "obsidiana/x.md",
             ".obsidian/"
         ));
+    }
+
+    // ─── B4: per-sync_root verify_repair tests ────────────────────────────
+
+    /// B4 core: VerifyRepair walks only its own vault_root — paths in the
+    /// manifest are relative to that root, not to any global container.
+    ///
+    /// Two roots (root_a, root_b) each contain different files. A
+    /// VerifyRepair rooted at root_a must return ONLY root_a's entries;
+    /// one rooted at root_b must return ONLY root_b's entries.
+    #[tokio::test]
+    async fn verify_repair_manifest_rooted_at_passed_sync_root() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+
+        write_file(root_a.path(), "a_note.md", b"content-a");
+        write_file(root_b.path(), "b_note.md", b"content-b");
+
+        let (vr_a, _ja, _jda) =
+            make_vr(root_a.path().to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let (vr_b, _jb, _jdb) =
+            make_vr(root_b.path().to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+
+        let manifest_a = vr_a.build_local_manifest().unwrap();
+        let manifest_b = vr_b.build_local_manifest().unwrap();
+
+        // root_a manifest must contain only a_note.md, no b_note.md.
+        let paths_a: Vec<&str> = manifest_a.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths_a, vec!["a_note.md"], "root_a manifest wrong: {paths_a:?}");
+
+        // root_b manifest must contain only b_note.md, no a_note.md.
+        let paths_b: Vec<&str> = manifest_b.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths_b, vec!["b_note.md"], "root_b manifest wrong: {paths_b:?}");
+    }
+
+    /// B4: `roots_to_reconcile_pairs` returns one entry per sync_root with
+    /// the correct subscriber ID priority:
+    ///   1. Root's own subscriber_id when non-empty.
+    ///   2. Fallback subscriber_id when root's field is empty.
+    #[test]
+    fn roots_to_reconcile_pairs_two_roots_correct_subscriber_ids() {
+        use crate::config::SyncRoot;
+        use super::roots_to_reconcile_pairs;
+
+        let roots = vec![
+            SyncRoot {
+                path: PathBuf::from("/vault/MainFrame"),
+                route: String::new(),
+                subscriber_id: "sub-own".to_string(), // explicit
+            },
+            SyncRoot {
+                path: PathBuf::from("/vault/Dev"),
+                route: "dev".to_string(),
+                subscriber_id: String::new(), // empty → use fallback
+            },
+        ];
+
+        let pairs = roots_to_reconcile_pairs(&roots, "sub-fallback");
+        assert_eq!(pairs.len(), 2, "must produce one pair per sync_root");
+
+        // First root has its own subscriber_id.
+        assert_eq!(pairs[0].0, PathBuf::from("/vault/MainFrame"));
+        assert_eq!(pairs[0].1, "sub-own", "first root must use its own subscriber_id");
+
+        // Second root falls back.
+        assert_eq!(pairs[1].0, PathBuf::from("/vault/Dev"));
+        assert_eq!(pairs[1].1, "sub-fallback", "second root (empty subscriber_id) must use fallback");
+    }
+
+    /// B4: `roots_to_reconcile_pairs` returns an empty Vec for an empty
+    /// sync_roots list (no roots configured → no reconciliation pairs).
+    #[test]
+    fn roots_to_reconcile_pairs_empty_roots_returns_empty() {
+        use super::roots_to_reconcile_pairs;
+        let pairs = roots_to_reconcile_pairs(&[], "sub-fallback");
+        assert!(pairs.is_empty());
+    }
+
+    /// B4: single legacy root with empty subscriber_id takes the fallback.
+    #[test]
+    fn roots_to_reconcile_pairs_single_legacy_root_uses_fallback() {
+        use crate::config::SyncRoot;
+        use super::roots_to_reconcile_pairs;
+
+        let roots = vec![SyncRoot {
+            path: PathBuf::from("/vaults/Mainframe"),
+            route: String::new(),
+            subscriber_id: String::new(), // back-compat: empty → fallback
+        }];
+        let pairs = roots_to_reconcile_pairs(&roots, "sub-legacy-123");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "sub-legacy-123");
     }
 }

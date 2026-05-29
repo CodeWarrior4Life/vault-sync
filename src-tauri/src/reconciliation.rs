@@ -59,6 +59,7 @@ use tokio::sync::Mutex;
 use crate::api_client::ApiClient;
 use crate::push_journal::PushJournal;
 use crate::tray_state::SharedTrayState;
+use crate::config::SyncRoot;
 use crate::verify_repair::{VerifyRepair, VerifyRepairConfig, VerifyRepairError, VerifyRepairReport};
 
 /// Default cadence between reconciliation passes when the env var isn't
@@ -190,6 +191,70 @@ pub async fn run_reconciliation_pass(
     }
 
     result
+}
+
+/// B4 (Nexus Sync): pure helper that extracts `(root_path, subscriber_id)`
+/// pairs from the config's `sync_roots` list, applying the same fallback
+/// priority as `lib::effective_subscriber_id`:
+///
+/// 1. Root's own `subscriber_id` when non-empty.
+/// 2. `fallback_subscriber_id` (the top-level `Config.subscriber_id`) otherwise.
+///
+/// Callers iterate the returned pairs and spawn one reconciliation task per
+/// entry, so drift detection is per-root rather than against a single global
+/// vault root.
+///
+/// Mirrors `verify_repair::roots_to_reconcile_pairs` but lives in this module
+/// so the reconciliation spawn path has a single, local source of truth.
+pub fn recon_pairs_from_sync_roots(
+    sync_roots: &[SyncRoot],
+    fallback_subscriber_id: &str,
+) -> Vec<(PathBuf, String)> {
+    sync_roots
+        .iter()
+        .map(|root| {
+            let sub_id = if !root.subscriber_id.is_empty() {
+                root.subscriber_id.clone()
+            } else {
+                fallback_subscriber_id.to_string()
+            };
+            (root.path.clone(), sub_id)
+        })
+        .collect()
+}
+
+/// B4 (Nexus Sync): spawn one reconciliation backstop task per sync_root.
+///
+/// Each task is fully independent: it has its own `vault_root`
+/// (= `sync_root.path`), its own `device_id` (= effective subscriber_id for
+/// that root), and shares the API client + push_journal + tray_state with the
+/// rest of the pipeline.
+///
+/// Returns the `JoinHandle`s so the caller can keep them alive (the inner
+/// loops run for the daemon's lifetime). An empty `sync_roots` slice yields
+/// an empty Vec — no tasks spawned, no reconciliation runs.
+///
+/// On the kill switch being set, each individual task logs once and returns
+/// immediately (the kill switch is global across all roots, per env var).
+pub fn spawn_reconciliation_tasks_for_roots(
+    sync_roots: &[SyncRoot],
+    fallback_subscriber_id: &str,
+    api: Arc<ApiClient>,
+    journal: Arc<Mutex<PushJournal>>,
+    tray_state: SharedTrayState,
+) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+    recon_pairs_from_sync_roots(sync_roots, fallback_subscriber_id)
+        .into_iter()
+        .map(|(root_path, subscriber_id)| {
+            spawn_reconciliation_task(
+                root_path,
+                Arc::clone(&api),
+                Arc::clone(&journal),
+                subscriber_id,
+                tray_state.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Spawn the long-running recon task. Returns the JoinHandle so the
@@ -339,5 +404,93 @@ mod tests {
         assert!(s.recon_in_progress);
         s.set_recon_in_progress(false);
         assert!(!s.recon_in_progress);
+    }
+
+    // ─── B4: per-sync_root reconciliation tests ───────────────────────────
+
+    /// B4 core: `recon_pairs_from_sync_roots` returns one (root, sub_id) pair
+    /// per sync_root. Roots with an explicit subscriber_id use it; roots with
+    /// an empty subscriber_id fall back to the config-level subscriber_id.
+    #[test]
+    fn recon_pairs_from_sync_roots_two_roots_subscriber_priority() {
+        use crate::config::SyncRoot;
+
+        let roots = vec![
+            SyncRoot {
+                path: PathBuf::from("/vaults/Mainframe"),
+                route: String::new(),
+                subscriber_id: "sub-own".to_string(), // explicit per-root
+            },
+            SyncRoot {
+                path: PathBuf::from("/vaults/Dev"),
+                route: "dev".to_string(),
+                subscriber_id: String::new(), // empty → fallback
+            },
+        ];
+
+        let pairs = recon_pairs_from_sync_roots(&roots, "sub-fallback");
+        assert_eq!(pairs.len(), 2, "must produce one pair per sync_root");
+
+        assert_eq!(pairs[0].0, PathBuf::from("/vaults/Mainframe"));
+        assert_eq!(
+            pairs[0].1, "sub-own",
+            "first root must use its own subscriber_id"
+        );
+
+        assert_eq!(pairs[1].0, PathBuf::from("/vaults/Dev"));
+        assert_eq!(
+            pairs[1].1, "sub-fallback",
+            "second root (empty subscriber_id) must fall back to config subscriber_id"
+        );
+    }
+
+    /// B4: empty sync_roots list → empty pairs Vec (no reconciliation runs).
+    #[test]
+    fn recon_pairs_from_sync_roots_empty_is_noop() {
+        let pairs = recon_pairs_from_sync_roots(&[], "sub-fallback");
+        assert!(pairs.is_empty());
+    }
+
+    /// B4: single legacy root with empty subscriber_id inherits fallback —
+    /// this is the back-compat path for existing single-vault installs.
+    #[test]
+    fn recon_pairs_from_sync_roots_single_legacy_root_uses_fallback() {
+        use crate::config::SyncRoot;
+
+        let roots = vec![SyncRoot {
+            path: PathBuf::from("/vaults/Mainframe"),
+            route: String::new(),
+            subscriber_id: String::new(), // legacy: always empty pre-B2b
+        }];
+        let pairs = recon_pairs_from_sync_roots(&roots, "sub-legacy-123");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, PathBuf::from("/vaults/Mainframe"));
+        assert_eq!(pairs[0].1, "sub-legacy-123");
+    }
+
+    /// B4: both roots have explicit subscriber IDs → no fallback needed.
+    #[test]
+    fn recon_pairs_from_sync_roots_both_explicit_no_fallback_used() {
+        use crate::config::SyncRoot;
+
+        let roots = vec![
+            SyncRoot {
+                path: PathBuf::from("/a"),
+                route: String::new(),
+                subscriber_id: "sub-a".to_string(),
+            },
+            SyncRoot {
+                path: PathBuf::from("/b"),
+                route: "b".to_string(),
+                subscriber_id: "sub-b".to_string(),
+            },
+        ];
+        let pairs = recon_pairs_from_sync_roots(&roots, "sub-should-not-appear");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1, "sub-a");
+        assert_eq!(pairs[1].1, "sub-b");
+        // The fallback must not have leaked in.
+        assert!(!pairs[0].1.contains("should-not-appear"));
+        assert!(!pairs[1].1.contains("should-not-appear"));
     }
 }

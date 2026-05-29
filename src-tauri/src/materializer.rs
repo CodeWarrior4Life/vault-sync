@@ -1167,4 +1167,106 @@ mod tests {
         m.refresh_conflict_count_into_tray();
         m.refresh_conflict_count_into_tray();
     }
+
+    // ---- B4: per-sync_root materializer tests --------------------------------
+
+    /// B4 core: each sync_root gets its own Materializer constructed with
+    /// `sync_root.path` as `vaults_root`. Writes must land at
+    /// `<sync_root.path>/<wire_path>`, NOT at some global vaults container.
+    ///
+    /// Simulates the two-root scenario:
+    ///   root_a → /tmp/.../RootA/
+    ///   root_b → /tmp/.../RootB/
+    ///
+    /// A Materializer constructed for root_a writes `notes/x.md` to
+    /// `RootA/notes/x.md`; one for root_b writes the same wire_path to
+    /// `RootB/notes/x.md`. They must NOT cross-contaminate.
+    #[test]
+    fn per_root_materializer_writes_to_sync_root_path_join_wire_path() {
+        // Two completely separate sync roots (two vault directories).
+        let ws_tmp = TempDir::new().unwrap();
+
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+
+        let mk_for_root = |root_path: &std::path::Path| {
+            Materializer::new(
+                root_path.to_path_buf(),
+                Some("shadow/".to_string()),
+                MaterializerMode::Live,
+                ws_tmp.path().to_path_buf(),
+                "sub-test".to_string(),
+                default_cfg(),
+            )
+        };
+
+        let mat_a = mk_for_root(root_a.path());
+        let mat_b = mk_for_root(root_b.path());
+
+        // Build payloads with the SAME wire path (relative to their respective root).
+        let wire_path = "notes/x.md";
+        let make_payload = |body: &str| {
+            let fm = serde_json::json!({"title": "T"});
+            let fm_yaml = serde_yaml::to_string(&fm).unwrap();
+            let serialized = format!("---\n{fm_yaml}---\n\n{body}");
+            NotePayload {
+                path: wire_path.to_string(),
+                frontmatter: fm,
+                body: body.into(),
+                sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
+                modified: "2026-05-29T00:00:00Z".into(),
+                file_mtime: None,
+            }
+        };
+
+        let out_a = mat_a.write(&make_payload("body-a")).unwrap();
+        let out_b = mat_b.write(&make_payload("body-b")).unwrap();
+
+        // Materializer A must write to root_a/<wire_path>.
+        let expected_a = root_a.path().join(wire_path);
+        match out_a {
+            MaterializeOutcome::Wrote { path } => assert_eq!(path, expected_a, "root_a target mismatch"),
+            other => panic!("expected Wrote for root_a, got {other:?}"),
+        }
+        assert!(expected_a.exists());
+        let content_a = std::fs::read_to_string(&expected_a).unwrap();
+        assert!(content_a.contains("body-a"), "root_a content wrong: {content_a:?}");
+
+        // Materializer B must write to root_b/<wire_path>.
+        let expected_b = root_b.path().join(wire_path);
+        match out_b {
+            MaterializeOutcome::Wrote { path } => assert_eq!(path, expected_b, "root_b target mismatch"),
+            other => panic!("expected Wrote for root_b, got {other:?}"),
+        }
+        assert!(expected_b.exists());
+        let content_b = std::fs::read_to_string(&expected_b).unwrap();
+        assert!(content_b.contains("body-b"), "root_b content wrong: {content_b:?}");
+
+        // No cross-contamination: root_a must NOT contain root_b's file.
+        let cross_a = root_a.path().join(wire_path);
+        let cross_b = root_b.path().join(wire_path);
+        let read_cross_a = std::fs::read_to_string(&cross_a).unwrap();
+        let read_cross_b = std::fs::read_to_string(&cross_b).unwrap();
+        assert!(!read_cross_a.contains("body-b"), "root_a must not contain root_b content");
+        assert!(!read_cross_b.contains("body-a"), "root_b must not contain root_a content");
+    }
+
+    /// B4: `live_path_for(wire_path)` returns `<sync_root.path>/<wire_path>`.
+    /// The caller uses this to locate the file before write (e.g. conflict detection).
+    #[test]
+    fn live_path_for_returns_sync_root_join_wire_path() {
+        let sync_root = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let mat = Materializer::new(
+            sync_root.path().to_path_buf(),
+            None,
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub".to_string(),
+            default_cfg(),
+        );
+        let wire = "01_Inbox/note.md";
+        let result = mat.live_path_for(wire);
+        assert_eq!(result, sync_root.path().join(wire));
+    }
 }

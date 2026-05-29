@@ -46,19 +46,29 @@ pub(crate) fn push_journal_path(
         .join("push_journal.jsonl")
 }
 
-/// Build a `VerifyRepair` from explicit inputs (config + token + workspace).
-/// Pulled out of the `#[tauri::command]` for unit-testability — the command
-/// itself does the env-driven I/O (config load + keyring read) and delegates
-/// here. Mirrors the `pair` / `pair_inner` split in `pairing.rs`.
+/// Build a `VerifyRepair` from explicit inputs (config + token + workspace +
+/// vault_root). Pulled out of the `#[tauri::command]` for unit-testability
+/// — the command itself does the env-driven I/O (config load + keyring read)
+/// and delegates here. Mirrors the `pair` / `pair_inner` split in `pairing.rs`.
+///
+/// B4 (Nexus Sync): `vault_root` is now a separate parameter so callers can
+/// pass each `sync_root.path` independently, running one VerifyRepair per
+/// root instead of a single global `cfg.vaults_root` sweep.
+///
+/// `subscriber_id` is also separated from `cfg.subscriber_id` so the caller
+/// can supply the *effective* per-root subscriber (resolved via
+/// `effective_subscriber_id(&root, &cfg)` in `lib.rs`).
 pub(crate) fn build_verify_repair(
     cfg: &config::Config,
     token: &str,
     workspace_root: PathBuf,
+    vault_root: PathBuf,
+    subscriber_id: &str,
 ) -> Result<(VerifyRepair, Arc<Mutex<PushJournal>>), String> {
     let api = ApiClient::new(&cfg.nexus_url, token).map_err(|e| e.to_string())?;
     let api_arc = Arc::new(api);
 
-    let journal_path = push_journal_path(&workspace_root, &cfg.subscriber_id);
+    let journal_path = push_journal_path(&workspace_root, subscriber_id);
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create_dir_all({}) failed: {e}", parent.display()))?;
@@ -66,27 +76,30 @@ pub(crate) fn build_verify_repair(
     let journal = PushJournal::open(&journal_path).map_err(|e| e.to_string())?;
     let journal_arc = Arc::new(Mutex::new(journal));
 
-    // S477: post-watch-root-fix, `vaults_root` IS the verify-repair root.
-    // The vault folder is encoded as the first segment of each path; we
-    // no longer join a per-config `vault_name`.
-    let vault_root = cfg.vaults_root.clone();
     let vr = VerifyRepair::new(
         vault_root,
         api_arc,
         journal_arc.clone(),
-        cfg.subscriber_id.clone(),
+        subscriber_id.to_string(),
         VerifyRepairConfig::default(),
     );
     Ok((vr, journal_arc))
 }
 
 /// Owner-invokable Tauri command. Loads the daemon config, pulls the token
-/// from the keyring (or file fallback), opens the shared push_journal, then
-/// runs `VerifyRepair::run` end-to-end.
+/// from the keyring (or file fallback), then runs `VerifyRepair::run`
+/// end-to-end for EACH sync_root (B4 per-root semantics).
 ///
-/// Returns the structured report so the tray click handler can render a
+/// Reports from individual roots are merged into a single aggregate
+/// `VerifyRepairReport` so the tray click handler can render a combined
 /// summary dialog. On any failure the `String` body is logged + surfaced to
 /// the dialog ("Verify and repair failed: …"); the daemon does NOT crash.
+///
+/// B4 (Nexus Sync): iterates `cfg.sync_roots` so every configured root gets
+/// its own manifest walk + reconcile call. Each root uses its effective
+/// subscriber_id (root's own when set, else top-level fallback) as the
+/// `device_id` passed to the server reconcile endpoint, ensuring the server
+/// maps the manifest to the correct subscriber namespace.
 #[tauri::command]
 pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
     let cfg_path = config::default_config_path();
@@ -103,18 +116,69 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
     };
 
     let workspace_root = resolve_workspace_root();
-    let (vr, _journal) = build_verify_repair(&cfg, &token, workspace_root)?;
-    let report = vr.run().await.map_err(|e| e.to_string())?;
-    tracing::info!(
-        files_scanned = report.files_scanned,
-        modify_count = report.modify_count,
-        add_count = report.add_count,
-        delete_count = report.delete_count,
-        substrate_refused_count = report.substrate_refused_count,
-        elapsed_ms = report.elapsed_ms,
-        "verify_repair_run: complete"
+
+    // B4: iterate sync_roots, running one VerifyRepair per root.
+    // Derive the per-root (vault_root, subscriber_id) pairs using the
+    // same priority logic as lib::effective_subscriber_id.
+    let pairs = crate::verify_repair::roots_to_reconcile_pairs(
+        &cfg.sync_roots,
+        &cfg.subscriber_id,
     );
-    Ok(report)
+
+    // If sync_roots is empty (should not happen post-B1 back-compat, but
+    // handle gracefully), fall back to the legacy single-root path using
+    // cfg.vaults_root + cfg.subscriber_id.
+    let pairs = if pairs.is_empty() {
+        vec![(cfg.vaults_root.clone(), cfg.subscriber_id.clone())]
+    } else {
+        pairs
+    };
+
+    // Aggregate all per-root reports into one combined report.
+    let mut combined = VerifyRepairReport::default();
+    for (vault_root, subscriber_id) in &pairs {
+        let (vr, _journal) = build_verify_repair(
+            &cfg,
+            &token,
+            workspace_root.clone(),
+            vault_root.clone(),
+            subscriber_id,
+        )?;
+        let report = vr.run().await.map_err(|e| e.to_string())?;
+        tracing::info!(
+            root = %vault_root.display(),
+            subscriber_id = %subscriber_id,
+            files_scanned = report.files_scanned,
+            modify_count = report.modify_count,
+            add_count = report.add_count,
+            substrate_refused_count = report.substrate_refused_count,
+            elapsed_ms = report.elapsed_ms,
+            "verify_repair_run: per-root complete"
+        );
+        // Accumulate into combined report.
+        combined.files_scanned += report.files_scanned;
+        combined.files_in_sync += report.files_in_sync;
+        combined.modify_count += report.modify_count;
+        combined.modify_paths_sample.extend(report.modify_paths_sample);
+        combined.add_count += report.add_count;
+        combined.add_paths_sample.extend(report.add_paths_sample);
+        combined.delete_count += report.delete_count;
+        combined.delete_paths_sample.extend(report.delete_paths_sample);
+        combined.substrate_refused_count += report.substrate_refused_count;
+        combined.extension_filtered_count += report.extension_filtered_count;
+        combined.errors.extend(report.errors);
+        combined.elapsed_ms += report.elapsed_ms;
+    }
+    tracing::info!(
+        roots_scanned = pairs.len(),
+        files_scanned = combined.files_scanned,
+        modify_count = combined.modify_count,
+        add_count = combined.add_count,
+        substrate_refused_count = combined.substrate_refused_count,
+        elapsed_ms = combined.elapsed_ms,
+        "verify_repair_run: all roots complete"
+    );
+    Ok(combined)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,14 +383,23 @@ mod tests {
         let srv = Server::new_async().await;
         let cfg = make_config(&srv.url(), vault_parent.path().to_path_buf(), vault_name);
 
-        let (vr, _journal) =
-            build_verify_repair(&cfg, "vsk_test", workspace.path().to_path_buf()).unwrap();
+        // B4: pass vault_root explicitly (the vault folder, not the parent).
+        // The manifest entry for TestVault/a.md is "a.md" when rooted at the
+        // vault folder directly (post-B4 per-root semantics).
+        let vault_root = vault_parent.path().join(vault_name);
+        let (vr, _journal) = build_verify_repair(
+            &cfg,
+            "vsk_test",
+            workspace.path().to_path_buf(),
+            vault_root,
+            &cfg.subscriber_id,
+        )
+        .unwrap();
         let m = vr.build_local_manifest().unwrap();
         assert_eq!(m.len(), 1);
-        // S477: vault_root is vaults_root verbatim, so the manifest entry
-        // for a file at vaults_root/TestVault/a.md surfaces with the vault
-        // folder as its first path segment.
-        assert_eq!(m[0].path, "TestVault/a.md");
+        // B4: vault_root = vaults_root/vault_name → manifest path is just "a.md"
+        // (no vault folder prefix, since vault_root IS the vault folder).
+        assert_eq!(m[0].path, "a.md");
 
         let journal_path = push_journal_path(workspace.path(), &cfg.subscriber_id);
         assert!(journal_path.parent().unwrap().is_dir());
@@ -353,8 +426,16 @@ mod tests {
             .await;
 
         let cfg = make_config(&srv.url(), vault_parent.path().to_path_buf(), vault_name);
-        let (vr, _journal) =
-            build_verify_repair(&cfg, "vsk_test", workspace.path().to_path_buf()).unwrap();
+        // B4: pass the per-root vault_root (the vault folder itself).
+        let vault_root = vault_parent.path().join(vault_name);
+        let (vr, _journal) = build_verify_repair(
+            &cfg,
+            "vsk_test",
+            workspace.path().to_path_buf(),
+            vault_root,
+            &cfg.subscriber_id,
+        )
+        .unwrap();
         let report = vr.run().await.unwrap();
         assert_eq!(report.files_scanned, 1);
         assert_eq!(report.files_in_sync, 1);
@@ -397,8 +478,16 @@ mod tests {
             .create_async()
             .await;
         let cfg = make_config(&srv.url(), vault_parent.path().to_path_buf(), vault_name);
-        let (vr, _journal) =
-            build_verify_repair(&cfg, "vsk_test", workspace.path().to_path_buf()).unwrap();
+        // B4: pass per-root vault_root explicitly.
+        let vault_root = vault_parent.path().join(vault_name);
+        let (vr, _journal) = build_verify_repair(
+            &cfg,
+            "vsk_test",
+            workspace.path().to_path_buf(),
+            vault_root,
+            &cfg.subscriber_id,
+        )
+        .unwrap();
         let report = vr.run().await.unwrap();
 
         let json = serde_json::to_string(&report).expect("serialize");
@@ -537,5 +626,142 @@ mod tests {
         let _ = std::fs::remove_file(&nope);
         let result = config::Config::load_from(&nope);
         assert!(result.is_err());
+    }
+
+    // ─── B4: per-sync_root build_verify_repair tests ─────────────────────
+
+    /// B4 core: `build_verify_repair` accepts an explicit per-root `vault_root`
+    /// and `subscriber_id`. Two independently created VerifyRepair instances
+    /// (one per sync_root) must each walk only their own directory.
+    #[tokio::test]
+    async fn build_verify_repair_per_root_walks_own_directory_only() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        fs::write(root_a.path().join("note_a.md"), b"in-root-a").unwrap();
+        fs::write(root_b.path().join("note_b.md"), b"in-root-b").unwrap();
+
+        let srv = Server::new_async().await;
+        // Use the same nexus_url for both; subscriber_ids differ.
+        let cfg = Config {
+            nexus_url: srv.url(),
+            subscriber_id: "sub-fallback".to_string(),
+            vaults_root: root_a.path().to_path_buf(), // not used by build_verify_repair post-B4
+            daemon_version: "0.4.0-test".to_string(),
+            daemon_platform: "test".to_string(),
+            last_event_id: None,
+            sync_roots: vec![],
+        };
+
+        let (vr_a, _j_a) = build_verify_repair(
+            &cfg,
+            "vsk_test",
+            workspace.path().to_path_buf(),
+            root_a.path().to_path_buf(),
+            "sub-a",
+        )
+        .unwrap();
+
+        let (vr_b, _j_b) = build_verify_repair(
+            &cfg,
+            "vsk_test",
+            workspace.path().to_path_buf(),
+            root_b.path().to_path_buf(),
+            "sub-b",
+        )
+        .unwrap();
+
+        let manifest_a = vr_a.build_local_manifest().unwrap();
+        let manifest_b = vr_b.build_local_manifest().unwrap();
+
+        let paths_a: Vec<&str> = manifest_a.iter().map(|e| e.path.as_str()).collect();
+        let paths_b: Vec<&str> = manifest_b.iter().map(|e| e.path.as_str()).collect();
+
+        assert_eq!(paths_a, vec!["note_a.md"], "root_a must only see its own note; got {paths_a:?}");
+        assert_eq!(paths_b, vec!["note_b.md"], "root_b must only see its own note; got {paths_b:?}");
+
+        // No cross-contamination.
+        assert!(
+            !paths_a.contains(&"note_b.md"),
+            "root_a manifest must not include root_b files"
+        );
+        assert!(
+            !paths_b.contains(&"note_a.md"),
+            "root_b manifest must not include root_a files"
+        );
+    }
+
+    /// B4: verify_repair_run aggregates over all sync_roots. Build the VR
+    /// for a 2-root config using the helper and confirm both roots are covered.
+    /// Uses `build_verify_repair` directly (the Tauri command itself can't be
+    /// invoked in unit tests without a running Tauri runtime).
+    #[tokio::test]
+    async fn build_verify_repair_two_root_aggregate() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        // root_a: 2 files. root_b: 1 file.
+        fs::write(root_a.path().join("alpha.md"), b"a1").unwrap();
+        fs::write(root_a.path().join("beta.md"), b"a2").unwrap();
+        fs::write(root_b.path().join("gamma.md"), b"b1").unwrap();
+
+        let mut srv = Server::new_async().await;
+        let _mock = srv
+            .mock("POST", "/api/sync/reconcile")
+            .with_status(200)
+            .with_body(r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#)
+            .expect_at_least(2) // once per sync_root
+            .create_async()
+            .await;
+
+        let cfg = Config {
+            nexus_url: srv.url(),
+            subscriber_id: "sub-top".to_string(),
+            vaults_root: root_a.path().to_path_buf(),
+            daemon_version: "0.4.0-test".to_string(),
+            daemon_platform: "test".to_string(),
+            last_event_id: None,
+            sync_roots: vec![
+                crate::config::SyncRoot {
+                    path: root_a.path().to_path_buf(),
+                    route: String::new(),
+                    subscriber_id: "sub-a".to_string(),
+                },
+                crate::config::SyncRoot {
+                    path: root_b.path().to_path_buf(),
+                    route: "dev".to_string(),
+                    subscriber_id: String::new(), // → falls back to sub-top
+                },
+            ],
+        };
+
+        // Derive pairs as verify_repair_run does internally.
+        let pairs = crate::verify_repair::roots_to_reconcile_pairs(
+            &cfg.sync_roots,
+            &cfg.subscriber_id,
+        );
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1, "sub-a");
+        assert_eq!(pairs[1].1, "sub-top"); // fallback
+
+        // Run each root and aggregate (mirrors verify_repair_run logic).
+        let mut total_scanned = 0usize;
+        for (vault_root, subscriber_id) in &pairs {
+            let (vr, _j) = build_verify_repair(
+                &cfg,
+                "vsk_test",
+                workspace.path().to_path_buf(),
+                vault_root.clone(),
+                subscriber_id,
+            )
+            .unwrap();
+            let report = vr.run().await.unwrap();
+            total_scanned += report.files_scanned;
+        }
+        // root_a has 2 files, root_b has 1 → total = 3.
+        assert_eq!(total_scanned, 3, "aggregate must cover all sync_roots");
+        _mock.assert_async().await;
     }
 }

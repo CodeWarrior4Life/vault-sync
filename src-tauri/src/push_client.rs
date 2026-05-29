@@ -1008,4 +1008,132 @@ mod tests {
         // Event nack'd → still in journal.
         assert_eq!(s.uploads_pending, 1);
     }
+
+    // ---- B4: per-sync_root push_client tests --------------------------------
+
+    /// B4: the push_client resolves lazy content_bytes reads relative to
+    /// the `vault_root` it was constructed with (the sync_root.path), NOT
+    /// any global vaults_root or working directory.
+    ///
+    /// Two separate vault roots (root_a, root_b) each contain a file at the
+    /// SAME relative path ("notes/shared.md"). A PushClient constructed for
+    /// root_a must read from root_a; one for root_b reads from root_b.
+    #[tokio::test]
+    async fn lazy_read_uses_passed_vault_root_not_global() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+
+        let rel = "notes/shared.md";
+        let body_a = b"content-from-root-a";
+        let body_b = b"content-from-root-b";
+
+        std::fs::create_dir_all(root_a.path().join("notes")).unwrap();
+        std::fs::create_dir_all(root_b.path().join("notes")).unwrap();
+        std::fs::write(root_a.path().join(rel), body_a).unwrap();
+        std::fs::write(root_b.path().join(rel), body_b).unwrap();
+
+        // Build two servers, each asserting on the content they receive.
+        let expected_b64_a = B64.encode(body_a);
+        let expected_b64_b = B64.encode(body_b);
+
+        let mut srv_a = Server::new_async().await;
+        let m_a = srv_a
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"content":"{expected_b64_a}"}}"#
+            )))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut srv_b = Server::new_async().await;
+        let m_b = srv_b
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"content":"{expected_b64_b}"}}"#
+            )))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":2,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let lazy_evt = |device_suffix: &str| PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: rel.to_string(),
+            action: PushAction::Modify,
+            base_hash: Some("0".repeat(64)),
+            content_sha: "a".repeat(64),
+            content_bytes: None, // lazy — will be read from vault_root at drain time
+            queued_at: chrono::Utc::now(),
+            device_id: format!("dev-{device_suffix}"),
+        };
+
+        let (_da, journal_a) = make_journal_with(vec![lazy_evt("a")]);
+        let (_db, journal_b) = make_journal_with(vec![lazy_evt("b")]);
+
+        let client_a =
+            make_client_with_root(&srv_a.url(), journal_a.clone(), root_a.path().to_path_buf())
+                .await;
+        let client_b =
+            make_client_with_root(&srv_b.url(), journal_b.clone(), root_b.path().to_path_buf())
+                .await;
+
+        // Each client drains its journal. Mockito asserts the server received
+        // the correct body for each root.
+        let outcomes_a = client_a.drain_once().await;
+        assert_eq!(outcomes_a.len(), 1);
+        assert!(
+            matches!(outcomes_a[0].1, PushOutcome::Sent { .. }),
+            "client_a should send; got {:?}",
+            outcomes_a[0].1
+        );
+
+        let outcomes_b = client_b.drain_once().await;
+        assert_eq!(outcomes_b.len(), 1);
+        assert!(
+            matches!(outcomes_b[0].1, PushOutcome::Sent { .. }),
+            "client_b should send; got {:?}",
+            outcomes_b[0].1
+        );
+
+        m_a.assert_async().await;
+        m_b.assert_async().await;
+    }
+
+    /// B4: pushed paths are relative to the sync_root the PushClient was
+    /// constructed for. The `path` field on the PushEvent is already the
+    /// root-relative path (wired by file_watcher per B2). Verify the
+    /// pre-journal filter does NOT try to absolutize or re-root the path.
+    #[test]
+    fn pre_journal_filter_treats_path_as_root_relative() {
+        let cfg = config_for_test();
+        // Construct with an arbitrary root — filter is path-string-only,
+        // does no filesystem I/O (just rasp_fence + extension + idempotency).
+        let client = PushClient {
+            api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
+            journal: Arc::new(Mutex::new(
+                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+            )),
+            device_id: "d".into(),
+            config: cfg,
+            vault_root: PathBuf::from("/sync/root/a"), // per-root path
+            tray_state: None,
+        };
+        // Root-relative path "01_Inbox/note.md" — not prefixed with the
+        // sync root string. The filter should pass (not substrate, allowed ext).
+        let result = client.pre_journal_filter(
+            "01_Inbox/note.md",
+            b"some content",
+            None,
+        );
+        assert!(result.is_none(), "root-relative path must not be filtered; got {result:?}");
+    }
 }
