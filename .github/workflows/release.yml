@@ -9,6 +9,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false  # one platform's transient upload failure must NOT cancel the others (S481)
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: windows-x86_64 }
@@ -44,6 +45,10 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
       - name: Upload to Nexus
+        # Non-fatal: the GH Release upload above is the primary artifact channel.
+        # A transient Nexus/CF 504 here must not fail the platform's release job
+        # (S481: linux 504'd on Nexus upload + fail-fast cancelled windows).
+        continue-on-error: true
         env:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
         run: ./scripts/upload-to-nexus.sh ${{ matrix.platform }} ${{ github.ref_name }}
