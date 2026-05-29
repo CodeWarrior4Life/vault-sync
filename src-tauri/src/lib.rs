@@ -46,6 +46,38 @@ pub fn notify_user(app: &tauri::AppHandle, title: &str, body: &str) {
     }
 }
 
+/// v0.3.9 (Option A): the daemon's effective single-vault root.
+/// Returns `vaults_root.join(vault_name)`. If `vault_name` is empty
+/// (pre-v0.3.9 config), attempts single-`.obsidian`-subdir inference of
+/// `vaults_root`; errors (with the candidate list) if zero or more-than-one
+/// candidate is found, so the startup guard can refuse to sync and notify
+/// the user to re-pair.
+pub fn effective_vault_root(cfg: &crate::config::Config) -> Result<std::path::PathBuf, String> {
+    if !cfg.vault_name.is_empty() {
+        return Ok(cfg.vaults_root.join(&cfg.vault_name));
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&cfg.vaults_root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.join(".obsidian").exists() {
+                candidates.push(p);
+            }
+        }
+    }
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!(
+            "vault_name empty and no .obsidian-bearing subdir under {:?} — re-pair needed",
+            cfg.vaults_root
+        )),
+        n => Err(format!(
+            "vault_name empty and {n} candidate vault folders ({candidates:?}) under {:?} — re-pair needed",
+            cfg.vaults_root
+        )),
+    }
+}
+
 /// S477 §3.2: enumerate immediate subdirectories of `vaults_root` for the
 /// wizard's Paired panel detected-vaults list. Pure stdlib + platform-agnostic.
 #[tauri::command]
@@ -346,8 +378,30 @@ fn spawn_sse_consumer(
             device_id: cfg.subscriber_id.clone(),
             ..Default::default()
         };
+        // v0.3.9 Option A: re-anchor to the single vault root so bare server
+        // paths land INSIDE <vaults_root>/<vault_name>/. On guard failure
+        // (empty vault_name + ambiguous inference), refuse to start the
+        // SSE/materialize pipeline and surface a user notification.
+        let vault_root = match effective_vault_root(&cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("cannot start SSE materialize: {e}");
+                if let Ok(mut s) = tray_state.write() {
+                    s.set_error(
+                        tray_state::ConnectionStatus::Error,
+                        format!("Re-pair needed: {e}"),
+                    );
+                }
+                notify_user(
+                    &app,
+                    "Vault sync paused",
+                    "Re-pair to set your vault folder — sync paused until then.",
+                );
+                return;
+            }
+        };
         let materializer = materializer::Materializer::new(
-            cfg.vaults_root.clone(),
+            vault_root.clone(),
             snap.shadow_path.clone(),
             materializer::MaterializerMode::from_str(&snap.materializer_mode),
             workspace_root,
@@ -539,13 +593,28 @@ fn spawn_push_pipeline(
         }
     };
 
-    // S477: the watch + push root is the configured `vaults_root`,
-    // verbatim. Do NOT join `vault_name` — `vaults_root` is the
-    // appointed sync root and can contain multiple vault folders.
-    // The watcher emits paths relative to `vaults_root` (so the
-    // vault folder name becomes the first segment of the pushed
-    // path), and the server handles per-vault namespacing.
-    let vault_root = cfg.vaults_root.clone();
+    // v0.3.9 Option A: push/reconcile must emit BARE paths, so the watcher
+    // and push client are anchored at the single vault root
+    // (vaults_root/vault_name). Mirror the SSE pipeline's failure surfacing —
+    // notify the user, don't die silently.
+    let vault_root = match effective_vault_root(cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("cannot start push pipeline: {e}");
+            if let Ok(mut s) = tray_state.write() {
+                s.set_error(
+                    tray_state::ConnectionStatus::Error,
+                    format!("Re-pair needed: {e}"),
+                );
+            }
+            notify_user(
+                app,
+                "Vault sync paused",
+                "Re-pair to set your vault folder — sync paused until then.",
+            );
+            return None;
+        }
+    };
 
     // --- push_client: journal → server drain loop ---
     let api_for_push = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
@@ -819,5 +888,75 @@ mod tests {
             spawn_side, vr_side,
             "push journal path must match between push pipeline and verify_repair"
         );
+    }
+}
+
+#[cfg(test)]
+mod effective_root_tests {
+    use super::effective_vault_root;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn cfg(vaults_root: &str, vault_name: &str) -> Config {
+        Config {
+            nexus_url: "https://x".into(),
+            subscriber_id: "s".into(),
+            vaults_root: PathBuf::from(vaults_root),
+            vault_name: vault_name.into(),
+            daemon_version: "0.3.9".into(),
+            daemon_platform: "test".into(),
+            last_event_id: None,
+        }
+    }
+
+    #[test]
+    fn effective_root_joins_vault_name() {
+        let c = cfg("/Vaults", "Mainframe");
+        assert_eq!(
+            effective_vault_root(&c).unwrap(),
+            PathBuf::from("/Vaults").join("Mainframe")
+        );
+    }
+
+    #[test]
+    fn effective_root_errors_on_empty_vault_name_when_no_inference() {
+        let c = cfg("/no/such/dir/xyz_v039", "");
+        assert!(effective_vault_root(&c).is_err());
+    }
+
+    #[test]
+    fn effective_root_infers_single_obsidian_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("Mainframe");
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        // an orphan tree WITHOUT .obsidian must NOT count as a candidate
+        std::fs::create_dir_all(tmp.path().join("02_Projects")).unwrap();
+        let c = cfg(tmp.path().to_str().unwrap(), "");
+        assert_eq!(effective_vault_root(&c).unwrap(), vault);
+    }
+
+    #[test]
+    fn effective_root_errors_when_multiple_obsidian_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Mainframe").join(".obsidian")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("Secondary").join(".obsidian")).unwrap();
+        let c = cfg(tmp.path().to_str().unwrap(), "");
+        assert!(
+            effective_vault_root(&c).is_err(),
+            "ambiguous inference must error so startup guard refuses to sync"
+        );
+    }
+
+    #[test]
+    fn bare_relative_under_effective_root_has_no_vault_prefix() {
+        let c = cfg("/Vaults", "Mainframe");
+        let root = effective_vault_root(&c).unwrap();
+        let abs = root.join("02_Projects").join("Foo.md");
+        let rel = abs.strip_prefix(&root).unwrap();
+        assert_eq!(
+            rel,
+            std::path::Path::new("02_Projects").join("Foo.md").as_path()
+        );
+        assert!(!rel.to_string_lossy().starts_with("Mainframe/"));
     }
 }
