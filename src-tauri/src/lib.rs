@@ -194,6 +194,25 @@ fn spawn_updater_check(app: tauri::AppHandle) {
     });
 }
 
+/// B2 (Nexus Sync): pure helper that extracts the ordered list of
+/// `(watch_root, route)` pairs from `cfg.sync_roots`.
+///
+/// Callers iterate this list and spawn one push+watch pipeline per entry.
+/// The returned `PathBuf` is the directory passed verbatim as the watcher
+/// root; pushed paths will be computed RELATIVE to that directory by
+/// `FileWatcher`. No vault-name / first-segment prefix is added here —
+/// path namespacing is handled server-side via the `route` field.
+///
+/// Returns an empty Vec only when `cfg.sync_roots` is empty (which the B1
+/// back-compat logic prevents in practice — at minimum one entry is
+/// synthesised from `vaults_root`).
+pub fn roots_to_watch(cfg: &config::Config) -> Vec<(std::path::PathBuf, String)> {
+    cfg.sync_roots
+        .iter()
+        .map(|sr| (sr.path.clone(), sr.route.clone()))
+        .collect()
+}
+
 /// Boot the SSE consumer from a saved config + keyring token. Runs on the
 /// Tauri async runtime so it doesn't block app startup.
 fn spawn_sse_consumer(
@@ -210,13 +229,22 @@ fn spawn_sse_consumer(
             }
         };
 
-        // v0.3 — redflag.md circuit breaker (mandate §3). S477: check the
-        // full vaults_root (the daemon's watch root), not vaults_root +
-        // vault_name. A `redflag.md` placed at the vaults_root level is
-        // a kill switch covering every vault under it; per-vault
-        // emergency stops are a future refinement.
-        let vault_root = cfg.vaults_root.clone();
-        let gate = redflag::RedflagGate::new(vault_root.clone());
+        // B2: derive the watch roots from sync_roots. Use the first root as
+        // the redflag gate anchor (covers the primary vault). A future task
+        // can extend this to check all roots.
+        let watch_roots = roots_to_watch(&cfg);
+        if watch_roots.is_empty() {
+            tracing::warn!(
+                "sync_roots is empty — no watch pipeline will start. \
+                 Check config: at least one [[sync_roots]] entry is required."
+            );
+            return;
+        }
+        // Redflag gate: checked against the first sync root (primary vault).
+        // Future: extend to all roots (deferred — multi-root redflag is a
+        // follow-up task).
+        let primary_root = watch_roots[0].0.clone();
+        let gate = redflag::RedflagGate::new(primary_root.clone());
         match gate.check() {
             redflag::RedflagStatus::Tripped { path, .. } => {
                 tracing::error!(
@@ -284,16 +312,27 @@ fn spawn_sse_consumer(
         {
             let mut vaults_to_scan: Vec<std::path::PathBuf> =
                 obsidian_install_detect::find_known_vaults();
-            // S477: enumerate every immediate subdirectory of `vaults_root`
-            // that looks like an Obsidian vault (has a `.obsidian/` dir).
-            // Adds any vaults Obsidian's registry hasn't seen yet (fresh
-            // install, or non-default registry locations).
-            if let Ok(entries) = std::fs::read_dir(&cfg.vaults_root) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_dir() && p.join(".obsidian").is_dir() {
-                        if !vaults_to_scan.iter().any(|q| q == &p) {
-                            vaults_to_scan.push(p);
+            // B2: scan each sync_root.path directly (it IS the vault root
+            // now, not a parent container). Also scan any immediate
+            // subdirectories that look like Obsidian vaults in case a
+            // sync_root is a parent container.
+            for (root_path, _route) in &watch_roots {
+                // Add the root itself if it has an .obsidian dir.
+                if root_path.join(".obsidian").is_dir() {
+                    if !vaults_to_scan.iter().any(|q| q == root_path) {
+                        vaults_to_scan.push(root_path.clone());
+                    }
+                }
+                // Also enumerate immediate subdirectories (back-compat: in
+                // case sync_root is a parent container rather than the
+                // vault itself).
+                if let Ok(entries) = std::fs::read_dir(root_path) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_dir() && p.join(".obsidian").is_dir() {
+                            if !vaults_to_scan.iter().any(|q| q == &p) {
+                                vaults_to_scan.push(p);
+                            }
                         }
                     }
                 }
@@ -346,8 +385,12 @@ fn spawn_sse_consumer(
             device_id: cfg.subscriber_id.clone(),
             ..Default::default()
         };
+        // B2: materializer uses the primary sync_root.path as vault root.
+        // Multi-root materialization is a deferred task (one materializer
+        // per sync_root); for now the SSE consumer materializes into the
+        // first root only (back-compat with single-vault setups).
         let materializer = materializer::Materializer::new(
-            cfg.vaults_root.clone(),
+            primary_root.clone(),
             snap.shadow_path.clone(),
             materializer::MaterializerMode::from_str(&snap.materializer_mode),
             workspace_root,
@@ -374,19 +417,26 @@ fn spawn_sse_consumer(
             }
         });
 
-        // v0.3 push side — start the file_watcher (local edits → journal) and
-        // the push_client drain loop (journal → server). This is what makes
-        // the daemon genuinely BIDIRECTIONAL; without it the daemon is
-        // pull-only and verify_repair's journal appends are never drained.
+        // B2 (Nexus Sync): push side — iterate sync_roots, spawning one
+        // watch+push pipeline per sync_root, each rooted at sync_root.path.
+        // Pushed paths are RELATIVE to that root (no vault-name first-segment
+        // prepend — the server handles routing via the route field, which is
+        // wired per-push in a later task; for now all pipelines share the
+        // single cfg.subscriber_id).
         //
-        // We start the push pipeline here, AFTER the redflag-clear gate above
-        // (mandate §3 — a tripped redflag returns early and never reaches this
-        // point). `snap.scope_roots` / `snap.scope_excludes` are consumed by
-        // the SSE consumer below, so clone them for the watcher first.
+        // DEFERRED (multi-route/per-subscriber plumbing): each sync_root
+        // carries a `route` string intended for server-side subscriber scope
+        // selection. Sending the correct route on each push request and
+        // registering per-sync_root subscriber IDs requires controller changes
+        // that are out of B2 scope. For now, all roots share one subscriber_id
+        // and the route is unused on the push wire. Tracked for a later task.
         //
-        // The returned `_watch_handle` MUST stay alive for the lifetime of the
-        // daemon: dropping it stops the OS watcher (see `WatchHandle::Drop`).
-        // We bind it into this async scope, which lives across the
+        // `snap.scope_roots` / `snap.scope_excludes` are consumed by the SSE
+        // consumer below, so clone them for each watcher first.
+        //
+        // The returned `_watch_handles` Vec MUST stay alive for the daemon's
+        // lifetime: dropping any handle stops the corresponding OS watcher.
+        // We bind the Vec into this async scope so it lives across the
         // forever-awaiting `consumer.run().await` at the tail of this task.
         let watch_scope_roots = snap.scope_roots.clone();
         let watch_scope_excludes = snap.scope_excludes.clone();
@@ -394,14 +444,20 @@ fn spawn_sse_consumer(
         // uses (`commands::resolve_workspace_root`), guaranteeing both call
         // sites open the identical push_journal.jsonl file.
         let workspace_root_for_journal = commands::resolve_workspace_root();
-        let _watch_handle = spawn_push_pipeline(
-            &app,
-            &cfg,
-            workspace_root_for_journal,
-            watch_scope_roots,
-            watch_scope_excludes,
-            tray_state.clone(),
-        );
+        let _watch_handles: Vec<_> = watch_roots
+            .iter()
+            .map(|(root_path, _route)| {
+                spawn_push_pipeline(
+                    &app,
+                    &cfg,
+                    root_path.clone(),
+                    workspace_root_for_journal.clone(),
+                    watch_scope_roots.clone(),
+                    watch_scope_excludes.clone(),
+                    tray_state.clone(),
+                )
+            })
+            .collect();
 
         // S477 v0.3.8 (A): per-subscriber on-disk path for last_event_id
         // persistence. Lives alongside the push_journal under the workspace
@@ -452,9 +508,9 @@ fn spawn_sse_consumer(
         if let Err(e) = consumer.run(resumed_id, shutdown_rx).await {
             tracing::error!("SSE consumer exited with error: {e}");
         }
-        // Keep the watch handle bound until the task actually unwinds (only
+        // Keep all watch handles alive until the task actually unwinds (only
         // reached if the SSE consumer returns, which it normally never does).
-        drop(_watch_handle);
+        drop(_watch_handles);
     });
 }
 
@@ -463,6 +519,13 @@ fn spawn_sse_consumer(
 /// file_watcher (local FS edits → journal), and spawns the push_client drain
 /// loop (journal → `POST /api/sync/push`). Returns the [`file_watcher::WatchHandle`]
 /// which the caller MUST keep alive — dropping it stops the OS watcher.
+///
+/// ## B2 (Nexus Sync): per-sync_root watch_root
+/// `watch_root` is the directory the `FileWatcher` is rooted at — passed
+/// directly from `sync_root.path`. Pushed paths are computed RELATIVE to
+/// `watch_root` by `FileWatcher`, so NO vault-name / first-segment prefix
+/// is added by this function. The old `cfg.vaults_root` field is no longer
+/// used in this path.
 ///
 /// ## ApiClient sharing
 /// `ApiClient::new` is cheap (a reqwest client + base URL + token header).
@@ -490,6 +553,7 @@ fn spawn_sse_consumer(
 fn spawn_push_pipeline(
     app: &tauri::AppHandle,
     cfg: &config::Config,
+    watch_root: std::path::PathBuf,
     workspace_root: std::path::PathBuf,
     scope_roots: Vec<String>,
     scope_excludes: Vec<String>,
@@ -539,13 +603,9 @@ fn spawn_push_pipeline(
         }
     };
 
-    // S477: the watch + push root is the configured `vaults_root`,
-    // verbatim. Do NOT join `vault_name` — `vaults_root` is the
-    // appointed sync root and can contain multiple vault folders.
-    // The watcher emits paths relative to `vaults_root` (so the
-    // vault folder name becomes the first segment of the pushed
-    // path), and the server handles per-vault namespacing.
-    let vault_root = cfg.vaults_root.clone();
+    // B2: watch_root is passed in directly from sync_root.path —
+    // paths will be relative to watch_root (no first-segment prefix).
+    let vault_root = watch_root;
 
     // --- push_client: journal → server drain loop ---
     let api_for_push = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
@@ -819,5 +879,101 @@ mod tests {
             spawn_side, vr_side,
             "push journal path must match between push pipeline and verify_repair"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // B2: roots_to_watch helper tests
+    // -------------------------------------------------------------------------
+
+    fn make_config_with_sync_roots(sync_roots: Vec<config::SyncRoot>) -> config::Config {
+        config::Config {
+            nexus_url: "https://nexus.example.com".into(),
+            subscriber_id: "sub-b2-test".into(),
+            vaults_root: PathBuf::from("/Users/test/Vaults"),
+            daemon_version: "0.4.0".into(),
+            daemon_platform: "test-platform".into(),
+            last_event_id: None,
+            sync_roots,
+        }
+    }
+
+    /// roots_to_watch returns one entry per sync_root entry — verifies the
+    /// iteration contract that drives the per-root watch+push pipeline spawn.
+    #[test]
+    fn roots_to_watch_returns_one_entry_per_sync_root() {
+        let cfg = make_config_with_sync_roots(vec![
+            config::SyncRoot {
+                path: PathBuf::from("/Vaults/Mainframe"),
+                route: String::new(),
+            },
+            config::SyncRoot {
+                path: PathBuf::from("/Vaults/Dev"),
+                route: "dev".into(),
+            },
+        ]);
+        let result = roots_to_watch(&cfg);
+        assert_eq!(result.len(), 2, "expected 2 entries for a 2-root config");
+        assert_eq!(result[0].0, PathBuf::from("/Vaults/Mainframe"));
+        assert_eq!(result[0].1, "");
+        assert_eq!(result[1].0, PathBuf::from("/Vaults/Dev"));
+        assert_eq!(result[1].1, "dev");
+    }
+
+    /// roots_to_watch returns exactly 1 entry for a back-compat single-root
+    /// config (the B1 synthesised case: vaults_root with no sync_roots in TOML
+    /// produces exactly one SyncRoot entry).
+    #[test]
+    fn roots_to_watch_returns_one_entry_for_back_compat_single_root() {
+        let cfg = make_config_with_sync_roots(vec![config::SyncRoot {
+            path: PathBuf::from("/Vaults/Mainframe"),
+            route: String::new(),
+        }]);
+        let result = roots_to_watch(&cfg);
+        assert_eq!(result.len(), 1, "expected 1 entry for a back-compat single-root config");
+        assert_eq!(result[0].0, PathBuf::from("/Vaults/Mainframe"));
+        assert_eq!(result[0].1, "");
+    }
+
+    /// roots_to_watch returns an empty Vec when sync_roots is empty.
+    /// This is the degenerate case that triggers the "warn and skip" path
+    /// in spawn_sse_consumer.
+    #[test]
+    fn roots_to_watch_returns_empty_for_empty_sync_roots() {
+        let cfg = make_config_with_sync_roots(vec![]);
+        let result = roots_to_watch(&cfg);
+        assert!(result.is_empty(), "expected empty Vec for empty sync_roots");
+    }
+
+    /// roots_to_watch preserves order — the first entry returned is the
+    /// primary root used for the redflag gate and the SSE materializer.
+    #[test]
+    fn roots_to_watch_preserves_sync_roots_order() {
+        let paths = vec![
+            PathBuf::from("/alpha"),
+            PathBuf::from("/beta"),
+            PathBuf::from("/gamma"),
+        ];
+        let sync_roots = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| config::SyncRoot {
+                path: p.clone(),
+                route: format!("route-{i}"),
+            })
+            .collect();
+        let cfg = make_config_with_sync_roots(sync_roots);
+        let result = roots_to_watch(&cfg);
+        assert_eq!(result.len(), 3);
+        for (i, expected_path) in paths.iter().enumerate() {
+            assert_eq!(
+                &result[i].0, expected_path,
+                "entry {i} path must match sync_roots[{i}].path"
+            );
+            assert_eq!(
+                result[i].1,
+                format!("route-{i}"),
+                "entry {i} route must match sync_roots[{i}].route"
+            );
+        }
     }
 }
