@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::push_journal::{new_event_id, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA};
-use crate::rasp_fence::{classify_path, PathClassification};
+use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 use crate::redflag::DeleteBurstDetector;
 use crate::tray_state::SharedTrayState;
 
@@ -301,6 +301,17 @@ impl FileWatcher {
                     };
                 }
             }
+        }
+
+        // (2c) macOS junk files — AppleDouble `._*` sidecars and `.DS_Store`.
+        // Carve-out: `.nx-<host>` machine-namespace dirs are NOT junk (see
+        // rasp_fence::is_junk_path). `.nx-` has 'n' after the dot, so the
+        // `._` prefix check never fires on them — structurally distinct.
+        if is_junk_path(&norm) {
+            return FilterDecision::DropExclude {
+                path: norm,
+                exclude_rule: "macos-junk".to_string(),
+            };
         }
 
         // (3) User scope_excludes.

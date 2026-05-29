@@ -172,6 +172,39 @@ pub fn is_substrate_path(path: &str) -> bool {
     classify_path(path).is_substrate()
 }
 
+/// Returns `true` iff the path contains a junk segment that must be excluded
+/// from sync regardless of vault configuration.
+///
+/// Junk classes (checked per path segment after normalization):
+/// - **AppleDouble files** — any basename that starts with `._` (e.g.
+///   `._note.md`, `dir/._x.md`). These are macOS extended-attribute sidecar
+///   files that cause duplicate messes on non-HFS+ filesystems.
+/// - **`.DS_Store`** — macOS folder metadata, exact basename match (case-
+///   sensitive per macOS convention).
+///
+/// Carve-out — `.nx-*` machine-namespace segments (e.g. `.nx-trinity/`,
+/// `.nx-morpheus/`) are NOT junk. The `._` prefix requires a literal
+/// underscore after the dot, so `.nx-` (dot + 'n') is structurally
+/// distinct and is never matched by the AppleDouble check. This is verified
+/// by the `includes_nx_host_namespace` test.
+pub fn is_junk_path(path: &str) -> bool {
+    let normalized = normalize(path);
+    for segment in normalized.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        // AppleDouble: basename starts with `._`
+        if segment.starts_with("._") {
+            return true;
+        }
+        // .DS_Store: exact basename (case-sensitive)
+        if segment == ".DS_Store" {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +403,93 @@ mod tests {
             PathClassification::Substrate { rule } => assert_eq!(rule, "_rapport/triage/"),
             other => panic!("expected Substrate, got {:?}", other),
         }
+    }
+
+    // --- B3: AppleDouble / DS_Store junk exclusion + .nx-* carve-out ---
+
+    #[test]
+    fn excludes_appledouble() {
+        // Root-level AppleDouble sidecar
+        assert!(is_junk_path("._note.md"), "._note.md should be junk");
+        // Nested AppleDouble sidecar
+        assert!(is_junk_path("dir/._x.md"), "dir/._x.md should be junk");
+        // Any basename starting with ._
+        assert!(is_junk_path("._anything"), "._anything should be junk");
+        // Deep nesting
+        assert!(
+            is_junk_path("02_Projects/Foo/._hidden.md"),
+            "deeply nested ._hidden.md should be junk"
+        );
+        // Windows backslash path normalized
+        assert!(
+            is_junk_path("02_Projects\\Foo\\._bar.md"),
+            "backslash path with ._bar.md should be junk"
+        );
+    }
+
+    #[test]
+    fn excludes_dsstore() {
+        assert!(is_junk_path(".DS_Store"), ".DS_Store at root should be junk");
+        assert!(
+            is_junk_path("dir/.DS_Store"),
+            ".DS_Store nested should be junk"
+        );
+        assert!(
+            is_junk_path("02_Projects/Nexus/.DS_Store"),
+            ".DS_Store deep nested should be junk"
+        );
+    }
+
+    #[test]
+    fn includes_nx_host_namespace() {
+        // .nx-<host> machine-namespace dirs must NOT be treated as junk.
+        assert!(
+            !is_junk_path(".nx-trinity/build/out.bin"),
+            ".nx-trinity/ should NOT be junk"
+        );
+        assert!(
+            !is_junk_path("dir/.nx-morpheus/x.md"),
+            ".nx-morpheus/ nested should NOT be junk"
+        );
+        assert!(
+            !is_junk_path(".nx-neo/y"),
+            ".nx-neo/ top-level should NOT be junk"
+        );
+        // The ._* rule requires underscore immediately after dot — .nx- has 'n',
+        // so it is structurally distinct. Belt-and-suspenders check:
+        assert!(
+            !is_junk_path(".nx-morpheus/build/x"),
+            ".nx-morpheus/build/x should NOT be junk (no ._ segment)"
+        );
+    }
+
+    #[test]
+    fn still_excludes_substrate() {
+        // Substrate RASP rules are orthogonal to the junk fence — B3 must not
+        // disturb them. (.obsidian/ / .trash/ / .git/ are handled by
+        // file_watcher HARDCODED_EXCLUDES, not the RASP fence directly —
+        // these three use is_substrate_path which tests the RASP fence only.)
+        assert!(
+            is_substrate_path("_rapport/people/x"),
+            "_rapport/people is substrate"
+        );
+        assert!(
+            is_substrate_path("02_Projects/Protocols/foo.md"),
+            "Protocols dir is substrate"
+        );
+        assert!(
+            is_substrate_path("_project/anything.md"),
+            "_project/ is substrate"
+        );
+    }
+
+    #[test]
+    fn normal_note_not_excluded() {
+        assert!(
+            !is_junk_path("02_Projects/foo.md"),
+            "ordinary note should not be junk"
+        );
+        assert!(!is_junk_path("Daily/2026-05-29.md"), "daily note not junk");
+        assert!(!is_junk_path("01_Inbox/quick.md"), "inbox note not junk");
     }
 }
