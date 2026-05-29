@@ -22,11 +22,23 @@ pub enum ConfigError {
 /// subscriber scope on the server side.  An empty string (`""`) is the
 /// canonical Mainframe vault (bare storage).  Examples: `""`, `"dev"`,
 /// `"archive"`.
+///
+/// `subscriber_id` (B2b): the subscriber ID this root pushes under.  The
+/// server maps subscriber → its registered route → storage.  For the vault
+/// root (back-compat path), this is copied from the top-level
+/// `Config.subscriber_id` by `from_toml_back_compat`.  For extra roots
+/// added via `[[sync_roots]]` blocks that omit this field, it defaults to
+/// `""` — filled in at pairing time (a later task).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SyncRoot {
     pub path: std::path::PathBuf,
     #[serde(default)]
     pub route: String,
+    /// B2b: per-root subscriber ID. Defaults to `""` when omitted from TOML
+    /// (filled at pairing). The back-compat synthesis path assigns the
+    /// top-level `Config.subscriber_id` here automatically.
+    #[serde(default)]
+    pub subscriber_id: String,
 }
 
 /// Intermediate deserialisation target that tolerates the legacy
@@ -104,14 +116,23 @@ impl Config {
         let raw: RawConfig = toml::from_str(s)?;
 
         let sync_roots = if !raw.sync_roots.is_empty() {
+            // Explicit [[sync_roots]] blocks: use as-is. Their `subscriber_id`
+            // defaults to "" via #[serde(default)] when omitted from TOML.
             raw.sync_roots
         } else {
             // Legacy path: synthesise from vaults_root + optional vault_name.
+            // B2b: the synthesised vault root inherits the top-level
+            // subscriber_id so existing installs keep pushing under the same
+            // subscriber they always have.
             let path = match raw.vault_name.as_deref() {
                 Some(name) if !name.is_empty() => raw.vaults_root.join(name),
                 _ => raw.vaults_root.clone(),
             };
-            vec![SyncRoot { path, route: String::new() }]
+            vec![SyncRoot {
+                path,
+                route: String::new(),
+                subscriber_id: raw.subscriber_id.clone(),
+            }]
         };
 
         Ok(Config {
@@ -261,16 +282,91 @@ daemon_platform = "macos-aarch64"
                 SyncRoot {
                     path: PathBuf::from("/Users/test/Vaults/Mainframe"),
                     route: String::new(),
+                    subscriber_id: "sub-rt".into(),
                 },
                 SyncRoot {
                     path: PathBuf::from("/Users/test/DevVaults/Work"),
                     route: "work".into(),
+                    subscriber_id: String::new(),
                 },
             ],
         };
         let serialized = toml::to_string_pretty(&original).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
         assert_eq!(original, deserialized, "round-trip must produce identical Config");
+    }
+
+    // --- B2b: per-root subscriber_id tests ---
+
+    /// A `[[sync_roots]]` block with an explicit `subscriber_id` value must
+    /// surface that value on the parsed `SyncRoot`.
+    #[test]
+    fn sync_root_carries_subscriber_id() {
+        let toml_str = r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-vault"
+vaults_root = "/Users/test/Vaults"
+daemon_version = "0.4.0"
+daemon_platform = "macos-aarch64"
+
+[[sync_roots]]
+path = "/Users/test/Vaults/Mainframe"
+route = ""
+subscriber_id = "sub-dev"
+"#;
+        let cfg = Config::from_toml_back_compat(toml_str)
+            .expect("[[sync_roots]] with subscriber_id must parse");
+        assert_eq!(cfg.sync_roots.len(), 1);
+        assert_eq!(
+            cfg.sync_roots[0].subscriber_id, "sub-dev",
+            "subscriber_id from [[sync_roots]] block must be preserved"
+        );
+    }
+
+    /// When a `[[sync_roots]]` block OMITS `subscriber_id`, the field must
+    /// default to `""` (to be filled at pairing).
+    #[test]
+    fn empty_sync_root_subscriber_defaults_blank() {
+        let toml_str = r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-vault"
+vaults_root = "/Users/test/Vaults"
+daemon_version = "0.4.0"
+daemon_platform = "macos-aarch64"
+
+[[sync_roots]]
+path = "/Users/test/Vaults/Dev"
+route = "dev"
+"#;
+        let cfg = Config::from_toml_back_compat(toml_str)
+            .expect("[[sync_roots]] without subscriber_id must parse");
+        assert_eq!(cfg.sync_roots.len(), 1);
+        assert_eq!(
+            cfg.sync_roots[0].subscriber_id, "",
+            "subscriber_id must default to empty string when omitted"
+        );
+    }
+
+    /// Legacy on-disk config (no `[[sync_roots]]` block): the synthesised
+    /// `SyncRoot` must inherit the top-level `subscriber_id` so existing
+    /// installs keep pushing under the same subscriber they always have.
+    #[test]
+    fn back_compat_assigns_top_level_subscriber_id_to_vault_root() {
+        let toml_str = r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-legacy-123"
+vaults_root = "/Users/test/Vaults"
+vault_name = "Mainframe"
+daemon_version = "0.3.8"
+daemon_platform = "macos-aarch64"
+"#;
+        let cfg = Config::from_toml_back_compat(toml_str)
+            .expect("legacy back-compat must synthesise sync_root with subscriber_id");
+        assert_eq!(cfg.sync_roots.len(), 1, "expected exactly 1 synthesised sync_root");
+        assert_eq!(
+            cfg.sync_roots[0].subscriber_id, "sub-legacy-123",
+            "synthesised vault sync_root must carry the top-level subscriber_id"
+        );
     }
 }
 

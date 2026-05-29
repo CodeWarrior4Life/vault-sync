@@ -213,6 +213,28 @@ pub fn roots_to_watch(cfg: &config::Config) -> Vec<(std::path::PathBuf, String)>
         .collect()
 }
 
+/// B2b (Nexus Sync): resolve the effective subscriber_id for a single
+/// sync root.
+///
+/// Priority rule:
+/// 1. If `root.subscriber_id` is non-empty, use it — the root has its own
+///    server-registered subscriber (assigned at pairing).
+/// 2. Otherwise fall back to `cfg.subscriber_id` — the top-level (vault-
+///    root) subscriber, which is the only subscriber on existing installs
+///    and is always set by `from_toml_back_compat` on the synthesised entry.
+///
+/// This ensures the vault root keeps pushing under the existing subscriber
+/// after a B2b upgrade (back-compat) while new roots added via
+/// `[[sync_roots]]` blocks without a `subscriber_id` yet fall back to the
+/// same top-level subscriber until they are properly paired.
+pub fn effective_subscriber_id(root: &config::SyncRoot, cfg: &config::Config) -> String {
+    if !root.subscriber_id.is_empty() {
+        root.subscriber_id.clone()
+    } else {
+        cfg.subscriber_id.clone()
+    }
+}
+
 /// Boot the SSE consumer from a saved config + keyring token. Runs on the
 /// Tauri async runtime so it doesn't block app startup.
 fn spawn_sse_consumer(
@@ -444,13 +466,19 @@ fn spawn_sse_consumer(
         // uses (`commands::resolve_workspace_root`), guaranteeing both call
         // sites open the identical push_journal.jsonl file.
         let workspace_root_for_journal = commands::resolve_workspace_root();
-        let _watch_handles: Vec<_> = watch_roots
+        // B2b: iterate sync_roots directly so we have the full SyncRoot struct
+        // (including subscriber_id). effective_subscriber_id resolves the
+        // per-root subscriber (root's own if set, else top-level fallback).
+        let _watch_handles: Vec<_> = cfg
+            .sync_roots
             .iter()
-            .map(|(root_path, _route)| {
+            .map(|root| {
+                let eff_sub = effective_subscriber_id(root, &cfg);
                 spawn_push_pipeline(
                     &app,
                     &cfg,
-                    root_path.clone(),
+                    eff_sub,
+                    root.path.clone(),
                     workspace_root_for_journal.clone(),
                     watch_scope_roots.clone(),
                     watch_scope_excludes.clone(),
@@ -550,9 +578,16 @@ fn spawn_sse_consumer(
 /// wire-up low-risk). The drain loop never loses appends; worst case is a
 /// one-poll-interval (≤5s) latency before verify_repair's enqueued pushes
 /// upload.
+/// B2b (Nexus Sync): `subscriber_id` is now passed in as the *effective*
+/// per-root subscriber, resolved by the caller via
+/// `effective_subscriber_id(&root, &cfg)`.  Every internal use of a
+/// subscriber ID inside this function (token load, journal path, push
+/// client, reconciler, file watcher) now uses this parameter, so each
+/// sync root truly pushes under its own registered subscriber.
 fn spawn_push_pipeline(
     app: &tauri::AppHandle,
     cfg: &config::Config,
+    subscriber_id: String,
     watch_root: std::path::PathBuf,
     workspace_root: std::path::PathBuf,
     scope_roots: Vec<String>,
@@ -561,7 +596,7 @@ fn spawn_push_pipeline(
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
 
-    let token = match token_store::load(&cfg.subscriber_id) {
+    let token = match token_store::load(&subscriber_id) {
         Ok(Some(t)) => t,
         _ => {
             tracing::error!("push pipeline: token unavailable; not starting push side");
@@ -575,7 +610,7 @@ fn spawn_push_pipeline(
     };
 
     // Shared journal — SAME path verify_repair uses (commands.rs SoT).
-    let journal_path = commands::push_journal_path(&workspace_root, &cfg.subscriber_id);
+    let journal_path = commands::push_journal_path(&workspace_root, &subscriber_id);
     if let Some(parent) = journal_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::error!(
@@ -632,7 +667,7 @@ fn spawn_push_pipeline(
     let push_client = push_client::PushClient::new(
         api_for_push,
         journal.clone(),
-        cfg.subscriber_id.clone(),
+        subscriber_id.clone(),
         push_cfg,
         vault_root.clone(),
     )
@@ -644,7 +679,7 @@ fn spawn_push_pipeline(
     let (push_shutdown_tx, push_shutdown_rx) = tokio::sync::watch::channel(false);
     tracing::info!(
         "starting push_client drain loop for subscriber_id={}",
-        cfg.subscriber_id
+        subscriber_id
     );
     tauri::async_runtime::spawn(async move {
         let _hold_tx = push_shutdown_tx; // keep sender alive for the loop's lifetime
@@ -667,7 +702,7 @@ fn spawn_push_pipeline(
                 vault_root.clone(),
                 Arc::new(recon_api),
                 journal.clone(),
-                cfg.subscriber_id.clone(),
+                subscriber_id.clone(),
                 tray_state.clone(),
             );
         }
@@ -719,7 +754,7 @@ fn spawn_push_pipeline(
         watcher_journal,
         burst,
         watcher_cfg,
-        cfg.subscriber_id.clone(),
+        subscriber_id.clone(),
     ) {
         Ok(w) => w.with_tray_state(tray_state),
         Err(e) => {
@@ -736,7 +771,7 @@ fn spawn_push_pipeline(
         Ok(handle) => {
             tracing::info!(
                 "file_watcher started for subscriber_id={}",
-                cfg.subscriber_id
+                subscriber_id
             );
             Some(handle)
         }
@@ -905,10 +940,12 @@ mod tests {
             config::SyncRoot {
                 path: PathBuf::from("/Vaults/Mainframe"),
                 route: String::new(),
+                subscriber_id: String::new(),
             },
             config::SyncRoot {
                 path: PathBuf::from("/Vaults/Dev"),
                 route: "dev".into(),
+                subscriber_id: String::new(),
             },
         ]);
         let result = roots_to_watch(&cfg);
@@ -927,6 +964,7 @@ mod tests {
         let cfg = make_config_with_sync_roots(vec![config::SyncRoot {
             path: PathBuf::from("/Vaults/Mainframe"),
             route: String::new(),
+            subscriber_id: String::new(),
         }]);
         let result = roots_to_watch(&cfg);
         assert_eq!(result.len(), 1, "expected 1 entry for a back-compat single-root config");
@@ -959,6 +997,7 @@ mod tests {
             .map(|(i, p)| config::SyncRoot {
                 path: p.clone(),
                 route: format!("route-{i}"),
+                subscriber_id: String::new(),
             })
             .collect();
         let cfg = make_config_with_sync_roots(sync_roots);
@@ -975,5 +1014,52 @@ mod tests {
                 "entry {i} route must match sync_roots[{i}].route"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // B2b: effective_subscriber_id resolver tests
+    // -------------------------------------------------------------------------
+
+    fn make_cfg_with_top_level_sub(sub: &str) -> config::Config {
+        config::Config {
+            nexus_url: "https://nexus.example.com".into(),
+            subscriber_id: sub.into(),
+            vaults_root: PathBuf::from("/Users/test/Vaults"),
+            daemon_version: "0.4.0".into(),
+            daemon_platform: "test-platform".into(),
+            last_event_id: None,
+            sync_roots: vec![],
+        }
+    }
+
+    /// When a root has its own non-empty subscriber_id, that value is used —
+    /// NOT the top-level cfg.subscriber_id.
+    #[test]
+    fn effective_subscriber_id_uses_root_then_falls_back() {
+        let cfg = make_cfg_with_top_level_sub("sub-top-level");
+
+        // Root with its own subscriber_id → root wins.
+        let root_with_sub = config::SyncRoot {
+            path: PathBuf::from("/Vaults/Dev"),
+            route: "dev".into(),
+            subscriber_id: "sub-dev".into(),
+        };
+        assert_eq!(
+            effective_subscriber_id(&root_with_sub, &cfg),
+            "sub-dev",
+            "non-empty root.subscriber_id must be preferred over cfg.subscriber_id"
+        );
+
+        // Root with empty subscriber_id → falls back to cfg.
+        let root_without_sub = config::SyncRoot {
+            path: PathBuf::from("/Vaults/Mainframe"),
+            route: String::new(),
+            subscriber_id: String::new(),
+        };
+        assert_eq!(
+            effective_subscriber_id(&root_without_sub, &cfg),
+            "sub-top-level",
+            "empty root.subscriber_id must fall back to cfg.subscriber_id"
+        );
     }
 }
