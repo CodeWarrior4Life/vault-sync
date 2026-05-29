@@ -61,6 +61,9 @@ pub async fn pair_inner(
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: detect_platform(),
         last_event_id: None,
+        // TODO(B2): populate sync_roots from pairing wizard input once
+        // the watch loop iterates sync_roots instead of vaults_root.
+        sync_roots: vec![],
     };
     cfg.save_to(&config_path)?;
 

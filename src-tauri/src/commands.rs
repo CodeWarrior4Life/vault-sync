@@ -261,6 +261,8 @@ mod tests {
             daemon_version: "0.3.0-test".to_string(),
             daemon_platform: "test".to_string(),
             last_event_id: None,
+            // TODO(B2): populate sync_roots once watch loop iterates them.
+            sync_roots: vec![],
         }
     }
 
