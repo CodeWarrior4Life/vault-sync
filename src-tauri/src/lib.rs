@@ -118,7 +118,7 @@ pub fn run() {
             // endpoints declared in tauri.conf.json. Runs detached so a slow
             // /admin/api/vault-sync/releases/<platform>/latest doesn't block
             // SSE startup. Failures log only — never block the daemon.
-            spawn_updater_check(app.handle().clone());
+            spawn_updater_check(app.handle().clone(), shared_state.clone());
 
             // v0.3: app has no meaning without a valid pairing. Open the
             // wizard window automatically if config OR token is missing.
@@ -163,33 +163,113 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// Pure decision: should the daemon restart NOW to apply a staged update?
+///
+/// `update_staged` — an update has been downloaded+installed and awaits restart.
+/// `secs_since_staged` — seconds since it was staged (drives the max-defer ceiling).
+/// `secs_since_activity` — seconds since the last SSE/FS event (None = never).
+/// Idle = no pending uploads, not verifying, not reconciling, and quiescent for
+/// `quiescent_secs`. The redflag/halt state is intentionally NOT an input — a
+/// wedged daemon must still be able to take an update. The max-defer ceiling
+/// forces a restart after `max_defer_secs` regardless of busyness so an
+/// always-busy host can't starve (load-bearing on macOS/Linux; on Windows the
+/// NSIS update force-exits + relaunches on its own).
+#[allow(clippy::too_many_arguments)]
+pub fn should_restart_now(
+    update_staged: bool,
+    secs_since_staged: u64,
+    secs_since_activity: Option<u64>,
+    uploads_pending: u64,
+    verify_in_progress: bool,
+    recon_in_progress: bool,
+    quiescent_secs: u64,
+    max_defer_secs: u64,
+) -> bool {
+    if !update_staged {
+        return false;
+    }
+    if secs_since_staged >= max_defer_secs {
+        return true;
+    }
+    if uploads_pending > 0 || verify_in_progress || recon_in_progress {
+        return false;
+    }
+    match secs_since_activity {
+        Some(s) => s >= quiescent_secs,
+        None => true,
+    }
+}
+
 /// Check for a daemon update from the Nexus-served release endpoint. If
-/// available, download + install in the background. v0.1.4 ships silent
-/// auto-update by default; a future version can promote to "prompt first".
-fn spawn_updater_check(app: tauri::AppHandle) {
+/// available, download + install in the background, then restart the daemon
+/// once it is idle (or the max-defer ceiling is hit). v0.1.4 shipped a fire-
+/// once check; S484 (v0.4.2) adds a 6h periodic loop + restart-when-idle.
+fn spawn_updater_check(app: tauri::AppHandle, tray_state: tray_state::SharedTrayState) {
+    use std::time::{Duration, Instant};
+    const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+    const POLL_WHEN_STAGED: Duration = Duration::from_secs(60);
+    const QUIESCENT_SECS: u64 = 300;
+    const MAX_DEFER_SECS: u64 = 24 * 3600;
     tauri::async_runtime::spawn(async move {
-        let updater = match app.updater() {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!("updater init failed: {e}");
-                return;
-            }
-        };
-        match updater.check().await {
-            Ok(Some(update)) => {
-                tracing::info!(
-                    "update available: {} -> {}; downloading",
-                    env!("CARGO_PKG_VERSION"),
-                    update.version
-                );
-                if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-                    tracing::warn!("update download_and_install failed: {e}");
-                } else {
-                    tracing::info!("update installed; will apply on next launch");
+        let mut staged_at: Option<Instant> = None;
+        loop {
+            // Only check for a new update while none is staged (else the running
+            // binary's version stays old and we'd re-download every cycle).
+            if staged_at.is_none() {
+                match app.updater() {
+                    Ok(updater) => match updater.check().await {
+                        Ok(Some(update)) => {
+                            tracing::info!(
+                                "update available: {} -> {}; downloading",
+                                env!("CARGO_PKG_VERSION"),
+                                update.version
+                            );
+                            match update.download_and_install(|_, _| {}, || {}).await {
+                                Ok(()) => {
+                                    staged_at = Some(Instant::now());
+                                    tracing::info!("update staged; restart when idle");
+                                }
+                                Err(e) => tracing::warn!("download_and_install failed: {e}"),
+                            }
+                        }
+                        Ok(None) => tracing::debug!("no update available"),
+                        Err(e) => tracing::warn!("update check failed: {e}"),
+                    },
+                    Err(e) => tracing::warn!("updater init failed: {e}"),
                 }
             }
-            Ok(None) => tracing::debug!("no update available"),
-            Err(e) => tracing::warn!("update check failed: {e}"),
+            if let Some(since) = staged_at {
+                let (secs_activity, pending, verify, recon) = match tray_state.read() {
+                    Ok(s) => (
+                        s.last_event_at
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs()),
+                        s.uploads_pending as u64,
+                        s.verify_in_progress,
+                        s.recon_in_progress,
+                    ),
+                    Err(_) => (None, 0, false, false),
+                };
+                if should_restart_now(
+                    true,
+                    since.elapsed().as_secs(),
+                    secs_activity,
+                    pending,
+                    verify,
+                    recon,
+                    QUIESCENT_SECS,
+                    MAX_DEFER_SECS,
+                ) {
+                    tracing::info!("applying staged update — restarting daemon");
+                    app.restart();
+                }
+            }
+            let nap = if staged_at.is_some() {
+                POLL_WHEN_STAGED
+            } else {
+                CHECK_INTERVAL
+            };
+            tokio::time::sleep(nap).await;
         }
     });
 }
@@ -1065,5 +1145,30 @@ mod tests {
             "sub-top-level",
             "empty root.subscriber_id must fall back to cfg.subscriber_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod restart_gate_tests {
+    use super::should_restart_now;
+
+    #[test]
+    fn restart_gate_logic() {
+        let q = 300u64; // quiescent secs
+        let md = 86_400u64; // max-defer secs
+        // No update staged → never restart.
+        assert!(!should_restart_now(false, 0, None, 0, false, false, q, md));
+        // Staged + never-any-activity → restart.
+        assert!(should_restart_now(true, 10, None, 0, false, false, q, md));
+        // Staged + uploads pending → wait.
+        assert!(!should_restart_now(true, 10, None, 3, false, false, q, md));
+        // Staged + verify in progress → wait.
+        assert!(!should_restart_now(true, 10, Some(999), 0, true, false, q, md));
+        // Staged + recent activity (< quiescent) → wait.
+        assert!(!should_restart_now(true, 10, Some(60), 0, false, false, q, md));
+        // Staged + quiescent elapsed → restart.
+        assert!(should_restart_now(true, 10, Some(400), 0, false, false, q, md));
+        // Max-defer elapsed overrides busyness → restart even if busy.
+        assert!(should_restart_now(true, 90_000, Some(1), 5, true, true, q, md));
     }
 }
