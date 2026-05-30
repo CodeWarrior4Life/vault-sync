@@ -743,6 +743,10 @@ fn spawn_push_pipeline(
         20,
         std::time::Duration::from_secs(30),
     )));
+    // S484: expose the valve so the tray "Resume delete propagation" action
+    // can reset it in place (no daemon restart). Register before `burst` is
+    // moved into the file watcher below.
+    redflag::register_delete_burst_handle(burst.clone());
     let watcher_cfg = file_watcher::FileWatcherConfig {
         allowed_extensions: vec!["md".into(), "canvas".into()],
         scope_roots,

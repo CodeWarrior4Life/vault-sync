@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Sentinel filename, matched case-sensitively at the vault root.
@@ -179,6 +180,50 @@ impl DeleteBurstDetector {
     /// Is the detector currently in the paused state?
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+}
+
+/// Process-global handle to the daemon's single [`DeleteBurstDetector`].
+///
+/// S484: the delete-burst valve is created deep in the file-watcher spawn
+/// (after the tray is already built), so the tray can't be handed the `Arc`
+/// at build time. Registering it here lets the tray "Resume delete
+/// propagation" action reset the valve IN PLACE — previously the only way to
+/// clear a delete-burst pause was a full daemon restart. There is exactly one
+/// detector per daemon process, so a global is the right shape.
+static DELETE_BURST_HANDLE: OnceLock<Arc<Mutex<DeleteBurstDetector>>> = OnceLock::new();
+
+/// Register the daemon's delete-burst detector for tray-driven resume.
+/// Called once at file-watcher construction. Idempotent (`OnceLock::set`
+/// ignores a second call), so it is safe even if construction is retried.
+pub fn register_delete_burst_handle(burst: Arc<Mutex<DeleteBurstDetector>>) {
+    let _ = DELETE_BURST_HANDLE.set(burst);
+}
+
+/// Reset a shared delete-burst detector in place: clear the paused state and
+/// the sliding window so delete-propagation resumes immediately. Returns
+/// `true` iff the detector WAS paused before the reset (so the caller can show
+/// an accurate confirmation). A poisoned lock yields `false` (treated as
+/// "nothing resumed"). This is the pure, testable core of [`resume_delete_propagation`].
+pub fn reset_burst_detector(burst: &Arc<Mutex<DeleteBurstDetector>>) -> bool {
+    match burst.lock() {
+        Ok(mut d) => {
+            let was_paused = d.is_paused();
+            d.reset();
+            was_paused
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resume outbound delete-propagation by resetting the registered detector.
+/// Returns `true` iff the valve was paused (and is now cleared); `false` if no
+/// detector has been registered yet or it was not paused. Invoked by the tray
+/// "Resume delete propagation" menu action.
+pub fn resume_delete_propagation() -> bool {
+    match DELETE_BURST_HANDLE.get() {
+        Some(handle) => reset_burst_detector(handle),
+        None => false,
     }
 }
 
@@ -345,6 +390,40 @@ mod tests {
             }
             other => panic!("expected BelowThreshold after reset, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn reset_burst_detector_reports_prior_paused_and_clears() {
+        // S484: the tray "Resume delete propagation" action resets the shared
+        // detector in place (no daemon restart). The helper returns whether it
+        // WAS paused so the tray can show an accurate confirmation, and the
+        // detector must be usable (BelowThreshold) immediately afterward.
+        use std::sync::{Arc, Mutex};
+        let arc = Arc::new(Mutex::new(DeleteBurstDetector::new(
+            20,
+            Duration::from_secs(30),
+        )));
+        let now = Instant::now();
+        {
+            let mut d = arc.lock().unwrap();
+            for i in 0..20 {
+                d.record_delete_at(now + Duration::from_millis(i));
+            }
+            assert!(d.is_paused(), "precondition: detector should be paused");
+        }
+
+        let was_paused = reset_burst_detector(&arc);
+        assert!(was_paused, "reset should report it WAS paused");
+        assert!(
+            !arc.lock().unwrap().is_paused(),
+            "detector should be cleared after reset"
+        );
+
+        // Idempotent: a second reset reports not-paused (nothing to resume).
+        assert!(
+            !reset_burst_detector(&arc),
+            "second reset should report not-paused"
+        );
     }
 
     #[test]

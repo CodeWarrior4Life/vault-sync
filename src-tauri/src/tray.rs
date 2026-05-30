@@ -284,6 +284,35 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     let _ = app.shell().open(path.to_string_lossy().to_string(), None);
                 }
             }
+            "delete-burst-status" => {
+                // S484: in-app resume. The delete-burst valve pauses OUTBOUND
+                // delete-propagation after >20 deletes/30s (a bulk-delete
+                // guard); inbound note sync is never affected. Previously the
+                // only way to clear it was a full daemon restart. This resets
+                // the shared detector in place and refreshes the surface now.
+                tracing::info!("tray: delete-burst resume clicked");
+                let was_paused = crate::redflag::resume_delete_propagation();
+                if let Ok(mut s) = st.write() {
+                    s.set_delete_burst_paused(false);
+                }
+                // Refresh the tooltip immediately rather than waiting for the
+                // 2s poller, so the user sees the pause clear on click.
+                if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+                    if let Ok(s) = st.read() {
+                        let _ = tray.set_tooltip(Some(&build_tooltip(&s)));
+                    }
+                }
+                let msg = if was_paused {
+                    "Delete propagation resumed. Local deletions will sync to \
+                     the server again. (Inbound note sync was never paused.)"
+                } else {
+                    "Delete propagation was not paused — nothing to resume."
+                };
+                app.dialog()
+                    .message(msg)
+                    .title("Delete propagation")
+                    .show(|_| {});
+            }
             "quit" => {
                 app.exit(0);
             }
@@ -341,7 +370,9 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                         String::new()
                     };
                     let burst = if s.delete_burst_paused {
-                        "Delete-burst paused — review".to_string()
+                        // S484: clickable — invoking it resets the valve in
+                        // place (no daemon restart). Label says so explicitly.
+                        "▶ Resume delete propagation (paused after bulk delete)".to_string()
                     } else {
                         String::new()
                     };
@@ -609,17 +640,25 @@ pub fn build_tooltip(state: &TrayState) -> String {
         return format!("❌ Disconnected • {err}");
     }
 
-    // (3) Issue — integrity failures / unresolved conflicts / delete-burst pause.
+    // (3) Issue — surface only the ACTIVE problems, each named explicitly.
+    //     S484: a bare "paused" is ambiguous (paused what? the whole sync?),
+    //     and showing "0 integrity / 0 conflicts / paused" when delete-burst
+    //     is the ONLY issue misleads the user into thinking sync is broken.
+    //     So we join only the issues that are actually present, and the
+    //     delete-burst entry names exactly what is paused (outbound
+    //     delete-propagation) plus reassures that inbound note sync is fine.
     if state.integrity_failures > 0 || state.conflict_unresolved > 0 || state.delete_burst_paused {
-        let burst = if state.delete_burst_paused {
-            "paused"
-        } else {
-            ""
-        };
-        return format!(
-            "⚠ {} integrity / {} conflicts / {}",
-            state.integrity_failures, state.conflict_unresolved, burst
-        );
+        let mut parts: Vec<String> = Vec::new();
+        if state.integrity_failures > 0 {
+            parts.push(format!("{} integrity", state.integrity_failures));
+        }
+        if state.conflict_unresolved > 0 {
+            parts.push(format!("{} conflicts", state.conflict_unresolved));
+        }
+        if state.delete_burst_paused {
+            parts.push("delete-propagation paused (inbound sync OK)".to_string());
+        }
+        return format!("⚠ {}", parts.join(" / "));
     }
 
     // (4) Uploading — pending push events queued.
@@ -713,7 +752,9 @@ mod tests {
         let t = build_tooltip(&s);
         assert!(t.starts_with("⚠"), "got: {t}");
         assert!(t.contains("3 integrity"), "got: {t}");
-        assert!(t.contains("0 conflicts"), "got: {t}");
+        // S484: only ACTIVE issues are surfaced — no misleading "0 conflicts"
+        // zero-noise when there are none.
+        assert!(!t.contains("conflicts"), "should omit zero conflicts: {t}");
     }
 
     #[test]
@@ -722,6 +763,8 @@ mod tests {
         s.conflict_unresolved = 4;
         let t = build_tooltip(&s);
         assert!(t.contains("4 conflicts"), "got: {t}");
+        // S484: integrity is healthy → not shown.
+        assert!(!t.contains("integrity"), "should omit zero integrity: {t}");
     }
 
     #[test]
@@ -730,7 +773,29 @@ mod tests {
         s.delete_burst_paused = true;
         let t = build_tooltip(&s);
         assert!(t.starts_with("⚠"), "got: {t}");
-        assert!(t.contains("paused"), "got: {t}");
+        // S484: "paused" alone is ambiguous — name WHAT is paused and reassure
+        // that inbound note sync still works.
+        assert!(
+            t.contains("delete-propagation paused"),
+            "must name what is paused: {t}"
+        );
+        assert!(t.contains("inbound sync OK"), "must reassure inbound: {t}");
+        // No misleading zero-noise when burst is the only issue.
+        assert!(!t.contains("0 integrity"), "no zero-noise: {t}");
+        assert!(!t.contains("0 conflicts"), "no zero-noise: {t}");
+    }
+
+    #[test]
+    fn tooltip_issue_branch_multiple_issues_joined() {
+        let mut s = fresh();
+        s.integrity_failures = 2;
+        s.conflict_unresolved = 1;
+        s.delete_burst_paused = true;
+        let t = build_tooltip(&s);
+        assert!(t.contains("2 integrity"), "got: {t}");
+        assert!(t.contains("1 conflicts"), "got: {t}");
+        assert!(t.contains("delete-propagation paused"), "got: {t}");
+        assert!(t.contains(" / "), "issues should be joined: {t}");
     }
 
     #[test]
