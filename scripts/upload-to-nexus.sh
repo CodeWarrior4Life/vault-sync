@@ -1,60 +1,35 @@
 #!/usr/bin/env bash
-# Upload the Tauri updater bundle (NOT the user-facing installer) + its
-# .sig file to Nexus. The pair is what `tauri-plugin-updater` reads via
-# the `endpoints` URL — the .sig signs the updater bundle, not the .dmg/
-# .msi/.deb that users download from GitHub Releases.
+# Stage the Tauri updater bundle + its .sig to Nexus (is_current=FALSE on the
+# server; promoted separately). Discovers the artifact by its .sig sibling so it
+# adapts to whatever createUpdaterArtifacts emits (NSIS .zip / .app.tar.gz /
+# .AppImage). A missing .sig is a HARD ERROR — signing failed must fail the
+# release, never silently skip (that is how only linux ever published).
 #
-# Per Tauri 2.x `createUpdaterArtifacts: true`:
-#   - macOS  → `*.app.tar.gz` + `*.app.tar.gz.sig`
-#   - Windows→ `*.msi` (NSIS .exe also possible) + `*.msi.sig`
-#   - Linux  → `*.AppImage` + `*.AppImage.sig`
-#
-# Args:
-#   $1 PLATFORM  — one of: windows-x86_64 / macos-x86_64 / macos-aarch64 / linux-x86_64
-#   $2 VERSION   — tag like v0.1.0 (the leading `v` is stripped)
+# Args: $1 PLATFORM (darwin-x86_64|darwin-aarch64|windows-x86_64|linux-x86_64)
+#       $2 VERSION  (tag like v0.4.2; leading v is stripped)
 set -euo pipefail
 PLATFORM="$1"
 VERSION="$2"
 ROOT="src-tauri/target"
 
-case "$PLATFORM" in
-  windows-x86_64)
-    BUNDLE=$(find "$ROOT" -type f -name '*.msi' -path '*/release/bundle/msi/*' | head -1)
-    ;;
-  macos-x86_64|macos-aarch64)
-    BUNDLE=$(find "$ROOT" -type f -name '*.app.tar.gz' -path '*/release/bundle/macos/*' | head -1)
-    ;;
-  linux-x86_64)
-    BUNDLE=$(find "$ROOT" -type f -name '*.AppImage' -path '*/release/bundle/appimage/*' | head -1)
-    ;;
-  *)
-    echo "::error::unknown PLATFORM '$PLATFORM'"; exit 1 ;;
-esac
-
-if [ -z "${BUNDLE:-}" ] || [ ! -f "$BUNDLE" ]; then
-  echo "::warning::no updater bundle for $PLATFORM (createUpdaterArtifacts may be off); skipping Nexus upload"
-  exit 0
+SIG=$(find "$ROOT" -type f -name '*.sig' -path '*/release/bundle/*' | head -1)
+if [ -z "${SIG:-}" ] || [ ! -f "$SIG" ]; then
+  echo "::error::no .sig updater artifact for $PLATFORM (signing failed or createUpdaterArtifacts off)"
+  exit 1
+fi
+BUNDLE="${SIG%.sig}"
+if [ ! -f "$BUNDLE" ]; then
+  echo "::error::.sig $SIG has no sibling bundle $BUNDLE"
+  exit 1
 fi
 
-SIG="${BUNDLE}.sig"
-if [ ! -f "$SIG" ]; then
-  echo "::warning::no .sig next to $BUNDLE (signing may have failed silently); skipping Nexus upload"
-  exit 0
-fi
-
-# Nexus upload schema requires the signature as a hex-encoded string
-# (`bytes.fromhex(...)` on the server). The .sig file itself is plaintext
-# (minisign untrusted-comment + base64), so we hex-encode the WHOLE file
-# (newlines + comments + payload) before sending. Original implementation
-# used `xxd -p` which isn't on stock GHA macOS images; python3 is on all
-# four GHA runner images so we use it as the portable hex encoder.
 SIG_HEX=$(python3 -c "import sys; print(open(sys.argv[1],'rb').read().hex())" "$SIG")
 
-curl -fSs -X POST \
+curl -fSs --retry 3 --retry-delay 5 -X POST \
   -H "Authorization: Bearer $NEXUS_CI_TOKEN" \
   -F "version=${VERSION#v}" \
   -F "signature=${SIG_HEX}" \
   -F "binary=@${BUNDLE}" \
   "https://nexus.obsidian-inc.com/admin/api/vault-sync/releases/${PLATFORM}/upload"
 echo
-echo "uploaded $(basename "$BUNDLE") + sig for $PLATFORM v${VERSION#v}"
+echo "staged $(basename "$BUNDLE") + sig for $PLATFORM v${VERSION#v}"
