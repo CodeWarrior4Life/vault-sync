@@ -114,10 +114,11 @@ pub fn run() {
 
             tray::build_tray(app.handle(), shared_state.clone())?;
 
-            // v0.1.4: silent auto-update check on startup. Uses the pubkey +
-            // endpoints declared in tauri.conf.json. Runs detached so a slow
-            // /admin/api/vault-sync/releases/<platform>/latest doesn't block
-            // SSE startup. Failures log only — never block the daemon.
+            // S484: silent auto-update — checks on startup AND every 6h, using
+            // the pubkey + endpoints in tauri.conf.json. Runs detached so a slow
+            // /admin/api/vault-sync/releases/<platform>/latest never blocks SSE
+            // startup; on a staged update it restarts the daemon when idle.
+            // Failures log only — never block the daemon.
             spawn_updater_check(app.handle().clone(), shared_state.clone());
 
             // v0.3: app has no meaning without a valid pairing. Open the

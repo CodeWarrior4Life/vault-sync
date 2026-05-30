@@ -33,6 +33,9 @@ import base64, json, sys
 pk = json.load(open("src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"]
 open(sys.argv[1], "wb").write(base64.b64decode(pk))
 PY
-command -v rsign >/dev/null 2>&1 || cargo install rsign2 --quiet
+# --locked for reproducible deps; the release.yml "Cache rsign2" step restores
+# ~/.cargo/bin/rsign across runs so this from-source build happens once per OS,
+# not on every release (and isn't hostage to a crates.io hiccup in the gate).
+command -v rsign >/dev/null 2>&1 || cargo install rsign2 --locked --quiet
 rsign verify -p "$WORK/pub.key" -x "$SIG" "$LOCAL_BUNDLE"
 echo "verified $PLATFORM v$VERSION: retrievable + byte-identical + signature matches bundled pubkey"

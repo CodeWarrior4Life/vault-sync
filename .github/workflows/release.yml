@@ -49,6 +49,15 @@ jobs:
         env:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
         run: ./scripts/upload-to-nexus.sh ${{ matrix.platform }} ${{ github.ref_name }}
+      - name: Cache rsign2 (minisign verifier)
+        # Restores the from-source rsign build across releases so the HARD GATE
+        # below doesn't rebuild it (or hit a crates.io hiccup) on every run.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/rsign
+            ~/.cargo/bin/rsign.exe
+          key: rsign2-${{ runner.os }}-v1
       - name: Verify Nexus publish (HARD GATE)
         env:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
