@@ -13,8 +13,8 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: windows-x86_64 }
-          - { os: macos-latest,   target: x86_64-apple-darwin,    platform: macos-x86_64 }
-          - { os: macos-14,       target: aarch64-apple-darwin,   platform: macos-aarch64 }
+          - { os: macos-latest,   target: x86_64-apple-darwin,    platform: darwin-x86_64 }
+          - { os: macos-14,       target: aarch64-apple-darwin,   platform: darwin-aarch64 }
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, platform: linux-x86_64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -39,16 +39,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*-setup.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
-      - name: Upload to Nexus
-        # Non-fatal: the GH Release upload above is the primary artifact channel.
-        # A transient Nexus/CF 504 here must not fail the platform's release job
-        # (S481: linux 504'd on Nexus upload + fail-fast cancelled windows).
+      - name: Upload to Nexus (stage)
         continue-on-error: true
         env:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
         run: ./scripts/upload-to-nexus.sh ${{ matrix.platform }} ${{ github.ref_name }}
+      - name: Verify Nexus publish (HARD GATE)
+        env:
+          NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
+        run: ./scripts/verify-nexus-release.sh ${{ matrix.platform }} ${{ github.ref_name }}
