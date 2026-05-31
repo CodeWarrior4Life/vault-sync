@@ -81,7 +81,11 @@ pub struct NotePayload {
     pub body: String,
     pub sha256: String,
     pub modified: String,
-    pub file_mtime: Option<String>,
+    // Server returns file_mtime as a unix-timestamp float (vault_notes.file_mtime
+    // is double precision), e.g. 1779300968.264 — NOT a string. Typing this as
+    // Option<String> made every /api/sync/note body-fetch fail serde decode
+    // ("error decoding response body"), breaking the entire pull path (S485 e2e).
+    pub file_mtime: Option<f64>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).
