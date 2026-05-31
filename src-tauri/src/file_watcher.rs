@@ -1440,7 +1440,10 @@ mod tests {
                     "expected non-zero current limit, got {current}"
                 );
             }
-            other => panic!("expected InotifyLimitExceeded, got {other:?}"),
+            // Split so the Ok arm need not Debug-format WatchHandle (which
+            // holds a non-Debug notify watcher); FileWatcherError is Debug.
+            Ok(_) => panic!("expected InotifyLimitExceeded, got Ok(WatchHandle)"),
+            Err(e) => panic!("expected InotifyLimitExceeded, got {e:?}"),
         }
     }
 }
