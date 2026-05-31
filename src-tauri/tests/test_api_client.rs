@@ -28,14 +28,23 @@ async fn health_401_returns_auth_error() {
 
 #[tokio::test]
 async fn body_fetch_returns_envelope() {
+    // Real server wire shape (nexus sync_routes_p1.py get_note_body): file_mtime
+    // is a unix-ts FLOAT (BUG 1, c7d17a2) and the envelope carries `enriched_body`
+    // = the exact bytes the `sha256` is computed over (BUG 2, S486). The daemon
+    // materializes enriched_body verbatim, so the pull path must decode it.
     let mut srv = Server::new_async().await;
     let _m = srv.mock("GET", "/api/sync/note?path=foo.md")
         .with_status(200)
-        .with_body(r#"{"path":"foo.md","frontmatter":{"title":"X"},"body":"hello","sha256":"abc","modified":"2026-05-25T00:00:00Z","file_mtime":"2026-05-25T00:00:00Z"}"#)
+        .with_body(r#"{"path":"foo.md","frontmatter":{"title":"X"},"body":"hello","sha256":"abc","modified":"2026-05-25T00:00:00Z","file_mtime":1779300968.264,"enriched_body":"---\ntitle: X\n---\nhello","content_hash":"abc","updated_at":"2026-05-25T00:00:00Z"}"#)
         .create_async().await;
     let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
     let np = client.fetch_note("foo.md").await.unwrap();
     assert_eq!(np.body, "hello");
+    assert_eq!(np.file_mtime, Some(1779300968.264));
+    assert_eq!(
+        np.enriched_body.as_deref(),
+        Some("---\ntitle: X\n---\nhello")
+    );
 }
 
 #[tokio::test]

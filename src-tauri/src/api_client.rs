@@ -86,6 +86,16 @@ pub struct NotePayload {
     // Option<String> made every /api/sync/note body-fetch fail serde decode
     // ("error decoding response body"), breaking the entire pull path (S485 e2e).
     pub file_mtime: Option<f64>,
+    // S486 BUG 2 fix: the server returns the EXACT bytes it hashed for `sha256`
+    // as `enriched_body` (server cache_writer computes sha256(enriched_body);
+    // on a cache miss enriched_body == body_raw == the sha256 basis). The
+    // pull-path materializer writes THIS verbatim instead of re-serializing
+    // frontmatter (serde_yaml can never reproduce the original bytes), so the
+    // strict integrity check passes by construction and the note stays
+    // byte-faithful. `serde(default)` keeps back-compat with older servers that
+    // omit the field (materializer falls back to frontmatter reconstruction).
+    #[serde(default)]
+    pub enriched_body: Option<String>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).

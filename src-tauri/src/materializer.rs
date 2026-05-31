@@ -341,8 +341,21 @@ impl Materializer {
             }));
         }
 
-        // 4. Build serialized content + content_sha.
-        let content = serialize_with_frontmatter(payload);
+        // 4. Resolve canonical content + content_sha.
+        //    BUG 2 (S486): the server's `sha256` is computed over the EXACT
+        //    bytes it returns as `enriched_body` (server cache_writer hashes
+        //    enriched_body; on a cache miss enriched_body == body_raw == the
+        //    sha256 basis). Materialize those bytes verbatim so the strict
+        //    integrity check passes by construction AND the note stays
+        //    byte-faithful — re-serializing frontmatter through serde_yaml uses
+        //    a different YAML rendering + `\n\n` separator and could never
+        //    reproduce the original bytes, which failed integrity on every
+        //    fronted note. Fall back to reconstruction only for older servers
+        //    that don't send the field.
+        let content = match &payload.enriched_body {
+            Some(raw) => raw.clone(),
+            None => serialize_with_frontmatter(payload),
+        };
         let content_bytes = content.as_bytes();
         let actual_sha = hex::encode(Sha256::digest(content_bytes));
 
@@ -707,6 +720,9 @@ mod tests {
             sha256: sha256_hex(&serialized),
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
+            // Mirror the real server: enriched_body is the exact content the
+            // sha256 is computed over (S486).
+            enriched_body: Some(serialized),
         }
     }
 
@@ -714,6 +730,86 @@ mod tests {
         let mut p = payload(path, body);
         p.sha256 = "0".repeat(64);
         p
+    }
+
+    // ---- BUG 2 (S486): pull-path integrity over enriched_body -------------
+
+    /// Real-server shape: `sha256` is computed over the EXACT bytes the server
+    /// returns as `enriched_body` (server cache_writer hashes enriched_body;
+    /// cache-miss path sets enriched_body == body_raw == the sha256 basis).
+    /// The daemon must materialize `enriched_body` verbatim — NOT a serde_yaml
+    /// reconstruction, which uses different frontmatter serialization + a
+    /// `\n\n` separator and could never byte-match, so the strict integrity
+    /// check failed on every fronted note (S485 e2e blocker). With the field
+    /// present and integrity ENABLED, the write must succeed and reproduce the
+    /// server bytes exactly.
+    #[test]
+    fn pull_path_materializes_server_enriched_body_verbatim_integrity_ok() {
+        let mut cfg = default_cfg();
+        cfg.enable_integrity_check = true;
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+
+        // The server's faithful bytes use a SINGLE-newline frontmatter
+        // separator; serde_yaml reconstruction emits `---\n{yaml}---\n\n{body}`
+        // (double newline) — guaranteeing the two differ.
+        let original = "---\ntitle: Real\n---\nSingle-newline body, server-faithful.\n";
+        let p = NotePayload {
+            path: format!("{VAULT}/01_Inbox/faithful.md"),
+            frontmatter: serde_json::json!({"title": "Real"}),
+            body: "Single-newline body, server-faithful.\n".into(),
+            sha256: sha256_hex(original),
+            modified: "2026-05-31T00:00:00Z".into(),
+            file_mtime: None,
+            enriched_body: Some(original.to_string()),
+        };
+
+        // Guard: if reconstruction happened to equal the server bytes this
+        // test wouldn't exercise the bug.
+        assert_ne!(
+            serialize_with_frontmatter(&p),
+            original,
+            "reconstruction must differ from server bytes for this regression to be meaningful"
+        );
+
+        let out = m.write(&p).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "strict integrity must PASS by materializing enriched_body verbatim, got {out:?}"
+        );
+        let on_disk =
+            std::fs::read_to_string(vaults.path().join(VAULT).join("01_Inbox/faithful.md"))
+                .unwrap();
+        assert_eq!(
+            on_disk, original,
+            "must write the server's exact hashed bytes (byte-faithful)"
+        );
+    }
+
+    /// Back-compat: an older server that omits `enriched_body` (field defaults
+    /// to None) still materializes via frontmatter reconstruction.
+    #[test]
+    fn pull_path_falls_back_to_reconstruction_when_enriched_body_absent() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let fm = serde_json::json!({"title": "Legacy"});
+        let fm_yaml = serde_yaml::to_string(&fm).unwrap();
+        let serialized = format!("---\n{fm_yaml}---\n\nlegacy body");
+        let p = NotePayload {
+            path: format!("{VAULT}/01_Inbox/legacy.md"),
+            frontmatter: fm,
+            body: "legacy body".into(),
+            sha256: sha256_hex(&serialized),
+            modified: "2026-05-31T00:00:00Z".into(),
+            file_mtime: None,
+            enriched_body: None,
+        };
+        let out = m.write(&p).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
+        let on_disk =
+            std::fs::read_to_string(vaults.path().join(VAULT).join("01_Inbox/legacy.md")).unwrap();
+        assert_eq!(on_disk, serialized);
     }
 
     // ---- mode-routing -----------------------------------------------------
@@ -865,6 +961,7 @@ mod tests {
             sha256: sha256_hex(&serialized),
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
+            enriched_body: Some(serialized),
         };
         let out = m.write(&p).unwrap();
         assert_eq!(
@@ -1216,6 +1313,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
                 modified: "2026-05-29T00:00:00Z".into(),
                 file_mtime: None,
+                enriched_body: Some(serialized),
             }
         };
 

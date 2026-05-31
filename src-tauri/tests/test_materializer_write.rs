@@ -43,6 +43,7 @@ fn payload(path: &str, body: &str) -> NotePayload {
         sha256: sha256_hex(&serialized),
         modified: "2026-05-27T00:00:00Z".into(),
         file_mtime: None,
+        enriched_body: Some(serialized),
     }
 }
 
