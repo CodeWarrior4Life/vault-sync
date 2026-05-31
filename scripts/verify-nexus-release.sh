@@ -37,5 +37,11 @@ PY
 # ~/.cargo/bin/rsign across runs so this from-source build happens once per OS,
 # not on every release (and isn't hostage to a crates.io hiccup in the gate).
 command -v rsign >/dev/null 2>&1 || cargo install rsign2 --locked --quiet
-rsign verify -p "$WORK/pub.key" -x "$SIG" "$LOCAL_BUNDLE"
+# Tauri writes the updater .sig as BASE64 of the minisign signature *file*
+# (text: "untrusted comment: ...\n<b64 sig line>"). rsign2's `-x` expects that
+# raw minisign signature file, so decode the tauri wrapper first — feeding the
+# base64 blob directly fails with "could not read signature file: Missing
+# signature" and the HARD GATE never actually verifies any release (S486).
+python3 -c "import base64,sys;open(sys.argv[2],'wb').write(base64.b64decode(open(sys.argv[1],'rb').read()))" "$SIG" "$WORK/sig.minisign"
+rsign verify -p "$WORK/pub.key" -x "$WORK/sig.minisign" "$LOCAL_BUNDLE"
 echo "verified $PLATFORM v$VERSION: retrievable + byte-identical + signature matches bundled pubkey"
