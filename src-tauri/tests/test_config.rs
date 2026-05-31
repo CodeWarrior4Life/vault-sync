@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vault_sync_daemon::config::{Config, ConfigError};
+use vault_sync_daemon::config::{Config, ConfigError, SyncRoot};
 
 #[test]
 fn save_then_load_round_trips() {
@@ -13,6 +13,14 @@ fn save_then_load_round_trips() {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_platform: "linux-x86_64".to_string(),
         last_event_id: None,
+        // Populated to the value load synthesizes from vaults_root (no
+        // vault_name) so the round-trip is exact: load() uses an explicit
+        // non-empty sync_roots as-is, and synthesizes only when empty.
+        sync_roots: vec![SyncRoot {
+            path: PathBuf::from("/home/user/vault"),
+            route: String::new(),
+            subscriber_id: "test-sid".to_string(),
+        }],
     };
     cfg.save_to(&path).unwrap();
     let loaded = Config::load_from(&path).unwrap();
@@ -37,6 +45,7 @@ fn path_handles_unicode_filenames() {
         daemon_version: "0.1.0".to_string(),
         daemon_platform: "linux-x86_64".to_string(),
         last_event_id: None,
+        sync_roots: vec![],
     };
     cfg.save_to(&path).unwrap();
     let loaded = Config::load_from(&path).unwrap();

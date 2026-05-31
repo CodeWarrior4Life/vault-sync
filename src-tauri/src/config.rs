@@ -112,6 +112,7 @@ impl Config {
     ///       `SyncRoot { path: vaults_root.join(vault_name), route: "" }`.
     ///    b. Otherwise synthesise
     ///       `SyncRoot { path: vaults_root, route: "" }`.
+    #[allow(clippy::doc_overindented_list_items)]
     pub fn from_toml_back_compat(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
 
@@ -162,6 +163,18 @@ impl Config {
         fs::write(path, s)?;
         Ok(())
     }
+}
+
+/// Returns the OS-appropriate config path:
+/// - Windows: `%APPDATA%\Nexus\vault-sync\config.toml`
+/// - macOS:   `~/Library/Application Support/Nexus/vault-sync/config.toml`
+/// - Linux:   `$XDG_CONFIG_HOME/nexus-vault-sync/config.toml` (default `~/.config/nexus-vault-sync/config.toml`)
+pub fn default_config_path() -> PathBuf {
+    let base = dirs::config_dir().expect("config dir resolvable");
+    #[cfg(target_os = "linux")]
+    return base.join("nexus-vault-sync").join("config.toml");
+    #[cfg(not(target_os = "linux"))]
+    return base.join("Nexus").join("vault-sync").join("config.toml");
 }
 
 #[cfg(test)]
@@ -383,16 +396,4 @@ daemon_platform = "macos-aarch64"
             "synthesised vault sync_root must carry the top-level subscriber_id"
         );
     }
-}
-
-/// Returns the OS-appropriate config path:
-/// - Windows: `%APPDATA%\Nexus\vault-sync\config.toml`
-/// - macOS:   `~/Library/Application Support/Nexus/vault-sync/config.toml`
-/// - Linux:   `$XDG_CONFIG_HOME/nexus-vault-sync/config.toml` (default `~/.config/nexus-vault-sync/config.toml`)
-pub fn default_config_path() -> PathBuf {
-    let base = dirs::config_dir().expect("config dir resolvable");
-    #[cfg(target_os = "linux")]
-    return base.join("nexus-vault-sync").join("config.toml");
-    #[cfg(not(target_os = "linux"))]
-    return base.join("Nexus").join("vault-sync").join("config.toml");
 }

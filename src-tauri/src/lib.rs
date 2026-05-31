@@ -415,10 +415,10 @@ fn spawn_sse_consumer(
             // sync_root is a parent container.
             for (root_path, _route) in &watch_roots {
                 // Add the root itself if it has an .obsidian dir.
-                if root_path.join(".obsidian").is_dir() {
-                    if !vaults_to_scan.iter().any(|q| q == root_path) {
-                        vaults_to_scan.push(root_path.clone());
-                    }
+                if root_path.join(".obsidian").is_dir()
+                    && !vaults_to_scan.iter().any(|q| q == root_path)
+                {
+                    vaults_to_scan.push(root_path.clone());
                 }
                 // Also enumerate immediate subdirectories (back-compat: in
                 // case sync_root is a parent container rather than the
@@ -426,10 +426,11 @@ fn spawn_sse_consumer(
                 if let Ok(entries) = std::fs::read_dir(root_path) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.is_dir() && p.join(".obsidian").is_dir() {
-                            if !vaults_to_scan.iter().any(|q| q == &p) {
-                                vaults_to_scan.push(p);
-                            }
+                        if p.is_dir()
+                            && p.join(".obsidian").is_dir()
+                            && !vaults_to_scan.iter().any(|q| q == &p)
+                        {
+                            vaults_to_scan.push(p);
                         }
                     }
                 }
@@ -659,6 +660,7 @@ fn spawn_sse_consumer(
 /// subscriber ID inside this function (token load, journal path, push
 /// client, reconciler, file watcher) now uses this parameter, so each
 /// sync root truly pushes under its own registered subscriber.
+#[allow(clippy::too_many_arguments)]
 fn spawn_push_pipeline(
     app: &tauri::AppHandle,
     cfg: &config::Config,
@@ -1064,7 +1066,7 @@ mod tests {
     /// primary root used for the redflag gate and the SSE materializer.
     #[test]
     fn roots_to_watch_preserves_sync_roots_order() {
-        let paths = vec![
+        let paths = [
             PathBuf::from("/alpha"),
             PathBuf::from("/beta"),
             PathBuf::from("/gamma"),

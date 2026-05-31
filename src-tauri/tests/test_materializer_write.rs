@@ -73,7 +73,11 @@ fn live_write_lands_in_vault_tree() {
     let v = TempDir::new().unwrap();
     let w = TempDir::new().unwrap();
     let m = mk(&v, &w, MaterializerMode::Live);
-    let out = m.write(&payload("01_Inbox/foo.md", "hello")).unwrap();
+    // Wire paths carry the vault folder as their first segment (sync_roots
+    // model); live mode joins straight onto vaults_root.
+    let out = m
+        .write(&payload(&format!("{VAULT}/01_Inbox/foo.md"), "hello"))
+        .unwrap();
     let expected = v.path().join(VAULT).join("01_Inbox/foo.md");
     assert_eq!(
         out,

@@ -92,7 +92,7 @@ impl SseConsumer {
     }
 
     /// Atomic-write the given id to disk (tmp + rename). Failure is logged
-    /// + swallowed — losing one event's persistence is not worth crashing
+    /// and swallowed — losing one event's persistence is not worth crashing
     /// the SSE loop. The next event will re-persist over the same file.
     fn persist_last_event_id(&self, id: &str) {
         let Some(path) = &self.last_event_id_path else {
