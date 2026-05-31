@@ -1269,4 +1269,43 @@ mod tests {
         let result = mat.live_path_for(wire);
         assert_eq!(result, sync_root.path().join(wire));
     }
+
+    /// Ported from main v0.3.9 (S479 E1, commit e816439) into the sync_roots
+    /// line. The S479 duplicate-filename bug (`…`→`ΓÇª`, `'`→`ΓÇÖ`, `🚨`→`≡ƒÜ¿`)
+    /// came from a shared Windows ingest-layer writer decoding UTF-8 bytes as
+    /// the CP437 OEM console codepage. The daemon's materializer was AUDITED
+    /// CLEAN (it uses `std::fs`/`OsStr`, UTF-16/UTF-8 native on Windows), so
+    /// there is no boundary to fix — this test PINS that property under the
+    /// per-root (B4) materialize path: a note whose name carries non-ASCII
+    /// punctuation + an emoji materializes to disk with a byte-identical UTF-8
+    /// filename, never CP437-mangled, so any future OEM-decode regression fails
+    /// loudly.
+    #[test]
+    fn materialize_preserves_unicode_filename_bytes_not_cp437() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        // Non-ASCII punctuation (… ' – " ") + emoji (🚨) — the exact mojibake
+        // class from the S479 worklist.
+        let name = "Probe … 'q' – \u{201C}d\u{201D} 🚨.md";
+        let rel = format!("01_Inbox/{name}");
+        let out = m.write(&payload(&rel, "hello")).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "expected Wrote, got {out:?}"
+        );
+        // Per-root convention: Live writes under <vaults_root>/<VAULT>/...
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == name),
+            "on-disk filename must be byte-identical UTF-8; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("ΓÇ") || n.contains("≡ƒ")),
+            "CP437 mojibake detected on disk: {names:?}"
+        );
+    }
 }
