@@ -1225,30 +1225,46 @@ mod tests {
         // Materializer A must write to root_a/<wire_path>.
         let expected_a = root_a.path().join(wire_path);
         match out_a {
-            MaterializeOutcome::Wrote { path } => assert_eq!(path, expected_a, "root_a target mismatch"),
+            MaterializeOutcome::Wrote { path } => {
+                assert_eq!(path, expected_a, "root_a target mismatch")
+            }
             other => panic!("expected Wrote for root_a, got {other:?}"),
         }
         assert!(expected_a.exists());
         let content_a = std::fs::read_to_string(&expected_a).unwrap();
-        assert!(content_a.contains("body-a"), "root_a content wrong: {content_a:?}");
+        assert!(
+            content_a.contains("body-a"),
+            "root_a content wrong: {content_a:?}"
+        );
 
         // Materializer B must write to root_b/<wire_path>.
         let expected_b = root_b.path().join(wire_path);
         match out_b {
-            MaterializeOutcome::Wrote { path } => assert_eq!(path, expected_b, "root_b target mismatch"),
+            MaterializeOutcome::Wrote { path } => {
+                assert_eq!(path, expected_b, "root_b target mismatch")
+            }
             other => panic!("expected Wrote for root_b, got {other:?}"),
         }
         assert!(expected_b.exists());
         let content_b = std::fs::read_to_string(&expected_b).unwrap();
-        assert!(content_b.contains("body-b"), "root_b content wrong: {content_b:?}");
+        assert!(
+            content_b.contains("body-b"),
+            "root_b content wrong: {content_b:?}"
+        );
 
         // No cross-contamination: root_a must NOT contain root_b's file.
         let cross_a = root_a.path().join(wire_path);
         let cross_b = root_b.path().join(wire_path);
         let read_cross_a = std::fs::read_to_string(&cross_a).unwrap();
         let read_cross_b = std::fs::read_to_string(&cross_b).unwrap();
-        assert!(!read_cross_a.contains("body-b"), "root_a must not contain root_b content");
-        assert!(!read_cross_b.contains("body-a"), "root_b must not contain root_a content");
+        assert!(
+            !read_cross_a.contains("body-b"),
+            "root_a must not contain root_b content"
+        );
+        assert!(
+            !read_cross_b.contains("body-a"),
+            "root_b must not contain root_a content"
+        );
     }
 
     /// B4: `live_path_for(wire_path)` returns `<sync_root.path>/<wire_path>`.

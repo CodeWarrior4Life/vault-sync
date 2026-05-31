@@ -1135,21 +1135,37 @@ mod tests {
         write_file(root_a.path(), "a_note.md", b"content-a");
         write_file(root_b.path(), "b_note.md", b"content-b");
 
-        let (vr_a, _ja, _jda) =
-            make_vr(root_a.path().to_path_buf(), "http://127.0.0.1:1", test_config()).await;
-        let (vr_b, _jb, _jdb) =
-            make_vr(root_b.path().to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let (vr_a, _ja, _jda) = make_vr(
+            root_a.path().to_path_buf(),
+            "http://127.0.0.1:1",
+            test_config(),
+        )
+        .await;
+        let (vr_b, _jb, _jdb) = make_vr(
+            root_b.path().to_path_buf(),
+            "http://127.0.0.1:1",
+            test_config(),
+        )
+        .await;
 
         let manifest_a = vr_a.build_local_manifest().unwrap();
         let manifest_b = vr_b.build_local_manifest().unwrap();
 
         // root_a manifest must contain only a_note.md, no b_note.md.
         let paths_a: Vec<&str> = manifest_a.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths_a, vec!["a_note.md"], "root_a manifest wrong: {paths_a:?}");
+        assert_eq!(
+            paths_a,
+            vec!["a_note.md"],
+            "root_a manifest wrong: {paths_a:?}"
+        );
 
         // root_b manifest must contain only b_note.md, no a_note.md.
         let paths_b: Vec<&str> = manifest_b.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths_b, vec!["b_note.md"], "root_b manifest wrong: {paths_b:?}");
+        assert_eq!(
+            paths_b,
+            vec!["b_note.md"],
+            "root_b manifest wrong: {paths_b:?}"
+        );
     }
 
     /// B4: `roots_to_reconcile_pairs` returns one entry per sync_root with
@@ -1158,8 +1174,8 @@ mod tests {
     ///   2. Fallback subscriber_id when root's field is empty.
     #[test]
     fn roots_to_reconcile_pairs_two_roots_correct_subscriber_ids() {
-        use crate::config::SyncRoot;
         use super::roots_to_reconcile_pairs;
+        use crate::config::SyncRoot;
 
         let roots = vec![
             SyncRoot {
@@ -1179,11 +1195,17 @@ mod tests {
 
         // First root has its own subscriber_id.
         assert_eq!(pairs[0].0, PathBuf::from("/vault/MainFrame"));
-        assert_eq!(pairs[0].1, "sub-own", "first root must use its own subscriber_id");
+        assert_eq!(
+            pairs[0].1, "sub-own",
+            "first root must use its own subscriber_id"
+        );
 
         // Second root falls back.
         assert_eq!(pairs[1].0, PathBuf::from("/vault/Dev"));
-        assert_eq!(pairs[1].1, "sub-fallback", "second root (empty subscriber_id) must use fallback");
+        assert_eq!(
+            pairs[1].1, "sub-fallback",
+            "second root (empty subscriber_id) must use fallback"
+        );
     }
 
     /// B4: `roots_to_reconcile_pairs` returns an empty Vec for an empty
@@ -1198,8 +1220,8 @@ mod tests {
     /// B4: single legacy root with empty subscriber_id takes the fallback.
     #[test]
     fn roots_to_reconcile_pairs_single_legacy_root_uses_fallback() {
-        use crate::config::SyncRoot;
         use super::roots_to_reconcile_pairs;
+        use crate::config::SyncRoot;
 
         let roots = vec![SyncRoot {
             path: PathBuf::from("/vaults/Mainframe"),

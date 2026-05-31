@@ -26,7 +26,11 @@ pub fn daemon_platform() -> &'static str {
 }
 
 pub fn user_agent_string() -> String {
-    format!("lattice-vault-sync/{}/{}", daemon_version(), daemon_platform())
+    format!(
+        "lattice-vault-sync/{}/{}",
+        daemon_version(),
+        daemon_platform()
+    )
 }
 
 #[derive(Debug, Error)]

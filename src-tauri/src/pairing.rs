@@ -91,10 +91,7 @@ pub async fn pair_inner(
 }
 
 #[tauri::command]
-pub async fn pair(
-    app: tauri::AppHandle,
-    input: PairingInput,
-) -> Result<PairingSuccess, String> {
+pub async fn pair(app: tauri::AppHandle, input: PairingInput) -> Result<PairingSuccess, String> {
     let result = pair_inner(input, default_config_path())
         .await
         .map_err(|e| e.to_string())?;

@@ -35,13 +35,7 @@ use tauri_plugin_updater::UpdaterExt;
 /// Failures (no permission, daemon backend down) are logged at WARN and
 /// swallowed -- a missing notification must NEVER take the daemon down.
 pub fn notify_user(app: &tauri::AppHandle, title: &str, body: &str) {
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()
-    {
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
         tracing::warn!("notification failed (title={title:?}): {e}");
     }
 }
@@ -581,8 +575,8 @@ fn spawn_sse_consumer(
         // The Config.last_event_id field is preserved as a back-compat
         // fallback (older daemons may have populated it via the legacy code
         // path); disk-persisted value takes precedence.
-        let resumed_id = sse::SseConsumer::load_last_event_id(&last_event_id_path)
-            .or(cfg.last_event_id.clone());
+        let resumed_id =
+            sse::SseConsumer::load_last_event_id(&last_event_id_path).or(cfg.last_event_id.clone());
         if let Some(rid) = &resumed_id {
             tracing::info!(
                 last_event_id = %rid,
@@ -788,9 +782,7 @@ fn spawn_push_pipeline(
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "reconciliation: api client init failed: {e}; backstop not spawned"
-            );
+            tracing::warn!("reconciliation: api client init failed: {e}; backstop not spawned");
         }
     }
 
@@ -854,10 +846,7 @@ fn spawn_push_pipeline(
     };
     match watcher.start() {
         Ok(handle) => {
-            tracing::info!(
-                "file_watcher started for subscriber_id={}",
-                subscriber_id
-            );
+            tracing::info!("file_watcher started for subscriber_id={}", subscriber_id);
             Some(handle)
         }
         Err(file_watcher::FileWatcherError::InotifyLimitExceeded { current }) => {
@@ -1052,7 +1041,11 @@ mod tests {
             subscriber_id: String::new(),
         }]);
         let result = roots_to_watch(&cfg);
-        assert_eq!(result.len(), 1, "expected 1 entry for a back-compat single-root config");
+        assert_eq!(
+            result.len(),
+            1,
+            "expected 1 entry for a back-compat single-root config"
+        );
         assert_eq!(result[0].0, PathBuf::from("/Vaults/Mainframe"));
         assert_eq!(result[0].1, "");
     }
@@ -1157,19 +1150,55 @@ mod restart_gate_tests {
     fn restart_gate_logic() {
         let q = 300u64; // quiescent secs
         let md = 86_400u64; // max-defer secs
-        // No update staged → never restart.
+                            // No update staged → never restart.
         assert!(!should_restart_now(false, 0, None, 0, false, false, q, md));
         // Staged + never-any-activity → restart.
         assert!(should_restart_now(true, 10, None, 0, false, false, q, md));
         // Staged + uploads pending → wait.
         assert!(!should_restart_now(true, 10, None, 3, false, false, q, md));
         // Staged + verify in progress → wait.
-        assert!(!should_restart_now(true, 10, Some(999), 0, true, false, q, md));
+        assert!(!should_restart_now(
+            true,
+            10,
+            Some(999),
+            0,
+            true,
+            false,
+            q,
+            md
+        ));
         // Staged + recent activity (< quiescent) → wait.
-        assert!(!should_restart_now(true, 10, Some(60), 0, false, false, q, md));
+        assert!(!should_restart_now(
+            true,
+            10,
+            Some(60),
+            0,
+            false,
+            false,
+            q,
+            md
+        ));
         // Staged + quiescent elapsed → restart.
-        assert!(should_restart_now(true, 10, Some(400), 0, false, false, q, md));
+        assert!(should_restart_now(
+            true,
+            10,
+            Some(400),
+            0,
+            false,
+            false,
+            q,
+            md
+        ));
         // Max-defer elapsed overrides busyness → restart even if busy.
-        assert!(should_restart_now(true, 90_000, Some(1), 5, true, true, q, md));
+        assert!(should_restart_now(
+            true,
+            90_000,
+            Some(1),
+            5,
+            true,
+            true,
+            q,
+            md
+        ));
     }
 }

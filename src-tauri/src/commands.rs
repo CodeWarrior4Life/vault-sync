@@ -120,10 +120,7 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
     // B4: iterate sync_roots, running one VerifyRepair per root.
     // Derive the per-root (vault_root, subscriber_id) pairs using the
     // same priority logic as lib::effective_subscriber_id.
-    let pairs = crate::verify_repair::roots_to_reconcile_pairs(
-        &cfg.sync_roots,
-        &cfg.subscriber_id,
-    );
+    let pairs = crate::verify_repair::roots_to_reconcile_pairs(&cfg.sync_roots, &cfg.subscriber_id);
 
     // If sync_roots is empty (should not happen post-B1 back-compat, but
     // handle gracefully), fall back to the legacy single-root path using
@@ -159,11 +156,15 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
         combined.files_scanned += report.files_scanned;
         combined.files_in_sync += report.files_in_sync;
         combined.modify_count += report.modify_count;
-        combined.modify_paths_sample.extend(report.modify_paths_sample);
+        combined
+            .modify_paths_sample
+            .extend(report.modify_paths_sample);
         combined.add_count += report.add_count;
         combined.add_paths_sample.extend(report.add_paths_sample);
         combined.delete_count += report.delete_count;
-        combined.delete_paths_sample.extend(report.delete_paths_sample);
+        combined
+            .delete_paths_sample
+            .extend(report.delete_paths_sample);
         combined.substrate_refused_count += report.substrate_refused_count;
         combined.extension_filtered_count += report.extension_filtered_count;
         combined.errors.extend(report.errors);
@@ -678,8 +679,16 @@ mod tests {
         let paths_a: Vec<&str> = manifest_a.iter().map(|e| e.path.as_str()).collect();
         let paths_b: Vec<&str> = manifest_b.iter().map(|e| e.path.as_str()).collect();
 
-        assert_eq!(paths_a, vec!["note_a.md"], "root_a must only see its own note; got {paths_a:?}");
-        assert_eq!(paths_b, vec!["note_b.md"], "root_b must only see its own note; got {paths_b:?}");
+        assert_eq!(
+            paths_a,
+            vec!["note_a.md"],
+            "root_a must only see its own note; got {paths_a:?}"
+        );
+        assert_eq!(
+            paths_b,
+            vec!["note_b.md"],
+            "root_b must only see its own note; got {paths_b:?}"
+        );
 
         // No cross-contamination.
         assert!(
@@ -711,7 +720,9 @@ mod tests {
         let _mock = srv
             .mock("POST", "/api/sync/reconcile")
             .with_status(200)
-            .with_body(r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#)
+            .with_body(
+                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
+            )
             .expect_at_least(2) // once per sync_root
             .create_async()
             .await;
@@ -738,10 +749,8 @@ mod tests {
         };
 
         // Derive pairs as verify_repair_run does internally.
-        let pairs = crate::verify_repair::roots_to_reconcile_pairs(
-            &cfg.sync_roots,
-            &cfg.subscriber_id,
-        );
+        let pairs =
+            crate::verify_repair::roots_to_reconcile_pairs(&cfg.sync_roots, &cfg.subscriber_id);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].1, "sub-a");
         assert_eq!(pairs[1].1, "sub-top"); // fallback

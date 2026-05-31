@@ -1435,7 +1435,10 @@ mod tests {
         let w = make_watcher(&dir, vec![], vec![]);
         match w.start() {
             Err(FileWatcherError::InotifyLimitExceeded { current }) => {
-                assert!(current > 0, "expected non-zero current limit, got {current}");
+                assert!(
+                    current > 0,
+                    "expected non-zero current limit, got {current}"
+                );
             }
             other => panic!("expected InotifyLimitExceeded, got {other:?}"),
         }

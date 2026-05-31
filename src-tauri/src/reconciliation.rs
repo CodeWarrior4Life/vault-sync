@@ -57,10 +57,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::api_client::ApiClient;
+use crate::config::SyncRoot;
 use crate::push_journal::PushJournal;
 use crate::tray_state::SharedTrayState;
-use crate::config::SyncRoot;
-use crate::verify_repair::{VerifyRepair, VerifyRepairConfig, VerifyRepairError, VerifyRepairReport};
+use crate::verify_repair::{
+    VerifyRepair, VerifyRepairConfig, VerifyRepairError, VerifyRepairReport,
+};
 
 /// Default cadence between reconciliation passes when the env var isn't
 /// set. 10 minutes — long enough to be idle-friendly, short enough that

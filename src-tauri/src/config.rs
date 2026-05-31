@@ -239,7 +239,11 @@ daemon_platform = "macos-aarch64"
 "#;
         let cfg = Config::from_toml_back_compat(toml_str)
             .expect("legacy vaults_root+vault_name must synthesize sync_roots");
-        assert_eq!(cfg.sync_roots.len(), 1, "expected exactly 1 synthesized sync_root");
+        assert_eq!(
+            cfg.sync_roots.len(),
+            1,
+            "expected exactly 1 synthesized sync_root"
+        );
         assert_eq!(cfg.sync_roots[0].route, "");
         assert!(
             cfg.sync_roots[0].path.ends_with("Mainframe"),
@@ -260,7 +264,11 @@ daemon_platform = "macos-aarch64"
 "#;
         let cfg = Config::from_toml_back_compat(toml_str)
             .expect("legacy vaults_root-only must synthesize sync_roots");
-        assert_eq!(cfg.sync_roots.len(), 1, "expected exactly 1 synthesized sync_root");
+        assert_eq!(
+            cfg.sync_roots.len(),
+            1,
+            "expected exactly 1 synthesized sync_root"
+        );
         assert_eq!(cfg.sync_roots[0].route, "");
         assert_eq!(
             cfg.sync_roots[0].path,
@@ -293,7 +301,10 @@ daemon_platform = "macos-aarch64"
         };
         let serialized = toml::to_string_pretty(&original).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
-        assert_eq!(original, deserialized, "round-trip must produce identical Config");
+        assert_eq!(
+            original, deserialized,
+            "round-trip must produce identical Config"
+        );
     }
 
     // --- B2b: per-root subscriber_id tests ---
@@ -362,7 +373,11 @@ daemon_platform = "macos-aarch64"
 "#;
         let cfg = Config::from_toml_back_compat(toml_str)
             .expect("legacy back-compat must synthesise sync_root with subscriber_id");
-        assert_eq!(cfg.sync_roots.len(), 1, "expected exactly 1 synthesised sync_root");
+        assert_eq!(
+            cfg.sync_roots.len(),
+            1,
+            "expected exactly 1 synthesised sync_root"
+        );
         assert_eq!(
             cfg.sync_roots[0].subscriber_id, "sub-legacy-123",
             "synthesised vault sync_root must carry the top-level subscriber_id"

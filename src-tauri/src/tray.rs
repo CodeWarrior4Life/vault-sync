@@ -106,7 +106,12 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let menu: Menu<Wry> = MenuBuilder::new(app)
         .items(&[&status_item, &activity_item, &last_error_item])
         .separator()
-        .items(&[&pending_item, &conflicts_item, &recon_item, &verify_repair_item])
+        .items(&[
+            &pending_item,
+            &conflicts_item,
+            &recon_item,
+            &verify_repair_item,
+        ])
         .separator()
         .items(&[&redflag_item, &delete_burst_item])
         .separator()

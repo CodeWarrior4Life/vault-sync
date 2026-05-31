@@ -1145,11 +1145,10 @@ mod tests {
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
-        let result = client.pre_journal_filter(
-            "01_Inbox/note.md",
-            b"some content",
-            None,
+        let result = client.pre_journal_filter("01_Inbox/note.md", b"some content", None);
+        assert!(
+            result.is_none(),
+            "root-relative path must not be filtered; got {result:?}"
         );
-        assert!(result.is_none(), "root-relative path must not be filtered; got {result:?}");
     }
 }

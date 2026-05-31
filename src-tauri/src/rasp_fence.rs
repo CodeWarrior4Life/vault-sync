@@ -460,7 +460,10 @@ mod tests {
 
     #[test]
     fn excludes_dsstore() {
-        assert!(is_junk_path(".DS_Store"), ".DS_Store at root should be junk");
+        assert!(
+            is_junk_path(".DS_Store"),
+            ".DS_Store at root should be junk"
+        );
         assert!(
             is_junk_path("dir/.DS_Store"),
             ".DS_Store nested should be junk"
