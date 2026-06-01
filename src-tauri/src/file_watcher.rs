@@ -272,8 +272,13 @@ impl FileWatcher {
 
         // (1) Out-of-scope: forbid path-traversal escapes & absolute paths
         // (the normalizer should have stripped vault_root prefix already, so
-        // remaining absolute paths are bugs).
-        if norm.starts_with('/') || norm.starts_with('\\') || norm.contains("..") {
+        // remaining absolute paths are bugs). `..` is only a traversal when it
+        // is a whole path *segment* — a title ending in `...` (S490) merely
+        // *contains* `..` and must NOT be dropped.
+        if norm.starts_with('/')
+            || norm.starts_with('\\')
+            || crate::scope::has_dotdot_segment(&norm)
+        {
             return FilterDecision::DropOutOfScope { path: norm };
         }
 
@@ -1148,6 +1153,16 @@ mod tests {
             w.classify(&evt),
             FilterDecision::DropOutOfScope { .. }
         ));
+    }
+
+    #[test]
+    fn trailing_dots_in_name_allowed() {
+        // S490 regression: a title ending in `...` (three ASCII dots) contains
+        // `..` as a substring but is a legit name, not a traversal.
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let evt = created("01_Notes/Anysa says....md");
+        assert!(matches!(w.classify(&evt), FilterDecision::Allow(_)));
     }
 
     #[test]

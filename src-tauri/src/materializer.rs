@@ -1144,6 +1144,16 @@ mod tests {
     }
 
     #[test]
+    fn write_allows_trailing_dots_in_name() {
+        // S490 regression: a note whose title ends in `...` (three ASCII dots)
+        // contains `..` as a substring but is NOT a traversal — it must
+        // materialize, not get black-holed.
+        let (_v, _w, m) = mk(MaterializerMode::Shadow, default_cfg());
+        let out = m.write(&payload("01_Notes/Anysa says....md", "x"));
+        assert!(out.is_ok(), "trailing-dots name should write, got {:?}", out);
+    }
+
+    #[test]
     fn delete_renames_to_deleted_ts() {
         let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
         m.write(&payload("01_Inbox/foo.md", "x")).unwrap();

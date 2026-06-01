@@ -307,9 +307,14 @@ impl PushJournal {
     /// `append_batch` writes "what fits" and here nothing fits → 0 written).
     pub fn append(&mut self, evt: PushEvent) -> Result<(), JournalError> {
         // Pre-check so a single over-cap append errors (matching the old
-        // contract) rather than silently writing 0 events.
+        // contract) rather than silently writing 0 events. Re-measure from
+        // disk first (see append_batch) so the check reflects the real shared
+        // file size, not a stale-high per-handle projection.
         let mut line = serde_json::to_string(&evt)?;
         line.push('\n');
+        self.total_bytes = std::fs::metadata(&self.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         if self.total_bytes.saturating_add(line.len() as u64) > self.max_bytes {
             return Err(JournalError::CapacityExceeded {
                 current: self.total_bytes,
@@ -342,6 +347,18 @@ impl PushJournal {
             .create(true)
             .append(true)
             .open(&self.path)?;
+
+        // Refresh the byte projection from disk before the capacity check.
+        // `total_bytes` is a PER-HANDLE projection and other handles
+        // (push_client drain+ack → rewrite()) SHRINK the shared file. An
+        // append-only handle (file_watcher) never drains, so without this
+        // refresh its projection only ever climbs — once it touches the cap it
+        // can NEVER append again, even after the journal has been fully drained
+        // to 0 bytes, hot-spinning on CapacityExceeded against an empty file.
+        // (S490 runaway: on-disk journal 0 bytes, projection stuck at ~100MB,
+        // 500k+ capacity-exceeded warnings, all new events dropped.) Mirrors
+        // the disk re-read that `drain()` and `rewrite()` already do.
+        self.total_bytes = f.metadata().map(|m| m.len()).unwrap_or(self.total_bytes);
 
         let total = events.len();
         let mut written = 0usize;
@@ -536,6 +553,44 @@ mod tests {
             other => panic!("expected CapacityExceeded, got {:?}", other),
         }
         assert_eq!(j.len(), 0);
+    }
+
+    #[test]
+    fn append_refreshes_projection_across_handles() {
+        // S490 regression. `total_bytes` is a PER-HANDLE projection. An
+        // append-only handle (file_watcher) must not get stuck at a stale-high
+        // projection after ANOTHER handle (push_client) drains+acks the shared
+        // file to empty. Before the fix, handle A's projection climbed to the
+        // cap and never recovered → every append failed CapacityExceeded
+        // forever against a 0-byte journal (the runaway hot-spin).
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let cap = 400u64; // a few entries fit, then the cap trips
+
+        // Handle A (file_watcher role): append until the cap is reached.
+        let mut a = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut n = 0;
+        loop {
+            match a.append(evt(&format!("notes/{n}.md"), PushAction::Create)) {
+                Ok(()) => n += 1,
+                Err(JournalError::CapacityExceeded { .. }) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+            assert!(n <= 1000, "capacity never hit — bad test cap");
+        }
+        assert!(n > 0, "should write at least one event before the cap");
+
+        // Handle B (push_client role): drain + ack everything → file → 0 bytes.
+        let mut b = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let cursors: Vec<_> = b.drain(10_000).unwrap().into_iter().map(|(_, c)| c).collect();
+        b.ack_batch(cursors).unwrap();
+        assert_eq!(b.len(), 0, "journal should be empty after ack");
+
+        // Handle A still holds a stale-high projection. After the fix it
+        // re-measures from disk and the append SUCCEEDS instead of looping.
+        a.append(evt("notes/after-drain.md", PushAction::Create))
+            .expect("append must succeed once the shared file is drained to empty");
+        assert_eq!(a.len(), 1);
     }
 
     #[test]
