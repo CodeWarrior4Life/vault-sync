@@ -56,6 +56,49 @@ mod ts {
     }
 }
 
+/// Serde adapter for `content_bytes`: encode embedded bodies as **base64**, not
+/// the default `serde_json` representation of `Vec<u8>` (a JSON array of integer
+/// literals, e.g. `[104,101,...]`). The int-array form bloats each body ~4-6x
+/// (1-4 chars + comma per byte) against the journal's 100 MB capacity cap, so a
+/// large one-time reconciliation backlog overflowed the cap far faster than
+/// `push_client` could drain it — the file_watcher then hot-spun on
+/// `CapacityExceeded` (the S489/S490 storm). Base64 is ~1.33x raw, cutting that
+/// backlog ~3-4x and keeping it under cap.
+///
+/// Deserialize is backward-compatible: it accepts a base64 string (new), a
+/// legacy JSON array of `u8` (old on-disk lines), or `null` (`None`). The
+/// in-memory type stays `Option<Vec<u8>>`, so no caller changes.
+mod content_b64 {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => s.serialize_some(&STANDARD.encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        // Accept both the new base64 string and the legacy int-array so that
+        // journal lines written by <=v0.4.5 still load after the upgrade.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            B64(String),
+            Raw(Vec<u8>),
+        }
+        match Option::<Repr>::deserialize(d)? {
+            None => Ok(None),
+            Some(Repr::B64(s)) => STANDARD
+                .decode(s.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            Some(Repr::Raw(v)) => Ok(Some(v)),
+        }
+    }
+}
+
 /// Bump when the on-disk event shape changes.
 ///
 /// Stays at 1 across the v0.3 stale-state fix: the new `id` field carries a
@@ -131,6 +174,9 @@ pub struct PushEvent {
     /// `Some(bytes)`: body embedded inline (caller already had the bytes).
     /// `None`: content not embedded — the reader loads it from disk at push
     /// time. Lets verify_repair enqueue lightweight refs without re-reading.
+    /// On the wire this is base64 (see `content_b64`), NOT a JSON int-array —
+    /// the int-array bloat was the journal-overflow storm root cause.
+    #[serde(with = "content_b64", default)]
     pub content_bytes: Option<Vec<u8>>,
     #[serde(with = "ts")]
     pub queued_at: DateTime<Utc>,
@@ -511,6 +557,50 @@ mod tests {
 
     fn journal_path(dir: &TempDir) -> PathBuf {
         dir.path().join("sync-state").join("push_journal.jsonl")
+    }
+
+    #[test]
+    fn content_bytes_serialize_as_base64_not_int_array() {
+        // The storm fix: bodies must serialize as a base64 string, never the
+        // default serde_json int-array (`[104,101,...]`) that bloated the cap.
+        let e = evt("notes/a.md", PushAction::Create); // body = b"hello world"
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(
+            line.contains("\"content_bytes\":\"aGVsbG8gd29ybGQ=\""),
+            "expected base64 content_bytes, got: {line}"
+        );
+        assert!(
+            !line.contains("[104,101"),
+            "content_bytes must NOT be a JSON int-array: {line}"
+        );
+        // Round-trips back to the same bytes.
+        let back: PushEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.content_bytes, e.content_bytes);
+    }
+
+    #[test]
+    fn legacy_int_array_content_bytes_still_loads() {
+        // <=v0.4.5 wrote content_bytes as a JSON int-array. Those on-disk lines
+        // MUST still deserialize after the base64 upgrade (back-compat).
+        let legacy = r#"{"schema_version":1,"id":"legacy-1","path":"notes/a.md","action":"create","base_hash":null,"content_sha":"aaaa","content_bytes":[104,105,33],"queued_at":"2026-06-01T00:00:00+00:00","device_id":"dev"}"#;
+        let e: PushEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(e.content_bytes, Some(vec![104u8, 105, 33]));
+    }
+
+    #[test]
+    fn base64_is_much_smaller_than_int_array() {
+        // The actual fix metric: for a realistic body the base64 line is well
+        // under 2x the body, whereas the int-array form was ~4-6x.
+        let body = vec![b'x'; 10_000];
+        let mut e = evt("notes/big.md", PushAction::Create);
+        e.content_bytes = Some(body.clone());
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(
+            line.len() < body.len() * 2,
+            "base64 line {} should be < 2x body {} (int-array would be ~4-6x)",
+            line.len(),
+            body.len()
+        );
     }
 
     #[test]
