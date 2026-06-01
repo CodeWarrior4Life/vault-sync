@@ -312,9 +312,7 @@ impl PushJournal {
         // file size, not a stale-high per-handle projection.
         let mut line = serde_json::to_string(&evt)?;
         line.push('\n');
-        self.total_bytes = std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        self.total_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         if self.total_bytes.saturating_add(line.len() as u64) > self.max_bytes {
             return Err(JournalError::CapacityExceeded {
                 current: self.total_bytes,
@@ -582,7 +580,12 @@ mod tests {
 
         // Handle B (push_client role): drain + ack everything → file → 0 bytes.
         let mut b = PushJournal::open_with_capacity(&p, cap).unwrap();
-        let cursors: Vec<_> = b.drain(10_000).unwrap().into_iter().map(|(_, c)| c).collect();
+        let cursors: Vec<_> = b
+            .drain(10_000)
+            .unwrap()
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
         b.ack_batch(cursors).unwrap();
         assert_eq!(b.len(), 0, "journal should be empty after ack");
 

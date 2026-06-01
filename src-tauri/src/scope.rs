@@ -62,11 +62,13 @@ mod tests {
         // S490 regression: titles ending in `...` (three ASCII dots) contain
         // `..` as a substring but are NOT traversals.
         assert!(is_safe_path("01_Notes/Anysa says....md"));
-        assert!(is_safe_path("01_Notes/And that's the bottom line because....md"));
+        assert!(is_safe_path(
+            "01_Notes/And that's the bottom line because....md"
+        ));
         assert!(is_safe_path("01_Notes/A file named ... .md"));
         assert!(is_safe_path("01_Notes/...md")); // leading dots in a name
         assert!(is_safe_path("01_Notes/a..b.md")); // double dot mid-name
-        // ellipsis (U+2026) always passed; keep it green.
+                                                   // ellipsis (U+2026) always passed; keep it green.
         assert!(is_safe_path("01_Notes/Anysa says….md"));
     }
 

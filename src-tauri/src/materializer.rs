@@ -1150,7 +1150,11 @@ mod tests {
         // materialize, not get black-holed.
         let (_v, _w, m) = mk(MaterializerMode::Shadow, default_cfg());
         let out = m.write(&payload("01_Notes/Anysa says....md", "x"));
-        assert!(out.is_ok(), "trailing-dots name should write, got {:?}", out);
+        assert!(
+            out.is_ok(),
+            "trailing-dots name should write, got {:?}",
+            out
+        );
     }
 
     #[test]
