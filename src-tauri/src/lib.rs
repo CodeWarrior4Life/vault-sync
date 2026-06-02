@@ -202,7 +202,10 @@ pub fn should_restart_now(
 /// once check; S484 (v0.4.2) adds a 6h periodic loop + restart-when-idle.
 fn spawn_updater_check(app: tauri::AppHandle, tray_state: tray_state::SharedTrayState) {
     use std::time::{Duration, Instant};
-    const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+    // v0.4.12: poll every 5 min (was 6h) so a PUSHED release is detected and
+    // surfaced on the tray within minutes — auto-update must react to a push,
+    // not wait for the next restart. The check is a tiny GET; 5 min is cheap.
+    const CHECK_INTERVAL: Duration = Duration::from_secs(300);
     const POLL_WHEN_STAGED: Duration = Duration::from_secs(60);
     const QUIESCENT_SECS: u64 = 300;
     const MAX_DEFER_SECS: u64 = 24 * 3600;
@@ -220,6 +223,14 @@ fn spawn_updater_check(app: tauri::AppHandle, tray_state: tray_state::SharedTray
                                 env!("CARGO_PKG_VERSION"),
                                 update.version
                             );
+                            // v0.4.12: light up the tray indicator the moment we
+                            // detect the pushed release — obvious + persistent
+                            // until the restart applies it (the user can click
+                            // the tray item to apply now, or it auto-applies on
+                            // idle below).
+                            if let Ok(mut s) = tray_state.write() {
+                                s.set_update_available(Some(update.version.clone()));
+                            }
                             match update.download_and_install(|_, _| {}, || {}).await {
                                 Ok(()) => {
                                     staged_at = Some(Instant::now());

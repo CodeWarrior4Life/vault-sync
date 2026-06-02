@@ -108,6 +108,11 @@ pub struct TrayState {
     /// `verify_in_progress` (which is owner-invoked); the recon-sweep is the
     /// background-task variant.
     pub recon_in_progress: bool,
+    /// v0.4.12: Some(version) once the updater has detected (and is staging /
+    /// has staged) a newer release. Drives the obvious, persistent tray
+    /// indicator + the click-to-restart-and-apply menu item. Reset to None on
+    /// the freshly-restarted (already-updated) binary.
+    pub update_available: Option<String>,
 }
 
 impl TrayState {
@@ -137,7 +142,14 @@ impl TrayState {
             recon_pushes_total: 0,
             last_recon_at: None,
             recon_in_progress: false,
+            update_available: None,
         }
+    }
+
+    /// v0.4.12: record that a newer release is available/staged (Some(version))
+    /// or clear it (None). Idempotent setter for the updater task.
+    pub fn set_update_available(&mut self, version: Option<String>) {
+        self.update_available = version;
     }
 
     pub fn set_status(&mut self, status: ConnectionStatus) {

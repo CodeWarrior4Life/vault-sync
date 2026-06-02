@@ -545,14 +545,15 @@ impl VerifyRepair {
     ///
     /// v0.4.11: `base_hash` is the server-side CAS base the push handler checks
     /// against `vault_reconcile_state.fs_hash` — it MUST be the server's CURRENT
-    /// hash, NOT our local one:
-    ///   * `drift`             → `Some(server_hash)` (from the reconcile delta) so
-    ///                           the CAS passes and the local version overwrites
-    ///                           the diverged server one.
-    ///   * `missing-on-server` → `None` (sent as `""`) so the server CREATEs the
-    ///                           row (an `""` base on an existing row would conflict).
-    /// v0.4.10 wrongly sent our LOCAL hash here, which by definition mismatches a
-    /// drifted server row → every drift push 409'd `ConflictUnrecoverable`.
+    /// hash, NOT our local one.
+    ///
+    /// - `drift` → `Some(server_hash)` (from the reconcile delta) so the CAS
+    ///   passes and the local version overwrites the diverged server one.
+    /// - `missing-on-server` → `None` (sent as `""`) so the server CREATEs the
+    ///   row (an `""` base on an existing row would conflict).
+    ///
+    /// v0.4.10 wrongly sent our LOCAL hash here, which by definition mismatches
+    /// a drifted server row → every drift push 409'd `ConflictUnrecoverable`.
     fn build_modify_push(&self, entry: &ManifestEntry, base_hash: Option<String>) -> PushEvent {
         PushEvent {
             schema_version: CURRENT_SCHEMA,

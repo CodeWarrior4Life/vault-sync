@@ -58,6 +58,12 @@ const TRAY_ICON_ID: &str = "main-tray";
 /// (build_tooltip) updated within 2 s of every state change.
 pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> {
     info!("build_tray: entry");
+    // v0.4.12: update indicator. Top of the menu so a pending update is the
+    // first thing visible. Neutral + disabled when up to date; prominent +
+    // clickable ("restart & apply") once the updater stages a newer release.
+    let update_item = MenuItemBuilder::with_id("update", "✓ Up to date")
+        .enabled(false)
+        .build(app)?;
     let status_item = MenuItemBuilder::with_id("status", "Status: starting…")
         .enabled(false)
         .build(app)?;
@@ -104,6 +110,8 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu: Menu<Wry> = MenuBuilder::new(app)
+        .items(&[&update_item])
+        .separator()
         .items(&[&status_item, &activity_item, &last_error_item])
         .separator()
         .items(&[
@@ -318,6 +326,21 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     .title("Delete propagation")
                     .show(|_| {});
             }
+            "update" => {
+                // v0.4.12: click-to-update. Only meaningful once a release is
+                // staged (update_available is Some); the updater task has
+                // already downloaded+verified it, so a restart applies it.
+                let staged = st.read().ok().and_then(|s| s.update_available.clone());
+                if let Some(version) = staged {
+                    info!("tray: user clicked update — restarting to apply v{version}");
+                    app.restart();
+                } else {
+                    app.dialog()
+                        .message("You're on the latest version. The daemon checks for updates every few minutes and will flag one here the moment it's available.")
+                        .title("Nexus Vault Sync — up to date")
+                        .show(|_| {});
+                }
+            }
             "quit" => {
                 app.exit(0);
             }
@@ -346,6 +369,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
         let mut prev_redflag = String::new();
         let mut prev_burst = String::new();
         let mut prev_recon = String::new();
+        let mut prev_update = String::new();
         let mut prev_tooltip = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -398,6 +422,11 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     } else {
                         "Reconciliation: (no pass yet)".to_string()
                     };
+                    // v0.4.12: update-indicator line.
+                    let update = match &s.update_available {
+                        Some(v) => format!("⬆ Update to v{v} — click to restart & apply"),
+                        None => "✓ Up to date".to_string(),
+                    };
                     let tooltip = build_tooltip(&s);
                     Some((
                         s.status.label().to_string(),
@@ -408,6 +437,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                         redflag,
                         burst,
                         recon,
+                        update,
                         tooltip,
                     ))
                 }
@@ -422,6 +452,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 redflag_line,
                 burst_line,
                 recon_line,
+                update_line,
                 tooltip,
             )) = snapshot
             else {
@@ -481,6 +512,21 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                     let _ = item.set_text(&recon_line);
                 }
                 prev_recon = recon_line;
+            }
+            if update_line != prev_update {
+                let pending = update_line.starts_with('⬆');
+                if let Some(item) = handles.as_deref().and_then(|h| h.update.as_ref()) {
+                    // Enabled (clickable → restart & apply) only when an update
+                    // is pending; disabled informational "✓ Up to date" otherwise.
+                    let _ = item.set_text(&update_line);
+                    let _ = item.set_enabled(pending);
+                }
+                // Make it obvious WITHOUT opening the menu: show a "⬆" badge as
+                // the tray title (macOS renders it beside the icon; no-op on
+                // platforms without a tray title). Persists until the update is
+                // applied (then the fresh binary reports up-to-date → cleared).
+                let _ = tray_for_refresh.set_title(if pending { Some("⬆") } else { None });
+                prev_update = update_line;
             }
             if tooltip != prev_tooltip {
                 let _ = tray_for_refresh.set_tooltip(Some(&tooltip));
@@ -566,6 +612,7 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
     // can update them. Using try_state means the refresher gracefully no-ops
     // if the handles aren't registered (shouldn't happen but safer than panic).
     app.manage(TrayMenuHandles {
+        update: Some(update_item),
         status: Some(status_item),
         activity: Some(activity_item),
         last_error: Some(last_error_item),
@@ -589,6 +636,8 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
 
 /// Tauri State container for the live menu items that the refresher updates.
 struct TrayMenuHandles {
+    /// v0.4.12: the update-indicator item ("✓ Up to date" / "⬆ Update to vX…").
+    update: Option<MenuItem<Wry>>,
     status: Option<MenuItem<Wry>>,
     activity: Option<MenuItem<Wry>>,
     last_error: Option<MenuItem<Wry>>,
