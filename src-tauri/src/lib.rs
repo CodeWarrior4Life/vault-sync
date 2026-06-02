@@ -51,11 +51,24 @@ fn list_vault_folders(vaults_root: String) -> Vec<commands_vaults::VaultFolderIn
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
             // S477 §3.3 (v0.3.7): second-launch "find-me" path -- raise the
             // wizard if it's hidden or minimized, then focus it. Without
             // .show() + .unminimize() the user clicking the dock/.app a
             // second time sees nothing happen.
+            //
+            // S489: but a `--silent` second launch is a BACKGROUND respawn
+            // (login autostart, or a launchd KeepAlive agent relaunching the
+            // daemon after a quit/crash) -- NOT a user asking to see the
+            // window. Raising the wizard on those turns any external respawn
+            // into a popup loop: quit -> respawn(--silent) -> show() -> quit...
+            // Only a genuine user re-launch (no --silent) should find-me the
+            // window. The daemon is tray-resident; background relaunches must
+            // stay silent.
+            if argv.iter().any(|a| a == "--silent") {
+                tracing::info!("single_instance: --silent relaunch — not raising window");
+                return;
+            }
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.unminimize();

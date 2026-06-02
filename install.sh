@@ -92,6 +92,21 @@ case "$OS" in
     xattr -dr com.apple.quarantine "$APP_DST" 2>/dev/null || true
     codesign --force --deep --sign - "$APP_DST" 2>&1 | grep -v '^$' || true
     hdiutil detach "$MOUNT" -quiet || true
+    # S489: purge any hand-rolled KeepAlive LaunchAgent. The app is tray-
+    # resident and owns its own login-autostart via the tauri autostart
+    # plugin (which launches with --silent and no KeepAlive). An external
+    # KeepAlive agent respawns the GUI after every quit, and the single-
+    # instance handler then re-raises the pairing wizard — an inescapable
+    # popup loop. Remove it so the plugin can own the LaunchAgent cleanly.
+    # Idempotent: only touches an agent that actually carries KeepAlive
+    # (the rogue marker — the plugin's own agent never sets it).
+    LEGACY_AGENT="$HOME/Library/LaunchAgents/com.lattice.vault-sync.plist"
+    if [ -f "$LEGACY_AGENT" ] && grep -q "KeepAlive" "$LEGACY_AGENT" 2>/dev/null; then
+      log "removing rogue KeepAlive LaunchAgent (causes pairing-wizard popup loop)…"
+      launchctl unload "$LEGACY_AGENT" 2>/dev/null || true
+      launchctl bootout "gui/$(id -u)/com.lattice.vault-sync" 2>/dev/null || true
+      rm -f "$LEGACY_AGENT"
+    fi
     log "launching…"
     open -a "$APP_DISPLAY"
     log "done. menu-bar icon should appear within a couple seconds."
