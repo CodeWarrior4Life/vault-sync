@@ -125,7 +125,10 @@ pub enum FilterDecision {
 /// stops the watcher (the `_watcher` field's Drop releases the OS handle and
 /// the `_task` join handle is aborted via the embedded shutdown channel).
 pub struct WatchHandle {
-    _watcher: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
+    _watcher: notify_debouncer_full::Debouncer<
+        notify::RecommendedWatcher,
+        notify_debouncer_full::RecommendedCache,
+    >,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -585,8 +588,8 @@ impl FileWatcher {
         }
     }
 
-    /// Take a raw `notify-debouncer-mini::DebouncedEvent` path and produce a
-    /// `WatchEvent` of the given variant kind. Used by the FS-watcher loop.
+    /// Take a raw notify event path and produce a `WatchEvent` of the given
+    /// variant kind. Used by the FS-watcher loop (per-path, post kind-filter).
     /// Public for integration tests that bypass the spawned task.
     pub fn normalize_event(&self, abs: &Path, kind: WatchEventKindHint) -> Option<WatchEvent> {
         let p = self.normalize_path(abs)?;
@@ -605,12 +608,14 @@ impl FileWatcher {
     /// events through `classify` and into the journal. Returns a
     /// [`WatchHandle`] — dropping it stops the watcher.
     ///
-    /// NOTE: notify-debouncer-mini emits a single coarse-grained event kind
-    /// per debounce window — we cannot reliably distinguish create vs modify
-    /// from the debouncer alone. The current strategy:
+    /// NOTE: as of v0.4.9 we use notify-debouncer-FULL, which preserves the raw
+    /// `notify::Event` kind. The task loop FIRST drops non-mutating kinds
+    /// (`Access(*)`, `Modify(Metadata)` — see `is_mutating_kind`), then funnels
+    /// the surviving paths through `classify` into the journal. We still derive
+    /// create-vs-modify-vs-delete from path existence (the server reconciler is
+    /// create/modify tolerant):
     ///
-    ///   - Path exists & journal has no Create yet → emit Created.
-    ///   - Path exists & previously seen → emit Modified.
+    ///   - Path exists → emit Modified.
     ///   - Path does not exist → emit Deleted.
     ///
     /// Rename detection is deferred (debounced renames typically surface as
@@ -621,15 +626,29 @@ impl FileWatcher {
     /// and load-bearing) are the canary the rest of the daemon depends on.
     pub fn start(self) -> Result<WatchHandle, FileWatcherError> {
         use notify::RecursiveMode;
-        use notify_debouncer_mini::new_debouncer;
+        use notify_debouncer_full::new_debouncer;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let debounce = Duration::from_millis(self.config.debounce_ms);
 
-        let mut debouncer = new_debouncer(debounce, move |res| {
-            // Forward into the tokio-side queue; drop on closed channel.
-            let _ = tx.send(res);
-        })?;
+        // v0.4.9: notify-debouncer-FULL (was -mini). full preserves the raw
+        // `notify::Event` kind on each DebouncedEvent, which -mini collapsed to a
+        // coarse `Any`. We NEED the kind: notify 7.0's inotify mask hardcodes
+        // IN_OPEN + IN_ATTRIB, so every file *read* emits `Access(Open)` and every
+        // metadata/atime touch emits `Modify(Metadata)`. Those are NOT content
+        // changes — forwarding them as Modified pushes was the reconciliation-
+        // backstop journal storm: verify_repair's hash walk opens all ~28K .md
+        // files, so each backstop produced ~28K spurious pushes that filled the
+        // 100 MB journal and tripped the breaker. We filter them by kind in the
+        // task loop below (see `is_mutating_kind`).
+        let mut debouncer = new_debouncer(
+            debounce,
+            None,
+            move |res: notify_debouncer_full::DebounceEventResult| {
+                // Forward into the tokio-side queue; drop on closed channel.
+                let _ = tx.send(res);
+            },
+        )?;
 
         // S477 §3.5 (v0.3.7): on Linux, catch inotify watch-limit exhaustion
         // (`notify::ErrorKind::MaxFilesWatch`) and surface as a structured
@@ -638,10 +657,7 @@ impl FileWatcher {
         // behavior via `?`-propagation.
         #[cfg(target_os = "linux")]
         {
-            if let Err(e) = debouncer
-                .watcher()
-                .watch(&self.vault_root, RecursiveMode::Recursive)
-            {
+            if let Err(e) = debouncer.watch(&self.vault_root, RecursiveMode::Recursive) {
                 if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
                     let current = read_inotify_limit().unwrap_or(0);
                     return Err(FileWatcherError::InotifyLimitExceeded { current });
@@ -651,9 +667,7 @@ impl FileWatcher {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            debouncer
-                .watcher()
-                .watch(&self.vault_root, RecursiveMode::Recursive)?;
+            debouncer.watch(&self.vault_root, RecursiveMode::Recursive)?;
         }
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -675,7 +689,25 @@ impl FileWatcher {
                             None => break, // channel closed → debouncer dropped
                             Some(Ok(events)) => {
                                 for de in events {
-                                    me.handle_debounced_event(&de).await;
+                                    // v0.4.9 ROOT-CAUSE FIX: drop non-mutating
+                                    // events. notify 7.0 watches IN_OPEN + IN_ATTRIB,
+                                    // so reads emit `Access(*)` and atime/perm touches
+                                    // emit `Modify(Metadata)`. Neither is a content
+                                    // change. Forwarding reads as Modified pushes was
+                                    // the backstop storm; dropping them here also
+                                    // breaks the read→event→read feedback loop (the
+                                    // handler below re-reads each file to hash it,
+                                    // which would otherwise re-fire `Access(Open)`).
+                                    if !is_mutating_kind(&de.event.kind) {
+                                        tracing::trace!(
+                                            kind = ?de.event.kind,
+                                            "file_watcher: dropping non-mutating event"
+                                        );
+                                        continue;
+                                    }
+                                    for path in &de.event.paths {
+                                        me.handle_fs_path(path).await;
+                                    }
                                 }
                                 // Storm circuit-breaker: if a wedged-at-capacity
                                 // journal tripped the breaker, halt the loop
@@ -688,8 +720,11 @@ impl FileWatcher {
                                     break;
                                 }
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!("file_watcher: notify error: {e}");
+                            Some(Err(errors)) => {
+                                // debouncer-full reports a batch of notify errors.
+                                for e in &errors {
+                                    tracing::warn!("file_watcher: notify error: {e}");
+                                }
                             }
                         }
                     }
@@ -704,21 +739,19 @@ impl FileWatcher {
         })
     }
 
-    async fn handle_debounced_event(&self, de: &notify_debouncer_mini::DebouncedEvent) {
-        let kind = if de.path.exists() {
-            // We don't know create-vs-modify from debouncer-mini; default
-            // to Modified. The push_client / server-side reconciler is
-            // create-modify-tolerant (PushAction::Create vs Modify only
-            // differs in base_hash handling, which we leave None here).
+    async fn handle_fs_path(&self, abs: &Path) {
+        let kind = if abs.exists() {
+            // We keep the exists-based create-vs-modify heuristic: default to
+            // Modified for any path that still exists. The push_client /
+            // server-side reconciler is create-modify-tolerant (PushAction::Create
+            // vs Modify only differs in base_hash handling, which we leave None
+            // here). The caller has already filtered to mutating event kinds.
             WatchEventKindHint::Modified
         } else {
             WatchEventKindHint::Deleted
         };
-        let Some(evt) = self.normalize_event(&de.path, kind) else {
-            tracing::debug!(
-                "file_watcher: dropped event outside vault root: {:?}",
-                de.path
-            );
+        let Some(evt) = self.normalize_event(abs, kind) else {
+            tracing::debug!("file_watcher: dropped event outside vault root: {abs:?}");
             return;
         };
         let decision = self.classify_and_count(&evt);
@@ -816,7 +849,8 @@ impl FileWatcher {
     }
 }
 
-/// Hint for normalize_event because notify-debouncer-mini collapses kinds.
+/// Hint for normalize_event — we still derive create/modify/delete from path
+/// existence rather than the (now kind-aware) debouncer event, see `handle_fs_path`.
 #[derive(Debug, Clone, Copy)]
 pub enum WatchEventKindHint {
     Created,
@@ -859,6 +893,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.update(bytes);
     let digest = h.finalize();
     hex::encode(digest)
+}
+
+/// v0.4.9 ROOT-CAUSE FILTER: true iff a notify event kind represents a real
+/// content/namespace mutation we should consider pushing.
+///
+/// We DROP exactly two non-mutating categories and keep everything else:
+///   * `Access(_)` — file opened / read / closed-without-write. notify 7.0's
+///     inotify mask hardcodes `IN_OPEN`, so EVERY read of a watched file emits
+///     `Access(Open)`. verify_repair's reconciliation hash-walk opens all ~28K
+///     `.md` files on every 600 s backstop; forwarding those as Modified pushes
+///     was the journal storm. Dropping `Access` ALSO breaks the feedback loop:
+///     `handle_fs_path` re-reads each file to hash it, which itself emits
+///     `Access(Open)` — without this filter that re-read re-enters the queue
+///     forever (the breaker was the only thing stopping the hot-spin).
+///   * `Modify(Metadata(_))` — atime / mtime / permission / ownership changes
+///     with no content change (e.g. `touch`, a chmod, or an atime bump). Not a
+///     content edit, so nothing to sync.
+///
+/// Everything else — `Create`, `Remove`, `Modify(Data|Name|Other|Any)`, and the
+/// coarse `Any`/`Other` kinds some non-inotify backends emit — is treated as a
+/// real mutation and kept. This is deliberately fail-OPEN: when in doubt we sync
+/// (a spurious push is cheap and idempotent; a dropped real edit is data loss).
+/// The flood we are killing is exclusively `Access`/`Metadata`, never these.
+fn is_mutating_kind(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+    use notify::EventKind;
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }
 
 fn rewrite_event_path(evt: WatchEvent, path: String) -> WatchEvent {
@@ -1462,12 +1526,58 @@ mod tests {
         );
     }
 
+    // ---------- v0.4.9 non-mutating-event filter ----------
+
+    #[test]
+    fn is_mutating_kind_drops_access_and_metadata() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+            RenameMode,
+        };
+        use notify::EventKind;
+
+        // DROP: every flavor of Access (file opens/reads/closes). These are the
+        // IN_OPEN events that drove the reconciliation-backstop storm — a pure
+        // read-walk of the vault must produce ZERO push-worthy events.
+        assert!(!is_mutating_kind(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_mutating_kind(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_mutating_kind(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_mutating_kind(&EventKind::Access(AccessKind::Any)));
+
+        // DROP: metadata-only changes (atime/mtime/perms/ownership) — `touch`,
+        // chmod, etc. carry no content change.
+        assert!(!is_mutating_kind(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
+        assert!(!is_mutating_kind(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+
+        // KEEP: real content/namespace mutations.
+        assert!(is_mutating_kind(&EventKind::Create(CreateKind::File)));
+        assert!(is_mutating_kind(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_mutating_kind(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_mutating_kind(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        // KEEP: coarse kinds some non-inotify backends (FSEvents/Windows) emit —
+        // fail-OPEN so we never silently drop a real edit.
+        assert!(is_mutating_kind(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_mutating_kind(&EventKind::Any));
+    }
+
     // ---------- FS-integration (#[ignore]) ----------
 
     /// Local-only smoke test: actually spawn the OS watcher, write a file,
     /// and confirm the journal grows. Ignored in CI because:
     ///   - tokio runtime + notify timing is flaky on Windows GitHub Actions runners.
-    ///   - notify-debouncer-mini fires inside a 500ms window so the test
+    ///   - notify-debouncer-full fires inside a 500ms window so the test
     ///     sleeps, which is hostile to CI determinism.
     /// Run locally with `cargo test --lib file_watcher -- --ignored`.
     #[tokio::test]
