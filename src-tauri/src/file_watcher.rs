@@ -191,6 +191,12 @@ pub struct FileWatcher {
     /// Set true once the storm breaker trips. The FS-watcher loop checks this
     /// and halts so a wedged-at-capacity journal can't drive a hot-spin.
     fenced: Arc<AtomicBool>,
+    /// Echo guard (S492): shared with the materializer. Before enqueueing a
+    /// create/modify event, the watcher checks whether the file's current
+    /// content hash matches a recent materializer write; if so the event is a
+    /// server echo (not a user edit) and is skipped — breaking the
+    /// SSE->materialize->watcher->push feedback loop that flooded the journal.
+    echo_guard: Option<Arc<crate::echo_guard::EchoGuard>>,
 }
 
 impl FileWatcher {
@@ -210,7 +216,17 @@ impl FileWatcher {
             tray_state: None,
             cap_fail_streak: Arc::new(AtomicU64::new(0)),
             fenced: Arc::new(AtomicBool::new(false)),
+            echo_guard: None,
         })
+    }
+
+    /// Builder-style: attach the shared [`EchoGuard`](crate::echo_guard::EchoGuard)
+    /// so materializer-written files are recognized as echoes and skipped at
+    /// enqueue. Backwards-compatible — without it, no echo-suppression (every
+    /// write is enqueued, the pre-S492 behavior).
+    pub fn with_echo_guard(mut self, guard: Arc<crate::echo_guard::EchoGuard>) -> Self {
+        self.echo_guard = Some(guard);
+        self
     }
 
     /// True once the storm circuit-breaker has tripped. The FS-watcher loop
@@ -734,6 +750,26 @@ impl FileWatcher {
                     }
                     WatchEvent::Deleted { .. } => None,
                 };
+                // S492 echo-suppression: if the file's current content matches a
+                // recent materializer write, this event is a server echo (the
+                // SSE consumer just wrote it), NOT a user edit — skip it instead
+                // of enqueueing a spurious local push. Exact (path, sha) match
+                // only, so a genuine edit (different sha) is never suppressed.
+                if let (Some(guard), Some(bytes)) = (&self.echo_guard, &content) {
+                    let echo_path = match &allowed {
+                        WatchEvent::Created { path } | WatchEvent::Modified { path } => {
+                            Some(path.as_str())
+                        }
+                        WatchEvent::Renamed { new_path, .. } => Some(new_path.as_str()),
+                        WatchEvent::Deleted { .. } => None,
+                    };
+                    if let Some(p) = echo_path {
+                        if guard.is_echo(p, &sha256_hex(bytes)) {
+                            tracing::debug!("file_watcher: skipping materializer echo for {p}");
+                            return;
+                        }
+                    }
+                }
                 let Some(push_evt) = self.to_push_event(&allowed, content) else {
                     tracing::debug!(
                         "file_watcher: to_push_event returned None for {:?}",

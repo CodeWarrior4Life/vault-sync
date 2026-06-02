@@ -3,6 +3,7 @@ pub mod commands;
 pub mod commands_vaults;
 pub mod config;
 pub mod conflict_stash;
+pub mod echo_guard;
 pub mod file_watcher;
 pub mod integrity_check;
 pub mod keyring;
@@ -483,6 +484,11 @@ fn spawn_sse_consumer(
             device_id: cfg.subscriber_id.clone(),
             ..Default::default()
         };
+        // S492 echo guard: shared between the materializer (records its writes)
+        // and every file_watcher (skips the resulting echo events). One guard
+        // for the daemon so the SSE->materialize->watcher->push loop is broken
+        // across all sync_roots.
+        let echo_guard = std::sync::Arc::new(echo_guard::EchoGuard::new());
         // B2: materializer uses the primary sync_root.path as vault root.
         // Multi-root materialization is a deferred task (one materializer
         // per sync_root); for now the SSE consumer materializes into the
@@ -495,7 +501,8 @@ fn spawn_sse_consumer(
             cfg.subscriber_id.clone(),
             materializer_cfg,
         )
-        .with_tray_state(tray_state.clone());
+        .with_tray_state(tray_state.clone())
+        .with_echo_guard(echo_guard.clone());
 
         // Wave 4: spawn a 60s periodic task that refreshes the tray's
         // `conflict_unresolved` counter from the on-disk stash siblings.
@@ -559,6 +566,7 @@ fn spawn_sse_consumer(
                     watch_scope_roots.clone(),
                     watch_scope_excludes.clone(),
                     tray_state.clone(),
+                    echo_guard.clone(),
                 )
             })
             .collect();
@@ -670,6 +678,7 @@ fn spawn_push_pipeline(
     scope_roots: Vec<String>,
     scope_excludes: Vec<String>,
     tray_state: tray_state::SharedTrayState,
+    echo_guard: std::sync::Arc<echo_guard::EchoGuard>,
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
 
@@ -835,7 +844,7 @@ fn spawn_push_pipeline(
         watcher_cfg,
         subscriber_id.clone(),
     ) {
-        Ok(w) => w.with_tray_state(tray_state),
+        Ok(w) => w.with_tray_state(tray_state).with_echo_guard(echo_guard),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
             notify_user(

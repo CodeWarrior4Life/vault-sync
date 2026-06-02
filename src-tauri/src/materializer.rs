@@ -181,6 +181,11 @@ pub struct Materializer {
     /// `refresh_conflict_count_into_tray()` may be called by a background
     /// timer to refresh `tray.conflict_unresolved`.
     tray_state: Option<SharedTrayState>,
+    /// Echo guard (S492): records the content hash of every file this
+    /// materializer writes so the file_watcher can skip re-enqueueing the
+    /// resulting filesystem event (a server echo, not a user edit). Shared
+    /// `Arc` with the file_watcher; clones share the same guard.
+    echo_guard: Option<Arc<crate::echo_guard::EchoGuard>>,
     /// Epoch-millis of the last `refresh_conflict_count_into_tray()` call.
     /// Wrapped in `Arc<AtomicI64>` so a cloned materializer (used by the
     /// 60s background refresh task in `lib::spawn_sse_consumer`) shares
@@ -198,6 +203,7 @@ impl Clone for Materializer {
             subscriber_slug: self.subscriber_slug.clone(),
             config: self.config.clone(),
             tray_state: self.tray_state.clone(),
+            echo_guard: self.echo_guard.clone(),
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
         }
     }
@@ -227,8 +233,18 @@ impl Materializer {
             subscriber_slug,
             config,
             tray_state: None,
+            echo_guard: None,
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    /// Builder-style: attach the shared [`EchoGuard`](crate::echo_guard::EchoGuard)
+    /// so every write records its content hash for file_watcher echo-suppression.
+    /// Backwards-compatible — without it, `echo_guard = None` and no recording
+    /// happens (pre-S492 behavior).
+    pub fn with_echo_guard(mut self, guard: Arc<crate::echo_guard::EchoGuard>) -> Self {
+        self.echo_guard = Some(guard);
+        self
     }
 
     /// Builder-style: attach a `SharedTrayState`. After this, integrity-check
@@ -358,6 +374,18 @@ impl Materializer {
         };
         let content_bytes = content.as_bytes();
         let actual_sha = hex::encode(Sha256::digest(content_bytes));
+
+        // S492 echo-suppression: record what we are about to write so the
+        // file_watcher skips the resulting filesystem event instead of
+        // re-enqueuing it as a spurious local push (the SSE->materialize->
+        // file_watcher->push feedback loop that flooded the journal). Recorded
+        // here (after content+sha resolution, before the disk write) so the
+        // entry is present when the watcher observes the write. Harmless on the
+        // idempotent-skip paths below: the local file already equals this sha,
+        // so suppressing a matching event is still correct.
+        if let Some(g) = &self.echo_guard {
+            g.record(&payload.path, &actual_sha);
+        }
 
         // 5. Compute target.
         let target = self.target_for(&payload.path);
