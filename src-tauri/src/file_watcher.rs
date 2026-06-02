@@ -37,13 +37,16 @@
 //! rename bug §1 implicitly references).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::push_journal::{new_event_id, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA};
+use crate::push_journal::{
+    new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
+};
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 use crate::redflag::DeleteBurstDetector;
 use crate::tray_state::SharedTrayState;
@@ -163,6 +166,15 @@ fn read_inotify_limit() -> Option<u64> {
         .ok()
 }
 
+/// Storm circuit-breaker threshold: this many CONSECUTIVE journal
+/// `CapacityExceeded` failures trips the breaker. Normal operation never sees a
+/// run this long (the journal cap is 100 MB and push_client drains it); a long
+/// consecutive run means the journal is wedged at capacity and the file_watcher
+/// is hot-spinning on it (the S489/S490 storm: 745k failures, 85% CPU, 290 MB
+/// logs). Rather than spin and do harm, we trip, write a loud diagnostic, and
+/// halt the watcher so the cause is recoverable from the log post-mortem.
+const STORM_BREAKER_THRESHOLD: u64 = 200;
+
 pub struct FileWatcher {
     vault_root: PathBuf,
     journal: Arc<Mutex<PushJournal>>,
@@ -173,6 +185,12 @@ pub struct FileWatcher {
     /// `classify_and_count` (used by integration tests + the spawned
     /// FS-watcher task) increments per-reason filter counters.
     tray_state: Option<SharedTrayState>,
+    /// Count of CONSECUTIVE journal `CapacityExceeded` append failures. Reset
+    /// to 0 on any successful append. Feeds the storm circuit-breaker.
+    cap_fail_streak: Arc<AtomicU64>,
+    /// Set true once the storm breaker trips. The FS-watcher loop checks this
+    /// and halts so a wedged-at-capacity journal can't drive a hot-spin.
+    fenced: Arc<AtomicBool>,
 }
 
 impl FileWatcher {
@@ -190,7 +208,33 @@ impl FileWatcher {
             config,
             device_id: device_id.into(),
             tray_state: None,
+            cap_fail_streak: Arc::new(AtomicU64::new(0)),
+            fenced: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// True once the storm circuit-breaker has tripped. The FS-watcher loop
+    /// halts when this flips; exposed for tests + the loop's halt check.
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// Record the outcome of a journal append for the storm breaker.
+    /// `is_capacity` = the append failed with `CapacityExceeded`. A successful
+    /// (or non-capacity) append resets the consecutive streak. Returns true iff
+    /// THIS call trips the breaker (crosses the threshold for the first time),
+    /// so the caller logs the loud diagnostic exactly once.
+    fn record_append_capacity(&self, is_capacity: bool) -> bool {
+        if !is_capacity {
+            self.cap_fail_streak.store(0, Ordering::Relaxed);
+            return false;
+        }
+        let streak = self.cap_fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= STORM_BREAKER_THRESHOLD {
+            // Trip exactly once (first thread/iteration to swap false->true).
+            return !self.fenced.swap(true, Ordering::Relaxed);
+        }
+        false
     }
 
     /// Builder-style: attach a SharedTrayState so each filtered event
@@ -411,7 +455,14 @@ impl FileWatcher {
                     action: PushAction::Create,
                     base_hash: None,
                     content_sha: sha256_hex(&bytes),
-                    content_bytes: Some(bytes),
+                    // Lazy ref (v0.4.7): hash the body for content_sha but do
+                    // NOT embed it. push_client reads the file from disk at
+                    // drain time (it already supports content_bytes=None, as
+                    // verify_repair's refs do). Embedding full bodies bloated
+                    // the journal past its 100 MB cap during reconciliation
+                    // backlogs and drove the file_watcher storm (S489/S490);
+                    // refs stay tiny + constant-size regardless of file size.
+                    content_bytes: None,
                     queued_at: now,
                     device_id: self.device_id.clone(),
                 })
@@ -431,7 +482,14 @@ impl FileWatcher {
                     // push_client OR the server retry path handle it.
                     base_hash: None,
                     content_sha: sha256_hex(&bytes),
-                    content_bytes: Some(bytes),
+                    // Lazy ref (v0.4.7): hash the body for content_sha but do
+                    // NOT embed it. push_client reads the file from disk at
+                    // drain time (it already supports content_bytes=None, as
+                    // verify_repair's refs do). Embedding full bodies bloated
+                    // the journal past its 100 MB cap during reconciliation
+                    // backlogs and drove the file_watcher storm (S489/S490);
+                    // refs stay tiny + constant-size regardless of file size.
+                    content_bytes: None,
                     queued_at: now,
                     device_id: self.device_id.clone(),
                 })
@@ -467,7 +525,14 @@ impl FileWatcher {
                     action: PushAction::Create,
                     base_hash: None,
                     content_sha: sha256_hex(&bytes),
-                    content_bytes: Some(bytes),
+                    // Lazy ref (v0.4.7): hash the body for content_sha but do
+                    // NOT embed it. push_client reads the file from disk at
+                    // drain time (it already supports content_bytes=None, as
+                    // verify_repair's refs do). Embedding full bodies bloated
+                    // the journal past its 100 MB cap during reconciliation
+                    // backlogs and drove the file_watcher storm (S489/S490);
+                    // refs stay tiny + constant-size regardless of file size.
+                    content_bytes: None,
                     queued_at: now,
                     device_id: self.device_id.clone(),
                 })
@@ -596,6 +661,16 @@ impl FileWatcher {
                                 for de in events {
                                     me.handle_debounced_event(&de).await;
                                 }
+                                // Storm circuit-breaker: if a wedged-at-capacity
+                                // journal tripped the breaker, halt the loop
+                                // rather than hot-spin. The loud diagnostic was
+                                // already logged at the trip; this just stops.
+                                if me.is_fenced() {
+                                    tracing::error!(
+                                        "file_watcher: storm circuit-breaker fenced — halting event loop (see the STORM CIRCUIT-BREAKER diagnostic above; restart the daemon after clearing the journal backlog)"
+                                    );
+                                    break;
+                                }
                             }
                             Some(Err(e)) => {
                                 tracing::warn!("file_watcher: notify error: {e}");
@@ -667,11 +742,32 @@ impl FileWatcher {
                     return;
                 };
                 match self.journal.lock() {
-                    Ok(mut j) => {
-                        if let Err(e) = j.append(push_evt) {
-                            tracing::warn!("file_watcher: journal append failed: {e}");
+                    Ok(mut j) => match j.append(push_evt) {
+                        Ok(()) => {
+                            // Success resets the consecutive-capacity streak.
+                            self.record_append_capacity(false);
                         }
-                    }
+                        Err(e) => {
+                            let is_capacity = matches!(e, JournalError::CapacityExceeded { .. });
+                            if is_capacity {
+                                // DEBUG, not WARN: a capacity failure under a
+                                // wedged journal can fire thousands/sec — warn
+                                // here was the 290 MB log-spam half of the
+                                // storm. The breaker below is the loud signal.
+                                tracing::debug!("file_watcher: journal append failed: {e}");
+                            } else {
+                                tracing::warn!("file_watcher: journal append failed: {e}");
+                            }
+                            if self.record_append_capacity(is_capacity) {
+                                tracing::error!(
+                                    target: "vault_sync_daemon::file_watcher",
+                                    threshold = STORM_BREAKER_THRESHOLD,
+                                    error = %e,
+                                    "STORM CIRCUIT-BREAKER TRIPPED: {STORM_BREAKER_THRESHOLD} consecutive journal CapacityExceeded failures — the push journal is wedged at its 100MB cap and the file_watcher would hot-spin (the S489/S490 storm: 85% CPU, 290MB logs, all new events dropped). HALTING the file_watcher to prevent CPU/log runaway. Likely cause: a reconciliation/materializer backlog filled the journal faster than push_client could drain it. Investigate sync-state/push_journal.jsonl (at cap?) and push_client drain health (server reachable? reconciliation HTTP errors?). The watcher will NOT auto-resume — restart the daemon after the backlog clears."
+                                );
+                            }
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!("file_watcher: journal mutex poisoned: {e}");
                     }
@@ -1195,7 +1291,10 @@ mod tests {
         let push = w.to_push_event(&evt, Some(body.clone())).unwrap();
         assert_eq!(push.action, PushAction::Create);
         assert_eq!(push.path, "02_Projects/Foo/n.md");
-        assert_eq!(push.content_bytes, Some(body));
+        // v0.4.7 lazy ref: the body is NOT embedded (push_client reads it from
+        // disk at drain); content_sha is still computed from the body.
+        assert!(push.content_bytes.is_none());
+        assert_eq!(push.content_sha, sha256_hex(&body));
         assert!(push.base_hash.is_none());
         assert_eq!(push.content_sha.len(), 64);
         assert_eq!(push.device_id, "dev-test");
@@ -1209,7 +1308,9 @@ mod tests {
         let body = b"# updated".to_vec();
         let push = w.to_push_event(&evt, Some(body.clone())).unwrap();
         assert_eq!(push.action, PushAction::Modify);
-        assert_eq!(push.content_bytes, Some(body));
+        // v0.4.7 lazy ref: not embedded; content_sha still computed.
+        assert!(push.content_bytes.is_none());
+        assert_eq!(push.content_sha, sha256_hex(&body));
     }
 
     #[test]
@@ -1236,7 +1337,9 @@ mod tests {
         let push = w.to_push_event(&evt, Some(body.clone())).unwrap();
         assert_eq!(push.action, PushAction::Create);
         assert_eq!(push.path, "02_Projects/Foo/b.md");
-        assert_eq!(push.content_bytes, Some(body));
+        // v0.4.7 lazy ref: not embedded; content_sha still computed.
+        assert!(push.content_bytes.is_none());
+        assert_eq!(push.content_sha, sha256_hex(&body));
     }
 
     #[test]
@@ -1246,6 +1349,33 @@ mod tests {
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = created("02_Projects/Foo/n.md");
         assert!(w.to_push_event(&evt, None).is_none());
+    }
+
+    // ---------- storm circuit-breaker ----------
+
+    #[test]
+    fn storm_breaker_trips_after_threshold_and_resets_on_success() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        // Just under the threshold: never trips, never fenced.
+        for _ in 0..(STORM_BREAKER_THRESHOLD - 1) {
+            assert!(!w.record_append_capacity(true));
+        }
+        assert!(!w.is_fenced());
+        // A successful append resets the consecutive streak to zero.
+        assert!(!w.record_append_capacity(false));
+        assert!(!w.is_fenced());
+        // Fresh run must climb from zero again, then trip exactly once.
+        let mut trips = 0;
+        for _ in 0..STORM_BREAKER_THRESHOLD {
+            if w.record_append_capacity(true) {
+                trips += 1;
+            }
+        }
+        assert_eq!(trips, 1, "breaker should signal a trip exactly once");
+        assert!(w.is_fenced());
+        // Already fenced → further capacity failures do not re-signal.
+        assert!(!w.record_append_capacity(true));
     }
 
     // ---------- normalize_path() ----------
