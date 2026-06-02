@@ -168,73 +168,47 @@ struct ConflictBody {
     expected_hash: Option<String>,
 }
 
-/// One entry in the local-manifest payload sent to `/api/sync/reconcile`.
-/// Mandate §3 "Verify and repair all files" / §5 reconcile contract.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReconcileEntry {
+/// One entry in the `/api/sync/reconcile-batch` request. `fs_hash` is the
+/// raw-file-bytes SHA-256 the server keeps in `vault_reconcile_state.fs_hash`
+/// — the same hash `verify_repair` already computes during its manifest walk.
+///
+/// v0.4.10: migrated off the dead legacy `/api/sync/reconcile` endpoint, which
+/// gated on the SQLite `sync_devices` table the v0.3+ subscriber daemon never
+/// registers in (it registers as a `vault_subscribers` row via
+/// `PATCH /subscribers/me`, never `POST /register`). Every legacy reconcile
+/// call 404'd "Device not registered", so the backstop never functioned.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReconcileBatchItem {
     pub path: String,
-    pub content_hash: String,
-    pub size_bytes: u64,
+    pub fs_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ReconcileRequest<'a> {
-    pub device_id: &'a str,
-    // Server's ReconcileRequest (nexus/core/sync/models.py) names this field
-    // `manifest`, not `entries`. Mismatch → HTTP 422. Verified S473.
-    #[serde(rename = "manifest")]
-    pub entries: &'a [ReconcileEntry],
+pub struct ReconcileBatchRequest {
+    pub paths: Vec<ReconcileBatchItem>,
 }
 
-/// Action the server tells the client to perform. Matches the live server
-/// vocabulary (nexus/core/sync) — verified S473.
-/// `Push` — client should upload its local canonical (reason=client_only or
-///          hash_mismatch).
-/// `Pull` — server has it, client missing (reason=server_only). The SSE
-///          consumer materializes it; verify_repair does NOT write the FS.
-/// `Skip` — in sync (reason=identical); no-op.
-/// There is NO "delete" action — the server never asks the client to delete.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReconcileAction {
-    Push,
-    Pull,
-    Skip,
-}
-
-/// One entry in the server's reconcile `actions` array.
+/// One per-path delta in the `/api/sync/reconcile-batch` response.
+/// `state` is the server vocabulary:
+/// * `"match"`             — local fs_hash == server fs_hash; in sync, skip.
+/// * `"drift"`             — local differs from server; client should push.
+/// * `"missing-on-server"` — server has no row for this path; client should push.
+///
+/// The server only returns deltas for paths the client SENT, so there is no
+/// "pull" outcome here — server-only files are surfaced by the SSE/changes
+/// feed, not by reconcile-batch.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ReconcileActionEntry {
+pub struct ReconcileDelta {
     pub path: String,
-    pub action: ReconcileAction,
-    /// Server reason vocabulary: "client_only", "server_only",
-    /// "hash_mismatch", "identical".
-    pub reason: String,
-    /// Server-side canonical content_hash. Useful for the client to compare
-    /// or to skip if it already matches local (defense-in-depth).
+    pub state: String,
     #[serde(default)]
     pub server_hash: Option<String>,
-    #[serde(default)]
-    pub server_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct ReconcileStats {
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ReconcileBatchResponse {
     #[serde(default)]
-    pub push: u64,
-    #[serde(default)]
-    pub pull: u64,
-    #[serde(default)]
-    pub identical: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReconcileResponse {
-    pub actions: Vec<ReconcileActionEntry>,
-    #[serde(default)]
-    pub stats: ReconcileStats,
-    #[serde(default)]
-    pub server_time: String,
+    pub deltas: Vec<ReconcileDelta>,
 }
 
 pub struct ApiClient {
@@ -315,28 +289,27 @@ impl ApiClient {
     /// docs / `PushStatus` for the 4-state response envelope. Maps 409 to
     /// `ApiError::Conflict { expected_hash }` so the caller (conflict
     /// resolver) can re-fetch+merge+replay per R2.
-    /// POST a local manifest to the server's reconcile endpoint. The server
-    /// returns an `actions` list (Push / Pull / Skip) plus `stats` and
-    /// `server_time`. Per mandate §3 + §5 reconcile contract. Used by
-    /// `verify_repair::VerifyRepair::run` for the owner-invoked full-vault
-    /// rescan.
-    pub async fn reconcile(
+    /// POST the local manifest to the server's reconcile endpoint and get back
+    /// a per-path delta list (`match` / `drift` / `missing-on-server`).
+    ///
+    /// v0.4.10: targets `/api/sync/reconcile-batch` (the Postgres
+    /// `vault_reconcile_state` contract, subscriber-bearer auth) — NOT the
+    /// legacy `/api/sync/reconcile` (SQLite `sync_devices`), which 404'd
+    /// "Device not registered" for every v0.3+ subscriber. Used by
+    /// `verify_repair::VerifyRepair::run` for the reconciliation backstop.
+    pub async fn reconcile_batch(
         &self,
-        req: &ReconcileRequest<'_>,
-    ) -> Result<ReconcileResponse, ApiError> {
-        // v0.3.1: per-call timeout override. The client default (30s) is
-        // sized for small request/response pairs (health, single push) and
-        // blew up on the first real reconcile against a 6k+ note vault:
-        // the SERVER returned a 28k-entry plan (Reconciliation plan: 28152
-        // push, 0 pull, 0 identical -- container log 2026-05-27 16:37:44),
-        // but reqwest's 30s wall-clock fired while reading the response
-        // body, so the daemon surfaced "network error: error sending request"
-        // even though the server logged 200 OK. 300s gives initial-pair on
-        // a multi-tens-of-thousands-of-files vault plenty of room without
-        // hanging forever on a truly stuck request.
+        req: &ReconcileBatchRequest,
+    ) -> Result<ReconcileBatchResponse, ApiError> {
+        // 300s per-call timeout override. The client default (30s) is sized for
+        // small request/response pairs (health, single push); a full-vault
+        // manifest (tens of thousands of paths) produces a large pair that the
+        // 30s wall-clock fired on mid-body-read, surfacing a spurious "network
+        // error" even though the server logged 200 (verified S473 against a
+        // 28k-entry plan). 300s gives the initial-pair on a huge vault room.
         let resp = self
             .http
-            .post(format!("{}/api/sync/reconcile", self.base_url))
+            .post(format!("{}/api/sync/reconcile-batch", self.base_url))
             .bearer_auth(&self.token)
             .json(req)
             .timeout(Duration::from_secs(300))
@@ -462,55 +435,58 @@ impl ApiClient {
 mod tests {
     use super::*;
 
-    /// Regression guard for the S473 server/client contract mismatch: the
-    /// daemon used to expect `{"diff":[...]}` but the live server returns
-    /// `{"actions":[...],"stats":{...},"server_time":"..."}`. Deserialize the
-    /// EXACT verified-live server response body and assert it parses + every
-    /// field populates with the correct vocabulary.
+    /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
+    /// response body (`{"deltas":[{path,state,server_hash?}]}`) and assert every
+    /// state-vocabulary variant parses, including the optional `server_hash`.
     #[test]
-    fn reconcile_response_deserializes_live_server_contract() {
+    fn reconcile_batch_response_deserializes_live_server_contract() {
         let body = r#"{
-            "actions": [
-                {"path": "test/probe.md", "action": "push", "reason": "client_only", "server_hash": null, "server_size": null}
-            ],
-            "stats": {"push": 1, "pull": 0, "identical": 0},
-            "server_time": "2026-05-27T17:04:04.112114+00:00"
+            "deltas": [
+                {"path": "a.md", "state": "drift", "server_hash": "deadbeef"},
+                {"path": "b.md", "state": "missing-on-server"},
+                {"path": "c.md", "state": "match", "server_hash": "abc123"}
+            ]
         }"#;
 
-        let resp: ReconcileResponse = serde_json::from_str(body).expect("must parse live contract");
+        let resp: ReconcileBatchResponse =
+            serde_json::from_str(body).expect("must parse live reconcile-batch contract");
 
-        assert_eq!(resp.actions.len(), 1);
-        let a = &resp.actions[0];
-        assert_eq!(a.path, "test/probe.md");
-        assert_eq!(a.action, ReconcileAction::Push);
-        assert_eq!(a.reason, "client_only");
-        assert_eq!(a.server_hash, None);
-        assert_eq!(a.server_size, None);
-
-        assert_eq!(resp.stats.push, 1);
-        assert_eq!(resp.stats.pull, 0);
-        assert_eq!(resp.stats.identical, 0);
-        assert_eq!(resp.server_time, "2026-05-27T17:04:04.112114+00:00");
+        assert_eq!(resp.deltas.len(), 3);
+        assert_eq!(resp.deltas[0].path, "a.md");
+        assert_eq!(resp.deltas[0].state, "drift");
+        assert_eq!(resp.deltas[0].server_hash.as_deref(), Some("deadbeef"));
+        // `missing-on-server` carries no server_hash → defaults to None.
+        assert_eq!(resp.deltas[1].state, "missing-on-server");
+        assert_eq!(resp.deltas[1].server_hash, None);
+        assert_eq!(resp.deltas[2].state, "match");
+        assert_eq!(resp.deltas[2].server_hash.as_deref(), Some("abc123"));
     }
 
-    /// All three action variants + reasons round-trip from the wire vocabulary.
+    /// An empty / absent `deltas` array deserializes to an empty Vec (the
+    /// in-sync case where every sent path matched but the server returned none).
     #[test]
-    fn reconcile_action_vocabulary_parses() {
-        let body = r#"{
-            "actions": [
-                {"path": "a.md", "action": "push", "reason": "hash_mismatch", "server_hash": "deadbeef", "server_size": 11},
-                {"path": "b.md", "action": "pull", "reason": "server_only", "server_hash": "abc", "server_size": 42},
-                {"path": "c.md", "action": "skip", "reason": "identical"}
-            ],
-            "stats": {"push": 1, "pull": 1, "identical": 1},
-            "server_time": ""
-        }"#;
-        let resp: ReconcileResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(resp.actions[0].action, ReconcileAction::Push);
-        assert_eq!(resp.actions[1].action, ReconcileAction::Pull);
-        assert_eq!(resp.actions[2].action, ReconcileAction::Skip);
-        // Missing optional fields default cleanly.
-        assert_eq!(resp.actions[2].server_hash, None);
-        assert_eq!(resp.actions[2].server_size, None);
+    fn reconcile_batch_empty_deltas_parses() {
+        let resp: ReconcileBatchResponse = serde_json::from_str(r#"{"deltas": []}"#).unwrap();
+        assert!(resp.deltas.is_empty());
+        let resp2: ReconcileBatchResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(resp2.deltas.is_empty());
+    }
+
+    /// Request serializes to the server-expected `{"paths":[{path,fs_hash}]}`.
+    #[test]
+    fn reconcile_batch_request_serializes_paths_fs_hash() {
+        let req = ReconcileBatchRequest {
+            paths: vec![ReconcileBatchItem {
+                path: "notes/a.md".into(),
+                fs_hash: "abc".into(),
+            }],
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(j.contains("\"paths\""));
+        assert!(j.contains("\"path\":\"notes/a.md\""));
+        assert!(j.contains("\"fs_hash\":\"abc\""));
+        // No device_id / manifest leftovers from the legacy contract.
+        assert!(!j.contains("device_id"));
+        assert!(!j.contains("manifest"));
     }
 }

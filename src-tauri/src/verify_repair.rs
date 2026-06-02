@@ -2,24 +2,31 @@
 //! v0.3 mandate §3 "Verify and repair all files" + §4.1).
 //!
 //! Borrowed pattern from obsidian-livesync's same-named admin command. When
-//! the owner clicks "Verify and repair all files" in the tray, we walk every
-//! file in the configured vault, compute local SHA-256, ship the manifest to
-//! the server, and react to the server `actions` list:
+//! the owner clicks "Verify and repair all files" in the tray (and on the
+//! periodic reconciliation backstop), we walk every file in the configured
+//! vault, compute its raw-bytes SHA-256, ship `{path, fs_hash}` to the server's
+//! `POST /api/sync/reconcile-batch`, and react to the per-path `state` deltas:
 //!
-//! * `Push` (reason=client_only OR hash_mismatch — local exists, server
-//!   missing/divergent) → enqueue a `PushAction::Modify` event into the
-//!   push_journal. The push_client drain-loop ships it out of band. Counted
-//!   under `modify_count` in the report (field name kept for tray/dialog
-//!   compatibility).
-//! * `Pull` (reason=server_only — server has it, local doesn't) → LOG ONLY.
-//!   v0.3 relies on the SSE subscriber to materialize server-side adds;
-//!   verify_repair never writes the FS itself. Counted under `add_count`.
-//! * `Skip` (reason=identical) → no-op; the file is in sync.
+//! * `"drift"` (local fs_hash != server) / `"missing-on-server"` (server has no
+//!   row) → enqueue a `PushAction::Modify` event into the push_journal. The
+//!   push_client drain-loop ships it out of band. Counted under `modify_count`
+//!   (field name kept for tray/dialog compatibility).
+//! * `"match"` → no-op; the file is in sync.
 //!
-//! NOTE: the server has NO "delete" concept — it never asks the client to
-//! delete. A file that exists locally but not on the server is a
-//! `push/client_only`, NOT a delete. `delete_count` therefore stays 0; the
-//! field is retained only for tray/dialog struct compatibility.
+//! There is NO "pull" outcome — reconcile-batch only echoes paths the client
+//! SENT, so it never asks us to fetch a server-only file; those are
+//! materialized by the SSE/changes feed instead. `add_count` therefore stays 0.
+//!
+//! v0.4.10: migrated off the dead legacy `POST /api/sync/reconcile` (SQLite
+//! `sync_devices`, which the v0.3+ subscriber daemon never registers in → every
+//! call 404'd "Device not registered") to `POST /api/sync/reconcile-batch`
+//! (Postgres `vault_reconcile_state`, subscriber-bearer auth). This is what
+//! finally makes the reconciliation backstop catch up files created/edited
+//! while the daemon was down. See `api_client::ReconcileBatchItem`.
+//!
+//! NOTE: the server has NO "delete" concept — a file local-only is a push, not
+//! a delete. `delete_count` therefore stays 0; the field is retained only for
+//! tray/dialog struct compatibility.
 //!
 //! Module is push-only on the write side — no `tokio::fs::write` calls happen
 //! here. Verification is read-side and reporting; mutation goes through the
@@ -74,7 +81,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
-use crate::api_client::{ApiClient, ApiError, ReconcileAction, ReconcileEntry, ReconcileRequest};
+use crate::api_client::{ApiClient, ApiError, ReconcileBatchItem, ReconcileBatchRequest};
 use crate::push_journal::{
     new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
@@ -149,11 +156,13 @@ pub struct ManifestEntry {
 pub struct VerifyRepairReport {
     pub files_scanned: usize,
     pub files_in_sync: usize,
-    /// `action == Push` (client_only OR hash_mismatch). Files the daemon
+    /// reconcile-batch `state` ∈ {drift, missing-on-server}. Files the daemon
     /// will upload. Field name kept for tray/dialog compatibility.
     pub modify_count: usize,
     pub modify_paths_sample: Vec<String>,
-    /// `action == Pull` (server_only). SSE consumer materializes; no FS write.
+    /// Always 0 under the reconcile-batch contract — it returns no "pull"
+    /// outcome (server-only files are the SSE feed's job). Retained for
+    /// tray/dialog struct compatibility.
     pub add_count: usize,
     pub add_paths_sample: Vec<String>,
     /// Always 0 — the server has no delete concept. Retained for tray/dialog
@@ -203,8 +212,8 @@ impl VerifyRepair {
 
     /// Full owner-invoked sweep:
     /// 1. Walk + hash → local manifest.
-    /// 2. POST /api/sync/reconcile.
-    /// 3. Apply diff per the rules above.
+    /// 2. POST /api/sync/reconcile-batch ({paths:[{path, fs_hash}]}).
+    /// 3. Enqueue a push for every drift / missing-on-server delta.
     /// 4. Return structured report.
     pub async fn run(&self) -> Result<VerifyRepairReport, VerifyRepairError> {
         let started = Instant::now();
@@ -213,87 +222,82 @@ impl VerifyRepair {
         let manifest = self.build_local_manifest_parallel(&mut report).await?;
         report.files_scanned = manifest.len();
 
-        let api_entries: Vec<ReconcileEntry> = manifest
+        // v0.4.10: send the manifest as the reconcile-batch payload —
+        // `{paths:[{path, fs_hash}]}`, where fs_hash is the raw-file SHA-256 we
+        // already computed during the walk (== server `vault_reconcile_state.fs_hash`).
+        let api_paths: Vec<ReconcileBatchItem> = manifest
             .iter()
-            .map(|m| ReconcileEntry {
+            .map(|m| ReconcileBatchItem {
                 path: m.path.clone(),
-                content_hash: m.content_hash.clone(),
-                size_bytes: m.size_bytes,
+                fs_hash: m.content_hash.clone(),
             })
             .collect();
 
-        let req = ReconcileRequest {
-            device_id: &self.device_id,
-            entries: &api_entries,
-        };
+        let req = ReconcileBatchRequest { paths: api_paths };
 
-        let actions = match self.api.reconcile(&req).await {
-            Ok(r) => r.actions,
+        let deltas = match self.api.reconcile_batch(&req).await {
+            Ok(r) => r.deltas,
             Err(e) => {
-                tracing::error!("reconcile failed: {e}");
+                tracing::error!("reconcile-batch failed: {e}");
                 return Err(VerifyRepairError::Api(e));
             }
         };
 
         // Build a quick lookup: path → ManifestEntry so we can locate the
-        // on-disk file for `Push` actions and enqueue a push.
+        // on-disk file for push deltas and enqueue a push.
         let local_index: std::collections::HashMap<&str, &ManifestEntry> =
             manifest.iter().map(|m| (m.path.as_str(), m)).collect();
 
-        // Collect all Push events during the action loop, then write them to
-        // the journal in ONE batched append after the loop. This replaces N
-        // individual open/flush/close cycles (one per push) with a single one.
+        // Collect all push events during the delta loop, then write them to the
+        // journal in ONE batched append after the loop (replaces N open/flush/
+        // close cycles with a single one).
         let mut pending_pushes: Vec<PushEvent> = Vec::new();
 
-        for entry in &actions {
-            match entry.action {
-                // Push (reason=client_only OR hash_mismatch): we hold the
-                // local canonical → upload it. Counted under modify_count
-                // (field name kept for tray/dialog compatibility).
-                ReconcileAction::Push => {
+        for delta in &deltas {
+            match delta.state.as_str() {
+                // Local differs from the server ("drift"), or the server has no
+                // row for this path ("missing-on-server") → upload the local
+                // canonical. Counted under modify_count (field name kept for
+                // tray/dialog compatibility). NOTE: reconcile-batch never asks
+                // us to PULL — it only echoes paths we sent; server-only files
+                // are materialized by the SSE/changes feed, not here.
+                "drift" | "missing-on-server" => {
                     report.modify_count += 1;
                     if report.modify_paths_sample.len() < SAMPLE_CAP {
-                        report.modify_paths_sample.push(entry.path.clone());
+                        report.modify_paths_sample.push(delta.path.clone());
                     }
 
-                    let Some(local) = local_index.get(entry.path.as_str()) else {
-                        // Server is asking us to push a path we never sent.
-                        // Treat as protocol error — log + skip.
+                    let Some(local) = local_index.get(delta.path.as_str()) else {
+                        // reconcile-batch only echoes paths we sent, so this is
+                        // unreachable in practice; guard defensively.
                         tracing::warn!(
-                            path = %entry.path,
-                            reason = %entry.reason,
-                            "reconcile requested push on path we did not send"
+                            path = %delta.path,
+                            state = %delta.state,
+                            "reconcile-batch delta for a path not in local manifest"
                         );
                         report.errors.push((
-                            entry.path.clone(),
-                            "push requested for path not in local manifest".to_string(),
+                            delta.path.clone(),
+                            "delta path not in local manifest".to_string(),
                         ));
                         continue;
                     };
 
-                    // Build a LIGHTWEIGHT (lazy) push ref — no file read here.
-                    // The push_client reads the body from disk at drain time.
-                    // base_hash is the local content_hash already computed in
-                    // the manifest walk (no re-hash, no re-read).
+                    // LIGHTWEIGHT (lazy) push ref — no file read here. The
+                    // push_client reads the body from disk at drain time;
+                    // base_hash reuses the manifest hash (no re-hash, no re-read).
                     pending_pushes.push(self.build_modify_push(local));
                 }
-                // Pull (reason=server_only): server has it, we don't. v0.3.0
-                // relies on the SSE consumer to materialize. We do NOT write
-                // the FS here.
-                ReconcileAction::Pull => {
-                    report.add_count += 1;
-                    if report.add_paths_sample.len() < SAMPLE_CAP {
-                        report.add_paths_sample.push(entry.path.clone());
-                    }
-                    tracing::info!(
-                        path = %entry.path,
-                        "verify_repair: server-side pull — SSE consumer will materialize"
+                // In sync — no-op.
+                "match" => {}
+                // Forward-compat: an unrecognized state is handled
+                // conservatively (no push) and logged, never silently dropped.
+                other => {
+                    tracing::warn!(
+                        path = %delta.path,
+                        state = %other,
+                        "reconcile-batch: unknown delta state — skipping (no push)"
                     );
                 }
-                // Skip (reason=identical): in sync. No-op — treated like the
-                // files that weren't in the response at all. files_in_sync is
-                // derived below.
-                ReconcileAction::Skip => {}
             }
         }
 
@@ -871,14 +875,17 @@ mod tests {
 
         let mut srv = Server::new_async().await;
         let m = srv
-            .mock("POST", "/api/sync/reconcile")
-            .match_body(mockito::Matcher::PartialJsonString(
-                r#"{"device_id":"dev-test"}"#.to_string(),
-            ))
+            .mock("POST", "/api/sync/reconcile-batch")
+            // v0.4.10 contract: request is {paths:[{path,fs_hash}]} — assert the
+            // manifest paths are present (and the legacy device_id is gone).
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""path":"notes/a\.md""#.to_string()),
+                mockito::Matcher::Regex(r#""fs_hash""#.to_string()),
+            ]))
             .with_status(200)
-            .with_body(
-                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            // All sent paths in sync → server may return them as "match" or omit
+            // them; an empty deltas list is the canonical "nothing to push".
+            .with_body(r#"{"deltas":[]}"#)
             .expect(1)
             .create_async()
             .await;
@@ -894,16 +901,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_enqueues_pushes_for_modify_actions() {
+    async fn run_enqueues_pushes_for_drift_state() {
         let vault = TempDir::new().unwrap();
         write_file(vault.path(), "notes/a.md", b"alpha-local");
 
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
+            // local differs from server → "drift" → enqueue a push.
             .with_body(
-                r#"{"actions":[{"path":"notes/a.md","action":"push","reason":"hash_mismatch","server_hash":"deadbeef","server_size":11}],"stats":{"push":1,"pull":0,"identical":0},"server_time":"2026-05-27T17:04:04.112114+00:00"}"#,
+                r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
             )
             .create_async()
             .await;
@@ -932,19 +940,16 @@ mod tests {
 
     #[tokio::test]
     async fn run_does_not_auto_delete_local_for_server_missing() {
-        // Server never sends a "delete" action. A file local-only on the
-        // client is a push/client_only: we upload it, and we NEVER delete
-        // the local file. delete_count stays 0.
+        // A file the server has no row for comes back "missing-on-server":
+        // we upload it, and we NEVER delete the local file. delete_count stays 0.
         let vault = TempDir::new().unwrap();
         let local_path = write_file(vault.path(), "notes/orphan.md", b"local-only");
 
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(
-                r#"{"actions":[{"path":"notes/orphan.md","action":"push","reason":"client_only","server_hash":null,"server_size":null}],"stats":{"push":1,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            .with_body(r#"{"deltas":[{"path":"notes/orphan.md","state":"missing-on-server"}]}"#)
             .create_async()
             .await;
 
@@ -963,17 +968,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_logs_add_actions_for_sse_to_handle() {
+    async fn run_match_state_is_noop_no_push() {
+        // v0.4.10: reconcile-batch returns "match" for in-sync paths. A match
+        // must enqueue nothing. (There is no "pull" outcome — reconcile-batch
+        // only echoes paths we sent; server-only files are the SSE feed's job.)
         let vault = TempDir::new().unwrap();
-        // Note: server-side path not present on disk locally.
         write_file(vault.path(), "notes/local.md", b"present");
 
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
             .with_body(
-                r#"{"actions":[{"path":"notes/remote.md","action":"pull","reason":"server_only","server_hash":"abc","server_size":42}],"stats":{"push":0,"pull":1,"identical":0},"server_time":""}"#,
+                r#"{"deltas":[{"path":"notes/local.md","state":"match","server_hash":"abc"}]}"#,
             )
             .create_async()
             .await;
@@ -981,10 +988,9 @@ mod tests {
         let (vr, journal, _jd) =
             make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
         let report = vr.run().await.unwrap();
-        assert_eq!(report.add_count, 1);
-        assert_eq!(report.add_paths_sample, vec!["notes/remote.md"]);
-        // We must NOT create remote.md on disk.
-        assert!(!vault.path().join("notes/remote.md").exists());
+        assert_eq!(report.modify_count, 0);
+        assert_eq!(report.add_count, 0);
+        assert_eq!(report.files_in_sync, 1);
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
     }
@@ -992,22 +998,19 @@ mod tests {
     #[tokio::test]
     async fn report_samples_first_50_paths() {
         let vault = TempDir::new().unwrap();
-        // Write 60 local files; server claims all 60 need modify.
+        // Write 60 local files; server reports all 60 as drift (need push).
         let mut diff_entries = Vec::new();
         for i in 0..60 {
             let rel = format!("notes/f{i:03}.md");
             write_file(vault.path(), &rel, format!("body-{i}").as_bytes());
             diff_entries.push(format!(
-                r#"{{"path":"{rel}","action":"push","reason":"hash_mismatch","server_hash":"h{i}","server_size":null}}"#
+                r#"{{"path":"{rel}","state":"drift","server_hash":"h{i}"}}"#
             ));
         }
-        let body = format!(
-            r#"{{"actions":[{}],"stats":{{"push":60,"pull":0,"identical":0}},"server_time":""}}"#,
-            diff_entries.join(",")
-        );
+        let body = format!(r#"{{"deltas":[{}]}}"#, diff_entries.join(","));
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
             .with_body(body)
             .create_async()
@@ -1038,11 +1041,9 @@ mod tests {
         write_file(vault.path(), "x.md", b"hi");
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(
-                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            .with_body(r#"{"deltas":[]}"#)
             .create_async()
             .await;
         let (vr, _j, _jd) = make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
@@ -1059,16 +1060,16 @@ mod tests {
 
     #[tokio::test]
     async fn modify_for_path_not_in_local_manifest_is_reported_as_error() {
-        // Server diff references a path we never sent. We can't push it
-        // (we don't have its bytes); record an error, don't crash.
+        // Defensive guard: a delta references a path we never sent (shouldn't
+        // happen — reconcile-batch echoes only sent paths — but must not crash).
         let vault = TempDir::new().unwrap();
         write_file(vault.path(), "real.md", b"x");
 
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(r#"{"actions":[{"path":"phantom.md","action":"push","reason":"client_only","server_hash":"abc","server_size":null}],"stats":{"push":1,"pull":0,"identical":0},"server_time":""}"#)
+            .with_body(r#"{"deltas":[{"path":"phantom.md","state":"missing-on-server"}]}"#)
             .create_async()
             .await;
         let (vr, _j, _jd) = make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
@@ -1084,7 +1085,7 @@ mod tests {
         write_file(vault.path(), "a.md", b"x");
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(500)
             .create_async()
             .await;

@@ -418,11 +418,9 @@ mod tests {
 
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(
-                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            .with_body(r#"{"deltas":[]}"#)
             .create_async()
             .await;
 
@@ -471,11 +469,9 @@ mod tests {
         fs::write(vault_parent.path().join(vault_name).join("a.md"), b"hello").unwrap();
         let mut srv = Server::new_async().await;
         let _m = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(
-                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            .with_body(r#"{"deltas":[]}"#)
             .create_async()
             .await;
         let cfg = make_config(&srv.url(), vault_parent.path().to_path_buf(), vault_name);
@@ -718,11 +714,9 @@ mod tests {
 
         let mut srv = Server::new_async().await;
         let _mock = srv
-            .mock("POST", "/api/sync/reconcile")
+            .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            .with_body(
-                r#"{"actions":[],"stats":{"push":0,"pull":0,"identical":0},"server_time":""}"#,
-            )
+            .with_body(r#"{"deltas":[]}"#)
             .expect_at_least(2) // once per sync_root
             .create_async()
             .await;
