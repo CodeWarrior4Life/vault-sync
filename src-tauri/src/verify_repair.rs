@@ -283,9 +283,12 @@ impl VerifyRepair {
                     };
 
                     // LIGHTWEIGHT (lazy) push ref — no file read here. The
-                    // push_client reads the body from disk at drain time;
-                    // base_hash reuses the manifest hash (no re-hash, no re-read).
-                    pending_pushes.push(self.build_modify_push(local));
+                    // push_client reads the body from disk at drain time. The
+                    // CAS base is the server's CURRENT hash from the delta:
+                    // Some(server_hash) for drift (overwrite the diverged row),
+                    // None for missing-on-server (create). delta.server_hash is
+                    // already exactly that (None when the server has no row).
+                    pending_pushes.push(self.build_modify_push(local, delta.server_hash.clone()));
                 }
                 // In sync — no-op.
                 "match" => {}
@@ -535,17 +538,28 @@ impl VerifyRepair {
         Ok(out)
     }
 
-    /// Build a LIGHTWEIGHT (lazy) Modify push event. Does NOT read the file —
-    /// `content_bytes: None` tells the push_client to read the body from disk
-    /// at drain time. `base_hash` / `content_sha` reuse the manifest hash that
-    /// was already computed during the walk (no re-hash, no re-read).
-    fn build_modify_push(&self, entry: &ManifestEntry) -> PushEvent {
+    /// Build a LIGHTWEIGHT (lazy) Modify push for a reconcile delta. Does NOT
+    /// read the file — `content_bytes: None` tells push_client to read the body
+    /// from disk at drain time. `content_sha` is the LOCAL (new) hash we're
+    /// writing (from the manifest walk; no re-hash).
+    ///
+    /// v0.4.11: `base_hash` is the server-side CAS base the push handler checks
+    /// against `vault_reconcile_state.fs_hash` — it MUST be the server's CURRENT
+    /// hash, NOT our local one:
+    ///   * `drift`             → `Some(server_hash)` (from the reconcile delta) so
+    ///                           the CAS passes and the local version overwrites
+    ///                           the diverged server one.
+    ///   * `missing-on-server` → `None` (sent as `""`) so the server CREATEs the
+    ///                           row (an `""` base on an existing row would conflict).
+    /// v0.4.10 wrongly sent our LOCAL hash here, which by definition mismatches a
+    /// drifted server row → every drift push 409'd `ConflictUnrecoverable`.
+    fn build_modify_push(&self, entry: &ManifestEntry, base_hash: Option<String>) -> PushEvent {
         PushEvent {
             schema_version: CURRENT_SCHEMA,
             id: new_event_id(),
             path: entry.path.clone(),
             action: PushAction::Modify,
-            base_hash: Some(entry.content_hash.clone()),
+            base_hash,
             content_sha: entry.content_hash.clone(),
             content_bytes: None,
             queued_at: chrono::Utc::now(),
@@ -933,9 +947,13 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0.path, "notes/a.md");
         assert_eq!(batch[0].0.action, PushAction::Modify);
-        // verify_repair now enqueues a LAZY ref — content is read at drain
-        // time by push_client, not embedded in the journal.
+        // verify_repair enqueues a LAZY ref — content is read at drain time by
+        // push_client, not embedded in the journal.
         assert_eq!(batch[0].0.content_bytes, None);
+        // v0.4.11: a DRIFT push must carry the SERVER's current hash as the CAS
+        // base (from the delta), NOT the local hash — else the server's
+        // base_hash==current check fails and the push 409s ConflictUnrecoverable.
+        assert_eq!(batch[0].0.base_hash.as_deref(), Some("deadbeef"));
     }
 
     #[tokio::test]
@@ -963,8 +981,15 @@ mod tests {
         // File still on disk — verify_repair never deletes.
         assert!(local_path.exists());
         // The local-only file is pushed up.
-        let j = journal.lock().await;
-        assert_eq!(j.len(), 1);
+        let batch = {
+            let mut j = journal.lock().await;
+            assert_eq!(j.len(), 1);
+            j.drain(10).unwrap()
+        };
+        assert_eq!(batch.len(), 1);
+        // v0.4.11: missing-on-server → base_hash None (sent as "") so the server
+        // CREATEs the row (a non-empty base on a missing row would conflict).
+        assert_eq!(batch[0].0.base_hash, None);
     }
 
     #[tokio::test]
