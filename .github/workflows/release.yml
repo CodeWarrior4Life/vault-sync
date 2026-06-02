@@ -66,3 +66,13 @@ jobs:
         env:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
         run: ./scripts/verify-nexus-release.sh ${{ matrix.platform }} ${{ github.ref_name }}
+      - name: Promote on Nexus (go live → auto-update)
+        # v0.4.13 (S493): flip the just-verified release to is_current=TRUE so
+        # the updater /latest endpoint actually serves it. WITHOUT this the
+        # upload stays STAGED (S484 gate) and NO daemon auto-updates — the fleet
+        # was frozen on v0.4.4 for exactly this reason. Runs only AFTER the
+        # signature HARD GATE, so an unsigned/broken build can never go live.
+        shell: bash  # windows-latest defaults to pwsh, can't run the .sh
+        env:
+          NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
+        run: ./scripts/promote-nexus.sh ${{ matrix.platform }} ${{ github.ref_name }}
