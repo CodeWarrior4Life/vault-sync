@@ -32,6 +32,12 @@ use crate::tray_state::SharedTrayState;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+// FileTimes::set_created (birthtime) is exposed via a platform-specific extension
+// trait — macOS (setattrlist) and Windows. Linux has no std API for it.
+#[cfg(target_os = "macos")]
+use std::os::darwin::fs::FileTimesExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileTimesExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -121,6 +127,46 @@ pub enum MaterializeOutcome {
 // ---------------------------------------------------------------------------
 // Materializer
 // ---------------------------------------------------------------------------
+
+/// Restore server-authoritative creation/modification times onto a freshly
+/// materialized file. macOS: `FileTimes::set_created` writes the birthtime via
+/// `setattrlist` — the timestamp Obsidian sorts "Created" by — so an atomic
+/// tmp+rename (new inode, birthtime=now) no longer clobbers the note's true
+/// created date. `set_modified` restores mtime. Best-effort by design: the file
+/// is already byte-faithful, so a timestamp-set failure is logged, never fatal.
+/// `created`/`file_mtime` are unix-timestamp floats from the server payload;
+/// either may be absent (older server) — we set whatever we have.
+fn restore_server_times(target: &Path, payload: &NotePayload) {
+    let to_systime = |ts: Option<f64>| -> Option<std::time::SystemTime> {
+        ts.and_then(|t| {
+            (t > 0.0).then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(t))
+        })
+    };
+    // mtime from file_mtime, falling back to created so set_times always has a base.
+    let mtime = to_systime(payload.file_mtime).or_else(|| to_systime(payload.created));
+    let Some(mtime) = mtime else {
+        return;
+    };
+    #[allow(unused_mut)]
+    let mut times = std::fs::FileTimes::new().set_modified(mtime);
+    // Birthtime is settable only on macOS/Windows (FileTimesExt). On Linux the
+    // ext4 birthtime is not writable via std; Linux clients are non-user-facing
+    // for the "Created" sort, so mtime-only is sufficient there.
+    #[cfg(any(target_os = "macos", windows))]
+    if let Some(ctime) = to_systime(payload.created) {
+        times = times.set_created(ctime);
+    }
+    match std::fs::File::options().write(true).open(target) {
+        Ok(f) => {
+            if let Err(e) = f.set_times(times) {
+                warn!(path = %target.display(), error = %e, "restore_server_times: set_times failed");
+            }
+        }
+        Err(e) => {
+            warn!(path = %target.display(), error = %e, "restore_server_times: reopen failed");
+        }
+    }
+}
 
 /// Materializer config — opt-in feature flags.  Defaults align with
 /// mandate §1 (integrity ON, ServerWins conflict default per §3).
@@ -463,6 +509,15 @@ impl Materializer {
         tmp.flush()?;
         tmp.persist(&target).map_err(|e| e.error)?;
 
+        // 8b. Restore server-authoritative timestamps. The atomic tmp+rename above
+        // gives `target` a brand-new inode whose birthtime = now; macOS/Obsidian
+        // read that as the note's "Created" date, so every re-materialization
+        // reorders the operator's note list to "today" (the ctime-clobber incident,
+        // 2026-06-05). Set birthtime from server `created` and mtime from
+        // `file_mtime`. Best-effort: a timestamp-set failure must NOT fail the
+        // (already byte-faithful) write.
+        restore_server_times(&target, payload);
+
         // 9. Post-write integrity check.
         if self.config.enable_integrity_check {
             let expected = ExpectedIntegrity {
@@ -748,6 +803,7 @@ mod tests {
             sha256: sha256_hex(&serialized),
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
+            created: None,
             // Mirror the real server: enriched_body is the exact content the
             // sha256 is computed over (S486).
             enriched_body: Some(serialized),
@@ -788,6 +844,7 @@ mod tests {
             sha256: sha256_hex(original),
             modified: "2026-05-31T00:00:00Z".into(),
             file_mtime: None,
+            created: None,
             enriched_body: Some(original.to_string()),
         };
 
@@ -828,6 +885,7 @@ mod tests {
             sha256: sha256_hex(&serialized),
             modified: "2026-05-31T00:00:00Z".into(),
             file_mtime: None,
+            created: None,
             enriched_body: None,
         };
         let out = m.write(&p).unwrap();
@@ -960,6 +1018,31 @@ mod tests {
         );
     }
 
+    /// Regression (2026-06-05 ctime-clobber): a fresh materialize must restore the
+    /// file's birthtime from server `created` (Obsidian "Created" sort) and mtime
+    /// from `file_mtime`, NOT leave them at "now". macOS-only: birthtime is the
+    /// platform timestamp Obsidian reads, and the one set_created writes.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn restores_birthtime_and_mtime_from_payload() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let created_ts = 1_577_882_096.0_f64; // 2020-01-01
+        let mtime_ts = 1_704_067_200.0_f64; // 2024-01-01
+        let mut p = payload("01_Inbox/ts.md", "hello");
+        p.created = Some(created_ts);
+        p.file_mtime = Some(mtime_ts);
+        m.write(&p).unwrap();
+        let md = std::fs::metadata(vaults.path().join(VAULT).join("01_Inbox/ts.md")).unwrap();
+        let near = |a: std::time::SystemTime, want: f64| {
+            let b = UNIX_EPOCH + Duration::from_secs_f64(want);
+            let d = a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap();
+            d < Duration::from_secs(2)
+        };
+        assert!(near(md.modified().unwrap(), mtime_ts), "mtime not restored from file_mtime");
+        assert!(near(md.created().unwrap(), created_ts), "birthtime not restored from created");
+    }
+
     #[test]
     fn frontmatter_only_rewrite_treated_as_identical() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -989,6 +1072,7 @@ mod tests {
             sha256: sha256_hex(&serialized),
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
+            created: None,
             enriched_body: Some(serialized),
         };
         let out = m.write(&p).unwrap();
@@ -1355,6 +1439,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
                 modified: "2026-05-29T00:00:00Z".into(),
                 file_mtime: None,
+            created: None,
                 enriched_body: Some(serialized),
             }
         };

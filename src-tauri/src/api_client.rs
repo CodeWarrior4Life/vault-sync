@@ -96,6 +96,13 @@ pub struct NotePayload {
     // omit the field (materializer falls back to frontmatter reconstruction).
     #[serde(default)]
     pub enriched_body: Option<String>,
+    // Canonical note creation time as a unix-timestamp float (vault_notes.created),
+    // e.g. 1709825021.0. The materializer restores this onto the written file's
+    // birthtime (macOS) so re-materialization no longer resets it to "now" — the
+    // ctime-clobber that reordered the operator's "Created"-sorted note list
+    // (2026-06-05). serde(default) keeps back-compat with servers that omit it.
+    #[serde(default)]
+    pub created: Option<f64>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).
