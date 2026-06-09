@@ -76,13 +76,31 @@ pub(crate) fn build_verify_repair(
     let journal = PushJournal::open(&journal_path).map_err(|e| e.to_string())?;
     let journal_arc = Arc::new(Mutex::new(journal));
 
+    // fix/reconcile-server-wins-shadow: wire the (read-only) shadow store so the
+    // owner-invoked "Verify and repair" makes the SAME push-vs-pull direction
+    // call the periodic backstop does. Loads the SAME on-disk shadow file the
+    // daemon maintains (path → last-synced server hash); reads the persisted
+    // (last-flushed, ≤30s old) state. With shadow but no materializer, the manual
+    // button correctly PUSHES genuine local edits (shadow == server) and DETECTS
+    // (counts) stale locals — their server-wins PULL is executed by the periodic
+    // backstop (which is wired with a materializer). This avoids constructing a
+    // materializer here without the server health snapshot (mode/shadow_path),
+    // which could write to the wrong place.
+    let shadow_path = workspace_root
+        .join(".lattice-runtime")
+        .join(subscriber_id)
+        .join("sync-state")
+        .join("shadow_hashes.json");
+    let shadow = crate::sync_shadow::ShadowStore::load(shadow_path);
+
     let vr = VerifyRepair::new(
         vault_root,
         api_arc,
         journal_arc.clone(),
         subscriber_id.to_string(),
         VerifyRepairConfig::default(),
-    );
+    )
+    .with_shadow(shadow);
     Ok((vr, journal_arc))
 }
 

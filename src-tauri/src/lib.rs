@@ -18,6 +18,7 @@ pub mod reconciliation;
 pub mod redflag;
 pub mod scope;
 pub mod sse;
+pub mod sync_shadow;
 pub mod token_store;
 pub mod tray;
 pub mod tray_state;
@@ -513,6 +514,19 @@ fn spawn_sse_consumer(
         // for the daemon so the SSE->materialize->watcher->push loop is broken
         // across all sync_roots.
         let echo_guard = std::sync::Arc::new(echo_guard::EchoGuard::new());
+        // fix/reconcile-server-wins-shadow: persistent per-file "last-synced
+        // server hash" marker. Shared (Arc) across the materializer (records on
+        // every pull), the push_client (records on every accepted push), and the
+        // reconcile backstop (reads to decide push-vs-pull on drift). Lives under
+        // the per-subscriber sync-state runtime dir, beside last_event_id.
+        let shadow = sync_shadow::ShadowStore::load(
+            commands::resolve_workspace_root()
+                .join(".lattice-runtime")
+                .join(&cfg.subscriber_id)
+                .join("sync-state")
+                .join("shadow_hashes.json"),
+        );
+        sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
         // B2: materializer uses the primary sync_root.path as vault root.
         // Multi-root materialization is a deferred task (one materializer
         // per sync_root); for now the SSE consumer materializes into the
@@ -526,7 +540,8 @@ fn spawn_sse_consumer(
             materializer_cfg,
         )
         .with_tray_state(tray_state.clone())
-        .with_echo_guard(echo_guard.clone());
+        .with_echo_guard(echo_guard.clone())
+        .with_shadow_store(shadow.clone());
 
         // Wave 4: spawn a 60s periodic task that refreshes the tray's
         // `conflict_unresolved` counter from the on-disk stash siblings.
@@ -581,6 +596,10 @@ fn spawn_sse_consumer(
             .iter()
             .map(|root| {
                 let eff_sub = effective_subscriber_id(root, &cfg);
+                // fix/reconcile-server-wins-shadow: hand the reconcile backstop
+                // its own materializer clone (to EXECUTE server-wins pulls) +
+                // the shared shadow store (to decide push-vs-pull). Clone here,
+                // BEFORE the primary materializer moves into the SSE consumer.
                 spawn_push_pipeline(
                     &app,
                     &cfg,
@@ -591,6 +610,8 @@ fn spawn_sse_consumer(
                     watch_scope_excludes.clone(),
                     tray_state.clone(),
                     echo_guard.clone(),
+                    materializer.clone(),
+                    shadow.clone(),
                 )
             })
             .collect();
@@ -703,6 +724,8 @@ fn spawn_push_pipeline(
     scope_excludes: Vec<String>,
     tray_state: tray_state::SharedTrayState,
     echo_guard: std::sync::Arc<echo_guard::EchoGuard>,
+    materializer: materializer::Materializer,
+    shadow: std::sync::Arc<sync_shadow::ShadowStore>,
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
 
@@ -781,7 +804,8 @@ fn spawn_push_pipeline(
         push_cfg,
         vault_root.clone(),
     )
-    .with_tray_state(tray_state.clone());
+    .with_tray_state(tray_state.clone())
+    .with_shadow_store(shadow.clone());
 
     // Never-fired shutdown channel — the push loop runs for the daemon's
     // lifetime. We hold the sender in the spawned task so it isn't dropped
@@ -808,12 +832,16 @@ fn spawn_push_pipeline(
     // push pipeline + file_watcher carry on.
     match api_client::ApiClient::new(&cfg.nexus_url, &token) {
         Ok(recon_api) => {
+            // fix/reconcile-server-wins-shadow: pass the materializer (to
+            // execute server-wins pulls) + shadow store (to decide direction).
             let _recon_task = reconciliation::spawn_reconciliation_task(
                 vault_root.clone(),
                 Arc::new(recon_api),
                 journal.clone(),
                 subscriber_id.clone(),
                 tray_state.clone(),
+                materializer.clone(),
+                shadow.clone(),
             );
         }
         Err(e) => {

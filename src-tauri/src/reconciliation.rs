@@ -135,24 +135,32 @@ impl EnvReader for MapEnv {
 /// - INFO at start (with the configured cadence the caller is enforcing).
 /// - INFO per action: pulled-list / pushed-count / in-sync-count.
 /// - WARN on any error path.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reconciliation_pass(
     vault_root: PathBuf,
     api: Arc<ApiClient>,
     journal: Arc<Mutex<PushJournal>>,
     device_id: String,
     tray_state: SharedTrayState,
+    materializer: crate::materializer::Materializer,
+    shadow: Arc<crate::sync_shadow::ShadowStore>,
 ) -> Result<VerifyRepairReport, VerifyRepairError> {
     if let Ok(mut w) = tray_state.write() {
         w.set_recon_in_progress(true);
     }
 
+    // fix/reconcile-server-wins-shadow: wire the materializer (executes
+    // server-wins pulls for stale-local drift) + shadow store (decides
+    // push-vs-pull) into the backstop.
     let vr = VerifyRepair::new(
         vault_root,
         api,
         journal,
         device_id,
         VerifyRepairConfig::default(),
-    );
+    )
+    .with_materializer(materializer)
+    .with_shadow(shadow);
 
     tracing::info!("reconciliation: pass starting");
     let result = vr.run().await;
@@ -238,12 +246,15 @@ pub fn recon_pairs_from_sync_roots(
 ///
 /// On the kill switch being set, each individual task logs once and returns
 /// immediately (the kill switch is global across all roots, per env var).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reconciliation_tasks_for_roots(
     sync_roots: &[SyncRoot],
     fallback_subscriber_id: &str,
     api: Arc<ApiClient>,
     journal: Arc<Mutex<PushJournal>>,
     tray_state: SharedTrayState,
+    materializer: crate::materializer::Materializer,
+    shadow: Arc<crate::sync_shadow::ShadowStore>,
 ) -> Vec<tauri::async_runtime::JoinHandle<()>> {
     recon_pairs_from_sync_roots(sync_roots, fallback_subscriber_id)
         .into_iter()
@@ -254,6 +265,8 @@ pub fn spawn_reconciliation_tasks_for_roots(
                 Arc::clone(&journal),
                 subscriber_id,
                 tray_state.clone(),
+                materializer.clone(),
+                shadow.clone(),
             )
         })
         .collect()
@@ -265,12 +278,15 @@ pub fn spawn_reconciliation_tasks_for_roots(
 ///
 /// Called from `lib::spawn_push_pipeline`'s success path after the
 /// push_journal handle is open.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reconciliation_task(
     vault_root: PathBuf,
     api: Arc<ApiClient>,
     journal: Arc<Mutex<PushJournal>>,
     device_id: String,
     tray_state: SharedTrayState,
+    materializer: crate::materializer::Materializer,
+    shadow: Arc<crate::sync_shadow::ShadowStore>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let env = ProcessEnv;
@@ -301,6 +317,8 @@ pub fn spawn_reconciliation_task(
                 Arc::clone(&journal),
                 device_id.clone(),
                 tray_state.clone(),
+                materializer.clone(),
+                shadow.clone(),
             )
             .await;
             // Errors are already WARN-logged by run_reconciliation_pass;

@@ -127,6 +127,12 @@ pub struct PushClient {
     /// increments `uploads_sent` / `uploads_failed` and updates
     /// `uploads_pending` after each `drain_once`.
     tray_state: Option<SharedTrayState>,
+    /// Persistent per-file shadow-hash store (fix/reconcile-server-wins-shadow).
+    /// After a push the server accepts (`Accepted`) the pushed local hash is
+    /// now the server's canonical; on `Merged` the server's returned canonical
+    /// hash is. Recording it keeps the reconcile backstop from later mistaking
+    /// a freshly-pushed file for a stale-pull candidate. `None` = no recording.
+    shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
 }
 
 impl PushClient {
@@ -144,6 +150,7 @@ impl PushClient {
             config,
             vault_root,
             tray_state: None,
+            shadow_store: None,
         }
     }
 
@@ -151,6 +158,15 @@ impl PushClient {
     /// tray menu / tooltip in near-real-time. Backwards-compatible.
     pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
         self.tray_state = Some(state);
+        self
+    }
+
+    /// Builder-style: attach the shared persistent
+    /// [`ShadowStore`](crate::sync_shadow::ShadowStore). After this, an
+    /// `Accepted`/`Merged` push records the now-canonical server hash for the
+    /// pushed path. Backwards-compatible — without it, no recording.
+    pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
+        self.shadow_store = Some(store);
         self
     }
 
@@ -388,7 +404,26 @@ impl PushClient {
         let mut last_err: Option<String> = None;
         for attempt in 0..self.config.max_retry_attempts {
             match self.api.push(&req).await {
-                Ok(resp) => return map_response(resp),
+                Ok(resp) => {
+                    // fix/reconcile-server-wins-shadow: a push the server
+                    // accepts means the canonical server hash is now known —
+                    // record it so the reconcile backstop won't later mistake
+                    // this just-pushed file for a stale-pull candidate.
+                    // Accepted → our pushed local hash IS the canonical.
+                    // Merged → the server's returned canonical hash is.
+                    // ConflictMarkers / Error → no clean canonical, skip.
+                    if let Some(sh) = &self.shadow_store {
+                        if let Some(h) = shadow_hash_for_ack(
+                            &resp.status,
+                            &evt.content_sha,
+                            resp.server_hash.as_deref(),
+                            resp.content_hash.as_deref(),
+                        ) {
+                            sh.record(&evt.path, &h);
+                        }
+                    }
+                    return map_response(resp);
+                }
                 Err(ApiError::Unauthorized) => {
                     return PushOutcome::Failed(FailureReason::Unauthorized);
                 }
@@ -436,6 +471,37 @@ impl PushClient {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Decide which hash (if any) to record into the ShadowStore for a push the
+/// server acked. Pure + table-tested.
+///
+/// * `Accepted` → the local bytes we pushed are now the server's canonical →
+///   record `local_sha`.
+/// * `Merged` → the server merged a concurrent edit and its returned canonical
+///   differs from what we pushed → record the server's canonical
+///   (`server_hash`, falling back to `content_hash` if the server only echoes
+///   that field). If neither is present, fall back to `local_sha` so we still
+///   record SOMETHING (better an approximate marker than none — drift will
+///   self-correct on the next pass).
+/// * `ConflictMarkers` / `Error` → no clean canonical was established → record
+///   nothing.
+fn shadow_hash_for_ack(
+    status: &PushStatus,
+    local_sha: &str,
+    server_hash: Option<&str>,
+    content_hash: Option<&str>,
+) -> Option<String> {
+    match status {
+        PushStatus::Accepted => Some(local_sha.to_string()),
+        PushStatus::Merged => Some(
+            server_hash
+                .or(content_hash)
+                .unwrap_or(local_sha)
+                .to_string(),
+        ),
+        PushStatus::ConflictMarkers | PushStatus::Error => None,
+    }
+}
 
 fn map_response(resp: PushResponse) -> PushOutcome {
     match resp.status {
@@ -712,6 +778,7 @@ mod tests {
             config: cfg,
             vault_root: PathBuf::from("/v"),
             tray_state: None,
+            shadow_store: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -735,6 +802,7 @@ mod tests {
             config: cfg,
             vault_root: PathBuf::from("/v"),
             tray_state: None,
+            shadow_store: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -754,6 +822,7 @@ mod tests {
             config: cfg,
             vault_root: PathBuf::from("/v"),
             tray_state: None,
+            shadow_store: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -772,6 +841,7 @@ mod tests {
             config: cfg,
             vault_root: PathBuf::from("/v"),
             tray_state: None,
+            shadow_store: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -1142,6 +1212,7 @@ mod tests {
             config: cfg,
             vault_root: PathBuf::from("/sync/root/a"), // per-root path
             tray_state: None,
+            shadow_store: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
@@ -1149,6 +1220,41 @@ mod tests {
         assert!(
             result.is_none(),
             "root-relative path must not be filtered; got {result:?}"
+        );
+    }
+
+    // --- shadow_hash_for_ack (fix/reconcile-server-wins-shadow) ---
+
+    #[test]
+    fn shadow_hash_for_ack_table() {
+        // Accepted → the pushed local hash is the new canonical.
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Accepted, "local", Some("srv"), Some("ch")),
+            Some("local".to_string())
+        );
+        // Merged → prefer server_hash.
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Merged, "local", Some("srv"), Some("ch")),
+            Some("srv".to_string())
+        );
+        // Merged, no server_hash → fall back to content_hash.
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Merged, "local", None, Some("ch")),
+            Some("ch".to_string())
+        );
+        // Merged, neither → fall back to local (record SOMETHING).
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Merged, "local", None, None),
+            Some("local".to_string())
+        );
+        // ConflictMarkers / Error → record nothing.
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::ConflictMarkers, "local", Some("srv"), None),
+            None
+        );
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Error, "local", Some("srv"), None),
+            None
         );
     }
 }

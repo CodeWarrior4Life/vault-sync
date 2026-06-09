@@ -237,6 +237,13 @@ pub struct Materializer {
     /// 60s background refresh task in `lib::spawn_sse_consumer`) shares
     /// the debounce window with the primary write-path instance.
     last_conflict_refresh_ms: Arc<AtomicI64>,
+    /// Persistent per-file shadow-hash store (fix/reconcile-server-wins-shadow).
+    /// On every write where the local file now equals the server's canonical
+    /// bytes, we record `path → payload.sha256` so the reconcile backstop can
+    /// later tell a genuine local edit (push) from a stale materialization
+    /// (pull). Optional + `Arc`-shared so a clone (reconcile, SSE consumer)
+    /// shares one on-disk marker; `None` keeps pre-fix behavior (no recording).
+    shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
 }
 
 impl Clone for Materializer {
@@ -251,6 +258,7 @@ impl Clone for Materializer {
             tray_state: self.tray_state.clone(),
             echo_guard: self.echo_guard.clone(),
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
+            shadow_store: self.shadow_store.clone(),
         }
     }
 }
@@ -281,7 +289,18 @@ impl Materializer {
             tray_state: None,
             echo_guard: None,
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
+            shadow_store: None,
         }
+    }
+
+    /// Builder-style: attach the shared persistent
+    /// [`ShadowStore`](crate::sync_shadow::ShadowStore). After this, every write
+    /// that leaves the local file equal to the server's canonical bytes records
+    /// `path → payload.sha256` so the reconcile backstop can resolve drift
+    /// direction (push vs pull). Backwards-compatible — without it, no recording.
+    pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
+        self.shadow_store = Some(store);
+        self
     }
 
     /// Builder-style: attach the shared [`EchoGuard`](crate::echo_guard::EchoGuard)
@@ -445,6 +464,12 @@ impl Materializer {
                         path = %payload.path,
                         "materializer skip — local already identical to canonical"
                     );
+                    // Local already equals the server's canonical bytes — record
+                    // the synced server hash so the reconcile backstop sees this
+                    // path as in-sync-with-server, not a stale-pull candidate.
+                    if let Some(sh) = &self.shadow_store {
+                        sh.record(&payload.path, &payload.sha256);
+                    }
                     return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
                 }
                 LocalCompare::Diverges { local_bytes } => {
@@ -557,6 +582,15 @@ impl Materializer {
                 path = %payload.path,
                 "materializer SHA mismatch (integrity-check disabled) — file written but does not match server hash"
             );
+        }
+
+        // The local file now equals the server's canonical bytes (we just wrote
+        // them and integrity passed). Record the synced server hash for the
+        // reconcile backstop's drift-direction decision. Reached only on the
+        // Wrote / Stashed success paths — IntegrityFailed returned above, so a
+        // failed write never records a (false) in-sync marker.
+        if let Some(sh) = &self.shadow_store {
+            sh.record(&payload.path, &payload.sha256);
         }
 
         if let Some(stash) = stash_path {
@@ -1389,6 +1423,38 @@ mod tests {
         // Must not panic, must not touch any tray (there is none).
         m.refresh_conflict_count_into_tray();
         m.refresh_conflict_count_into_tray();
+    }
+
+    // ---- shadow-store recording (fix/reconcile-server-wins-shadow) -----------
+
+    /// A successful Live write must record the server's canonical hash
+    /// (payload.sha256) into the attached ShadowStore, keyed by the wire path.
+    #[test]
+    fn successful_write_records_shadow_hash() {
+        use crate::sync_shadow::ShadowStore;
+        let dir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
+        let m = m_base.with_shadow_store(shadow.clone());
+        let p = payload("01_Inbox/foo.md", "hello");
+        let out = m.write(&p).unwrap();
+        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert_eq!(shadow.get(&p.path), Some(p.sha256.clone()));
+    }
+
+    /// An IntegrityFailed write must NOT record a shadow hash (the on-disk
+    /// bytes don't match the server canonical, so it isn't a true in-sync state).
+    #[test]
+    fn integrity_failed_write_does_not_record_shadow() {
+        use crate::sync_shadow::ShadowStore;
+        let dir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
+        let m = m_base.with_shadow_store(shadow.clone());
+        let p = payload_with_bad_sha("01_Inbox/foo.md", "hello");
+        let out = m.write(&p).unwrap();
+        assert!(matches!(out, MaterializeOutcome::IntegrityFailed { .. }));
+        assert_eq!(shadow.get(&p.path), None);
     }
 
     // ---- B4: per-sync_root materializer tests --------------------------------

@@ -185,12 +185,74 @@ pub enum VerifyRepairError {
     Journal(#[from] JournalError),
 }
 
+/// Direction the reconcile backstop should take for one drift/match/missing
+/// delta. The load-bearing decision of fix/reconcile-server-wins-shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Local is authoritative — upload it.
+    Push,
+    /// Server is authoritative — fetch + overwrite local (server-wins).
+    Pull,
+    /// In sync — do nothing.
+    Noop,
+}
+
+/// PURE drift-direction decision (table-tested). Given the reconcile delta
+/// `state`, the local file hash, the server's current hash, and the
+/// last-synced shadow hash, decide whether to push, pull, or no-op.
+///
+/// The crux for a mirror host that has a STALE prior-materialization:
+///
+/// * `"drift"` (local ≠ server):
+///   - shadow == server  ⇒ the server has NOT moved since we last synced this
+///     file ⇒ the local≠server diff can only be a genuine local user edit ⇒
+///     **Push**.
+///   - shadow absent, OR shadow ≠ server ⇒ the server HAS moved since we synced
+///     (or we never synced it) ⇒ our local copy is stale ⇒ **Pull** (server
+///     wins; overwrite the stale local). This is the storm fix — the old code
+///     unconditionally pushed here, 409-churning against newer server bytes.
+/// * `"missing-on-server"` ⇒ the server has no row for a file we hold ⇒ **Push**
+///   (create it). Shadow is irrelevant.
+/// * `"match"` ⇒ **Noop**.
+/// * unknown state ⇒ **Noop** (conservative; caller logs).
+pub fn decide_direction(
+    state: &str,
+    _local_hash: &str,
+    server_hash: Option<&str>,
+    shadow_hash: Option<&str>,
+) -> Direction {
+    match state {
+        "drift" => {
+            let is_local_edit = matches!(
+                (shadow_hash, server_hash),
+                (Some(sh), Some(srv)) if sh == srv
+            );
+            if is_local_edit {
+                Direction::Push
+            } else {
+                Direction::Pull
+            }
+        }
+        "missing-on-server" => Direction::Push,
+        "match" => Direction::Noop,
+        _ => Direction::Noop,
+    }
+}
+
 pub struct VerifyRepair {
     vault_root: PathBuf,
     api: Arc<ApiClient>,
     journal: Arc<Mutex<PushJournal>>,
     device_id: String,
     config: VerifyRepairConfig,
+    /// Optional materializer used to EXECUTE server-wins PULLs in the drift
+    /// arm (fetch_note → write). `None` in unit tests that only exercise the
+    /// manifest / push machinery — pulls are then counted but not executed.
+    materializer: Option<crate::materializer::Materializer>,
+    /// Optional persistent shadow-hash store consulted by `decide_direction`
+    /// to tell a genuine local edit (push) from a stale materialization (pull).
+    /// `None` ⇒ every drift falls to PULL (the safe mirror-host default).
+    shadow: Option<Arc<crate::sync_shadow::ShadowStore>>,
 }
 
 impl VerifyRepair {
@@ -207,7 +269,21 @@ impl VerifyRepair {
             journal,
             device_id,
             config,
+            materializer: None,
+            shadow: None,
         }
+    }
+
+    /// Builder: attach the materializer used to EXECUTE server-wins pulls.
+    pub fn with_materializer(mut self, m: crate::materializer::Materializer) -> Self {
+        self.materializer = Some(m);
+        self
+    }
+
+    /// Builder: attach the persistent shadow-hash store for drift-direction.
+    pub fn with_shadow(mut self, shadow: Arc<crate::sync_shadow::ShadowStore>) -> Self {
+        self.shadow = Some(shadow);
+        self
     }
 
     /// Full owner-invoked sweep:
@@ -252,16 +328,26 @@ impl VerifyRepair {
         // journal in ONE batched append after the loop (replaces N open/flush/
         // close cycles with a single one).
         let mut pending_pushes: Vec<PushEvent> = Vec::new();
+        // fix/reconcile-server-wins-shadow: paths whose local copy is a STALE
+        // prior-materialization (server moved since we synced) — resolve these
+        // server-wins (PULL + overwrite local), NOT push (which 409-churned).
+        let mut pending_pulls: Vec<String> = Vec::new();
 
         for delta in &deltas {
-            match delta.state.as_str() {
-                // Local differs from the server ("drift"), or the server has no
-                // row for this path ("missing-on-server") → upload the local
-                // canonical. Counted under modify_count (field name kept for
-                // tray/dialog compatibility). NOTE: reconcile-batch never asks
-                // us to PULL — it only echoes paths we sent; server-only files
-                // are materialized by the SSE/changes feed, not here.
-                "drift" | "missing-on-server" => {
+            let server_hash = delta.server_hash.as_deref();
+            let local_hash = local_index
+                .get(delta.path.as_str())
+                .map(|m| m.content_hash.as_str())
+                .unwrap_or("");
+            let shadow_hash = self.shadow.as_ref().and_then(|s| s.get(&delta.path));
+            let dir =
+                decide_direction(&delta.state, local_hash, server_hash, shadow_hash.as_deref());
+
+            match dir {
+                Direction::Push => {
+                    // Local is authoritative (genuine edit, or missing-on-server
+                    // create) → upload. Counted under modify_count (field name
+                    // kept for tray/dialog compatibility).
                     report.modify_count += 1;
                     if report.modify_paths_sample.len() < SAMPLE_CAP {
                         report.modify_paths_sample.push(delta.path.clone());
@@ -290,16 +376,30 @@ impl VerifyRepair {
                     // already exactly that (None when the server has no row).
                     pending_pushes.push(self.build_modify_push(local, delta.server_hash.clone()));
                 }
-                // In sync — no-op.
-                "match" => {}
-                // Forward-compat: an unrecognized state is handled
-                // conservatively (no push) and logged, never silently dropped.
-                other => {
-                    tracing::warn!(
+                Direction::Pull => {
+                    // Our local is stale (the server moved since we last synced,
+                    // or we never synced this path) → server-wins: fetch + write
+                    // (overwrite local). Executed after the loop with bounded
+                    // concurrency. Counted under add_count (Pull semantics).
+                    tracing::info!(
                         path = %delta.path,
-                        state = %other,
-                        "reconcile-batch: unknown delta state — skipping (no push)"
+                        state = %delta.state,
+                        shadow = ?shadow_hash,
+                        server = ?server_hash,
+                        "reconciliation: stale local — resolving server-wins (pull)"
                     );
+                    pending_pulls.push(delta.path.clone());
+                }
+                Direction::Noop => {
+                    if delta.state != "match" {
+                        // Forward-compat: an unrecognized state is handled
+                        // conservatively (no push/pull) and logged.
+                        tracing::warn!(
+                            path = %delta.path,
+                            state = %delta.state,
+                            "reconcile-batch: unknown delta state — skipping (noop)"
+                        );
+                    }
                 }
             }
         }
@@ -328,6 +428,79 @@ impl VerifyRepair {
                 Err(e) => {
                     tracing::warn!(error = %e, "verify_repair: append_batch failed");
                     report.errors.push(("<journal>".to_string(), e.to_string()));
+                }
+            }
+        }
+
+        // fix/reconcile-server-wins-shadow: EXECUTE the server-wins pulls. For
+        // each stale-local path, fetch the server's canonical and materialize
+        // it (the materializer server-wins-overwrites the divergent local;
+        // class-D paths stash first). Bounded concurrency ≤4. On any
+        // fetch/write error: record it and continue — idempotent, retried next
+        // pass. If no materializer is wired (unit tests), we DON'T push them;
+        // they're counted under a separate note so the intent is visible.
+        if !pending_pulls.is_empty() {
+            match &self.materializer {
+                Some(mat) => {
+                    use futures::stream::{self, StreamExt};
+                    let pull_count = pending_pulls.len();
+                    let results: Vec<(String, Result<crate::materializer::MaterializeOutcome, String>)> =
+                        stream::iter(pending_pulls.into_iter())
+                            .map(|path| {
+                                let api = Arc::clone(&self.api);
+                                let mat = mat.clone();
+                                async move {
+                                    match api.fetch_note(&path).await {
+                                        Ok(payload) => {
+                                            let r = mat
+                                                .write(&payload)
+                                                .map_err(|e| format!("materialize: {e}"));
+                                            (path, r)
+                                        }
+                                        Err(e) => (path, Err(format!("fetch: {e}"))),
+                                    }
+                                }
+                            })
+                            .buffer_unordered(4)
+                            .collect()
+                            .await;
+
+                    let mut pulled = 0usize;
+                    for (path, res) in results {
+                        match res {
+                            Ok(outcome) => {
+                                tracing::info!(path = %path, ?outcome, "reconciliation: pulled (server-wins)");
+                                pulled += 1;
+                                if report.add_paths_sample.len() < SAMPLE_CAP {
+                                    report.add_paths_sample.push(path);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(path = %path, error = %e, "reconciliation: pull failed");
+                                report.errors.push((path, e));
+                            }
+                        }
+                    }
+                    report.add_count = pulled;
+                    tracing::info!(
+                        requested = pull_count,
+                        pulled,
+                        "reconciliation: server-wins pull pass complete"
+                    );
+                }
+                None => {
+                    // No materializer (unit tests / dry-run): count the intent
+                    // but do NOT push these stale-local paths. Surfacing the
+                    // count keeps the no-silent-skip contract.
+                    let n = pending_pulls.len();
+                    tracing::info!(
+                        pending_pulls = n,
+                        "reconciliation: {n} stale-local pull(s) detected but no materializer wired — not executed, not pushed"
+                    );
+                    report.add_count = n;
+                    for p in pending_pulls.into_iter().take(SAMPLE_CAP) {
+                        report.add_paths_sample.push(p);
+                    }
                 }
             }
         }
@@ -917,6 +1090,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_enqueues_pushes_for_drift_state() {
+        // fix/reconcile-server-wins-shadow: drift is now PUSH only when the
+        // shadow == the current server hash (the server hasn't moved since we
+        // last synced ⇒ the local≠server diff is a genuine local edit). Seed
+        // the shadow with the server's current hash to model that case.
         let vault = TempDir::new().unwrap();
         write_file(vault.path(), "notes/a.md", b"alpha-local");
 
@@ -924,7 +1101,7 @@ mod tests {
         let _m = srv
             .mock("POST", "/api/sync/reconcile-batch")
             .with_status(200)
-            // local differs from server → "drift" → enqueue a push.
+            // local differs from server → "drift"; shadow==server → local edit → push.
             .with_body(
                 r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
             )
@@ -933,6 +1110,10 @@ mod tests {
 
         let (vr, journal, _jd) =
             make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("notes/a.md", "deadbeef"); // last-synced server hash == current server hash
+        let vr = vr.with_shadow(shadow);
         let report = vr.run().await.unwrap();
         assert_eq!(report.modify_count, 1);
         assert_eq!(report.modify_paths_sample, vec!["notes/a.md"]);
@@ -1024,11 +1205,16 @@ mod tests {
     #[tokio::test]
     async fn report_samples_first_50_paths() {
         let vault = TempDir::new().unwrap();
-        // Write 60 local files; server reports all 60 as drift (need push).
+        // Write 60 local files; server reports all 60 as drift. Seed the shadow
+        // with each server hash so they classify as genuine local edits (push),
+        // exercising the modify_paths_sample cap (fix/reconcile-server-wins-shadow).
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
         let mut diff_entries = Vec::new();
         for i in 0..60 {
             let rel = format!("notes/f{i:03}.md");
             write_file(vault.path(), &rel, format!("body-{i}").as_bytes());
+            shadow.record(&rel, &format!("h{i}")); // shadow == server hash → local edit → push
             diff_entries.push(format!(
                 r#"{{"path":"{rel}","state":"drift","server_hash":"h{i}"}}"#
             ));
@@ -1042,6 +1228,7 @@ mod tests {
             .create_async()
             .await;
         let (vr, _j, _jd) = make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let vr = vr.with_shadow(shadow);
         let report = vr.run().await.unwrap();
         assert_eq!(report.modify_count, 60);
         assert_eq!(report.modify_paths_sample.len(), SAMPLE_CAP);
@@ -1118,6 +1305,120 @@ mod tests {
         let (vr, _j, _jd) = make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
         let r = vr.run().await;
         assert!(matches!(r, Err(VerifyRepairError::Api(_))));
+    }
+
+    // ─── fix/reconcile-server-wins-shadow: decide_direction + pull ────────
+
+    #[test]
+    fn decide_direction_table() {
+        // drift + shadow absent → Pull (stale local on a mirror host).
+        assert_eq!(
+            decide_direction("drift", "local", Some("srv"), None),
+            Direction::Pull
+        );
+        // drift + shadow == server → Push (server unchanged → genuine local edit).
+        assert_eq!(
+            decide_direction("drift", "local", Some("srv"), Some("srv")),
+            Direction::Push
+        );
+        // drift + shadow != server → Pull (server moved since we synced).
+        assert_eq!(
+            decide_direction("drift", "local", Some("srv-new"), Some("srv-old")),
+            Direction::Pull
+        );
+        // drift + server_hash None (no current server hash) + shadow present →
+        // not equal → Pull.
+        assert_eq!(
+            decide_direction("drift", "local", None, Some("anything")),
+            Direction::Pull
+        );
+        // missing-on-server → Push (create), shadow irrelevant.
+        assert_eq!(
+            decide_direction("missing-on-server", "local", None, None),
+            Direction::Push
+        );
+        assert_eq!(
+            decide_direction("missing-on-server", "local", None, Some("x")),
+            Direction::Push
+        );
+        // match → Noop.
+        assert_eq!(
+            decide_direction("match", "local", Some("srv"), Some("srv")),
+            Direction::Noop
+        );
+        // unknown state → Noop (conservative).
+        assert_eq!(
+            decide_direction("weird", "local", Some("srv"), None),
+            Direction::Noop
+        );
+    }
+
+    /// End-to-end: a stale-local drift (shadow ABSENT) resolves server-wins —
+    /// the daemon fetches the server canonical and overwrites local, enqueues
+    /// NO push, and counts it under add_count.
+    #[tokio::test]
+    async fn run_pulls_stale_local_on_drift_no_shadow() {
+        use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
+
+        let vault = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        // Local stale copy.
+        write_file(vault.path(), "notes/a.md", b"stale-local-bytes");
+
+        // Server canonical bytes + their sha256.
+        let server_body = "server-canonical-bytes\n";
+        let server_sha = hex::encode(Sha256::digest(server_body.as_bytes()));
+
+        let mut srv = Server::new_async().await;
+        let _rec = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"deltas":[{{"path":"notes/a.md","state":"drift","server_hash":"{server_sha}"}}]}}"#
+            ))
+            .create_async()
+            .await;
+        // fetch_note returns the canonical, with enriched_body == hashed bytes.
+        let note_body = format!(
+            r#"{{"path":"notes/a.md","frontmatter":{{}},"body":{body},"sha256":"{server_sha}","modified":"2026-06-09T00:00:00Z","enriched_body":{body}}}"#,
+            body = serde_json::to_string(server_body).unwrap()
+        );
+        let _note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "path".into(),
+                "notes/a.md".into(),
+            ))
+            .with_status(200)
+            .with_body(note_body)
+            .create_async()
+            .await;
+
+        let (vr, journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        // Materializer rooted at the vault tree (Live), integrity ON.
+        let mat = Materializer::new(
+            vault.path().to_path_buf(),
+            Some("shadow/".into()),
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            MaterializerConfig::default(),
+        );
+        // No shadow → drift must PULL.
+        let vr = vr.with_materializer(mat);
+        let report = vr.run().await.unwrap();
+
+        // No push enqueued; one pull executed.
+        assert_eq!(report.modify_count, 0, "stale local must NOT push");
+        assert_eq!(report.add_count, 1, "stale local must pull (server-wins)");
+        assert_eq!(report.add_paths_sample, vec!["notes/a.md"]);
+        let j = journal.lock().await;
+        assert_eq!(j.len(), 0, "no push journaled for a pull");
+        drop(j);
+        // Local file now holds the server canonical bytes.
+        let on_disk = std::fs::read_to_string(vault.path().join("notes/a.md")).unwrap();
+        assert_eq!(on_disk, server_body);
     }
 
     // ─── helper-fn micro-tests ───────────────────────────────────────────
