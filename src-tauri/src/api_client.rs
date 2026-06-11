@@ -96,6 +96,14 @@ pub struct NotePayload {
     // omit the field (materializer falls back to frontmatter reconstruction).
     #[serde(default)]
     pub enriched_body: Option<String>,
+    // R3 (S498): canonical note CREATE time from the server (Nexus commit
+    // 7c8b07a6 adds `created` to GET /api/sync/note via _fetch_created_modified).
+    // The materializer uses it to restore the file's birthtime on materialize
+    // (R2) so Obsidian's "Created" sort doesn't show every synced note as
+    // created "today" (the tmp+rename write makes a NEW inode, resetting
+    // birthtime to now). `serde(default)` keeps back-compat with older servers.
+    #[serde(default)]
+    pub created: Option<String>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).

@@ -463,6 +463,12 @@ impl Materializer {
         tmp.flush()?;
         tmp.persist(&target).map_err(|e| e.error)?;
 
+        // 8b. R2 (S498): restore canonical timestamps. The tmp+rename above
+        // makes a NEW inode, so birthtime resets to "now" — which polluted
+        // Obsidian's "Created" sort (every synced note jumped to today).
+        // Best-effort: a timestamp failure must never fail the write itself.
+        apply_canonical_times(&target, payload);
+
         // 9. Post-write integrity check.
         if self.config.enable_integrity_check {
             let expected = ExpectedIntegrity {
@@ -579,6 +585,99 @@ impl Materializer {
 enum LocalCompare {
     Identical,
     Diverges { local_bytes: Vec<u8> },
+}
+
+// ---------------------------------------------------------------------------
+// R2 (S498): canonical-timestamp restoration after materialize
+// ---------------------------------------------------------------------------
+
+/// Parse a server timestamp string. Tries RFC 3339 first (the canonical wire
+/// shape, e.g. `2026-05-27T00:00:00Z` or with an offset), then a naive
+/// `YYYY-MM-DDTHH:MM:SS[.f]` / `YYYY-MM-DD HH:MM:SS[.f]` interpreted as UTC.
+fn parse_server_timestamp(s: &str) -> Option<std::time::SystemTime> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc).into());
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(naive.and_utc().into());
+        }
+    }
+    None
+}
+
+/// Restore the materialized file's timestamps to the note's canonical values:
+///
+/// * **mtime** — from `file_mtime` (the server's exact filesystem stamp, a
+///   unix-seconds float) when present, else parsed from `modified`.
+/// * **birthtime (create time)** — from `created` (R3: server sends it as of
+///   Nexus 7c8b07a6), applied per-platform:
+///   - macOS (APFS): `FileTimes::set_created` (setattrlist ATTR_CMN_CRTIME
+///     under the hood) — can move birthtime in either direction.
+///   - Windows (NTFS): `FileTimes::set_created` (SetFileTime).
+///   - Linux: **cannot be set.** btrfs/ext4 expose birthtime (statx `btime`)
+///     read-only; there is no kernel API to write it. This is a documented
+///     platform limitation — we do NOT fake it (e.g. via debugfs tricks).
+///     Obsidian's "Created" sort on Linux will reflect materialize time.
+///
+/// Best-effort by contract: failures are logged at WARN and swallowed — the
+/// note content (already persisted + integrity-checked by the caller) is
+/// canonical; timestamps are presentation hygiene. The resulting
+/// `Modify(Metadata)` filesystem event is dropped by the file_watcher's
+/// `is_mutating_kind` filter, so this never re-enqueues a push.
+fn apply_canonical_times(target: &Path, payload: &NotePayload) {
+    let modified = payload
+        .file_mtime
+        .map(|secs| {
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
+        })
+        .or_else(|| parse_server_timestamp(&payload.modified));
+    let created = payload
+        .created
+        .as_deref()
+        .and_then(parse_server_timestamp);
+
+    if modified.is_none() && created.is_none() {
+        return;
+    }
+
+    let mut times = fs::FileTimes::new();
+    if let Some(m) = modified {
+        times = times.set_modified(m);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::FileTimesExt;
+        if let Some(c) = created {
+            times = times.set_created(c);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTimesExt;
+        if let Some(c) = created {
+            times = times.set_created(c);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        // Linux: birthtime is read-only at the kernel level. Documented
+        // limitation — mtime is still restored below.
+        let _ = created;
+    }
+
+    let result = fs::File::options()
+        .write(true)
+        .open(target)
+        .and_then(|f| f.set_times(times));
+    if let Err(e) = result {
+        warn!(
+            path = %target.display(),
+            error = %e,
+            "apply_canonical_times failed — content written OK, timestamps left as-is"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +850,7 @@ mod tests {
             // Mirror the real server: enriched_body is the exact content the
             // sha256 is computed over (S486).
             enriched_body: Some(serialized),
+            created: None,
         }
     }
 
@@ -789,6 +889,7 @@ mod tests {
             modified: "2026-05-31T00:00:00Z".into(),
             file_mtime: None,
             enriched_body: Some(original.to_string()),
+            created: None,
         };
 
         // Guard: if reconstruction happened to equal the server bytes this
@@ -829,6 +930,7 @@ mod tests {
             modified: "2026-05-31T00:00:00Z".into(),
             file_mtime: None,
             enriched_body: None,
+            created: None,
         };
         let out = m.write(&p).unwrap();
         assert!(
@@ -990,6 +1092,7 @@ mod tests {
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
             enriched_body: Some(serialized),
+            created: None,
         };
         let out = m.write(&p).unwrap();
         assert_eq!(
@@ -1356,6 +1459,7 @@ mod tests {
                 modified: "2026-05-29T00:00:00Z".into(),
                 file_mtime: None,
                 enriched_body: Some(serialized),
+                created: None,
             }
         };
 
