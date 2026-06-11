@@ -372,6 +372,30 @@ impl PushClient {
                 }
             }
         };
+        // R1 (S498): push idempotency keyed on CONTENT hash, never mtime.
+        // If the bytes we are about to send hash to exactly the server's
+        // current hash (the CAS base on this event), the server already has
+        // this content — POSTing it is a pure no-op storm. This is the
+        // last-line guard that stopped the 2026-06-05 incident class: a
+        // server-side mtime re-stamp made reconcile mark ~29k content-
+        // unchanged files as drift, and the daemon re-pushed all of them.
+        // Deletes are exempt (no body; an empty-content hash match would be
+        // meaningless).
+        if !matches!(evt.action, PushAction::Delete) {
+            if let Some(base) = evt.base_hash.as_deref() {
+                if !base.is_empty() && sha256_hex(&content_bytes) == base {
+                    tracing::info!(
+                        path = %evt.path,
+                        hash = %base,
+                        "push skip — content identical to server hash (R1 idempotency)"
+                    );
+                    return PushOutcome::Skipped(SkipReason::IdenticalToServer {
+                        hash: base.to_string(),
+                    });
+                }
+            }
+        }
+
         let content_b64 = B64.encode(&content_bytes);
 
         let req = PushRequest {
@@ -780,6 +804,93 @@ mod tests {
         // local has today's bytes; only `updated:` differs
         let skip = client.pre_journal_filter("notes/a.md", today, Some(&server_hash));
         assert!(matches!(skip, Some(SkipReason::IdenticalToServer { .. })));
+    }
+
+    // --- R1 (S498): content-hash push idempotency ---
+
+    #[tokio::test]
+    async fn push_skips_on_content_identical_regardless_of_mtime() {
+        // R1: an event whose content hashes to exactly the server's current
+        // hash (the CAS base on the event) must be Skipped(IdenticalToServer)
+        // with ZERO HTTP calls, and acked out of the journal. mtime plays no
+        // role — the event was enqueued (e.g. by a reconcile pass after a
+        // server-side mtime re-stamp) but the CONTENT is unchanged.
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let body = b"identical-content";
+        let mut e = evt("notes/a.md", body);
+        e.base_hash = Some(sha256_hex(body));
+        let (_d, journal) = make_journal_with(vec![e]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PushOutcome::Skipped(SkipReason::IdenticalToServer { hash }) => {
+                assert_eq!(hash, &sha256_hex(body));
+            }
+            other => panic!("expected IdenticalToServer skip, got {other:?}"),
+        }
+        let j = journal.lock().await;
+        assert_eq!(j.len(), 0, "skip must ack — never wedge or re-storm");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lazy_reconcile_push_skips_when_disk_content_matches_server_hash() {
+        // The exact S498 storm shape: a lazy (content_bytes: None) reconcile
+        // push whose on-disk bytes hash to the server's current hash. The
+        // file's mtime is freshly bumped (the re-stamp) — irrelevant:
+        // content hash rules.
+        let vault = TempDir::new().unwrap();
+        let rel = "notes/lazy.md";
+        let body = b"unchanged-content";
+        let abs = vault.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+        let f = std::fs::File::options().write(true).open(&abs).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+        )
+        .unwrap();
+
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let lazy = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: rel.to_string(),
+            action: PushAction::Modify,
+            base_hash: Some(sha256_hex(body)), // server current == disk content
+            content_sha: sha256_hex(body),
+            content_bytes: None,
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        };
+        let (_d, journal) = make_journal_with(vec![lazy]);
+        let client =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf()).await;
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(
+                &outcomes[0].1,
+                PushOutcome::Skipped(SkipReason::IdenticalToServer { .. })
+            ),
+            "got {:?}",
+            outcomes[0].1
+        );
+        let j = journal.lock().await;
+        assert_eq!(j.len(), 0);
+        m.assert_async().await;
     }
 
     // --- HTTP-driven behaviors ---

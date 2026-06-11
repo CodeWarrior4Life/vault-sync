@@ -1101,6 +1101,70 @@ mod tests {
         );
     }
 
+    // ---- R2 (S498): canonical-timestamp restoration -----------------------
+
+    #[test]
+    fn write_restores_canonical_mtime_and_birthtime() {
+        // R2: materialize creates a NEW inode (tmp+rename), which resets both
+        // mtime and birthtime to "now" — Obsidian's "Created" sort then shows
+        // every synced note as created today. The materializer must restore
+        // mtime from file_mtime/modified on every platform, and birthtime
+        // from `created` on macOS/Windows. Linux CANNOT set birthtime
+        // (kernel exposes statx btime read-only) — documented limitation in
+        // apply_canonical_times; asserted only where settable.
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let mut p = payload("01_Inbox/old-note.md", "old content");
+        let created_secs: u64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+        let modified_secs: u64 = 1_738_368_000; // 2025-02-01T00:00:00Z
+        p.created = Some("2025-01-01T00:00:00Z".into());
+        p.file_mtime = Some(modified_secs as f64);
+
+        let out = m.write(&p).unwrap();
+        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+
+        let target = vaults.path().join(VAULT).join("01_Inbox/old-note.md");
+        let meta = std::fs::metadata(&target).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(
+            mtime, modified_secs,
+            "mtime must be restored from canonical file_mtime, not left at 'now'"
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let btime = meta
+                .created()
+                .unwrap()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(
+                btime, created_secs,
+                "birthtime must be restored from canonical created"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = created_secs;
+    }
+
+    #[test]
+    fn parse_server_timestamp_accepts_rfc3339_and_naive() {
+        let t = parse_server_timestamp("2025-01-01T00:00:00Z").unwrap();
+        let secs = t
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, 1_735_689_600);
+        // Naive forms (older server rows) parse as UTC.
+        assert!(parse_server_timestamp("2025-01-01T00:00:00").is_some());
+        assert!(parse_server_timestamp("2025-01-01 00:00:00.123456").is_some());
+        assert!(parse_server_timestamp("not-a-date").is_none());
+    }
+
     // ---- conflict stash ---------------------------------------------------
 
     #[test]

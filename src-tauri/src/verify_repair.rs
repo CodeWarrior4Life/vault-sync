@@ -262,6 +262,24 @@ impl VerifyRepair {
                 // us to PULL — it only echoes paths we sent; server-only files
                 // are materialized by the SSE/changes feed, not here.
                 "drift" | "missing-on-server" => {
+                    // R1 (S498): push idempotency keys on CONTENT hash, never
+                    // mtime. If the server's current hash equals the local
+                    // content hash we just computed, the content is identical
+                    // and there is nothing to push — regardless of any
+                    // server-side mtime re-stamp that made its drift detector
+                    // fire. This is the guard that stops the 29k-file
+                    // re-push storm at the source (the reconcile pass).
+                    if let Some(local) = local_index.get(delta.path.as_str()) {
+                        if delta.server_hash.as_deref() == Some(local.content_hash.as_str()) {
+                            tracing::debug!(
+                                path = %delta.path,
+                                state = %delta.state,
+                                "reconcile delta hash equals local content hash — in sync, no push (R1)"
+                            );
+                            continue;
+                        }
+                    }
+
                     report.modify_count += 1;
                     if report.modify_paths_sample.len() < SAMPLE_CAP {
                         report.modify_paths_sample.push(delta.path.clone());
@@ -955,6 +973,43 @@ mod tests {
         // base (from the delta), NOT the local hash — else the server's
         // base_hash==current check fails and the push 409s ConflictUnrecoverable.
         assert_eq!(batch[0].0.base_hash.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn drift_with_hash_equal_to_local_is_not_pushed() {
+        // R1 (S498): server says "drift" (its detector fired after a
+        // server-side mtime re-stamp) but returns a server_hash IDENTICAL to
+        // the local raw-bytes hash → content unchanged → NO push enqueued.
+        // This is the daemon-side guard that stopped the 29k-file re-push
+        // storm: change detection keys on content hash, never mtime.
+        let vault = TempDir::new().unwrap();
+        let body: &[u8] = b"same-bytes-both-sides";
+        write_file(vault.path(), "notes/a.md", body);
+        let local_hash = hex::encode(Sha256::digest(body));
+
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"deltas":[{{"path":"notes/a.md","state":"drift","server_hash":"{local_hash}"}}]}}"#
+            ))
+            .create_async()
+            .await;
+        let (vr, journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let report = vr.run().await.unwrap();
+        assert_eq!(
+            report.modify_count, 0,
+            "content-identical drift must not count as a push"
+        );
+        assert_eq!(report.files_in_sync, 1);
+        let j = journal.lock().await;
+        assert_eq!(
+            j.len(),
+            0,
+            "no push event may be enqueued for content-identical drift"
+        );
     }
 
     #[tokio::test]
