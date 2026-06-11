@@ -633,10 +633,7 @@ fn apply_canonical_times(target: &Path, payload: &NotePayload) {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
         })
         .or_else(|| parse_server_timestamp(&payload.modified));
-    let created = payload
-        .created
-        .as_deref()
-        .and_then(parse_server_timestamp);
+    let created = payload.created.as_deref().and_then(parse_server_timestamp);
 
     if modified.is_none() && created.is_none() {
         return;
@@ -1120,7 +1117,10 @@ mod tests {
         p.file_mtime = Some(modified_secs as f64);
 
         let out = m.write(&p).unwrap();
-        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
 
         let target = vaults.path().join(VAULT).join("01_Inbox/old-note.md");
         let meta = std::fs::metadata(&target).unwrap();

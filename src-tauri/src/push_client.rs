@@ -853,10 +853,8 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, body).unwrap();
         let f = std::fs::File::options().write(true).open(&abs).unwrap();
-        f.set_times(
-            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
-        )
-        .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .unwrap();
 
         let mut srv = Server::new_async().await;
         let m = srv
