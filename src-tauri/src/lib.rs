@@ -18,6 +18,7 @@ pub mod reconciliation;
 pub mod redflag;
 pub mod scope;
 pub mod sse;
+pub mod sync_health;
 pub mod sync_shadow;
 pub mod token_store;
 pub mod tray;
@@ -514,6 +515,14 @@ fn spawn_sse_consumer(
         // for the daemon so the SSE->materialize->watcher->push loop is broken
         // across all sync_roots.
         let echo_guard = std::sync::Arc::new(echo_guard::EchoGuard::new());
+        // opfix-vaultsync-dormancy: shared progress-tracking handle. The
+        // PushClient stamps it on every drain that processed >= 1 event; the
+        // per-sync_root watchdog reads it to detect "pending diffs but no
+        // push attempts for N minutes" (R1+R3) and recovers via app.restart()
+        // (R2). One Arc per daemon; all sync_roots share progress liveness so
+        // a stall on ANY root trips the watchdog (and the restarted process
+        // re-arms a fresh watchdog covering all roots).
+        let sync_health = sync_health::SyncHealth::new();
         // fix/reconcile-server-wins-shadow: persistent per-file "last-synced
         // server hash" marker. Shared (Arc) across the materializer (records on
         // every pull), the push_client (records on every accepted push), and the
@@ -612,6 +621,7 @@ fn spawn_sse_consumer(
                     echo_guard.clone(),
                     materializer.clone(),
                     shadow.clone(),
+                    sync_health.clone(),
                 )
             })
             .collect();
@@ -726,6 +736,7 @@ fn spawn_push_pipeline(
     echo_guard: std::sync::Arc<echo_guard::EchoGuard>,
     materializer: materializer::Materializer,
     shadow: std::sync::Arc<sync_shadow::ShadowStore>,
+    sync_health: std::sync::Arc<sync_health::SyncHealth>,
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
 
@@ -805,7 +816,8 @@ fn spawn_push_pipeline(
         vault_root.clone(),
     )
     .with_tray_state(tray_state.clone())
-    .with_shadow_store(shadow.clone());
+    .with_shadow_store(shadow.clone())
+    .with_sync_health(sync_health.clone());
 
     // Never-fired shutdown channel — the push loop runs for the daemon's
     // lifetime. We hold the sender in the spawned task so it isn't dropped
@@ -820,6 +832,69 @@ fn spawn_push_pipeline(
         push_client.run_loop(push_shutdown_rx).await;
         tracing::warn!("push_client.run_loop returned (unexpected for a forever loop)");
     });
+
+    // opfix-vaultsync-dormancy (R1+R2+R3): spawn the progress-stall watchdog
+    // alongside the push loop. It polls the journal depth every 60s; on a
+    // stall it fires the recovery closure which notifies the owner AND
+    // restarts the daemon (the only reliable way to revive a panicked async
+    // task: `tauri::async_runtime::spawn` swallows panics into a JoinHandle
+    // nobody awaits, which is precisely how the engine went quiet while the
+    // updater kept ticking in incident 2026-06-13).
+    {
+        let env = reconciliation::ProcessEnv;
+        let threshold = sync_health::read_threshold(&env);
+        let recovery_disabled = sync_health::is_recovery_disabled(&env);
+        let journal_for_watchdog = journal.clone();
+        let app_handle = app.clone();
+        let subscriber_for_log = subscriber_id.clone();
+        let _watchdog = sync_health::spawn_progress_stall_watchdog(
+            sync_health.clone(),
+            std::time::Duration::from_secs(60),
+            threshold,
+            recovery_disabled,
+            move || {
+                // Async closure: the journal is behind a tokio::sync::Mutex,
+                // which CANNOT be locked via blocking_lock from a tokio
+                // worker thread (panics). Hand the watchdog an async path so
+                // it awaits the lock cleanly.
+                let j = journal_for_watchdog.clone();
+                async move {
+                    let g = j.lock().await;
+                    g.len()
+                }
+            },
+            move |evt| {
+                tracing::error!(
+                    subscriber_id = %subscriber_for_log,
+                    pending = evt.pending,
+                    secs_since_progress = evt.secs_since_progress,
+                    "sync_health: push pipeline STALLED; recovering"
+                );
+                if let Err(e) = app_handle.emit("sync_stalled", &serde_json::json!({
+                    "pending": evt.pending,
+                    "secs_since_progress": evt.secs_since_progress,
+                    "subscriber_id": subscriber_for_log,
+                })) {
+                    tracing::warn!("failed to emit sync_stalled event: {e}");
+                }
+                notify_user(
+                    &app_handle,
+                    "Vault Sync stalled; restarting",
+                    &format!(
+                        "Push pipeline silent for {}m with {} pending edits. Restarting daemon to recover.",
+                        evt.secs_since_progress / 60,
+                        evt.pending
+                    ),
+                );
+                if evt.recovery_will_restart {
+                    // Hard recovery: re-init all sync tasks via a fresh
+                    // process. Matches what should_restart_now plus
+                    // app.restart already does on staged-update apply.
+                    app_handle.restart();
+                }
+            },
+        );
+    }
 
     // --- S477 v0.3.8 (D) reconciliation backstop ---
     // Periodic background sweep that diffs local vs server (via the same

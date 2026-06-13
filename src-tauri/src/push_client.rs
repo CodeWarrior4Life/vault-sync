@@ -133,6 +133,11 @@ pub struct PushClient {
     /// hash is. Recording it keeps the reconcile backstop from later mistaking
     /// a freshly-pushed file for a stale-pull candidate. `None` = no recording.
     shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// opfix-vaultsync-dormancy: shared progress-tracking handle. When set,
+    /// every `drain_once` that processed at least one event stamps a fresh
+    /// progress marker so the watchdog can distinguish "pipeline healthy"
+    /// from "pipeline silent with pending diffs" (R1+R3).
+    sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
 }
 
 impl PushClient {
@@ -151,6 +156,7 @@ impl PushClient {
             vault_root,
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         }
     }
 
@@ -167,6 +173,16 @@ impl PushClient {
     /// pushed path. Backwards-compatible — without it, no recording.
     pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
         self.shadow_store = Some(store);
+        self
+    }
+
+    /// opfix-vaultsync-dormancy: attach the shared
+    /// [`SyncHealth`](crate::sync_health::SyncHealth) handle. After this,
+    /// every `drain_once` that processed at least one event stamps a fresh
+    /// progress marker. Backwards-compatible; without it, no stamping
+    /// (which would defeat the watchdog, so the production wire-up sets it).
+    pub fn with_sync_health(mut self, health: Arc<crate::sync_health::SyncHealth>) -> Self {
+        self.sync_health = Some(health);
         self
     }
 
@@ -289,13 +305,25 @@ impl PushClient {
         }
         // Snapshot the journal depth so the tray's "Pending uploads" item
         // reflects what's still queued.
+        let pending_after = {
+            let j = self.journal.lock().await;
+            j.len()
+        };
         if let Some(tray) = &self.tray_state {
-            let pending = {
-                let j = self.journal.lock().await;
-                j.len()
-            };
             if let Ok(mut w) = tray.write() {
-                w.set_uploads_pending(pending);
+                w.set_uploads_pending(pending_after);
+            }
+        }
+        // opfix-vaultsync-dormancy (R1+R3): stamp progress whenever the
+        // pipeline DID work this tick: either it processed events, OR the
+        // journal is now empty (which means a prior drain caught up). The
+        // stamp is a never-failing test that the loop is actually pumping.
+        // Stamping on `out.is_empty() && pending_after > 0` would lie about
+        // progress on a hung-but-pending pipeline; we deliberately mark only
+        // when we observed forward motion this tick OR the backlog is gone.
+        if let Some(health) = &self.sync_health {
+            if !out.is_empty() || pending_after == 0 {
+                health.mark_progress();
             }
         }
         out
@@ -705,6 +733,98 @@ mod tests {
             config_for_test(),
             vault_root,
         )
+    }
+
+    // opfix-vaultsync-dormancy: regression test for the progress-stamping
+    // path. drain_once MUST stamp the SyncHealth progress marker whenever it
+    // processed at least one event; without this stamp the watchdog cannot
+    // tell a working pipeline from a dormant one. The test exercises the
+    // production wiring: PushClient::with_sync_health then drain_once then
+    // stamp.
+    //
+    // Pre-fix this file does not even compile against HEAD (no `sync_health`
+    // module, no `with_sync_health` builder). Red-on-old-code is therefore
+    // structural, not behavioral.
+    //
+    // Uses real-time sleep (not tokio paused time) because SyncHealth measures
+    // wall-clock via std::time::Instant, which tokio's virtual clock does
+    // NOT advance.
+    #[tokio::test]
+    async fn drain_once_stamps_sync_health_progress_when_events_processed() {
+        use crate::sync_health::SyncHealth;
+
+        // Substrate-refused path is the cheapest "processed an event" path:
+        // no HTTP call required, and we already know the test setup for it.
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let health = SyncHealth::new();
+
+        // Sleep BEFORE seeding the journal so that the elapsed-since-start
+        // clock advances measurably. After the sleep, secs_since_progress()
+        // reads ~2s (last_progress was initialized to 0 in `new()`).
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let before = health.secs_since_progress();
+        assert!(
+            before >= 1,
+            "without mark_progress, elapsed should be >= 1s after sleep, got {before}s"
+        );
+
+        let (_d, journal) = make_journal_with(vec![evt("00_VAULT.md", b"x")]);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_sync_health(health.clone());
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1, "drain_once must have processed the event");
+
+        let after = health.secs_since_progress();
+        assert!(
+            after < 1,
+            "mark_progress must have stamped during drain_once \
+             (elapsed before = {before}s, after = {after}s); \
+             without the stamp `after` would still be ~{before}s"
+        );
+    }
+
+    // opfix-vaultsync-dormancy: gate semantics. An empty journal (backlog
+    // caught up) is a "progress" signal too. A daemon that finishes its
+    // backlog and idles is healthy; the watchdog must not later interpret
+    // that idleness as a stall. The stamp covers that case.
+    #[tokio::test]
+    async fn drain_once_stamps_progress_on_caught_up_empty_journal() {
+        use crate::sync_health::SyncHealth;
+
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let health = SyncHealth::new();
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let before = health.secs_since_progress();
+        assert!(before >= 1, "elapsed should be measurable after sleep");
+
+        let (_d, journal) = make_journal_with(vec![]); // empty
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_sync_health(health.clone());
+
+        let outcomes = client.drain_once().await;
+        assert!(outcomes.is_empty(), "no events queued; empty outcomes");
+
+        let after = health.secs_since_progress();
+        assert!(
+            after < 1,
+            "empty journal at end of drain stamps progress (caught-up signal); \
+             elapsed before = {before}s, after = {after}s"
+        );
     }
 
     // --- pre-journal filter / pure-function tests (no HTTP) ---

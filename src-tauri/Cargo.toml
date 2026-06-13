@@ -50,6 +50,11 @@ walkdir = "2"
 [dev-dependencies]
 mockito = "1"
 rstest = "0.23"
+# opfix-vaultsync-dormancy: sync_health watchdog tests use
+# `tokio::time::advance` + `start_paused = true` to exercise the periodic
+# tick deterministically without real-time sleeps. Cargo unifies features
+# across normal+dev so this lights up `test-util` for the test build only.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = []
