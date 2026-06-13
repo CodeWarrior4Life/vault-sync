@@ -996,7 +996,10 @@ fn spawn_push_pipeline(
         watcher_cfg,
         subscriber_id.clone(),
     ) {
-        Ok(w) => w.with_tray_state(tray_state).with_echo_guard(echo_guard),
+        Ok(w) => w
+            .with_tray_state(tray_state)
+            .with_echo_guard(echo_guard)
+            .with_shadow_store(shadow.clone()),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
             notify_user(

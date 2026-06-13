@@ -200,6 +200,13 @@ pub struct FileWatcher {
     /// server echo (not a user edit) and is skipped — breaking the
     /// SSE->materialize->watcher->push feedback loop that flooded the journal.
     echo_guard: Option<Arc<crate::echo_guard::EchoGuard>>,
+    /// Persistent per-file last-synced hash store, shared with the materializer
+    /// and push_client. Used for the enqueue-time no-op dedup: before journaling
+    /// a create/modify, if the file's current bytes hash to the SAME value we
+    /// last synced for this path, the event is a pure no-op (touch, atime,
+    /// re-scan, redundant FS event) and is skipped, so genuine edits do not queue
+    /// behind thousands of redundant no-ops. `None` keeps pre-fix behavior.
+    shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
 }
 
 impl FileWatcher {
@@ -220,7 +227,17 @@ impl FileWatcher {
             cap_fail_streak: Arc::new(AtomicU64::new(0)),
             fenced: Arc::new(AtomicBool::new(false)),
             echo_guard: None,
+            shadow_store: None,
         })
+    }
+
+    /// Builder-style: attach the shared [`ShadowStore`](crate::sync_shadow::ShadowStore)
+    /// so the watcher can dedup no-op events at enqueue (skip a create/modify
+    /// whose bytes are byte-identical to the last-synced content for that path).
+    /// Backwards-compatible — without it, no enqueue-time dedup.
+    pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
+        self.shadow_store = Some(store);
+        self
     }
 
     /// Builder-style: attach the shared [`EchoGuard`](crate::echo_guard::EchoGuard)
@@ -783,24 +800,48 @@ impl FileWatcher {
                     }
                     WatchEvent::Deleted { .. } => None,
                 };
+                // Raw content sha of the current file bytes — shared by the
+                // echo-guard and the no-op dedup below (compute once).
+                let content_sha = content.as_ref().map(|b| sha256_hex(b));
+                let write_path = match &allowed {
+                    WatchEvent::Created { path } | WatchEvent::Modified { path } => {
+                        Some(path.as_str())
+                    }
+                    WatchEvent::Renamed { new_path, .. } => Some(new_path.as_str()),
+                    WatchEvent::Deleted { .. } => None,
+                };
                 // S492 echo-suppression: if the file's current content matches a
                 // recent materializer write, this event is a server echo (the
                 // SSE consumer just wrote it), NOT a user edit — skip it instead
                 // of enqueueing a spurious local push. Exact (path, sha) match
                 // only, so a genuine edit (different sha) is never suppressed.
-                if let (Some(guard), Some(bytes)) = (&self.echo_guard, &content) {
-                    let echo_path = match &allowed {
-                        WatchEvent::Created { path } | WatchEvent::Modified { path } => {
-                            Some(path.as_str())
-                        }
-                        WatchEvent::Renamed { new_path, .. } => Some(new_path.as_str()),
-                        WatchEvent::Deleted { .. } => None,
-                    };
-                    if let Some(p) = echo_path {
-                        if guard.is_echo(p, &sha256_hex(bytes)) {
-                            tracing::debug!("file_watcher: skipping materializer echo for {p}");
-                            return;
-                        }
+                if let (Some(guard), Some(sha), Some(p)) =
+                    (&self.echo_guard, &content_sha, write_path)
+                {
+                    if guard.is_echo(p, sha) {
+                        tracing::debug!("file_watcher: skipping materializer echo for {p}");
+                        return;
+                    }
+                }
+                // Enqueue-time no-op dedup (journal-bloat fix): if the file's
+                // current bytes are byte-identical to what we last synced for
+                // this path, this is a pure no-op (touch / atime / re-scan /
+                // redundant FS event) — skip it so genuine edits don't queue
+                // behind thousands of redundant no-ops draining as no-ops.
+                // RAW-sha equality ⟹ truly identical bytes, so a real edit (any
+                // byte change, incl. frontmatter) differs and is NEVER suppressed
+                // (the server/drain still dedups frontmatter-only churn via the
+                // normalized hash). The shadow_store records the raw on-disk sha
+                // of the last-synced content (push records `content_sha`, the
+                // materializer records the server bytes it wrote).
+                if let (Some(shadow), Some(sha), Some(p)) =
+                    (&self.shadow_store, &content_sha, write_path)
+                {
+                    if shadow.get(p).as_deref() == Some(sha.as_str()) {
+                        tracing::debug!(
+                            "file_watcher: skipping no-op (content identical to last-synced) for {p}"
+                        );
+                        return;
                     }
                 }
                 let Some(push_evt) = self.to_push_event(&allowed, content) else {
@@ -1017,6 +1058,61 @@ mod tests {
             old_path: o.to_string(),
             new_path: n.to_string(),
         }
+    }
+
+    // ---------- enqueue-time no-op dedup (journal-bloat fix) ----------
+
+    /// Regression: a create/modify whose bytes are byte-identical to the
+    /// last-synced content (recorded in the ShadowStore) is a pure no-op and
+    /// MUST NOT be enqueued — otherwise redundant FS events (touch / re-scan /
+    /// restart re-push) bury genuine edits behind thousands of no-op journal
+    /// entries. A real edit (any byte change) MUST still enqueue. Red on
+    /// pre-fix code: the watcher had no shadow_store / no enqueue dedup, so the
+    /// identical-content event was always appended.
+    #[tokio::test]
+    async fn identical_to_synced_is_deduped_but_real_edit_enqueues() {
+        let dir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(dir.path().join("shadow.json"));
+        let w = make_watcher(&dir, vec![], vec![]).with_shadow_store(shadow.clone());
+
+        let rel = "01_Notes/note.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let synced = b"---\ntitle: x\n---\nbody\n";
+        std::fs::write(&abs, synced).unwrap();
+        // Record what we last synced for this path = raw sha of these bytes.
+        shadow.record(rel, &sha256_hex(synced));
+
+        // Event for byte-identical content → NO-OP → must not enqueue.
+        w.handle_fs_path(&abs).await;
+        assert!(
+            w.journal.lock().unwrap().is_empty(),
+            "no-op (content identical to last-synced) must NOT enqueue"
+        );
+
+        // A genuine edit (different bytes) → MUST enqueue.
+        std::fs::write(&abs, b"---\ntitle: x\n---\nCHANGED body\n").unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            1,
+            "a real edit (changed bytes) MUST enqueue"
+        );
+    }
+
+    /// Without a shadow_store attached, behavior is unchanged: the event is
+    /// enqueued (no dedup). Guards against the dedup silently disabling pushes
+    /// when the store isn't wired.
+    #[tokio::test]
+    async fn no_shadow_store_still_enqueues() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let rel = "01_Notes/note.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, b"---\ntitle: x\n---\nbody\n").unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.lock().unwrap().len(), 1);
     }
 
     // ---------- classify() ----------
