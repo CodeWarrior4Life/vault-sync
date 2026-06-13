@@ -218,6 +218,34 @@ pub struct ReconcileBatchResponse {
     pub deltas: Vec<ReconcileDelta>,
 }
 
+/// One row from `GET /api/sync/changes` — a canonical note known to the
+/// server, in `change_seq` order. The server returns `{path, file_mtime,
+/// modified, indexed_at, lsn}` (NO content hash — clients compute their own FS
+/// hash and use `/reconcile-batch` for server-side comparison). R6 uses only
+/// `path` (to detect locally-missing canonical notes) and `lsn` (to page).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChangeRow {
+    pub path: String,
+    #[serde(default)]
+    pub file_mtime: f64,
+    #[serde(default)]
+    pub modified: String,
+    #[serde(default)]
+    pub indexed_at: String,
+    pub lsn: i64,
+}
+
+/// Response envelope for `GET /api/sync/changes`. `next_lsn` is the cursor to
+/// pass as `since` on the next page; it advances past skipped (cross-route)
+/// rows so a full enumeration always terminates.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ChangesResponse {
+    #[serde(default)]
+    pub changes: Vec<ChangeRow>,
+    #[serde(default)]
+    pub next_lsn: i64,
+}
+
 pub struct ApiClient {
     base_url: String,
     token: String,
@@ -277,6 +305,46 @@ impl ApiClient {
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound(path.to_string())),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                let retry = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(60);
+                Err(ApiError::RateLimited {
+                    retry_after_secs: retry,
+                })
+            }
+            s => Err(ApiError::Server(s.as_u16())),
+        }
+    }
+
+    /// `GET /api/sync/changes?since=<lsn>&limit=<n>` — one page of canonical
+    /// notes whose `change_seq > since`, in ascending `lsn` order. Paging from
+    /// `since=0` enumerates the ENTIRE server-side canonical set for this
+    /// subscriber's route, which is what the R6 pull-backfill walks to discover
+    /// notes that exist on the server but were never materialized locally
+    /// (created elsewhere / while this daemon was down beyond the SSE replay
+    /// window). The SSE feed only ever delivers notes that get a *fresh*
+    /// enrichment event, so it can never surface these — hence the dedicated
+    /// full enumeration here.
+    pub async fn get_changes(&self, since: i64, limit: u32) -> Result<ChangesResponse, ApiError> {
+        let resp = self
+            .http
+            .get(format!("{}/api/sync/changes", self.base_url))
+            .query(&[("since", since.to_string()), ("limit", limit.to_string())])
+            .bearer_auth(&self.token)
+            // A page is metadata-only (no note bodies), but a 5000-row page on a
+            // large vault is still a non-trivial pair; give it the same 120s
+            // room the reconcile manifest pair gets rather than the 30s default.
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(resp.json().await?),
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
+            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::SERVICE_UNAVAILABLE => {
                 let retry = resp
                     .headers()

@@ -780,7 +780,11 @@ mod tests {
             .with_sync_health(health.clone());
 
         let outcomes = client.drain_once().await;
-        assert_eq!(outcomes.len(), 1, "drain_once must have processed the event");
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "drain_once must have processed the event"
+        );
 
         let after = health.secs_since_progress();
         assert!(
@@ -899,6 +903,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -923,6 +928,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -943,6 +949,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -962,6 +969,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -1333,6 +1341,7 @@ mod tests {
             vault_root: PathBuf::from("/sync/root/a"), // per-root path
             tray_state: None,
             shadow_store: None,
+            sync_health: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).

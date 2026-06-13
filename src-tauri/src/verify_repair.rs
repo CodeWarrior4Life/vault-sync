@@ -340,8 +340,12 @@ impl VerifyRepair {
                 .map(|m| m.content_hash.as_str())
                 .unwrap_or("");
             let shadow_hash = self.shadow.as_ref().and_then(|s| s.get(&delta.path));
-            let dir =
-                decide_direction(&delta.state, local_hash, server_hash, shadow_hash.as_deref());
+            let dir = decide_direction(
+                &delta.state,
+                local_hash,
+                server_hash,
+                shadow_hash.as_deref(),
+            );
 
             match dir {
                 Direction::Push => {
@@ -444,26 +448,28 @@ impl VerifyRepair {
                 Some(mat) => {
                     use futures::stream::{self, StreamExt};
                     let pull_count = pending_pulls.len();
-                    let results: Vec<(String, Result<crate::materializer::MaterializeOutcome, String>)> =
-                        stream::iter(pending_pulls.into_iter())
-                            .map(|path| {
-                                let api = Arc::clone(&self.api);
-                                let mat = mat.clone();
-                                async move {
-                                    match api.fetch_note(&path).await {
-                                        Ok(payload) => {
-                                            let r = mat
-                                                .write(&payload)
-                                                .map_err(|e| format!("materialize: {e}"));
-                                            (path, r)
-                                        }
-                                        Err(e) => (path, Err(format!("fetch: {e}"))),
+                    let results: Vec<(
+                        String,
+                        Result<crate::materializer::MaterializeOutcome, String>,
+                    )> = stream::iter(pending_pulls)
+                        .map(|path| {
+                            let api = Arc::clone(&self.api);
+                            let mat = mat.clone();
+                            async move {
+                                match api.fetch_note(&path).await {
+                                    Ok(payload) => {
+                                        let r = mat
+                                            .write(&payload)
+                                            .map_err(|e| format!("materialize: {e}"));
+                                        (path, r)
                                     }
+                                    Err(e) => (path, Err(format!("fetch: {e}"))),
                                 }
-                            })
-                            .buffer_unordered(4)
-                            .collect()
-                            .await;
+                            }
+                        })
+                        .buffer_unordered(4)
+                        .collect()
+                        .await;
 
                     let mut pulled = 0usize;
                     for (path, res) in results {

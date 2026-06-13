@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::reconciliation::{EnvReader, ProcessEnv};
+use crate::reconciliation::EnvReader;
 
 /// Default threshold: pending-with-no-progress window before a stall fires.
 /// 15 minutes. Long enough to avoid false positives on a busy host doing one
@@ -293,7 +293,11 @@ mod tests {
     #[test]
     fn is_stalled_true_at_exact_threshold() {
         assert!(
-            is_stalled(1, DEFAULT_STALL_THRESHOLD_SECS, DEFAULT_STALL_THRESHOLD_SECS),
+            is_stalled(
+                1,
+                DEFAULT_STALL_THRESHOLD_SECS,
+                DEFAULT_STALL_THRESHOLD_SECS
+            ),
             "elapsed == threshold MUST trip (>= boundary, not >)"
         );
     }
@@ -302,7 +306,11 @@ mod tests {
     #[test]
     fn is_stalled_false_just_below_threshold() {
         assert!(
-            !is_stalled(1, DEFAULT_STALL_THRESHOLD_SECS - 1, DEFAULT_STALL_THRESHOLD_SECS),
+            !is_stalled(
+                1,
+                DEFAULT_STALL_THRESHOLD_SECS - 1,
+                DEFAULT_STALL_THRESHOLD_SECS
+            ),
             "elapsed = threshold - 1 must NOT trip"
         );
     }
@@ -367,12 +375,18 @@ mod tests {
     #[test]
     fn is_recovery_disabled_false_when_unset_or_empty() {
         assert!(!is_recovery_disabled(&env_with(&[])));
-        assert!(!is_recovery_disabled(&env_with(&[(ENV_DISABLE_RECOVERY, "")])));
+        assert!(!is_recovery_disabled(&env_with(&[(
+            ENV_DISABLE_RECOVERY,
+            ""
+        )])));
     }
 
     #[test]
     fn is_recovery_disabled_true_when_set() {
-        assert!(is_recovery_disabled(&env_with(&[(ENV_DISABLE_RECOVERY, "1")])));
+        assert!(is_recovery_disabled(&env_with(&[(
+            ENV_DISABLE_RECOVERY,
+            "1"
+        )])));
     }
 
     // ------------- watchdog end-to-end test (no tokio time wait) -------------
@@ -402,8 +416,8 @@ mod tests {
         let handle = spawn_progress_stall_watchdog(
             health.clone(),
             Duration::from_millis(10),
-            Duration::from_secs(0), // threshold = 0 -> any pending trips
-            false,                  // recovery enabled
+            Duration::from_secs(0),    // threshold = 0 -> any pending trips
+            false,                     // recovery enabled
             move || async { 5_usize }, // pending_fn -- always 5 diffs
             move |evt| {
                 fired_clone.fetch_add(1, Ordering::Relaxed);

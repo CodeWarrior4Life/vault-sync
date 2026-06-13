@@ -110,8 +110,7 @@ impl ShadowStore {
             Ok(m) => m.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let bytes = serde_json::to_vec(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -212,10 +211,7 @@ mod tests {
         let store = ShadowStore::load(path.clone());
         // Fresh load is not dirty → flush writes nothing and is Ok.
         assert!(store.flush().is_ok());
-        assert!(
-            !path.exists(),
-            "non-dirty flush must NOT create the file"
-        );
+        assert!(!path.exists(), "non-dirty flush must NOT create the file");
     }
 
     #[test]

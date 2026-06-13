@@ -11,6 +11,7 @@ pub mod materializer;
 pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
 pub mod pairing;
+pub mod pull_backfill;
 pub mod push_client;
 pub mod push_journal;
 pub mod rasp_fence;
@@ -870,11 +871,14 @@ fn spawn_push_pipeline(
                     secs_since_progress = evt.secs_since_progress,
                     "sync_health: push pipeline STALLED; recovering"
                 );
-                if let Err(e) = app_handle.emit("sync_stalled", &serde_json::json!({
-                    "pending": evt.pending,
-                    "secs_since_progress": evt.secs_since_progress,
-                    "subscriber_id": subscriber_for_log,
-                })) {
+                if let Err(e) = app_handle.emit(
+                    "sync_stalled",
+                    &serde_json::json!({
+                        "pending": evt.pending,
+                        "secs_since_progress": evt.secs_since_progress,
+                        "subscriber_id": subscriber_for_log,
+                    }),
+                ) {
                     tracing::warn!("failed to emit sync_stalled event: {e}");
                 }
                 notify_user(
@@ -921,6 +925,27 @@ fn spawn_push_pipeline(
         }
         Err(e) => {
             tracing::warn!("reconciliation: api client init failed: {e}; backstop not spawned");
+        }
+    }
+
+    // R6 pull-backfill: full server→local completeness pass. The reconciliation
+    // backstop above only reconciles paths that ALREADY exist locally (it sends
+    // its local manifest to /reconcile-batch); a note that exists only on the
+    // server is never in that manifest and is never pulled. This pass closes
+    // that gap by paging GET /changes?since=0 (the full canonical enumeration)
+    // and materializing every locally-missing, non-substrate note — the exact
+    // create-write the materializer was always capable of but was never asked
+    // to do. Honors VAULT_SYNC_DISABLE_BACKFILL + VAULT_SYNC_BACKFILL_INTERVAL_SECS.
+    // Non-fatal on api-client init failure.
+    match api_client::ApiClient::new(&cfg.nexus_url, &token) {
+        Ok(backfill_api) => {
+            let _backfill_task = pull_backfill::spawn_pull_backfill_task(
+                Arc::new(backfill_api),
+                materializer.clone(),
+            );
+        }
+        Err(e) => {
+            tracing::warn!("pull_backfill: api client init failed: {e}; backfill not spawned");
         }
     }
 

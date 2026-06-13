@@ -394,6 +394,15 @@ impl Materializer {
         self.vaults_root.join(rel)
     }
 
+    /// Mode-aware on-disk target for a relative path — the exact location
+    /// `write()` would materialize `rel` to. Public so the pull-backfill pass
+    /// (R6) can test local presence (`target_path(rel).exists()`) WITHOUT
+    /// fetching the note body: only genuinely-missing canonical notes are then
+    /// fetched + written, keeping the full-enumeration backfill cheap.
+    pub fn target_path(&self, rel: &str) -> PathBuf {
+        self.target_for(rel)
+    }
+
     /// Public main entry — writes a payload into vault (live) or shadow tree.
     pub fn write(&self, payload: &NotePayload) -> Result<MaterializeOutcome, MaterializerError> {
         // 1. Mode gate.
@@ -1070,11 +1079,20 @@ mod tests {
         let md = std::fs::metadata(vaults.path().join(VAULT).join("01_Inbox/ts.md")).unwrap();
         let near = |a: std::time::SystemTime, want: f64| {
             let b = UNIX_EPOCH + Duration::from_secs_f64(want);
-            let d = a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap();
+            let d = a
+                .duration_since(b)
+                .or_else(|_| b.duration_since(a))
+                .unwrap();
             d < Duration::from_secs(2)
         };
-        assert!(near(md.modified().unwrap(), mtime_ts), "mtime not restored from file_mtime");
-        assert!(near(md.created().unwrap(), created_ts), "birthtime not restored from created");
+        assert!(
+            near(md.modified().unwrap(), mtime_ts),
+            "mtime not restored from file_mtime"
+        );
+        assert!(
+            near(md.created().unwrap(), created_ts),
+            "birthtime not restored from created"
+        );
     }
 
     #[test]
@@ -1438,7 +1456,10 @@ mod tests {
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload("01_Inbox/foo.md", "hello");
         let out = m.write(&p).unwrap();
-        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
         assert_eq!(shadow.get(&p.path), Some(p.sha256.clone()));
     }
 
@@ -1505,7 +1526,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
                 modified: "2026-05-29T00:00:00Z".into(),
                 file_mtime: None,
-            created: None,
+                created: None,
                 enriched_body: Some(serialized),
             }
         };
