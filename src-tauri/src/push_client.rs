@@ -54,8 +54,18 @@ pub struct PushClientConfig {
     pub max_backoff_ms: u64,
     /// How many events to pull per `drain_once()`.
     pub batch_size: usize,
-    /// Sleep between drain ticks in `run_loop`.
+    /// Sleep between drain ticks in `run_loop` when the journal is CAUGHT UP
+    /// (idle). Long is fine — nothing to do.
     pub loop_interval_ms: u64,
+    /// Max concurrent in-flight push CHAINS per drain. The batch is grouped by
+    /// path; each path is a sequential chain (so the server's per-path CAS never
+    /// races and per-path order + version history are preserved), and up to this
+    /// many DISTINCT-path chains run concurrently. Bounds server load / 429 risk.
+    pub push_concurrency: usize,
+    /// Sleep between drain ticks when the journal STILL has work (backlog) —
+    /// short so the loop drains a deep backlog fast instead of waiting a full
+    /// `loop_interval_ms` between each batch.
+    pub busy_loop_interval_ms: u64,
 }
 
 impl Default for PushClientConfig {
@@ -68,6 +78,8 @@ impl Default for PushClientConfig {
             max_backoff_ms: 60_000,
             batch_size: 32,
             loop_interval_ms: 5_000,
+            push_concurrency: 6,
+            busy_loop_interval_ms: 250,
         }
     }
 }
@@ -268,11 +280,39 @@ impl PushClient {
             }
         };
 
-        let mut out = Vec::with_capacity(batch.len());
+        // Router-by-path concurrency: group the drained batch by path so each
+        // path becomes a SEQUENTIAL chain — the server's per-path CAS never
+        // races, and per-path order + version-history granularity are preserved
+        // (we push every event, never collapse). Up to `push_concurrency`
+        // DISTINCT-path chains then run CONCURRENTLY. Grouping preserves drain
+        // order within each path's chain (HashMap insertion appends in order).
+        use futures::stream::{self, StreamExt};
+        let mut groups: std::collections::HashMap<String, Vec<(PushEvent, JournalCursor)>> =
+            std::collections::HashMap::new();
         for (evt, cur) in batch {
-            let outcome = self.process_event(&evt).await;
-            // Ack on terminal-success (Sent / Merged / ConflictMarkers / Skipped).
-            // Nack on Failed → event stays in journal, retried next tick.
+            groups.entry(evt.path.clone()).or_default().push((evt, cur));
+        }
+        let chain_results: Vec<Vec<(PushEvent, JournalCursor, PushOutcome)>> =
+            stream::iter(groups.into_values())
+                .map(|chain| async move {
+                    let mut chain_out = Vec::with_capacity(chain.len());
+                    for (evt, cur) in chain {
+                        // Sequential within a path → no same-path CAS race.
+                        let outcome = self.process_event(&evt).await;
+                        chain_out.push((evt, cur, outcome));
+                    }
+                    chain_out
+                })
+                .buffer_unordered(self.config.push_concurrency.max(1))
+                .collect()
+                .await;
+
+        // Fold results: ack terminal-success cursors (batched under one lock),
+        // leave failures in the journal (nack is a no-op → retried next tick),
+        // and update tray telemetry. `out` is in chain-completion order.
+        let mut to_ack: Vec<JournalCursor> = Vec::new();
+        let mut out = Vec::new();
+        for (evt, cur, outcome) in chain_results.into_iter().flatten() {
             let should_ack = matches!(
                 outcome,
                 PushOutcome::Sent { .. }
@@ -283,10 +323,9 @@ impl PushClient {
                     | PushOutcome::Failed(FailureReason::Forbidden)
                     | PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
             );
-            let mut j = self.journal.lock().await;
-            let _ = if should_ack { j.ack(cur) } else { j.nack(cur) };
-            drop(j);
-
+            if should_ack {
+                to_ack.push(cur);
+            }
             // v0.3 tray telemetry — increment on Sent (success) or Failed
             // (NetworkExhausted only; auth/conflict outcomes are explicit
             // skip-class, not "failure" for the dashboard's purposes).
@@ -303,6 +342,11 @@ impl PushClient {
             }
             out.push((evt, outcome));
         }
+        if !to_ack.is_empty() {
+            let mut j = self.journal.lock().await;
+            let _ = j.ack_batch(to_ack);
+        }
+
         // Snapshot the journal depth so the tray's "Pending uploads" item
         // reflects what's still queued.
         let pending_after = {
@@ -329,14 +373,21 @@ impl PushClient {
         out
     }
 
-    /// Run drain_once on a periodic interval until shutdown signal flips
-    /// to `true`. Sleeps `loop_interval_ms` between ticks. Designed to be
-    /// spawned by lib::run() once Wave 2 wire-up lands.
+    /// Run drain_once on an ADAPTIVE interval until shutdown signal flips to
+    /// `true`. When a drain did work (a backlog is being chewed through) the
+    /// next tick fires after the short `busy_loop_interval_ms`; when caught up
+    /// (no outcomes) it waits the full `loop_interval_ms`. This drains a deep
+    /// backlog quickly without busy-spinning while idle.
     pub async fn run_loop(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let interval = Duration::from_millis(self.config.loop_interval_ms);
         loop {
             // Drain one batch.
             let outcomes = self.drain_once().await;
+            // Backlog present (we did work) → short interval; idle → full interval.
+            let interval = if outcomes.is_empty() {
+                Duration::from_millis(self.config.loop_interval_ms)
+            } else {
+                Duration::from_millis(self.config.busy_loop_interval_ms)
+            };
             for (evt, outcome) in &outcomes {
                 match outcome {
                     PushOutcome::Sent { seq, content_hash } => {
@@ -682,6 +733,8 @@ mod tests {
             max_backoff_ms: 10,
             batch_size: 8,
             loop_interval_ms: 50,
+            push_concurrency: 4,
+            busy_loop_interval_ms: 5,
         }
     }
 
@@ -1000,6 +1053,53 @@ mod tests {
         assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
+    }
+
+    /// Router-by-path drain: distinct paths run as concurrent chains while
+    /// multiple events for the SAME path stay in one sequential chain. EVERY
+    /// event is pushed (no collapse → version fidelity) and the journal fully
+    /// drains. Regression for the parallelization redesign.
+    #[tokio::test]
+    async fn drain_routes_by_path_processes_all_events_and_drains() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .create_async()
+            .await;
+        // 3 distinct paths + a 2nd event for one of them (same-path chain).
+        let (_d, journal) = make_journal_with(vec![
+            evt("notes/a.md", b"a1"),
+            evt("notes/b.md", b"b1"),
+            evt("notes/c.md", b"c1"),
+            evt("notes/a.md", b"a2"), // same path as a1 → same sequential chain
+        ]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(
+            outcomes.len(),
+            4,
+            "every event is pushed (no collapse — preserves version history)"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, o)| matches!(o, PushOutcome::Sent { .. })),
+            "all four accepted"
+        );
+        assert_eq!(
+            journal.lock().await.len(),
+            0,
+            "journal fully drained (batch-acked)"
+        );
+        let mut paths: Vec<&str> = outcomes.iter().map(|(e, _)| e.path.as_str()).collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths, vec!["notes/a.md", "notes/b.md", "notes/c.md"]);
     }
 
     #[tokio::test]

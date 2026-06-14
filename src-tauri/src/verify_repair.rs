@@ -923,10 +923,22 @@ mod tests {
         // so the prefix also catches rotated `.STALE-*` variants.
         let vault = TempDir::new().unwrap();
         let v = vault.path();
-        write_file(v, ".lattice-runtime/uuid/sync-state/push_journal.jsonl", b"x");
+        write_file(
+            v,
+            ".lattice-runtime/uuid/sync-state/push_journal.jsonl",
+            b"x",
+        );
         write_file(v, ".lattice-runtime/shadow/x.md", b"x");
-        write_file(v, ".lattice-runtime.STALE-S477/Mainframe/coordination.md", b"x");
-        write_file(v, ".lattice-runtime.STALE-S477/Mainframe/cache/dataview/q.md", b"x");
+        write_file(
+            v,
+            ".lattice-runtime.STALE-S477/Mainframe/coordination.md",
+            b"x",
+        );
+        write_file(
+            v,
+            ".lattice-runtime.STALE-S477/Mainframe/cache/dataview/q.md",
+            b"x",
+        );
         write_file(v, "Mainframe/.lattice-runtime.STALE-S477/memory/y.md", b"x");
         write_file(v, "notes/keeper.md", b"alpha");
         let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
