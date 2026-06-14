@@ -66,6 +66,10 @@ const HARDCODED_EXCLUDES: &[&str] = &[
     ".lattice-runtime",
     ".trash/",
     "._/", // S477: convention for organized machine-local trees
+    // A node_modules/ under the vault must never sync — it inflated the push
+    // journal with tens of thousands of entries (2026-06-14). Kept aligned with
+    // verify_repair::VerifyRepairConfig::default().hardcoded_excludes.
+    "node_modules/",
 ];
 
 /// Path-segment prefix matches. If ANY segment of the path (basename of any
@@ -1165,6 +1169,25 @@ mod tests {
             ".lattice-runtime/state.json",
             "Mainframe/.lattice-runtime/memory/x.md",
             "Mainframe/.lattice-runtime.STALE-S477/memory/y.md",
+        ] {
+            match w.classify(&modified(p)) {
+                FilterDecision::DropExclude { .. } => {}
+                other => panic!("expected DropExclude for {p}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A node_modules/ under the vault must be dropped at classify (root + any
+    /// nesting) — it inflated the push journal massively (2026-06-14). Must
+    /// match verify_repair's reconcile-walk exclude.
+    #[test]
+    fn node_modules_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        for p in [
+            "node_modules/sharp/README.md",
+            "Mainframe/node_modules/semver/range.md",
+            "02_Projects/foo/node_modules/x/index.md",
         ] {
             match w.classify(&modified(p)) {
                 FilterDecision::DropExclude { .. } => {}

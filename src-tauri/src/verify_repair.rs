@@ -131,6 +131,12 @@ impl Default for VerifyRepairConfig {
                 ".trash/".into(),
                 "._/".into(),
                 "_archive/".into(),
+                // Dependency tree that has no business syncing — a node_modules/
+                // under the vault inflated the push journal with tens of
+                // thousands of entries (observed 2026-06-14). NO trailing slash
+                // is unnecessary here (it is always a directory), but the segment
+                // match drops it at root or any nesting depth.
+                "node_modules/".into(),
             ],
             respect_substrate_fence: true,
             max_concurrent_hashes: 8,
@@ -948,6 +954,26 @@ mod tests {
             paths,
             vec!["notes/keeper.md"],
             "all .lattice-runtime* paths (live + rotated/stale, root + nested) must be excluded from the reconcile manifest"
+        );
+    }
+
+    /// A node_modules/ under the vault must be excluded from the reconcile walk
+    /// (root + nested) — it inflated the journal with tens of thousands of
+    /// entries (2026-06-14). Must match file_watcher's exclude.
+    #[tokio::test]
+    async fn manifest_excludes_node_modules() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "node_modules/sharp/README.md", b"x");
+        write_file(v, "Mainframe/node_modules/semver/range.md", b"x");
+        write_file(v, "notes/keeper.md", b"alpha");
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let m = vr.build_local_manifest().unwrap();
+        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["notes/keeper.md"],
+            "node_modules/ (root + nested) must be excluded from the reconcile manifest"
         );
     }
 

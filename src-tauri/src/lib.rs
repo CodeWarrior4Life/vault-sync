@@ -771,7 +771,44 @@ fn spawn_push_pipeline(
         }
     }
     let journal = match push_journal::PushJournal::open(&journal_path) {
-        Ok(j) => Arc::new(tokio::sync::Mutex::new(j)),
+        Ok(mut j) => {
+            // Journal-bloat remediation: collapse the accumulated backlog to one
+            // entry per path NOW — while `j` is still OWNED, before it is wrapped
+            // in the shared Arc<Mutex> and the drain loop / file_watcher spawn.
+            // There is no lock to contend, so compaction ALWAYS runs. (The
+            // earlier `journal.try_lock()`-after-Arc could silently lose a
+            // startup race and skip with no log, leaving a 171k-entry /
+            // 82%-duplicate backlog uncollapsed — observed 2026-06-14.) The
+            // pre-dedup file_watcher left journals heavily duplicated; v0.4.18
+            // stops NEW dupes, this clears the legacy ones. Non-fatal; kill
+            // switch VAULT_SYNC_DISABLE_COMPACTION.
+            let compaction_disabled = std::env::var("VAULT_SYNC_DISABLE_COMPACTION")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            if compaction_disabled {
+                tracing::info!(
+                    "push_journal: startup compaction disabled via VAULT_SYNC_DISABLE_COMPACTION"
+                );
+            } else {
+                match j.compact() {
+                    Ok((before, after)) if after < before => tracing::info!(
+                        before,
+                        after,
+                        removed = before - after,
+                        "push_journal: startup compaction collapsed redundant duplicates"
+                    ),
+                    Ok((n, _)) => tracing::info!(
+                        entries = n,
+                        "push_journal: startup compaction — nothing redundant"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "push_journal: startup compaction failed (non-fatal)"
+                    ),
+                }
+            }
+            Arc::new(tokio::sync::Mutex::new(j))
+        }
         Err(e) => {
             tracing::error!("push pipeline: journal open failed: {e}; not starting push side");
             notify_user(
@@ -782,39 +819,6 @@ fn spawn_push_pipeline(
             return None;
         }
     };
-
-    // Journal-bloat remediation: collapse the accumulated backlog to one entry
-    // per path at startup (before the drain loop + watcher start, so no
-    // concurrent append races). The pre-dedup file_watcher left journals up to
-    // ~97% redundant duplicates that drain as no-ops and bury real edits for
-    // hours; v0.4.18's enqueue dedup stops NEW duplicates, this clears the
-    // legacy ones. Best-effort + non-fatal; kill switch VAULT_SYNC_DISABLE_COMPACTION.
-    if std::env::var("VAULT_SYNC_DISABLE_COMPACTION")
-        .map(|v| v.is_empty())
-        .unwrap_or(true)
-    {
-        if let Ok(mut j) = journal.try_lock() {
-            match j.compact() {
-                Ok((before, after)) if after < before => tracing::info!(
-                    before,
-                    after,
-                    removed = before - after,
-                    "push_journal: startup compaction collapsed redundant duplicates"
-                ),
-                Ok((n, _)) => tracing::debug!(
-                    entries = n,
-                    "push_journal: startup compaction — nothing redundant"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, "push_journal: startup compaction failed (non-fatal)")
-                }
-            }
-        }
-    } else {
-        tracing::info!(
-            "push_journal: startup compaction disabled via VAULT_SYNC_DISABLE_COMPACTION"
-        );
-    }
 
     // B2: watch_root is passed in directly from sync_root.path —
     // paths will be relative to watch_root (no first-segment prefix).
