@@ -527,6 +527,41 @@ impl PushJournal {
         self.total_bytes = std::fs::metadata(&self.path)?.len();
         Ok(())
     }
+
+    /// Collapse the journal to at most one entry per `path`, keeping the LATEST
+    /// (last-on-disk) entry for each and preserving their relative order.
+    /// Returns `(before, after)` live-entry counts.
+    ///
+    /// Journal-bloat remediation: the file_watcher historically appended a fresh
+    /// entry for every FS event with no content dedup, so an actively-touched
+    /// vault accumulated tens of thousands of redundant entries for the same
+    /// handful of paths (observed 97% duplicates / a path re-queued 85×). They
+    /// drain one-by-one as server no-ops, burying genuine edits for hours.
+    /// Collapsing to one-per-path is SAFE: the duplicates are redundant pushes
+    /// of the SAME path; the kept (latest) entry supersedes the earlier ones,
+    /// content is read at drain time (entries are lazy), and push is
+    /// content-hash-idempotent server-side. A no-op when nothing is redundant.
+    pub fn compact(&mut self) -> Result<(usize, usize), JournalError> {
+        let live = Self::read_live_from(&self.path)?;
+        let before = live.len();
+        // Index of the LAST occurrence of each path.
+        let mut last_idx: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(live.len());
+        for (i, evt) in live.iter().enumerate() {
+            last_idx.insert(evt.path.as_str(), i);
+        }
+        let keep: std::collections::HashSet<usize> = last_idx.into_values().collect();
+        let after = keep.len();
+        if after < before {
+            let compacted: Vec<PushEvent> = live
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, e)| keep.contains(&i).then_some(e))
+                .collect();
+            self.rewrite(&compacted)?;
+        }
+        Ok((before, after))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +588,50 @@ mod tests {
             queued_at: Utc::now(),
             device_id: "dev-test".to_string(),
         }
+    }
+
+    /// Journal-bloat remediation: compaction collapses redundant duplicate
+    /// entries for the same path to ONE (the latest), preserving distinct paths.
+    #[test]
+    fn compact_collapses_duplicates_keeping_latest_per_path() {
+        let dir = TempDir::new().unwrap();
+        let mut j = PushJournal::open(&dir.path().join("j.jsonl")).unwrap();
+        // 3 redundant entries for a.md (remember the LAST id), 2 for b.md, 1 c.md.
+        let mut last_a = String::new();
+        for _ in 0..3 {
+            let e = evt("a.md", PushAction::Modify);
+            last_a = e.id.clone();
+            j.append(e).unwrap();
+        }
+        for _ in 0..2 {
+            j.append(evt("b.md", PushAction::Modify)).unwrap();
+        }
+        j.append(evt("c.md", PushAction::Create)).unwrap();
+        assert_eq!(j.len(), 6);
+
+        let (before, after) = j.compact().unwrap();
+        assert_eq!((before, after), (6, 3), "one entry per distinct path");
+        assert_eq!(j.len(), 3);
+
+        let kept: Vec<PushEvent> = j.drain(100).unwrap().into_iter().map(|(e, _)| e).collect();
+        let paths: std::collections::HashSet<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.md", "b.md", "c.md"].into_iter().collect(),
+            "exactly the distinct paths survive"
+        );
+        let a = kept.iter().find(|e| e.path == "a.md").unwrap();
+        assert_eq!(a.id, last_a, "must keep the LATEST entry for a path");
+    }
+
+    #[test]
+    fn compact_is_noop_without_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let mut j = PushJournal::open(&dir.path().join("j.jsonl")).unwrap();
+        j.append(evt("a.md", PushAction::Create)).unwrap();
+        j.append(evt("b.md", PushAction::Create)).unwrap();
+        assert_eq!(j.compact().unwrap(), (2, 2));
+        assert_eq!(j.len(), 2);
     }
 
     fn journal_path(dir: &TempDir) -> PathBuf {

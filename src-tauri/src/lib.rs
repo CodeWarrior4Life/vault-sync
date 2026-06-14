@@ -783,6 +783,39 @@ fn spawn_push_pipeline(
         }
     };
 
+    // Journal-bloat remediation: collapse the accumulated backlog to one entry
+    // per path at startup (before the drain loop + watcher start, so no
+    // concurrent append races). The pre-dedup file_watcher left journals up to
+    // ~97% redundant duplicates that drain as no-ops and bury real edits for
+    // hours; v0.4.18's enqueue dedup stops NEW duplicates, this clears the
+    // legacy ones. Best-effort + non-fatal; kill switch VAULT_SYNC_DISABLE_COMPACTION.
+    if std::env::var("VAULT_SYNC_DISABLE_COMPACTION")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        if let Ok(mut j) = journal.try_lock() {
+            match j.compact() {
+                Ok((before, after)) if after < before => tracing::info!(
+                    before,
+                    after,
+                    removed = before - after,
+                    "push_journal: startup compaction collapsed redundant duplicates"
+                ),
+                Ok((n, _)) => tracing::debug!(
+                    entries = n,
+                    "push_journal: startup compaction — nothing redundant"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "push_journal: startup compaction failed (non-fatal)")
+                }
+            }
+        }
+    } else {
+        tracing::info!(
+            "push_journal: startup compaction disabled via VAULT_SYNC_DISABLE_COMPACTION"
+        );
+    }
+
     // B2: watch_root is passed in directly from sync_root.path —
     // paths will be relative to watch_root (no first-segment prefix).
     let vault_root = watch_root;

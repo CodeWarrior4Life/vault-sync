@@ -58,6 +58,12 @@ use crate::tray_state::SharedTrayState;
 const HARDCODED_EXCLUDES: &[&str] = &[
     ".obsidian/",
     ".lattice-sync/",
+    // Daemon runtime/state dir. NO trailing slash so the prefix also matches
+    // rotated/stale variants like `.lattice-runtime.STALE-S477/`. When
+    // `sync_roots` is empty the watcher roots at `vaults_root` (the PARENT of
+    // the vault), so the daemon's own `.lattice-runtime` tree sits in scope and
+    // was being enqueued as pushes (thousands of self-generated junk entries).
+    ".lattice-runtime",
     ".trash/",
     "._/", // S477: convention for organized machine-local trees
 ];
@@ -1143,6 +1149,28 @@ mod tests {
             3,
             "recreate after delete must enqueue even with pre-delete-identical bytes"
         );
+    }
+
+    // ---------- .lattice-runtime exclude (journal-bloat / self-push fix) ----------
+
+    /// The daemon's own runtime dir (and rotated `.STALE-*` variants) must be
+    /// dropped at classify — when `sync_roots` is empty the watcher roots at
+    /// `vaults_root`, the parent of the vault, so `.lattice-runtime` is in scope
+    /// and was being enqueued as thousands of self-generated push entries.
+    #[test]
+    fn lattice_runtime_dir_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        for p in [
+            ".lattice-runtime/state.json",
+            "Mainframe/.lattice-runtime/memory/x.md",
+            "Mainframe/.lattice-runtime.STALE-S477/memory/y.md",
+        ] {
+            match w.classify(&modified(p)) {
+                FilterDecision::DropExclude { .. } => {}
+                other => panic!("expected DropExclude for {p}, got {other:?}"),
+            }
+        }
     }
 
     // ---------- classify() ----------
