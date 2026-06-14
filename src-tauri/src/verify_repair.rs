@@ -115,10 +115,21 @@ impl Default for VerifyRepairConfig {
     fn default() -> Self {
         Self {
             allowed_extensions: vec![".md".into(), ".canvas".into()],
+            // MUST stay aligned with file_watcher::HARDCODED_EXCLUDES — the live
+            // watcher and this startup reconcile walk are two enqueue paths into
+            // the SAME push pipeline; if one excludes a tree and the other does
+            // not, the reconcile walk manifests it and floods the server (the
+            // 2026-06-14 storm: 450 pushes/120s of `.lattice-runtime.STALE-S477/`
+            // because this list lacked `.lattice-runtime` while file_watcher had
+            // it). `.lattice-runtime` has NO trailing slash so the prefix also
+            // matches rotated/quarantine variants like `.lattice-runtime.STALE-*`
+            // (matched via starts_with_or_contains_segment).
             hardcoded_excludes: vec![
                 ".obsidian/".into(),
                 ".lattice-sync/".into(),
+                ".lattice-runtime".into(),
                 ".trash/".into(),
+                "._/".into(),
                 "_archive/".into(),
             ],
             respect_substrate_fence: true,
@@ -900,6 +911,32 @@ mod tests {
         let m = vr.build_local_manifest().unwrap();
         let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/keeper.md"]);
+    }
+
+    #[tokio::test]
+    async fn manifest_excludes_lattice_runtime_and_rotated_variants() {
+        // Regression for the 2026-06-14 push storm (450 pushes/120s): the
+        // startup reconcile walk lacked `.lattice-runtime` in its excludes
+        // (file_watcher had it), so it manifested the whole runtime tree —
+        // including the quarantine-renamed `.lattice-runtime.STALE-S477/`
+        // variant — and pushed all of it. The exclude has NO trailing slash
+        // so the prefix also catches rotated `.STALE-*` variants.
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, ".lattice-runtime/uuid/sync-state/push_journal.jsonl", b"x");
+        write_file(v, ".lattice-runtime/shadow/x.md", b"x");
+        write_file(v, ".lattice-runtime.STALE-S477/Mainframe/coordination.md", b"x");
+        write_file(v, ".lattice-runtime.STALE-S477/Mainframe/cache/dataview/q.md", b"x");
+        write_file(v, "Mainframe/.lattice-runtime.STALE-S477/memory/y.md", b"x");
+        write_file(v, "notes/keeper.md", b"alpha");
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let m = vr.build_local_manifest().unwrap();
+        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["notes/keeper.md"],
+            "all .lattice-runtime* paths (live + rotated/stale, root + nested) must be excluded from the reconcile manifest"
+        );
     }
 
     #[tokio::test]
