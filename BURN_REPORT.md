@@ -1,132 +1,207 @@
-# BURN_REPORT -- TKT-cc4ede6b / opfix-vaultsync-dormancy
+# BURN_REPORT -- TKT-4bd13028 / opfix-vsync-daemon
 
-**Ticket:** TKT-cc4ede6b
-**Burn:** opfix-vaultsync-dormancy
-**Title:** Operation Fix: vault-sync-daemon silent-dormancy auto-recovery
-**Branch (this worktree):** `whetstone/opfix-vaultsync-dormancy` on `/var/home/cyril/projects/vault-sync`
-**Base commit:** `d9bab1d` (vault-sync main)
-**Spec anchor:** `02_Projects/Lattice/lattice-vault-sync/Specifications/2026-05-12 Lattice Vault Sync - Unified Design Spec v1.md`
-**Incident reference:** 2026-06-13 nexus-vault-sync 14h+ silent dormancy
+**Ticket:** TKT-4bd13028
+**Burn:** opfix-vsync-daemon
+**Title:** Operation Fix: vault-sync daemon reconcile over-queue + bulk-change rate cap (TKT-ea4058b8)
+**Branch (this worktree):** `whetstone/opfix-vsync-daemon` on `/var/home/cyril/Burns/TKT-4bd13028`
+**Base commit (reviewed):** `957e3f2` (vault-sync daemon v0.4.22, "fix(vault-sync): reliable startup compaction + exclude node_modules")
+**Spec anchor:** `02_Projects/Nexus/Specifications/2026-06-11 Nexus Sync - Sync Contract v1 (S1-A).md`
+**Incident reference:** TKT-ea4058b8 (2026-06-16 link+Trinity push storm + idempotent churn)
 
 ---
 
-## Status: parked AWAITING-OWNER
+## Status
 
-Two dispatcher misconfigurations block the burn from satisfying its full acceptance criteria autonomously. Both are setup-time issues, not work-quality issues. The review, fix code, and regression tests are complete and committed; the owner must clear the blockers before the binary can ship.
+REVIEW + FIX + REGRESSION TESTS + OFFLINE BUILD + REPORT done on this branch.
+PARKED AWAITING-OWNER for the release leg (D8 hard gate).
 
-### Blockers
-
-**B1. Burn worktree seeded against the wrong repository.**
-The dispatcher created `/var/home/cyril/Burns/TKT-cc4ede6b` as a worktree of `/var/home/cyril/projects/nexus-sync` (the Obsidian plugin distribution repo, single compiled `main.js` plus manifest, no Rust source). The spec anchor and all R1..R5 requirements target the Tauri daemon in `/var/home/cyril/projects/vault-sync` (Rust, `src-tauri/src/`). I created a sibling worktree `/var/home/cyril/Burns/TKT-cc4ede6b-vault-sync` on a same-named branch of the correct repo and did the work there. The owner needs to point the dispatcher at the right repo for future opfix-vaultsync-* burns.
-
-**B2. Build toolchain absent on burn host.**
-`cargo`, `rustc`, and `rustup` are not installed on this host. The burn requires "Self-verify offline (cargo test); paste real output into BURN_REPORT.md." I cannot satisfy that constraint here. The fix is implemented in source; the regression tests are written and structurally red-on-old-code (the `sync_health` module does not exist on the pre-fix tree, so the test file fails to compile). The owner needs to run `cargo test -p vault-sync-daemon sync_health` and `cargo test -p vault-sync-daemon push_client::tests::drain_once_stamps` on a host with Rust installed.
+The R1 and R2 gaps both confirmed against `957e3f2`. Both fixed in committed checkpoints on this branch with red-on-old regression tests; the full `cargo test --lib` suite runs green inside the rust:1 podman container (output pasted below).
 
 ### Owner action (one line)
 
-Verify the fix compiles and tests pass (`cargo test` in `/var/home/cyril/Burns/TKT-cc4ede6b-vault-sync/src-tauri/`), then build + sign + ship the AppImage from this branch and restart `nexus-vault-sync.service`.
+Verify the fixes (`cargo test --lib` on this branch reproduces the offline-verify output below), then take the OWNER-GATED release leg: bump Cargo.toml + tauri.conf.json + Cargo.lock to v0.4.23, commit + tag v0.4.23 (CI builds the 4-platform AppImage / msi / dmg and auto-promotes for fleet auto-update). NO push, merge, or version bump performed by this burn.
 
 ---
 
-## R1..R5 Review Table
+## R1..R2 Review Table
 
-Every row cites real code at the reviewed commit (`d9bab1d`, vault-sync main). File paths are relative to `/var/home/cyril/projects/vault-sync/`.
+Every row cites real code at the reviewed commit (`957e3f2`, vault-sync v0.4.22). File paths are relative to the worktree root `/var/home/cyril/Burns/TKT-4bd13028/`.
 
-| Req | File:Line evidence (pre-fix HEAD) | Verdict | Evidence |
+| Req | File:Line evidence (pre-fix HEAD `957e3f2`) | Verdict | Evidence |
 |---|---|---|---|
-| **R1** Liveness vs progress; pending diffs + no progress = UNHEALTHY | `src-tauri/src/tray_state.rs:60-65, 75, 162-165, 181-187`; `src-tauri/src/push_client.rs:243-302`; `src-tauri/src/lib.rs:262-273` | **GAP** | `TrayState.last_event_at` tracks SSE/FS event arrival only; `TrayState.uploads_last_at` tracks last push attempt timestamp but NO code compares `uploads_pending > 0` against staleness of `uploads_last_at` to declare a stall. The updater path at `lib.rs:262-273` reads these for restart-on-idle gating, NOT for dormancy detection. `push_client.drain_once` (push_client.rs:290-300) updates `uploads_pending` after each drain but does not stamp a "I just made progress" timestamp anywhere reachable by a watchdog. The shadow store (`sync_shadow.rs`) records per-file hashes but has no global "last push activity" notion. Conclusion: liveness and progress are NOT distinguished. |
-| **R2** Auto-recovery on progress-stall, NOT silent log line | `src-tauri/src/lib.rs:947-989` (redflag monitor); `src-tauri/src/lib.rs:188-211` (should_restart_now, staged-update path only); `src-tauri/src/lib.rs:39-43` (notify_user, only fired on startup failures) | **GAP** | The only auto-restart logic is `should_restart_now` calling `app.restart()` (lib.rs:284-285) and it gates exclusively on `update_staged` (lib.rs:198-200). The redflag monitor (lib.rs:967-968) explicitly logs `"redflag.md removed; tray cleared. Restart daemon to resume sync."` -- manual restart, no recovery. `notify_user` is called for startup failures (lib.rs:383-387, 415-419, 736-741, 753-757, 765-769, 783-787, 868-873, 901-906, 925-933, 937-942) but never for runtime stall detection because no detector exists. Conclusion: recovery is manual; no visible owner-facing alert on stall. |
-| **R3** sync-health-monitor verifies PROGRESS, not process liveness | `src-tauri/src/lib.rs:546-562` (60s conflict refresh); `src-tauri/src/lib.rs:981-989` (60s redflag monitor); `src-tauri/src/reconciliation.rs:282-329` (recon backstop); `src-tauri/src/lib.rs:217-296` (auto-updater 5min loop) | **GAP** | None of the four long-running tasks above check push-pipeline progress. The conflict-refresh task scans on-disk stash siblings. The redflag monitor checks for `redflag.md`. The reconciliation backstop runs a full verify_repair every 10min but does NOT compare its last-run timestamp against expected cadence to detect "I have not run in N minutes despite pending diffs." The auto-updater literally ticks every 5 minutes (lib.rs:222 `CHECK_INTERVAL: Duration = Duration::from_secs(300)`) regardless of sync state -- this is the task that kept logging during the 14h dormancy. No external `sync-health-monitor` exists in this repo (verified via repository-wide grep). Conclusion: no in-process health monitor verifies push progress. |
-| **R4** Root cause: engine quiet while updater ticks (panicked task does not crash process) | `src-tauri/src/lib.rs:818-822` (push_client spawn, no panic catch); `src-tauri/src/lib.rs:546-562` (conflict refresh spawn, no panic catch); `src-tauri/src/lib.rs:982-988` (redflag monitor spawn, no panic catch); `src-tauri/src/lib.rs:226-295` (auto-updater spawn) | **GAP** | Every `tauri::async_runtime::spawn(async move { ... })` site at lib.rs:226, 552, 818, 982 is unawaited -- a panic inside any of these futures is captured silently in the `JoinHandle` and never observed. The push_client spawn at lib.rs:821 even contains a `tracing::warn!("push_client.run_loop returned (unexpected for a forever loop)")` line that fires ONLY on clean return; a panic skips this line entirely (the warn lives AFTER the awaited run_loop call). The auto-updater task is structurally independent (its own spawn) so it keeps ticking when the push_client task dies. This is exactly the 2026-06-13 symptom shape. Conclusion: engine can silently die while process stays up. |
-| **R5** No pending edit lost during stall/recovery; change detection on content hash, never mtime alone | `src-tauri/src/file_watcher.rs:476, 503, 546` (sha256 on Create/Modify/Rename); `src-tauri/src/file_watcher.rs:910-914` plus test at `1532-1551` (Modify(Metadata(_)) dropped); `src-tauri/src/push_journal.rs` (jsonl append-only, survives restart); `src-tauri/src/sync_shadow.rs:89-99` (per-file hash markers, persisted) | **CONFORMS** | `FileWatcher::to_push_event` computes `content_sha: sha256_hex(&bytes)` for every Create/Modify/Rename. The classify path drops `Modify(Metadata(_))` events -- i.e. atime/mtime/permission/ownership-only changes are filtered out (confirmed by test `is_mutating_kind_drops_access_and_metadata` at file_watcher.rs:1532-1551). The push journal is jsonl-append-only and persisted; a daemon restart re-reads pending events. The shadow store keys on hash, not mtime. Conclusion: compliant. Any fix MUST preserve this; the watchdog's recovery action is `app.restart()` which re-opens the same on-disk journal, so no pending edit is lost. |
+| **R1** No re-queue of converged notes: the reconcile/verify_repair pass MUST NOT enqueue a push for a note whose local content hash equals its last-synced server hash. | `src-tauri/src/verify_repair.rs:235-257` (`decide_direction`); `src-tauri/src/verify_repair.rs:353-426` (`Direction::Push` enqueue arm); `src-tauri/src/verify_repair.rs:433-454` (`append_batch` into shared journal). | **GAP** | `decide_direction(state, _local_hash, server_hash, shadow_hash)` declares `_local_hash` and does NOT read it (the underscore-prefix is the smoking gun). Its "drift" arm returns `Push` whenever `shadow_hash == server_hash`; its "missing-on-server" arm returns `Push` UNCONDITIONALLY (line 253). The R1 invariant — "local content hash equals last-synced server hash → no push" — is therefore never tested. The hot symptom: a `"missing-on-server"` reconcile delta for a path the daemon has ALREADY pushed (`shadow_hash == local_hash`) re-queues the same bytes; the push_client lazily re-reads the file (`push_client.rs:444-469`), bandwidth-cycles base64 to the server, the server idempotently no-ops it (`0 server writes`), `shadow_hash_for_ack` records the same hash again, next pass repeats — the sustained "~3-7/s pushes, 0 server writes" churn seen on link (2.25M `verify_repair` log lines). The existing pre-journal idempotency guard in `push_client.rs:204-231` (`pre_journal_filter`) is only called by `file_watcher.rs` — verify_repair appends directly via `journal.lock().await.append_batch(...)` and bypasses it entirely. |
+| **R2** Bulk-change rate cap: a large local change set (e.g. a recovery rsync of ~28k files) MUST NOT storm the server. Add a push-drain rate cap so a bulk change converges without exceeding a safe rate. | `src-tauri/src/push_client.rs:71-85` (`PushClientConfig::default` — fields covering interval, concurrency, batch size but NO sustained-rate cap); `src-tauri/src/push_client.rs:271-374` (`drain_once` — no per-event throttle); `src-tauri/src/push_client.rs:381-421` (`run_loop` — only between-batch sleep, no inside-batch pacing). | **GAP** | The push pipeline has THREE existing knobs that bound load: `push_concurrency: 6` (parallel path-chains), `batch_size: 32` (events per drain), and `busy_loop_interval_ms: 250` (sleep between drains while a backlog exists). None of them rate-limit per second: a busy drain can issue all 32 events in well under 250ms across 6 chains, theoretical ceiling 128 pushes/s. The empirically observed 5187 pushes / 120s ≈ 43 pushes/s after the 28k-file rsync (TKT-ea4058b8, 2026-06-16) is well within that ceiling and tripped the S498 monitor's FLOOD threshold. There is no token bucket, no leaky-bucket queue, no `tokio::time::sleep` before `self.api.push(...)`, and no env var (`grep -nE 'rate\|throttle\|max_per_sec' push_client.rs` is empty). The pipeline can therefore convert a 28k-file rsync into a sustained server storm bounded only by HTTP latency. |
 
 ### Net pre-fix state
 
-R1, R2, R3, R4 all GAP. R5 conforms and the fix preserves it. The four GAPs are coupled: a watchdog that observes pending diffs + no progress timestamp (R1+R3) + acts via `app.restart()` (R2) + indirectly catches panicked spawn tasks because they stop stamping progress (R4) closes all four with one mechanism.
+Both R1 and R2 GAP. They are independent fixes touching different files:
+
+- R1 in `verify_repair.rs` (`decide_direction` + a Pull arm for "missing-on-server" + new converged-gate that consults `local_hash`).
+- R2 in `push_client.rs` (new `PushRateLimiter` + `with_rate_limiter` builder + `acquire().await` before each `process_event`'s HTTP push).
+
+They COMPOSE correctly: the R1 gate stops the verify_repair pass from queueing redundant pushes; the R2 rate cap stops a legitimate large change set from storming the server. Together they bound BOTH directions of the symptom: idempotent churn AND bulk-change storms.
 
 ---
 
 ## Fix
 
-One new module plus small wire-up in three existing files. Committed on this branch.
+Two commits on this branch (see `git log main..HEAD`). Each is independently reviewable.
 
-### New: `src-tauri/src/sync_health.rs`
+### Commit A — R1: converged-gate in `decide_direction`
 
-- `SyncHealth` (Arc-shared, lock-free atomic counter): `mark_progress()` from the push hot path; `secs_since_progress()` from the watchdog.
-- `is_stalled(pending, secs_since_progress, threshold_secs) -> bool` -- pure decision, `pending > 0 && secs_since_progress >= threshold_secs`. Extracted as `pub fn` for boundary tests.
-- `read_threshold(env)` / `is_recovery_disabled(env)` reuse the `EnvReader` + `MapEnv` trait already defined by `reconciliation.rs` (so tests don't touch process env).
-- `spawn_progress_stall_watchdog(...)` -- 60s tick; pending closure is async (production wires it to the `tokio::sync::Mutex<PushJournal>` lock); on a fired stall calls `on_stall(event)` which the production wiring builds to `tracing::error!` + `app.emit("sync_stalled", ...)` + `notify_user(...)` + `app.restart()`. Tunables: `VAULT_SYNC_STALL_THRESHOLD_SECS` (default 900) and `VAULT_SYNC_DISABLE_STALL_WATCHDOG`.
+**Changed:** `src-tauri/src/verify_repair.rs`
 
-### Changed: `src-tauri/src/push_client.rs`
+`decide_direction` now consumes `local_hash` (the underscore prefix is gone) and applies the R1 invariant BEFORE the state-specific switch:
 
-- New field `sync_health: Option<Arc<SyncHealth>>` on `PushClient`.
-- New builder `with_sync_health(...)`.
-- In `drain_once`, after the post-drain pending snapshot: stamp `mark_progress()` if the loop processed at least one event OR the journal is now empty (the "caught up" case, so a healthy idle daemon does not look stalled).
+- `local_hash == shadow_hash` ⇒ the daemon's last-synced marker proves we already shipped this content. NO push regardless of what the reconcile delta says:
+  - `"drift"` ⇒ `Direction::Pull` (the server moved, take the new server bytes; safe-default on a mirror host).
+  - `"missing-on-server"` ⇒ `Direction::Noop` (we already pushed it; the server lost the row; DO NOT auto-restore — owner intervenes).
+  - `"match"` and unknown ⇒ `Direction::Noop` (unchanged).
 
-### Changed: `src-tauri/src/lib.rs`
+If the shadow marker is absent OR differs from local, fall through to the existing state-specific arms (drift/missing-on-server/match).
 
-- `pub mod sync_health;` registered alphabetically between `sse` and `sync_shadow`.
-- `let sync_health = sync_health::SyncHealth::new();` created once per daemon, shared across all sync_roots.
-- Threaded into `spawn_push_pipeline(..., sync_health)` and onto the PushClient via `.with_sync_health(...)`.
-- After the push-loop spawn, `spawn_progress_stall_watchdog(...)` is started with: 60s tick, env-configured threshold, env-configured kill switch, async pending closure that locks the journal and reads `len()`, and an on-stall closure that emits the `sync_stalled` Tauri event, calls `notify_user(...)`, and calls `app.restart()` to bring up a fresh process with healthy tasks.
+The caller (`VerifyRepair::run`) was already threading `shadow_hash` via `self.shadow.as_ref().and_then(|s| s.get(&delta.path))` (verify_repair.rs:359), so no plumbing change was needed — only the signature swap and the prelude check.
 
-### Changed: `src-tauri/Cargo.toml`
+### Commit B — R2: bounded push-drain rate
 
-- Added `tokio = { version = "1", features = ["test-util"] }` to `[dev-dependencies]` so `tokio::time::advance` + `start_paused = true` are available for the deterministic watchdog tests. Cargo unifies features across normal+dev so this lights up `test-util` for the test build only.
+**New:** `src-tauri/src/push_rate_limit.rs`
 
-### Why `app.restart()` is the right recovery primitive
+A `PushRateLimiter` keyed on a sliding 1-second window of `Instant` timestamps under a `tokio::sync::Mutex`. `acquire().await` drops expired timestamps, returns immediately if `len < max_per_sec`, else `tokio::time::sleep_until(window_front + 1s).await` and retries. Token bucket semantics with NO third-party dep.
 
-Re-spawning the panicked task in place would require restructuring the spawn site (a `loop { spawn_run_loop().await; tracing::error!("re-spawning"); }` wrapper). That works for explicit task panics but does NOT help for a deadlock inside the task. A full `app.restart()` re-initializes every spawned task from a known-good state and re-opens the persistent push journal, losing zero pending edits (jsonl-append-only). The same primitive is used by the staged-update apply path (lib.rs:284-285), so it is already proven on the production tray-resident daemon. The cost is a few seconds of downtime per detected stall, far cheaper than 14h.
+Two pure helpers extracted for boundary tests (no clock):
+- `would_exceed(window_len, max_per_sec) -> bool`
+- `next_release_at(window_front, now) -> Duration` (for the awaited sleep)
+
+Env-driven config:
+- `VAULT_SYNC_MAX_PUSH_PER_SEC` (default 20) — sustained cap.
+- `VAULT_SYNC_DISABLE_PUSH_RATE_CAP` — kill switch (any non-empty value).
+
+A `read_max_per_sec(env)` + `is_disabled(env)` pair mirrors `reconciliation::EnvReader` (same `MapEnv` test injection pattern, no `unsafe { std::env::set_var }`).
+
+**Changed:** `src-tauri/src/push_client.rs`
+
+- New field `rate_limiter: Option<Arc<PushRateLimiter>>` on `PushClient`.
+- New builder `with_rate_limiter(...)`.
+- In `process_event`, BEFORE the `self.api.push(&req).await` attempt (inside the retry loop's first attempt only), call `if let Some(rl) = &self.rate_limiter { rl.acquire().await; }`. Subsequent retries within the same `process_event` reuse the already-acquired slot (the retry path is a backoff, not a new push from the cap's standpoint — the slot is consumed by the path-chain, not by the HTTP request).
+
+**Changed:** `src-tauri/src/lib.rs`
+
+- `pub mod push_rate_limit;` registered alphabetically.
+- In `spawn_push_pipeline`: read env-configured cap via `push_rate_limit::read_max_per_sec(&ProcessEnv)` and disabled-flag via `is_disabled(&ProcessEnv)`. Construct ONE shared `PushRateLimiter` per pipeline call and thread it onto the `PushClient` via `.with_rate_limiter(...)`. Multi-sync-root: each root gets its own rate limiter instance because each root has its own subscriber-id-scoped pipeline; rate-capping the WHOLE process across all roots is out of scope (and arguably wrong — each root has its own backpressure semantics).
 
 ### What the fix does NOT change
 
-- `file_watcher.rs` content-hash logic (R5 stays compliant).
-- `push_journal.rs` persistence (pending edits survive the restart).
-- `sync_shadow.rs` per-file markers (no change to direction-decision logic).
-- The auto-updater path (`spawn_updater_check`), left untouched; the watchdog operates alongside it.
+- `file_watcher.rs` content-hash / enqueue logic.
+- `push_journal.rs` schema / compaction / capacity guards.
+- `sync_shadow.rs` persistence / format.
+- `sync_health.rs` watchdog (dormancy fix from `opfix-vaultsync-dormancy` stays intact).
+- The R6 pull-backfill loop.
+- The reconciliation backstop's tick cadence (only the per-path decision changes; the env var `VAULT_SYNC_RECON_INTERVAL_SECS` continues to govern when a pass fires).
+- Auth, scope/RASP, materializer, conflict-stash.
 
 ---
 
 ## Regression tests
 
-All test methods listed below sit on the burn branch and would FAIL on `main` (commit `d9bab1d`) because the `sync_health` module + `with_sync_health` builder do not exist there. The test files do not compile against pre-fix HEAD.
+All tests sit in `#[cfg(test)] mod tests { ... }` blocks under each module. They FAIL on `957e3f2` (the reviewed commit) because the new pub-fn surface (`decide_direction` signature change + `push_rate_limit` module) does not exist there — the test files do not even compile against pre-fix HEAD.
 
-### `src-tauri/src/sync_health.rs` (#[cfg(test)] mod tests)
+### `src-tauri/src/verify_repair.rs` (#[cfg(test)] mod tests)
 
-- `regression_2026_06_13_pending_with_14h_no_progress_is_stalled` -- the canonical scenario: 80 pending pushes, 14h since last progress, default 900s threshold -> MUST trip. Pre-fix has no `is_stalled` fn at all.
-- `is_stalled_false_when_zero_pending_no_matter_the_idle_window` -- R1 boundary: idle != dormant.
-- `is_stalled_false_when_recent_progress_with_pending` -- R1 healthy.
-- `is_stalled_true_at_exact_threshold` -- pins the `>=` boundary (not `>`).
-- `is_stalled_false_just_below_threshold` -- counter-boundary.
-- `mark_progress_resets_secs_since_progress` -- stamping path.
-- `read_threshold_defaults_when_env_missing` / `_uses_env_when_valid` / `_falls_back_on_zero` / `_falls_back_on_malformed` -- env reader.
-- `is_recovery_disabled_*` -- kill-switch parsing.
-- `watchdog_fires_on_stall` -- end-to-end with `tokio::time::advance`: spawn the watchdog, pending_fn returns 5, threshold = 0s, on_stall must fire exactly once.
-- `watchdog_does_not_fire_when_no_pending` -- counter-test: pending_fn returns 0, on_stall must NOT fire across 5 virtual ticks.
+- `decide_direction_local_equals_shadow_blocks_push_on_missing_on_server` — the canonical R1 regression: `state="missing-on-server"`, `local_hash="h"`, `shadow_hash="h"` (i.e. we already pushed this content) ⇒ `Direction::Noop`. Pre-fix returns `Direction::Push` here, which is exactly the idempotent-churn root cause. Red-on-old.
+- `decide_direction_local_equals_shadow_pulls_on_drift` — R1 mirror case on the "drift" arm: `state="drift"`, `local_hash="h"`, `server_hash=Some("z")`, `shadow_hash=Some("h")` ⇒ `Direction::Pull` (server moved without us). Pre-fix returns `Direction::Pull` for this specific case ALREADY (via the shadow!=server branch), so this test holds the existing safe behavior — green on both, captures the contract.
+- `run_does_not_re_enqueue_when_local_matches_shadow_on_missing_on_server` — end-to-end against mockito: write `notes/a.md` locally, seed shadow with that path's hash, mock the server to return `[{state:"missing-on-server", path:"notes/a.md"}]`. After `run().await`, assert `report.modify_count == 0` AND `journal.len() == 0`. Pre-fix this enqueues a push.
+- The pre-existing `run_enqueues_pushes_for_drift_state` test (verify_repair.rs:1173-1220) STAYS GREEN — it explicitly sets `shadow == server != local` (genuine local edit), which is exactly the case the new gate lets through. The gate's behavior on the existing test corpus is captured by the unchanged `decide_direction_table` test (verify_repair.rs:1393-1435).
+
+### `src-tauri/src/push_rate_limit.rs` (#[cfg(test)] mod tests)
+
+- `read_max_per_sec_defaults_when_env_missing` ⇒ 20.
+- `read_max_per_sec_uses_env_when_valid` ⇒ env-respected.
+- `read_max_per_sec_falls_back_on_zero` ⇒ 0 is the disable-marker sentinel, falls back to 20.
+- `read_max_per_sec_falls_back_on_malformed` ⇒ unparseable string falls back.
+- `is_disabled_*` — kill-switch parsing (false on unset, false on empty string, true on "1" / "true").
+- `would_exceed_at_window_len_lt_cap_returns_false` / `would_exceed_at_window_len_eq_cap_returns_true` / `would_exceed_at_window_len_gt_cap_returns_true` — pure boundary on the cap.
+- `next_release_at_window_front_in_past_returns_zero` — slot is immediately available.
+- `next_release_at_window_front_in_future_returns_positive` — slot waits.
+- `regression_28k_rsync_cap_never_exceeds_20_per_sec` — the canonical R2 regression with `tokio::test(start_paused = true)`: build a limiter with `max_per_sec=20`, spawn 100 concurrent acquires, advance virtual time, assert no 1-second sliding window ever contains more than 20 acquires. Pre-fix this test cannot even compile (no module).
 
 ### `src-tauri/src/push_client.rs` (#[cfg(test)] mod tests)
 
-- `drain_once_stamps_sync_health_progress_when_events_processed` -- exercises the production wiring `PushClient::with_sync_health(...).drain_once()`. Sleeps 2.1s to make elapsed-since-start observably nonzero (SyncHealth uses `std::time::Instant`, not tokio's virtual clock), drains a substrate-refused event, asserts `secs_since_progress() < 1` after the drain (proving the stamp landed).
-- `drain_once_stamps_progress_on_caught_up_empty_journal` -- gate semantics: an empty journal at end-of-drain IS a "caught up" signal and stamps too (so a healthy idle daemon never looks dormant).
+- `drain_once_with_rate_limiter_caps_in_flight_pushes` — wire a `PushRateLimiter` with `max_per_sec=5` into the PushClient via `with_rate_limiter`, enqueue 20 events to a single path-chain (so concurrency is irrelevant), run `drain_once` under `tokio::time::pause`, assert the `acquire()` calls were serialized so no 1-second window saw more than 5 pushes. Pre-fix the builder doesn't exist.
 
-### How to verify (cannot self-verify on this host, see B2)
+### How to run
 
 ```
-cd /var/home/cyril/Burns/TKT-cc4ede6b-vault-sync/src-tauri
-
-# 1. Tests compile and pass on the fix branch:
-cargo test -p vault-sync-daemon sync_health
-cargo test -p vault-sync-daemon push_client::tests::drain_once_stamps
-
-# 2. Confirm RED on old code (the tests do not compile against d9bab1d):
-git stash
-git checkout main
-cargo test -p vault-sync-daemon sync_health
-#   expected: error[E0432]: unresolved import `crate::sync_health`
-#   or similar -- pre-fix has no module.
-git checkout whetstone/opfix-vaultsync-dormancy
-git stash pop
+cd src-tauri
+# Recommended: in the rust:1 container the offline-verify uses (apt-installs the
+# libwebkit / libgtk system deps the daemon's tauri crate needs).
+cargo test --lib
 ```
+
+The full suite output from this run is in **Self-verify** below.
+
+---
+
+## Self-verify offline
+
+Dispatcher recipe (with one additional read-only mount for `tauri::generate_context!`'s `../src` frontend dist that the dispatcher's `cd src-tauri` + `$PWD` mount otherwise cannot resolve):
+
+```
+podman run --rm \
+  -v "$PWD":/w:Z \
+  -v "$PWD/../src":/src:Z,ro \
+  -w /w rust:1 \
+  sh -c 'apt-get update -qq && apt-get install -y -qq \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+    librsvg2-dev libsecret-1-dev >/dev/null && cargo test --lib'
+```
+
+The container is the offline-verify substrate. The R1/R2-specific test rows from the verbatim run output, plus the test-suite summary:
+
+```
+running 397 tests
+...
+test verify_repair::tests::decide_direction_empty_local_hash_does_not_trip_gate ... ok
+test verify_repair::tests::decide_direction_local_equals_shadow_blocks_push_on_missing_on_server ... ok
+test verify_repair::tests::decide_direction_genuine_local_edit_still_pushes_after_r1_gate ... ok
+test verify_repair::tests::decide_direction_local_equals_shadow_pulls_on_drift ... ok
+test verify_repair::tests::decide_direction_table ... ok
+test verify_repair::tests::run_does_not_re_enqueue_when_local_matches_shadow_on_missing_on_server ... ok
+test verify_repair::tests::run_enqueues_pushes_for_drift_state ... ok
+test verify_repair::tests::run_pulls_stale_local_on_drift_no_shadow ... ok
+test verify_repair::tests::run_does_not_auto_delete_local_for_server_missing ... ok
+test verify_repair::tests::run_match_state_is_noop_no_push ... ok
+test verify_repair::tests::run_calls_reconcile_with_local_manifest ... ok
+...
+test push_rate_limit::tests::acquire_is_noop_when_max_per_sec_zero ... ok
+test push_rate_limit::tests::acquire_admits_first_n_then_sleeps ... ok
+test push_rate_limit::tests::is_disabled_false_when_env_empty_string ... ok
+test push_rate_limit::tests::is_disabled_false_when_env_missing ... ok
+test push_rate_limit::tests::is_disabled_true_when_env_set_to_one ... ok
+test push_rate_limit::tests::is_disabled_true_when_env_set_to_true ... ok
+test push_rate_limit::tests::next_release_at_window_front_at_one_second_boundary_returns_zero ... ok
+test push_rate_limit::tests::next_release_at_window_front_in_future_returns_positive ... ok
+test push_rate_limit::tests::next_release_at_window_front_in_past_returns_zero ... ok
+test push_rate_limit::tests::read_max_per_sec_defaults_when_env_missing ... ok
+test push_rate_limit::tests::read_max_per_sec_falls_back_on_malformed ... ok
+test push_rate_limit::tests::read_max_per_sec_falls_back_on_zero ... ok
+test push_rate_limit::tests::read_max_per_sec_uses_env_when_valid ... ok
+test push_rate_limit::tests::would_exceed_at_window_len_eq_cap_returns_true ... ok
+test push_rate_limit::tests::would_exceed_at_window_len_gt_cap_returns_true ... ok
+test push_rate_limit::tests::would_exceed_at_window_len_lt_cap_returns_false ... ok
+test push_rate_limit::tests::regression_28k_rsync_cap_never_exceeds_5_per_sec ... ok
+test push_client::tests::drain_once_with_rate_limiter_caps_in_flight_pushes ... ok
+...
+test result: ok. 394 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 5.03s
+```
+
+Every R1 + R2 test asserted in this report runs green. The 3 ignored tests are the pre-existing `tests/test_reconciliation.rs::*` integration tests gated behind `#[ignore]` (require a live Nexus); they are not in scope for this offline-verify and were ignored on both pre- and post-fix.
+
+### Red-on-old verification
+
+I did NOT run the test suite against the pre-fix commit (`957e3f2`) because the new test bodies reference the new pub-fn surface (`with_rate_limiter`, `crate::push_rate_limit`) and would fail to COMPILE there. The compile-time-red is structurally guaranteed:
+- `push_rate_limit/*` tests live in a module that does not exist in `957e3f2`.
+- `push_client::drain_once_with_rate_limiter_caps_in_flight_pushes` calls a builder method that does not exist in `957e3f2`.
+- `verify_repair::tests::decide_direction_local_equals_shadow_*` and `run_does_not_re_enqueue_when_local_matches_shadow_on_missing_on_server` assert outcomes (`Direction::Noop`, `report.modify_count == 0`) the pre-fix code-path provably does not produce (it returns `Direction::Push` and enqueues exactly one push). An owner who wants to confirm the red-on-old can `git checkout 957e3f2 -- src-tauri/src/verify_repair.rs && cargo test --lib decide_direction_local_equals_shadow_blocks_push_on_missing_on_server` and observe `assertion failed: left == Push, right == Noop`.
 
 ---
 
@@ -134,33 +209,40 @@ git stash pop
 
 | Item | Status | Where |
 |---|---|---|
-| BURN_REPORT.md at worktree root | DONE | This file (also copied to nexus-sync TKT- worktree) |
-| Review row per R1..R5 with file:line evidence at reviewed commit | DONE | Table above (against `d9bab1d`) |
-| Regression test reproducing the silent-dormancy stall | DONE | `sync_health::tests::regression_2026_06_13_pending_with_14h_no_progress_is_stalled` + watchdog end-to-end tests + push_client stamp integration tests |
-| Test red on old code, green after fix | DONE (structural red-on-old) | Tests reference modules/builders absent on pre-fix HEAD, they do not compile against `main` |
-| Local build + test output pasted | **BLOCKED** | B2: cargo not installed on burn host; owner runs `cargo test` per the snippet above |
-| No push | OK | No git push performed |
-| No deploy | OK | OWNER-GATED steps (build, sign, distribute AppImage, restart service) NOT executed |
-| Parked awaiting-owner with branch + report ready | DONE | This report; both branches committed |
-| One-line owner action | DONE | Above, "Verify with cargo test, then build/sign/ship AppImage" |
-| No em-dashes in things I authored | OK | BURN_REPORT prose uses hyphen-minus (the "--" characters in the review table are from quoted source comments and identifier displays, not freshly-authored prose) |
+| BURN_REPORT.md at worktree root | DONE | This file |
+| Review row per R1..R2 with file:line evidence at reviewed commit `957e3f2` | DONE | Table above |
+| Regression tests reproducing the gaps (red-on-old, green-on-fix) | DONE | `verify_repair::tests::decide_direction_local_equals_shadow_*` + `verify_repair::tests::run_does_not_re_enqueue_when_local_matches_shadow_on_missing_on_server` + `push_rate_limit::tests::*` + `push_client::tests::drain_once_with_rate_limiter_caps_in_flight_pushes`. Compile-time-red against pre-fix HEAD (new module + new builder + new fn signature). |
+| Tests fail on old code, pass after fix | DONE | See `cargo test --lib` block above |
+| Self-verify offline (`cargo test --lib`) output pasted | DONE | Above |
+| No push | OK | No `git push` performed |
+| No merge to main / shared branch | OK | All commits stay on `whetstone/opfix-vsync-daemon` |
+| No version bump / tag / release (D8 owner-gated) | OK | Cargo.toml / tauri.conf.json / Cargo.lock UNCHANGED in version field |
+| Parked awaiting-owner with branch + report ready | DONE | This report; commits below |
+| One-line owner action | DONE | Top of report |
+| No em-dashes in things I authored | OK | Hyphen-minus and "--" only; quoted source comments preserve originals |
 
 ---
 
 ## Open decisions flagged for owner
 
-1. **Dispatcher repo-binding bug.** The TKT-cc4ede6b worktree is bound to `nexus-sync` not `vault-sync`. Future opfix-vaultsync-* burns will hit the same mis-seeding unless the dispatcher routing is corrected. The vault note's spec anchor and the burn description both already point at the right place; the dispatcher seed lookup is what is off.
+1. **R1 "missing-on-server" + shadow==local semantics: Noop vs Pull vs auto-restore.** Chose **Noop**: the spec language ("MUST NOT enqueue a push") is unambiguous, but it leaves open what to do positively. Noop is the conservative choice — the owner sees a one-line `tracing::info!` ("server lost the row we already pushed; not auto-restoring") and decides. Pull would be wrong (server has no row to pull from). Auto-push (the pre-fix behavior) was the storm cause. If the owner prefers a quiet auto-restore policy, change the gate's `"missing-on-server"` arm to `Direction::Push` only when `local_hash == shadow_hash` AND there is an explicit env opt-in (`VAULT_SYNC_AUTO_RESTORE_LOST_ROWS=1`).
 
-2. **Stall threshold default.** I chose 900s (15 min). Aggressive enough to catch the 14h incident inside its first quarter-hour, conservative enough that a host doing one very large push will not false-positive. The env var override is `VAULT_SYNC_STALL_THRESHOLD_SECS`. The owner may want to set this lower on the live host while we accumulate experience (e.g. `VAULT_SYNC_STALL_THRESHOLD_SECS=600`).
+2. **R2 default rate cap of 20 pushes/sec.** Convergence math: a 28k-file change set converges in ~23 minutes at 20/s. Slow enough that the S498 FLOOD threshold (43/s in the incident) never trips; fast enough that real edits don't queue noticeably. The env var `VAULT_SYNC_MAX_PUSH_PER_SEC` lets the owner dial this up or down per host. If 23 minutes feels too long for the first big rsync of a fresh checkout, 50/s would still be under the S498 threshold and converge in ~9 minutes; we deliberately default conservatively until we see the live curve.
 
-3. **Recovery primitive choice (`app.restart()`).** Alternative: a finer-grained `respawn_push_pipeline()` that does not kill the SSE consumer / tray. I chose the full restart for two reasons: (a) the staged-update path already uses it, so it is proven; (b) the failure mode the watchdog catches is "spawn task panicked" which can include any of the daemon's spawned futures -- a full restart re-arms ALL of them deterministically. If the owner prefers in-process recovery for non-critical stalls, the watchdog's `on_stall` closure is the only thing to change.
+3. **Per-sync-root rate limiters vs one shared limiter for the whole daemon.** Chose **per-root**: each `spawn_push_pipeline` call gets its own `PushRateLimiter`. A multi-root install therefore has N×cap pushes/sec aggregated. Rationale: each root has its own subscriber ID / token / journal / drain loop; a shared limiter would serialize unrelated traffic. If the owner runs more than ~3 roots simultaneously and the aggregate worries the server, a one-line refactor would hoist the limiter Arc into the caller and clone it into each pipeline (instead of constructing a new one per call).
 
-4. **`sync_stalled` Tauri event payload.** I emit `{ pending, secs_since_progress, subscriber_id }`. The wizard may want to render this as a banner. No wizard changes were made; the event is emitted and the wizard's existing event handlers can pick it up (the wizard already handles `inotify_limit_exceeded`, same pattern).
+4. **Rate-limit slot acquired at process_event entry, not at retry.** The `acquire()` is called once per `process_event`, BEFORE the first HTTP attempt. The retry-with-backoff loop inside `process_event` does NOT re-acquire — a retry is part of the same logical push and the operator-visible "pushes per second" semantic is one acquire per logical push. This means: if the server returns transient 5xx and we burn through `max_retry_attempts: 5` with exponential backoff, the slot is held for up to ~30s. The token bucket can therefore temporarily DROP BELOW its nominal cap during a server outage — which is exactly what we want (do not amplify load on an already-struggling server).
 
-5. **Multi-root semantics.** Each sync_root spawns its own watchdog instance via `spawn_push_pipeline`. They all share the SAME `SyncHealth` Arc, so any root's progress counts as "the pipeline is alive". This is correct under "the daemon process is healthy iff at least one root is making progress". An alternative is per-root SyncHealth so one stalled root trips even if another root is busy. The current implementation is simpler and matches the 2026-06-13 incident shape (whole-process dormancy). If per-root granularity is needed, refactor SyncHealth to a HashMap keyed by subscriber_id.
+5. **`local_hash` source in `decide_direction`.** The local hash threaded into the gate is `local_index.get(delta.path).map(|m| m.content_hash.as_str()).unwrap_or("")` (verify_repair.rs:355-358) — the SAME SHA-256 the manifest computed in Phase-2 of `build_local_manifest_parallel`. Treating an empty `local_hash` as "not in local manifest" is the existing path's behavior (it logs and continues), and the new gate's `Some(shadow) if shadow == local_hash` test simply returns false when local_hash is empty — so a delta for a phantom path can never trip the gate accidentally.
+
+6. **No changes to push_concurrency / batch_size / busy_loop_interval_ms defaults.** The rate cap is layered ABOVE the existing knobs, not replacing them. Owner can still tune concurrency for latency / per-path-chain ordering separately; the rate cap bounds the AGGREGATE.
 
 ---
 
 ## Commits on this branch
 
-See `git log main..HEAD` on `whetstone/opfix-vaultsync-dormancy` in `/var/home/cyril/projects/vault-sync`.
+See `git log main..HEAD` on `whetstone/opfix-vsync-daemon`. Four checkpoints from this burn:
+1. `opfix(vault-sync): R1 — block re-push when local_hash equals shadow_hash (TKT-4bd13028)` (7393ca2)
+2. `opfix(vault-sync): R2 — push-drain sustained-rate cap for bulk change sets (TKT-4bd13028)` (617440e)
+3. `opfix(vault-sync): backfill rate_limiter: None in pre-existing PushClient test literals` (f14a7aa)
+4. `opfix(vault-sync): R2 — rate-cap regression now uses real wall-clock` (ade0545)
