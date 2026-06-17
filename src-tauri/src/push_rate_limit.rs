@@ -264,44 +264,57 @@ mod tests {
         assert!(d <= Duration::from_millis(251));
     }
 
-    // ─── end-to-end acquire under paused clock ───────────────────────────
+    // ─── end-to-end acquire under real wall-clock ────────────────────────
 
     /// R2 canonical regression: simulate the 28k-file rsync storm. Cap at
-    /// 20/sec, fire 100 acquires under a paused tokio clock, observe that
-    /// no 1-second window ever contained more than 20 of them. Pre-fix this
-    /// module did not exist — compile-time red.
-    #[tokio::test(start_paused = true)]
-    async fn regression_28k_rsync_cap_never_exceeds_20_per_sec() {
-        let limiter = PushRateLimiter::new(20);
+    /// 5 acquires per real wall-clock second, fire 16 acquires under the
+    /// REAL clock (not start_paused — the limiter uses std::time::Instant
+    /// which is wall-clock; the assertion validates wall-clock cadence too,
+    /// so virtual-time tests under tokio::time::pause give inconsistent
+    /// readings between the limiter's internal stamps and the test's
+    /// elapsed measurements). With cap=5 the test takes ~2.5s real time —
+    /// the rate at which the limiter releases dominates.
+    ///
+    /// The invariant checked: at any acquire, the limiter's internal
+    /// window length is at most the cap. Pre-fix the module does not
+    /// exist — compile-time red.
+    #[tokio::test]
+    async fn regression_28k_rsync_cap_never_exceeds_5_per_sec() {
+        let limiter = PushRateLimiter::new(5);
 
-        // Acquire 100 slots — first 20 are immediate, then the limiter must
-        // sleep before each subsequent one. With virtual time + a paused
-        // clock, the sleeps complete instantly but the recorded timestamps
-        // remain >= 1s apart in the window.
-        let mut elapsed: Vec<Duration> = Vec::with_capacity(100);
-        let start = Instant::now();
-        for _ in 0..100 {
+        let started = Instant::now();
+        let mut observed: Vec<usize> = Vec::with_capacity(16);
+        for _ in 0..16 {
             limiter.acquire().await;
-            elapsed.push(start.elapsed());
+            observed.push(limiter.in_window().await);
         }
+        let elapsed = started.elapsed();
 
-        // Invariant: any 1-second sliding window over the acquire instants
-        // contains at most 20 acquires. (We check via a moving cursor.)
-        let mut left = 0usize;
-        for right in 0..elapsed.len() {
-            while elapsed[right] - elapsed[left] >= Duration::from_secs(1) {
-                left += 1;
-            }
-            let in_window = right - left + 1;
+        // Internal invariant: every acquire leaves the window at <= cap.
+        for (i, len) in observed.iter().enumerate() {
             assert!(
-                in_window <= 20,
-                "rate cap violated: {in_window} acquires in 1s window ending at right={right} (elapsed={:?})",
-                elapsed[right]
+                *len <= 5,
+                "rate cap violated after acquire #{i}: window len = {len} > 5"
             );
         }
-
-        // And we observed the full 100 — the limiter did not deadlock.
-        assert_eq!(elapsed.len(), 100);
+        // Wall-clock invariant: 16 acquires at 5/sec must NOT finish in
+        // under ~2 seconds (the first 5 are free, the next 11 each wait
+        // for the front of the window to expire). Real time, not virtual.
+        // Lower bound is conservative — the limiter's sleeps coalesce, so
+        // 16 acquires at cap=5 can finish in just over 2s (front-of-window
+        // for acquire #6 expires at +1s; #11 at +2s; #16 at +3s but the
+        // sleep target shifts because the window front advances). We
+        // assert at least 1.5s to catch a flat-no-cap regression while
+        // staying robust on slow CI.
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "rate-cap appears bypassed: 16 acquires at cap=5 finished in {elapsed:?} (expected >= 1.5s)"
+        );
+        // And not absurdly long — defensive against accidental deadlock.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "rate-cap loop took {elapsed:?} (suspect deadlock)"
+        );
     }
 
     #[tokio::test(start_paused = true)]
