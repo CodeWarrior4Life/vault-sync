@@ -1,10 +1,10 @@
-//! R2 (TKT-4bd13028) — sustained-rate cap for the push-drain pipeline.
+//! R2 (TKT-4bd13028) - sustained-rate cap for the push-drain pipeline.
 //!
 //! Wraps a 1-second sliding window of recent push `Instant` timestamps under
 //! a `tokio::sync::Mutex`. `acquire().await` is the gate every logical push
 //! passes through before its HTTP attempt. It drops timestamps older than 1s,
 //! returns immediately when the window has room, and otherwise sleeps until
-//! the front of the window falls off — token-bucket semantics with no
+//! the front of the window falls off - token-bucket semantics with no
 //! third-party crate.
 //!
 //! ## Why
@@ -14,14 +14,14 @@
 //! observed 2026-06-16 turned into a sustained 43 pushes/s storm that tripped
 //! the S498 FLOOD monitor on the Nexus server (TKT-ea4058b8). The cap here
 //! bounds aggregate push rate regardless of how many path-chains run in
-//! parallel — a global ceiling per `PushClient` instance.
+//! parallel - a global ceiling per `PushClient` instance.
 //!
 //! ## Env
 //!
-//! * `VAULT_SYNC_MAX_PUSH_PER_SEC` — sustained cap; default 20. Zero or
+//! * `VAULT_SYNC_MAX_PUSH_PER_SEC` - sustained cap; default 20. Zero or
 //!   malformed falls back to the default (the kill switch is a separate var
 //!   so a misconfigured number does not accidentally remove the cap).
-//! * `VAULT_SYNC_DISABLE_PUSH_RATE_CAP` — kill switch (any non-empty value).
+//! * `VAULT_SYNC_DISABLE_PUSH_RATE_CAP` - kill switch (any non-empty value).
 //!   When set, callers SHOULD skip building a limiter at all. The
 //!   `is_disabled` helper mirrors `reconciliation::is_disabled`.
 //!
@@ -35,7 +35,7 @@
 //! ## Compose
 //!
 //! The cap acquires ONE slot per LOGICAL push (one `process_event` call).
-//! The retry-with-backoff loop inside `process_event` does NOT re-acquire —
+//! The retry-with-backoff loop inside `process_event` does NOT re-acquire -
 //! a transient 5xx burst reuses the already-held slot, which means the
 //! effective per-second rate can dip BELOW the nominal cap during a server
 //! outage. That is the desired behavior: do not amplify load on a struggling
@@ -102,7 +102,7 @@ pub struct PushRateLimiter {
 
 impl PushRateLimiter {
     /// Build a limiter that caps at `max_per_sec` acquires per rolling 1s.
-    /// A `max_per_sec` of 0 is treated as "no cap" — `acquire` becomes a
+    /// A `max_per_sec` of 0 is treated as "no cap" - `acquire` becomes a
     /// no-op (callers should normally route through the kill switch + skip
     /// constructing the limiter, but this is a defense-in-depth guard).
     pub fn new(max_per_sec: usize) -> Arc<Self> {
@@ -113,7 +113,7 @@ impl PushRateLimiter {
     }
 
     /// Block until the next acquire is permitted, then record it. Safe to
-    /// call concurrently from any number of tasks — the inner `Mutex`
+    /// call concurrently from any number of tasks - the inner `Mutex`
     /// serializes the window updates and the sleep is awaited OUTSIDE the
     /// lock so other tasks can re-check the window.
     pub async fn acquire(&self) {
@@ -136,7 +136,7 @@ impl PushRateLimiter {
                     w.push_back(now);
                     return;
                 }
-                // Cap exhausted — sleep until the front falls off.
+                // Cap exhausted - sleep until the front falls off.
                 // SAFETY: w.len() >= max_per_sec >= 1, so front() is Some.
                 let front = *w
                     .front()
@@ -268,16 +268,16 @@ mod tests {
 
     /// R2 canonical regression: simulate the 28k-file rsync storm. Cap at
     /// 5 acquires per real wall-clock second, fire 16 acquires under the
-    /// REAL clock (not start_paused — the limiter uses std::time::Instant
+    /// REAL clock (not start_paused - the limiter uses std::time::Instant
     /// which is wall-clock; the assertion validates wall-clock cadence too,
     /// so virtual-time tests under tokio::time::pause give inconsistent
     /// readings between the limiter's internal stamps and the test's
-    /// elapsed measurements). With cap=5 the test takes ~2.5s real time —
+    /// elapsed measurements). With cap=5 the test takes ~2.5s real time -
     /// the rate at which the limiter releases dominates.
     ///
     /// The invariant checked: at any acquire, the limiter's internal
     /// window length is at most the cap. Pre-fix the module does not
-    /// exist — compile-time red.
+    /// exist - compile-time red.
     #[tokio::test]
     async fn regression_28k_rsync_cap_never_exceeds_5_per_sec() {
         let limiter = PushRateLimiter::new(5);
@@ -300,7 +300,7 @@ mod tests {
         // Wall-clock invariant: 16 acquires at 5/sec must NOT finish in
         // under ~2 seconds (the first 5 are free, the next 11 each wait
         // for the front of the window to expire). Real time, not virtual.
-        // Lower bound is conservative — the limiter's sleeps coalesce, so
+        // Lower bound is conservative - the limiter's sleeps coalesce, so
         // 16 acquires at cap=5 can finish in just over 2s (front-of-window
         // for acquire #6 expires at +1s; #11 at +2s; #16 at +3s but the
         // sleep target shifts because the window front advances). We
@@ -310,7 +310,7 @@ mod tests {
             elapsed >= Duration::from_millis(1500),
             "rate-cap appears bypassed: 16 acquires at cap=5 finished in {elapsed:?} (expected >= 1.5s)"
         );
-        // And not absurdly long — defensive against accidental deadlock.
+        // And not absurdly long - defensive against accidental deadlock.
         assert!(
             elapsed < Duration::from_secs(10),
             "rate-cap loop took {elapsed:?} (suspect deadlock)"
@@ -319,7 +319,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acquire_is_noop_when_max_per_sec_zero() {
-        // 0 means "no cap" — every acquire returns immediately.
+        // 0 means "no cap" - every acquire returns immediately.
         let limiter = PushRateLimiter::new(0);
         let start = Instant::now();
         for _ in 0..1000 {
@@ -343,7 +343,7 @@ mod tests {
         let start = Instant::now();
         limiter.acquire().await;
         let waited = start.elapsed();
-        // Allow generous slack for the paused-clock scheduling — the assert
+        // Allow generous slack for the paused-clock scheduling - the assert
         // simply requires we DID wait, not the exact duration.
         assert!(
             waited >= Duration::from_millis(1),

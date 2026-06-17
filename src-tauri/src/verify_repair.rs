@@ -218,7 +218,7 @@ pub enum Direction {
 /// `state`, the local file hash, the server's current hash, and the
 /// last-synced shadow hash, decide whether to push, pull, or no-op.
 ///
-/// ## R1 prelude — no re-queue of converged notes (TKT-4bd13028)
+/// ## R1 prelude - no re-queue of converged notes (TKT-4bd13028)
 ///
 /// Before the state-specific arms, the converged-gate fires: if the daemon's
 /// last-synced server hash (`shadow_hash`) equals the file's current local
@@ -228,12 +228,12 @@ pub enum Direction {
 /// verify_repair log lines, ~3-7/s pushes with 0 server writes on link).
 ///
 /// * gate fires + `"drift"` ⇒ **Pull** (the server bytes differ from us but we
-///   have not touched local — server moved without us — server-wins fetch).
+///   have not touched local - server moved without us - server-wins fetch).
 /// * gate fires + `"missing-on-server"` ⇒ **Noop** (we already pushed this; the
-///   server lost the row; DO NOT auto-restore — owner intervenes).
+///   server lost the row; DO NOT auto-restore - owner intervenes).
 /// * gate fires + anything else ⇒ **Noop**.
 ///
-/// ## Fall-through arms (gate did not fire) — mirror-host direction logic
+/// ## Fall-through arms (gate did not fire) - mirror-host direction logic
 ///
 /// * `"drift"` (local ≠ server):
 ///   - shadow == server  ⇒ the server has NOT moved since we last synced this
@@ -254,7 +254,7 @@ pub fn decide_direction(
     shadow_hash: Option<&str>,
 ) -> Direction {
     // R1 converged-gate. Empty `local_hash` (defensive: a delta for a phantom
-    // path not in the local manifest) can NEVER trip the gate — `Some(sh)` is
+    // path not in the local manifest) can NEVER trip the gate - `Some(sh)` is
     // only equal to `""` if the shadow itself is empty, which the ShadowStore
     // never records.
     if !local_hash.is_empty() {
@@ -264,7 +264,7 @@ pub fn decide_direction(
                     "drift" => Direction::Pull,
                     // "missing-on-server" + converged shadow: we already
                     // pushed this exact content; the server lost the row.
-                    // Do NOT auto-restore — the original push-storm cause.
+                    // Do NOT auto-restore - the original push-storm cause.
                     _ => Direction::Noop,
                 };
             }
@@ -1470,7 +1470,7 @@ mod tests {
 
     /// R1 canonical: a "missing-on-server" delta for a note whose LOCAL hash
     /// equals the shadow (= we already pushed this content) MUST NOT enqueue a
-    /// push. Pre-fix this returned `Direction::Push` — the idempotent-churn
+    /// push. Pre-fix this returned `Direction::Push` - the idempotent-churn
     /// root cause from TKT-ea4058b8 / 2.25M verify_repair log lines on link.
     #[test]
     fn decide_direction_local_equals_shadow_blocks_push_on_missing_on_server() {
@@ -1498,7 +1498,7 @@ mod tests {
     /// manifest, which the run() loop logs but does not crash on).
     #[test]
     fn decide_direction_empty_local_hash_does_not_trip_gate() {
-        // Empty local + empty shadow would otherwise look equal — gate must
+        // Empty local + empty shadow would otherwise look equal - gate must
         // skip this case so the existing fall-through arms still apply.
         assert_eq!(
             decide_direction("missing-on-server", "", None, None),
@@ -1520,7 +1520,7 @@ mod tests {
 
     /// R1 end-to-end: a "missing-on-server" reconcile delta whose LOCAL bytes
     /// hash to the same value as the persisted shadow marker (= we already
-    /// pushed this exact content) MUST result in zero pushes journaled — even
+    /// pushed this exact content) MUST result in zero pushes journaled - even
     /// though the server says "missing-on-server". Pre-fix this run enqueues
     /// exactly one redundant push.
     #[tokio::test]

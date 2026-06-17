@@ -850,7 +850,7 @@ fn spawn_push_pipeline(
     // R2 (TKT-4bd13028): sustained-rate cap for the push drain loop. Env-
     // configured via VAULT_SYNC_MAX_PUSH_PER_SEC (default 20); kill switch
     // VAULT_SYNC_DISABLE_PUSH_RATE_CAP. One limiter per pipeline / per
-    // sync_root — multi-root installs get N*cap aggregate, which is correct
+    // sync_root - multi-root installs get N*cap aggregate, which is correct
     // because each root has its own subscriber-id-scoped journal+drain loop.
     let push_env = reconciliation::ProcessEnv;
     let rate_limiter_for_push = if push_rate_limit::is_disabled(&push_env) {

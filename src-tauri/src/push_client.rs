@@ -503,7 +503,7 @@ impl PushClient {
 
         // R2 (TKT-4bd13028): sustained-rate cap. Acquire ONE slot per logical
         // push BEFORE the first HTTP attempt. Retries below reuse the same
-        // slot — the cap is "logical pushes per second", not "HTTP attempts
+        // slot - the cap is "logical pushes per second", not "HTTP attempts
         // per second", so a transient 5xx burst does not amplify load on a
         // struggling server. `None` ⇒ no cap (back-compat).
         if let Some(rl) = &self.rate_limiter {
@@ -1537,7 +1537,7 @@ mod tests {
         use crate::push_rate_limit::PushRateLimiter;
 
         // Stub the server to always accept. We are not testing HTTP behavior
-        // here — we are testing that the limiter slot is acquired per push.
+        // here - we are testing that the limiter slot is acquired per push.
         let mut srv = Server::new_async().await;
         let mock = srv
             .mock("POST", "/api/sync/push")
@@ -1564,7 +1564,7 @@ mod tests {
         let in_window = limiter.in_window().await;
         assert_eq!(
             in_window, 5,
-            "expected 5 acquires recorded in limiter window, got {in_window} — rate cap not wired into drain_once"
+            "expected 5 acquires recorded in limiter window, got {in_window} - rate cap not wired into drain_once"
         );
         mock.assert_async().await;
     }
