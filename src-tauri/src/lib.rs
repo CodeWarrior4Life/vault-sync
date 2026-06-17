@@ -14,6 +14,7 @@ pub mod pairing;
 pub mod pull_backfill;
 pub mod push_client;
 pub mod push_journal;
+pub mod push_rate_limit;
 pub mod rasp_fence;
 pub mod reconciliation;
 pub mod redflag;
@@ -846,7 +847,27 @@ fn spawn_push_pipeline(
         max_backoff_ms: 60_000,
         ..Default::default()
     };
-    let push_client = push_client::PushClient::new(
+    // R2 (TKT-4bd13028): sustained-rate cap for the push drain loop. Env-
+    // configured via VAULT_SYNC_MAX_PUSH_PER_SEC (default 20); kill switch
+    // VAULT_SYNC_DISABLE_PUSH_RATE_CAP. One limiter per pipeline / per
+    // sync_root — multi-root installs get N*cap aggregate, which is correct
+    // because each root has its own subscriber-id-scoped journal+drain loop.
+    let push_env = reconciliation::ProcessEnv;
+    let rate_limiter_for_push = if push_rate_limit::is_disabled(&push_env) {
+        tracing::info!(
+            "push_client: rate cap disabled via {}",
+            push_rate_limit::ENV_DISABLE
+        );
+        None
+    } else {
+        let cap = push_rate_limit::read_max_per_sec(&push_env);
+        tracing::info!(
+            max_per_sec = cap,
+            "push_client: sustained-rate cap armed (R2)"
+        );
+        Some(push_rate_limit::PushRateLimiter::new(cap))
+    };
+    let mut push_client = push_client::PushClient::new(
         api_for_push,
         journal.clone(),
         subscriber_id.clone(),
@@ -856,6 +877,9 @@ fn spawn_push_pipeline(
     .with_tray_state(tray_state.clone())
     .with_shadow_store(shadow.clone())
     .with_sync_health(sync_health.clone());
+    if let Some(rl) = rate_limiter_for_push {
+        push_client = push_client.with_rate_limiter(rl);
+    }
 
     // Never-fired shutdown channel — the push loop runs for the daemon's
     // lifetime. We hold the sender in the spawned task so it isn't dropped

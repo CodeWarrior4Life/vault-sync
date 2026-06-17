@@ -150,6 +150,12 @@ pub struct PushClient {
     /// progress marker so the watchdog can distinguish "pipeline healthy"
     /// from "pipeline silent with pending diffs" (R1+R3).
     sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
+    /// opfix-vsync-daemon R2 (TKT-4bd13028): sustained-rate cap. When set,
+    /// every `process_event` acquires one slot from the limiter before the
+    /// first HTTP push attempt. Retries within a single `process_event` do
+    /// NOT re-acquire (the slot is held by the logical push, not the
+    /// individual HTTP request). `None` ⇒ no cap.
+    rate_limiter: Option<Arc<crate::push_rate_limit::PushRateLimiter>>,
 }
 
 impl PushClient {
@@ -169,6 +175,7 @@ impl PushClient {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            rate_limiter: None,
         }
     }
 
@@ -195,6 +202,20 @@ impl PushClient {
     /// (which would defeat the watchdog, so the production wire-up sets it).
     pub fn with_sync_health(mut self, health: Arc<crate::sync_health::SyncHealth>) -> Self {
         self.sync_health = Some(health);
+        self
+    }
+
+    /// opfix-vsync-daemon R2 (TKT-4bd13028): attach the sustained-rate cap.
+    /// After this, every `process_event` acquires one slot before the first
+    /// HTTP push attempt. Bounds aggregate push rate per `PushClient`
+    /// instance regardless of `push_concurrency` / `batch_size` /
+    /// `busy_loop_interval_ms` (which set the structural shape of the drain
+    /// loop but no sustained-rate ceiling). `None` ⇒ no cap.
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: Arc<crate::push_rate_limit::PushRateLimiter>,
+    ) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -479,6 +500,15 @@ impl PushClient {
             base_hash: evt.base_hash.as_deref().unwrap_or(""),
             action,
         };
+
+        // R2 (TKT-4bd13028): sustained-rate cap. Acquire ONE slot per logical
+        // push BEFORE the first HTTP attempt. Retries below reuse the same
+        // slot — the cap is "logical pushes per second", not "HTTP attempts
+        // per second", so a transient 5xx burst does not amplify load on a
+        // struggling server. `None` ⇒ no cap (back-compat).
+        if let Some(rl) = &self.rate_limiter {
+            rl.acquire().await;
+        }
 
         let mut last_err: Option<String> = None;
         for attempt in 0..self.config.max_retry_attempts {
@@ -1485,5 +1515,52 @@ mod tests {
             shadow_hash_for_ack(&PushStatus::Error, "local", Some("srv"), None),
             None
         );
+    }
+
+    // ─── R2 (TKT-4bd13028): rate-cap integration test ─────────────────────
+
+    /// R2 regression: `drain_once` routed through `with_rate_limiter` MUST
+    /// call `acquire()` once per processed push. The test wires a generous
+    /// limiter (cap=100) so no acquire ever sleeps under the paused clock,
+    /// enqueues 5 events across distinct paths, runs `drain_once`, and
+    /// observes the limiter's `in_window` counter rose to 5. Pre-fix the
+    /// `with_rate_limiter` builder does not exist (compile-time red); a
+    /// future regression that wires the builder but skips the acquire call
+    /// in `process_event` would leave `in_window == 0` and trip the assert.
+    #[tokio::test(start_paused = true)]
+    async fn drain_once_with_rate_limiter_caps_in_flight_pushes() {
+        use crate::push_rate_limit::PushRateLimiter;
+
+        // Stub the server to always accept. We are not testing HTTP behavior
+        // here — we are testing that the limiter slot is acquired per push.
+        let mut srv = Server::new_async().await;
+        let mock = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","seq":1,"content_hash":"h"}"#)
+            .expect_at_least(5)
+            .create_async()
+            .await;
+
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(evt(&format!("notes/r2_{i}.md"), b"body"));
+        }
+        let (_jd, journal) = make_journal_with(events);
+        let client = make_client(&srv.url(), journal).await;
+        let limiter = PushRateLimiter::new(100);
+        let client = client.with_rate_limiter(limiter.clone());
+
+        let outcomes = client.drain_once().await;
+        // All 5 ran (cap is generous, no acquire sleeps).
+        assert_eq!(outcomes.len(), 5);
+        // CORE assertion: the limiter saw 5 acquires. Pre-fix the limiter is
+        // never called from process_event so in_window stays at 0.
+        let in_window = limiter.in_window().await;
+        assert_eq!(
+            in_window, 5,
+            "expected 5 acquires recorded in limiter window, got {in_window} — rate cap not wired into drain_once"
+        );
+        mock.assert_async().await;
     }
 }
