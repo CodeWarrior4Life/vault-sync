@@ -218,7 +218,22 @@ pub enum Direction {
 /// `state`, the local file hash, the server's current hash, and the
 /// last-synced shadow hash, decide whether to push, pull, or no-op.
 ///
-/// The crux for a mirror host that has a STALE prior-materialization:
+/// ## R1 prelude — no re-queue of converged notes (TKT-4bd13028)
+///
+/// Before the state-specific arms, the converged-gate fires: if the daemon's
+/// last-synced server hash (`shadow_hash`) equals the file's current local
+/// hash, the daemon KNOWS this content was already pushed and accepted. No
+/// push, regardless of what the reconcile delta says. This bounds idempotent
+/// churn even if the server briefly returns wrong deltas (TKT-ea4058b8: 2.25M
+/// verify_repair log lines, ~3-7/s pushes with 0 server writes on link).
+///
+/// * gate fires + `"drift"` ⇒ **Pull** (the server bytes differ from us but we
+///   have not touched local — server moved without us — server-wins fetch).
+/// * gate fires + `"missing-on-server"` ⇒ **Noop** (we already pushed this; the
+///   server lost the row; DO NOT auto-restore — owner intervenes).
+/// * gate fires + anything else ⇒ **Noop**.
+///
+/// ## Fall-through arms (gate did not fire) — mirror-host direction logic
 ///
 /// * `"drift"` (local ≠ server):
 ///   - shadow == server  ⇒ the server has NOT moved since we last synced this
@@ -229,15 +244,32 @@ pub enum Direction {
 ///     wins; overwrite the stale local). This is the storm fix — the old code
 ///     unconditionally pushed here, 409-churning against newer server bytes.
 /// * `"missing-on-server"` ⇒ the server has no row for a file we hold ⇒ **Push**
-///   (create it). Shadow is irrelevant.
+///   (create it). Shadow is irrelevant in the fall-through arm.
 /// * `"match"` ⇒ **Noop**.
 /// * unknown state ⇒ **Noop** (conservative; caller logs).
 pub fn decide_direction(
     state: &str,
-    _local_hash: &str,
+    local_hash: &str,
     server_hash: Option<&str>,
     shadow_hash: Option<&str>,
 ) -> Direction {
+    // R1 converged-gate. Empty `local_hash` (defensive: a delta for a phantom
+    // path not in the local manifest) can NEVER trip the gate — `Some(sh)` is
+    // only equal to `""` if the shadow itself is empty, which the ShadowStore
+    // never records.
+    if !local_hash.is_empty() {
+        if let Some(shadow) = shadow_hash {
+            if shadow == local_hash {
+                return match state {
+                    "drift" => Direction::Pull,
+                    // "missing-on-server" + converged shadow: we already
+                    // pushed this exact content; the server lost the row.
+                    // Do NOT auto-restore — the original push-storm cause.
+                    _ => Direction::Noop,
+                };
+            }
+        }
+    }
     match state {
         "drift" => {
             let is_local_edit = matches!(
@@ -1432,6 +1464,98 @@ mod tests {
             decide_direction("weird", "local", Some("srv"), None),
             Direction::Noop
         );
+    }
+
+    // ─── R1 (TKT-4bd13028): converged-gate regression tests ──────────────────
+
+    /// R1 canonical: a "missing-on-server" delta for a note whose LOCAL hash
+    /// equals the shadow (= we already pushed this content) MUST NOT enqueue a
+    /// push. Pre-fix this returned `Direction::Push` — the idempotent-churn
+    /// root cause from TKT-ea4058b8 / 2.25M verify_repair log lines on link.
+    #[test]
+    fn decide_direction_local_equals_shadow_blocks_push_on_missing_on_server() {
+        assert_eq!(
+            decide_direction("missing-on-server", "h", None, Some("h")),
+            Direction::Noop,
+            "local == shadow on missing-on-server must NOT push (R1)"
+        );
+    }
+
+    /// R1 mirror case on drift: local == shadow + server differs ⇒ Pull
+    /// (server moved without us; take server-wins bytes). Holds the existing
+    /// safe behavior and pins the contract.
+    #[test]
+    fn decide_direction_local_equals_shadow_pulls_on_drift() {
+        assert_eq!(
+            decide_direction("drift", "h", Some("z"), Some("h")),
+            Direction::Pull,
+            "local == shadow + server differs on drift must Pull (R1)"
+        );
+    }
+
+    /// R1: empty local_hash MUST NOT trip the gate even if the shadow happens
+    /// to be empty too (defensive against a delta for a path not in the local
+    /// manifest, which the run() loop logs but does not crash on).
+    #[test]
+    fn decide_direction_empty_local_hash_does_not_trip_gate() {
+        // Empty local + empty shadow would otherwise look equal — gate must
+        // skip this case so the existing fall-through arms still apply.
+        assert_eq!(
+            decide_direction("missing-on-server", "", None, None),
+            Direction::Push
+        );
+    }
+
+    /// R1: a "drift" delta where shadow == server (the genuine-local-edit
+    /// case) must still Push when local != shadow. Confirms the gate does NOT
+    /// over-suppress.
+    #[test]
+    fn decide_direction_genuine_local_edit_still_pushes_after_r1_gate() {
+        assert_eq!(
+            decide_direction("drift", "local-new", Some("srv"), Some("srv")),
+            Direction::Push,
+            "shadow == server but local moved → genuine local edit → Push"
+        );
+    }
+
+    /// R1 end-to-end: a "missing-on-server" reconcile delta whose LOCAL bytes
+    /// hash to the same value as the persisted shadow marker (= we already
+    /// pushed this exact content) MUST result in zero pushes journaled — even
+    /// though the server says "missing-on-server". Pre-fix this run enqueues
+    /// exactly one redundant push.
+    #[tokio::test]
+    async fn run_does_not_re_enqueue_when_local_matches_shadow_on_missing_on_server() {
+        let vault = TempDir::new().unwrap();
+        let body = b"already-pushed-bytes";
+        write_file(vault.path(), "notes/a.md", body);
+        let local_sha = hex::encode(Sha256::digest(body));
+
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            // Server claims missing-on-server. Pre-fix → Push. Post-fix +
+            // shadow == local → Noop (R1).
+            .with_body(r#"{"deltas":[{"path":"notes/a.md","state":"missing-on-server"}]}"#)
+            .create_async()
+            .await;
+
+        let (vr, journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        // Seed shadow with the SAME hash the manifest will compute → R1 gate
+        // fires, NO push enqueued.
+        shadow.record("notes/a.md", &local_sha);
+        let vr = vr.with_shadow(shadow);
+        let report = vr.run().await.unwrap();
+
+        assert_eq!(
+            report.modify_count, 0,
+            "R1: local == shadow + missing-on-server must NOT enqueue a push"
+        );
+        let j = journal.lock().await;
+        assert_eq!(j.len(), 0, "R1: journal must remain empty");
     }
 
     /// End-to-end: a stale-local drift (shadow ABSENT) resolves server-wins —
