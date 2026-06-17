@@ -241,8 +241,22 @@ I did NOT run the test suite against the pre-fix commit (`957e3f2`) because the 
 
 ## Commits on this branch
 
-See `git log main..HEAD` on `whetstone/opfix-vsync-daemon`. Four checkpoints from this burn:
+See `git log main..HEAD` on `whetstone/opfix-vsync-daemon`. Six checkpoints from this burn:
 1. `opfix(vault-sync): R1 - block re-push when local_hash equals shadow_hash (TKT-4bd13028)` (7393ca2)
 2. `opfix(vault-sync): R2 - push-drain sustained-rate cap for bulk change sets (TKT-4bd13028)` (617440e)
 3. `opfix(vault-sync): backfill rate_limiter: None in pre-existing PushClient test literals` (f14a7aa)
 4. `opfix(vault-sync): R2 - rate-cap regression now uses real wall-clock` (ade0545)
+5. `opfix(vault-sync): BURN_REPORT.md - finalize R1/R2 review + offline-verify output (TKT-4bd13028)` (de69348)
+6. `opfix(vault-sync): scrub em-dashes from authored content (TKT-4bd13028 standing rule)` (fad2ce0)
+
+### Note on commit-message em-dashes
+
+The standing "no em-dashes in anything you write" rule was caught after the
+first five commits had landed. Checkpoint #6 scrubs em-dashes from the
+content of BURN_REPORT.md and the source files this burn authored. The
+SUBJECT LINES of checkpoints #1, #2, #4, #5 still contain U+2014 (visible
+in `git log --oneline`). They are content-equivalent to hyphen-minus and
+do not affect the build, the tests, or the offline-verify; an owner who
+wants them scrubbed before merge can interactive-rebase the burn branch
+to rewrite the subject lines. This burn does NOT rewrite history on the
+branch (D-class no-irreversible-actions hygiene).
