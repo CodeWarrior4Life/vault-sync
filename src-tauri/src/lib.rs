@@ -507,8 +507,16 @@ fn spawn_sse_consumer(
         let workspace_root = dirs::data_local_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(std::env::temp_dir))
             .join("Nexus");
+        // D1 (S511, TKT-2dc9a17e): set the production conflict policy EXPLICITLY
+        // to NewerWins. The MaterializerConfig Default is ServerWins
+        // (materializer.rs), and lib.rs historically never overrode it, so
+        // production silently ran the silent-overwrite policy. The S511 write()
+        // path is now divergence-driven (always-stash) regardless of policy, but
+        // we set NewerWins explicitly here so a stray ServerWins value can never
+        // re-arm the old clobber, and the standalone ConflictStash API agrees.
         let materializer_cfg = materializer::MaterializerConfig {
             device_id: cfg.subscriber_id.clone(),
+            conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
             ..Default::default()
         };
         // S492 echo guard: shared between the materializer (records its writes)
@@ -537,6 +545,30 @@ fn spawn_sse_consumer(
                 .join("shadow_hashes.json"),
         );
         sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
+        // D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path. If the shadow store
+        // loaded EMPTY (fresh install / corrupt reset / manual delete), seed
+        // shadow=server for every already-mirrored note BEFORE the push pipeline
+        // (and its reconcile backstop) or the SSE consumer make any decision, so
+        // ~28k notes do not each fall to R5-conflict and spawn a conflict-copy
+        // avalanche. Best-effort + bounded (one reconcile-batch call); on any
+        // failure the always-stash floor keeps the host data-safe. Awaited here,
+        // before spawn_push_pipeline below, so the seed lands first.
+        if shadow.is_empty() {
+            match api_client::ApiClient::new(&cfg.nexus_url, &token) {
+                Ok(seed_api) => {
+                    let _ = reconciliation::seed_shadow_from_server_if_empty(
+                        primary_root.clone(),
+                        std::sync::Arc::new(seed_api),
+                        cfg.subscriber_id.clone(),
+                        shadow.clone(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!("D9 shadow seed: api client init failed: {e}; skipping seed");
+                }
+            }
+        }
         // B2: materializer uses the primary sync_root.path as vault root.
         // Multi-root materialization is a deferred task (one materializer
         // per sync_root); for now the SSE consumer materializes into the
@@ -1033,7 +1065,14 @@ fn spawn_push_pipeline(
         watcher_cfg,
         subscriber_id.clone(),
     ) {
-        Ok(w) => w.with_tray_state(tray_state).with_echo_guard(echo_guard),
+        // D6: gate the enqueue dedup on the shadow's last-server-ACCEPTED hash.
+        // D7: heartbeat + storm-fence into SyncHealth for the auto-recovery
+        // watchdog. Both share the same Arcs the push pipeline already holds.
+        Ok(w) => w
+            .with_tray_state(tray_state)
+            .with_echo_guard(echo_guard)
+            .with_shadow_store(shadow.clone())
+            .with_sync_health(sync_health.clone()),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
             notify_user(

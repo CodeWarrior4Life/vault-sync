@@ -20,16 +20,16 @@
 //! lives in the workspace runtime dir, not in `<vault>/.lattice-sync/`.
 
 use crate::api_client::NotePayload;
-use crate::conflict_stash::{
-    ConflictClass, ConflictClassifier, ConflictPolicy, ConflictStash, StashError,
-};
+use crate::conflict_stash::{ConflictClassifier, ConflictPolicy, ConflictStash, StashError};
 use crate::integrity_check::{
     ByteLevelResult, ExpectedIntegrity, IntegrityChecker, IntegrityError, IntegrityResult,
 };
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::scope::is_safe_path;
+use crate::sync_shadow::canonical_sync_path;
 use crate::tray_state::SharedTrayState;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 // FileTimes::set_created (birthtime) is exposed via a platform-specific extension
@@ -40,10 +40,10 @@ use std::os::darwin::fs::FileTimesExt as _;
 use std::os::windows::fs::FileTimesExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -100,6 +100,13 @@ pub enum SkipReason {
     IdenticalToLocal,
     /// Materializer is configured in `Disabled` mode.
     DisabledMode,
+    /// D2/R2 (S511, TKT-2dc9a17e): the local file diverges from the server,
+    /// but the shadow store records the server hash as the LAST-SYNCED value,
+    /// so only the LOCAL side moved since we synced. That is a genuine local
+    /// user edit. We deliberately do NOT write the (older) server bytes over
+    /// it; the file_watcher/push pipeline carries the edit UP. This is the
+    /// exact case the daemon used to silently revert.
+    LocalEditPreserved,
 }
 
 /// Outcome of a single `write()` call.
@@ -244,6 +251,15 @@ pub struct Materializer {
     /// (pull). Optional + `Arc`-shared so a clone (reconcile, SSE consumer)
     /// shares one on-disk marker; `None` keeps pre-fix behavior (no recording).
     shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// D2c (S511, TKT-2dc9a17e): per-path advisory lock registry. Serializes the
+    /// `exists -> compare -> read-shadow -> stash -> persist` critical section
+    /// for a SINGLE path so ~15 concurrent writers cannot lose a stash basis
+    /// (read-old-bytes, both stash, one rename wins) or spawn N re-conflicting
+    /// copies. Each distinct path gets its own `Mutex`; different paths proceed
+    /// in parallel. `Arc`-shared so all clones (SSE consumer, reconcile pull,
+    /// backfill) of one Materializer contend on the SAME lock per path. Coarse
+    /// outer mutex only guards the small registry HashMap, never the I/O.
+    path_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl Clone for Materializer {
@@ -259,6 +275,7 @@ impl Clone for Materializer {
             echo_guard: self.echo_guard.clone(),
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
             shadow_store: self.shadow_store.clone(),
+            path_locks: self.path_locks.clone(),
         }
     }
 }
@@ -290,6 +307,7 @@ impl Materializer {
             echo_guard: None,
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
             shadow_store: None,
+            path_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -403,8 +421,38 @@ impl Materializer {
         self.target_for(rel)
     }
 
+    /// Acquire (creating if needed) the per-path advisory lock for `key`.
+    /// Returns an `Arc<Mutex<()>>` the caller locks across the
+    /// exists -> compare -> stash -> persist critical section (D2c). The outer
+    /// registry mutex is held only briefly to look up / insert the entry.
+    fn path_lock_for(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut reg = self.path_locks.lock().unwrap_or_else(|p| p.into_inner());
+        reg.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Public main entry — writes a payload into vault (live) or shadow tree.
+    ///
+    /// Equivalent to [`write_with_change_seq`](Self::write_with_change_seq)
+    /// with `change_seq == 0`. The live SSE path threads the real server
+    /// `change_seq` (from the SSE envelope lsn) so a conflict stash is named
+    /// deterministically; callers without a change_seq (reconcile pull,
+    /// pull-backfill) use this and get a `0`-suffixed stash name.
     pub fn write(&self, payload: &NotePayload) -> Result<MaterializeOutcome, MaterializerError> {
+        self.write_with_change_seq(payload, 0)
+    }
+
+    /// D2 (S511, TKT-2dc9a17e): main write entry with the server `change_seq`
+    /// threaded in. `change_seq` orders "newer" (NEVER filesystem mtime, which
+    /// is arbitrary-writer-wins under clock skew + ~15 concurrent writers) and
+    /// names any conflict stash deterministically so concurrent writers across
+    /// the fleet converge on ONE stash filename instead of spawning N copies.
+    pub fn write_with_change_seq(
+        &self,
+        payload: &NotePayload,
+        change_seq: u64,
+    ) -> Result<MaterializeOutcome, MaterializerError> {
         // 1. Mode gate.
         if matches!(self.mode, MaterializerMode::Disabled) {
             info!(
@@ -464,61 +512,139 @@ impl Materializer {
         // 5. Compute target.
         let target = self.target_for(&payload.path);
 
-        // 6. Idempotency + conflict-stash (only meaningful if target exists).
+        // D2c (S511): acquire the per-path advisory lock and HOLD it across the
+        // whole exists -> compare -> read-shadow -> stash -> persist sequence so
+        // ~15 concurrent writers on the SAME path cannot lose a stash basis or
+        // race the rename. Keyed by the NFC-canonical path so all clones agree.
+        // Different paths take different locks and proceed in parallel. We tolerate
+        // a poisoned lock (a prior panic) by taking the inner guard: the critical
+        // section is idempotent + atomic, so proceeding is safe.
+        let lock = self.path_lock_for(&canonical_sync_path(&payload.path));
+        let _path_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 6. Unified decide() (S511 D2/D3): read the shadow store INSIDE write()
+        // and resolve push-vs-pull-vs-conflict per R1-R5 instead of the old
+        // policy-driven server-wins overwrite (which silently reverted genuine
+        // local edits). `server` is the raw server-canonical hash; `shadow` is
+        // the last-synced server hash for this path; local-vs-server is the
+        // frontmatter-normalized comparison (R1 idempotency basis). The stash is
+        // now DIVERGENCE-driven (always preserve the loser), never policy-driven.
         let mut stash_path: Option<PathBuf> = None;
         if target.exists() {
-            match self.compare_local_to_canonical(&target, content_bytes)? {
-                LocalCompare::Identical => {
+            let local_bytes = fs::read(&target)?;
+            let local_raw_sha = hex::encode(Sha256::digest(&local_bytes));
+            let local_eq_server = self.local_matches_canonical(&local_bytes, content_bytes);
+            let shadow = self
+                .shadow_store
+                .as_ref()
+                .and_then(|s| s.get(&payload.path));
+            // shadow holds the last-synced server RAW sha; server is payload.sha256.
+            let shadow_eq_server = shadow.as_deref() == Some(payload.sha256.as_str());
+            // local untouched since last sync = its raw bytes still hash to the
+            // last-synced server hash recorded in the shadow.
+            let local_eq_shadow = shadow.as_deref() == Some(local_raw_sha.as_str());
+
+            match decide(
+                local_eq_server,
+                shadow.is_some(),
+                shadow_eq_server,
+                local_eq_shadow,
+            ) {
+                Decision::Noop => {
                     info!(
                         path = %payload.path,
-                        "materializer skip — local already identical to canonical"
+                        "materializer skip: local already identical to canonical (R1)"
                     );
-                    // Local already equals the server's canonical bytes — record
-                    // the synced server hash so the reconcile backstop sees this
-                    // path as in-sync-with-server, not a stale-pull candidate.
+                    // Record the synced server hash so the reconcile backstop
+                    // sees this path as in-sync-with-server, not a stale-pull
+                    // candidate.
                     if let Some(sh) = &self.shadow_store {
                         sh.record(&payload.path, &payload.sha256);
                     }
                     return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
                 }
-                LocalCompare::Diverges { local_bytes } => {
-                    // Consult conflict-stash policy.
+                Decision::PreserveLocalEdit => {
+                    // R2: shadow == server (server has NOT moved since we synced)
+                    // AND local diverges => a genuine LOCAL edit. NEVER overwrite
+                    // it with the older server copy. Leave the file untouched so
+                    // the file_watcher/push pipeline carries the edit UP. This is
+                    // the exact silent-revert the operator hit (TKT-2dc9a17e).
+                    warn!(
+                        path = %payload.path,
+                        change_seq,
+                        "materializer R2: local edit diverges, server unchanged since last sync, PRESERVING local (will push up), NOT overwriting"
+                    );
+                    return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
+                }
+                Decision::PullClean => {
+                    // R3: local == last-synced shadow, only the server moved.
+                    // Clean pull, no stash needed (no unsynced local edit to lose).
+                    debug!(
+                        path = %payload.path,
+                        "materializer R3: clean pull (local was at last-synced bytes, server advanced)"
+                    );
+                }
+                Decision::Conflict => {
+                    // R4 (both moved) / R5 (shadow absent, unknown provenance):
+                    // ALWAYS-STASH-THEN-RESOLVE, regardless of Class or policy.
+                    // Stash the LOSER (local bytes) FIRST, atomically, BEFORE any
+                    // overwrite, so a crash mid-op never loses the loser; then the
+                    // server winner is materialized below. (I-83 NEVER-SILENT-
+                    // OVERWRITE.) The change_seq names the stash deterministically
+                    // so N fleet writers converge on one filename.
                     let class = ConflictClassifier::classify(&payload.path);
-                    let should_stash = class == ConflictClass::D
-                        || self.config.conflict_policy != ConflictPolicy::ServerWins;
-                    if should_stash {
-                        // Stash root: live-mode uses vaults_root (the watch
-                        // root) so stashes sit next to the canonical file
-                        // regardless of which vault under vaults_root holds
-                        // it; shadow-mode uses shadow_root.
-                        let stash_root = match self.mode {
-                            MaterializerMode::Live => self.vaults_root.clone(),
-                            _ => self.shadow_root(),
-                        };
-                        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
-                        let written = stasher.write_stash(
-                            &payload.path,
-                            &local_bytes,
-                            &self.config.device_id,
-                            0, // local_lsn unknown — use 0 placeholder in filename
-                        )?;
-                        warn!(
-                            path = %payload.path,
-                            stash = %written.display(),
-                            class = ?class,
-                            policy = ?self.config.conflict_policy,
-                            "materializer stashed local divergent revision"
-                        );
-                        stash_path = Some(written);
-                    } else {
-                        info!(
-                            path = %payload.path,
-                            class = ?class,
-                            "materializer server-wins: overwriting non-class-D divergent local"
-                        );
+                    let stash_root = match self.mode {
+                        MaterializerMode::Live => self.vaults_root.clone(),
+                        _ => self.shadow_root(),
+                    };
+                    let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
+                    // Compute the stash path FIRST and record it in the echo_guard
+                    // BEFORE writing it, so the file_watcher recognizes the stash
+                    // write as an echo and never enqueues the conflict copy as a
+                    // push (D5). The conflict copy is also excluded by name in the
+                    // watcher, but recording here is belt-and-braces and keys the
+                    // exact (path, sha) the watcher will observe.
+                    let stash_target = stasher.compute_stash_path_public(
+                        &payload.path,
+                        &self.config.device_id,
+                        change_seq,
+                    );
+                    if let (Some(g), Some(rel)) =
+                        (&self.echo_guard, self.rel_for_stash(&stash_target))
+                    {
+                        g.record(&rel, &local_raw_sha);
                     }
+                    let written = stasher.write_stash(
+                        &payload.path,
+                        &local_bytes,
+                        &self.config.device_id,
+                        change_seq,
+                    )?;
+                    warn!(
+                        path = %payload.path,
+                        stash = %written.display(),
+                        class = ?class,
+                        change_seq,
+                        shadow_present = shadow.is_some(),
+                        "materializer CONFLICT (R4/R5): stashed local divergent revision BEFORE overwrite, both byte-sets preserved"
+                    );
+                    stash_path = Some(written);
                 }
             }
+        } else if let Some(sh_hash) = self
+            .shadow_store
+            .as_ref()
+            .and_then(|s| s.get(&payload.path))
+        {
+            // The target does not exist locally but we have a shadow record for
+            // it: it was synced then deleted/moved away locally. This is benign
+            // for an UPSERT (we are about to (re)create it from the server); no
+            // stash is possible (no local bytes). Logged at debug only.
+            debug!(
+                path = %payload.path,
+                shadow = %sh_hash,
+                "materializer: target missing but shadow present, (re)creating from server"
+            );
         }
 
         // 7. Path-safety + parent dir.
@@ -541,7 +667,12 @@ impl Materializer {
         let mut tmp = NamedTempFile::new_in(parent)?;
         tmp.write_all(content_bytes)?;
         tmp.flush()?;
-        tmp.persist(&target).map_err(|e| e.error)?;
+        // D12 (S511): on Windows, prefer ReplaceFileW (preserves the destination
+        // file's ACLs/attributes and is atomic vs an open reader) over the bare
+        // MoveFileExW that tempfile::persist uses, with bounded backoff retry on
+        // ERROR_SHARING_VIOLATION (Obsidian holding the file) and \\?\ long-path
+        // via dunce. On every other platform this is a plain tempfile::persist.
+        atomic_persist(tmp, &target)?;
 
         // 8b. Restore server-authoritative timestamps. The atomic tmp+rename above
         // gives `target` a brand-new inode whose birthtime = now; macOS/Obsidian
@@ -621,27 +752,33 @@ impl Materializer {
         raw_root.canonicalize().unwrap_or(raw_root)
     }
 
-    /// Compare the on-disk file to incoming canonical bytes, normalized for
-    /// frontmatter idempotency (R16).
-    fn compare_local_to_canonical(
-        &self,
-        target: &Path,
-        canonical_bytes: &[u8],
-    ) -> Result<LocalCompare, MaterializerError> {
-        let local_bytes = fs::read(target)?;
+    /// True iff already-read `local_bytes` equal the incoming canonical bytes
+    /// after frontmatter + CRLF/BOM normalization (R16 + D11). Pure: the caller
+    /// reads the file once (inside the per-path lock) and hands the bytes in, so
+    /// the compare and the subsequent stash share one consistent read.
+    fn local_matches_canonical(&self, local_bytes: &[u8], canonical_bytes: &[u8]) -> bool {
         let local_norm =
-            normalize_for_diff(&local_bytes, &self.config.strip_frontmatter_fields_for_diff);
+            normalize_for_diff(local_bytes, &self.config.strip_frontmatter_fields_for_diff);
         let canonical_norm = normalize_for_diff(
             canonical_bytes,
             &self.config.strip_frontmatter_fields_for_diff,
         );
-        let local_hash = hex::encode(Sha256::digest(&local_norm));
-        let canonical_hash = hex::encode(Sha256::digest(&canonical_norm));
-        if local_hash == canonical_hash {
-            Ok(LocalCompare::Identical)
-        } else {
-            Ok(LocalCompare::Diverges { local_bytes })
-        }
+        local_norm == canonical_norm
+    }
+
+    /// D5 (S511): best-effort vaults-root-relative, forward-slash path of a
+    /// stash target, for echo-guard keying. The echo guard is keyed by the
+    /// same wire-path form the file_watcher normalizes to. Returns None if the
+    /// stash path is not under the active root (it always is in practice).
+    fn rel_for_stash(&self, stash_abs: &Path) -> Option<String> {
+        let root = match self.mode {
+            MaterializerMode::Live => &self.vaults_root,
+            _ => return None, // shadow-tree stashes are never watched, so no echo to suppress
+        };
+        stash_abs
+            .strip_prefix(root)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
     }
 
     /// Soft-delete preserves the v0.2 contract (move to `<name>.deleted-<ts>`).
@@ -663,20 +800,101 @@ impl Materializer {
             info!("soft_delete: nothing to delete at {}", path);
             return Ok(());
         }
-        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let renamed = target.with_file_name(format!(
-            "{}.deleted-{ts}",
+        // D13 (S511): the suffix carries NANOSECOND precision, not just
+        // second-granularity. Two deletes of the same path within one second
+        // (a recreate/delete loop, or ext4 with multiple writers) previously
+        // collided on a `.deleted-<YYYYMMDDTHHMMSSZ>` name and the second rename
+        // clobbered the first preserved copy. Nanos make the name effectively
+        // unique; a residual collision still falls through to a fresh inode
+        // because we never overwrite an existing target (rename onto a distinct
+        // name). No em-dashes in the format string (house rule).
+        let now = chrono::Utc::now();
+        let ts = now.format("%Y%m%dT%H%M%SZ");
+        let nanos = now.timestamp_subsec_nanos();
+        let mut renamed = target.with_file_name(format!(
+            "{}.deleted-{ts}-{nanos:09}",
             target.file_name().unwrap().to_string_lossy()
         ));
+        // Defensive: if that exact name somehow already exists, append a small
+        // counter so we never clobber an earlier preserved deletion.
+        if renamed.exists() {
+            for n in 2u32..u32::MAX {
+                let candidate = target.with_file_name(format!(
+                    "{}.deleted-{ts}-{nanos:09}-{n}",
+                    target.file_name().unwrap().to_string_lossy()
+                ));
+                if !candidate.exists() {
+                    renamed = candidate;
+                    break;
+                }
+            }
+        }
         fs::rename(&target, &renamed)?;
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())
     }
 }
 
-enum LocalCompare {
-    Identical,
-    Diverges { local_bytes: Vec<u8> },
+/// D2 (S511, TKT-2dc9a17e): the unified push-vs-pull-vs-conflict verdict for a
+/// single path. Returned by [`decide`]; consumed by `Materializer::write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// R1: local already equals the server canonical. Nothing to write.
+    Noop,
+    /// R2: shadow == server (server unchanged since last sync) AND local
+    /// diverges. A genuine local edit. Preserve local, do NOT write, let push
+    /// carry it up.
+    PreserveLocalEdit,
+    /// R3: local == last-synced shadow, only the server moved. Clean pull, no
+    /// stash needed.
+    PullClean,
+    /// R4 (both moved) / R5 (shadow absent, unknown provenance): true
+    /// concurrency. ALWAYS stash the local loser, then materialize the server
+    /// winner.
+    Conflict,
+}
+
+/// PURE decision function (table-tested) implementing the unified decide()
+/// R1-R5 (S511 spec "Unified decide() algorithm"). All inputs are derived
+/// relations so the function has no I/O and is exhaustively testable:
+///
+/// * `local_eq_server` - the (frontmatter+CRLF/BOM-normalized) local file
+///   equals the server canonical (R1 idempotency basis).
+/// * `shadow_present` - the shadow store has a last-synced hash for this path.
+/// * `shadow_eq_server` - that last-synced hash equals the current server hash
+///   (i.e. the server has NOT moved since we last synced).
+/// * `local_eq_shadow` - the local file's raw bytes still hash to the
+///   last-synced server hash (i.e. local has NOT been edited since last sync).
+///
+/// Ordering of "newer" is by server `change_seq` (handled by the caller naming
+/// the stash); this function never consults filesystem mtime.
+pub fn decide(
+    local_eq_server: bool,
+    shadow_present: bool,
+    shadow_eq_server: bool,
+    local_eq_shadow: bool,
+) -> Decision {
+    // R1: idempotent. Local already equals server, regardless of shadow.
+    if local_eq_server {
+        return Decision::Noop;
+    }
+    // R5: shadow absent and local diverges from server. Unknown provenance,
+    // NEVER assume server wins. Treat as concurrent => conflict (stash).
+    if !shadow_present {
+        return Decision::Conflict;
+    }
+    // R2: server unchanged since last sync AND local moved => genuine local
+    // edit. Must propagate UP, never be overwritten.
+    if shadow_eq_server {
+        return Decision::PreserveLocalEdit;
+    }
+    // R3: local untouched since last sync, only server moved => clean pull.
+    if local_eq_shadow {
+        return Decision::PullClean;
+    }
+    // R4: shadow present, server moved, AND local moved too => both diverged
+    // from the last-synced base => true conflict (stash the local loser).
+    Decision::Conflict
 }
 
 // ---------------------------------------------------------------------------
@@ -684,23 +902,42 @@ enum LocalCompare {
 // ---------------------------------------------------------------------------
 
 fn normalize_for_diff(content: &[u8], strip_fields: &[String]) -> Vec<u8> {
-    let s = match std::str::from_utf8(content) {
+    let raw = match std::str::from_utf8(content) {
         Ok(s) => s,
         Err(_) => return content.to_vec(),
     };
-    if !s.starts_with("---\n") && !s.starts_with("---\r\n") {
-        return content.to_vec();
+    // D11 (S511, TKT-2dc9a17e): CRLF/BOM normalization is part of the
+    // conflict-detection basis. A note edited on Windows (CRLF, and sometimes a
+    // UTF-8 BOM) versus the same logical content on a Unix host (LF) must NOT be
+    // a permanent false-conflict. We fold CRLF -> LF and strip a leading BOM
+    // BEFORE the frontmatter/idempotency hashing, on BOTH the frontmatter and
+    // the no-frontmatter passthrough paths. This changes only the DIFF BASIS,
+    // never the bytes written to disk (the materializer always persists the
+    // server's exact enriched_body verbatim).
+    let no_bom = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let normalized_eol: String = if no_bom.contains('\r') {
+        no_bom.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        no_bom.to_string()
+    };
+    let s = normalized_eol.as_str();
+
+    if !s.starts_with("---\n") {
+        // No (or non-leading) frontmatter: the EOL/BOM-normalized body IS the
+        // diff basis.
+        return s.as_bytes().to_vec();
     }
     let body_start = match find_frontmatter_end(s) {
         Some(i) => i,
-        None => return content.to_vec(),
+        None => return s.as_bytes().to_vec(),
     };
-    let after_open = if s.starts_with("---\r\n") { 5 } else { 4 };
+    // EOL already normalized to LF above, so the opening fence is always 4 bytes.
+    let after_open = 4;
     let fm_block = &s[after_open..body_start.fm_inner_end];
     let body = &s[body_start.body_start..];
 
     let stripped_fm = strip_yaml_fields(fm_block, strip_fields);
-    let mut out = String::with_capacity(content.len());
+    let mut out = String::with_capacity(s.len());
     out.push_str("---\n");
     out.push_str(&stripped_fm);
     if !stripped_fm.ends_with('\n') {
@@ -782,6 +1019,140 @@ fn serialize_with_frontmatter(payload: &NotePayload) -> String {
     }
     let fm_yaml = serde_yaml::to_string(&payload.frontmatter).unwrap_or_default();
     format!("---\n{fm_yaml}---\n\n{}", payload.body)
+}
+
+// ---------------------------------------------------------------------------
+// Atomic persist (D12: Windows-aware)
+// ---------------------------------------------------------------------------
+
+/// D12 (S511): atomically move a finished temp file onto `target`.
+///
+/// Non-Windows: a plain `tempfile::persist` (= `rename(2)`), the prior behavior.
+///
+/// Windows: prefer `ReplaceFileW` (preserves the destination's ACLs/attributes
+/// and is atomic against an open reader, unlike `MoveFileExW` which
+/// `tempfile::persist` uses), with bounded backoff retry on
+/// `ERROR_SHARING_VIOLATION` (Obsidian momentarily holding the file). Falls back
+/// to `MoveFileExW`-style persist when the destination does not yet exist
+/// (ReplaceFileW requires an existing target). Long paths are prefixed with
+/// `\\?\` via `dunce::simplified`'s inverse (we canonicalize through dunce on the
+/// target before the OS call). Code path is compiled only on Windows and must be
+/// re-verified on a booted Neo before Windows sync is re-enabled.
+#[cfg(not(windows))]
+fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
+    tmp.persist(target).map_err(|e| e.error)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    // ERROR_SHARING_VIOLATION = 32. Bounded backoff: a few short retries while
+    // Obsidian releases the handle, then surface a real error (NEVER a silent
+    // .tmp orphan).
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const MAX_ATTEMPTS: usize = 6;
+    const BASE_BACKOFF_MS: u64 = 25;
+
+    // Helper: widen an OS path to a NUL-terminated UTF-16 buffer for the W APIs.
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // Prefer the \\?\-prefixed long path form on the destination so >260-char
+    // notes do not fail on a host without LongPathsEnabled. dunce::canonicalize
+    // gives a clean path; if the parent cannot be canonicalized (target does not
+    // exist yet) we fall back to the raw target.
+    let dest_long: PathBuf = dunce::canonicalize(target.parent().unwrap_or(target))
+        .ok()
+        .and_then(|p| target.file_name().map(|f| p.join(f)))
+        .unwrap_or_else(|| target.to_path_buf());
+
+    // tempfile keeps the temp file; we need its path. Persist via ReplaceFileW
+    // when the destination already exists, else a direct persist (create).
+    if dest_long.exists() {
+        // ReplaceFileW(target, source, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, ..)
+        // is declared inline to avoid pulling in the full windows crate; this
+        // mirrors the FFI the std library uses internally.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn ReplaceFileW(
+                lpReplacedFileName: *const u16,
+                lpReplacementFileName: *const u16,
+                lpBackupFileName: *const u16,
+                dwReplaceFlags: u32,
+                lpExclude: *mut core::ffi::c_void,
+                lpReserved: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x0000_0002;
+
+        // Keep the temp file on disk under a stable path for the FFI call.
+        let (_file, tmp_path) = tmp.keep().map_err(|e| MaterializerError::Io(e.error))?;
+        let replaced = wide(&dest_long);
+        let replacement = wide(&tmp_path);
+
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let ok = unsafe {
+                ReplaceFileW(
+                    replaced.as_ptr(),
+                    replacement.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_IGNORE_MERGE_ERRORS,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            let retryable = err.raw_os_error() == Some(ERROR_SHARING_VIOLATION);
+            last_err = Some(err);
+            if retryable {
+                sleep(Duration::from_millis(BASE_BACKOFF_MS << attempt.min(5)));
+                continue;
+            }
+            break;
+        }
+        // ReplaceFileW failed for a non-retryable reason (or exhausted retries):
+        // best-effort fall back to a plain rename so we still converge, but never
+        // leave the temp orphaned silently.
+        warn!(
+            target = %dest_long.display(),
+            error = ?last_err,
+            "atomic_persist: ReplaceFileW failed, falling back to rename"
+        );
+        std::fs::rename(&tmp_path, &dest_long).map_err(MaterializerError::Io)?;
+        Ok(())
+    } else {
+        // Destination does not exist yet: a plain persist (create) with bounded
+        // sharing-violation backoff.
+        let mut tmp = tmp;
+        for attempt in 0..MAX_ATTEMPTS {
+            match tmp.persist(&dest_long) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if e.error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                        && attempt + 1 < MAX_ATTEMPTS
+                    {
+                        tmp = e.file;
+                        sleep(Duration::from_millis(BASE_BACKOFF_MS << attempt.min(5)));
+                        continue;
+                    }
+                    return Err(MaterializerError::Io(e.error));
+                }
+            }
+        }
+        unreachable!("persist loop returns inside the body")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,30 +1527,45 @@ mod tests {
         }
     }
 
+    /// S511 D2/D3 (TKT-2dc9a17e): a Class-C local divergence with NO shadow
+    /// record (shadow absent => R5, unknown provenance) now ALWAYS stashes the
+    /// local loser before materializing the server winner. This flips the
+    /// pre-S511 `stash_not_written_for_class_c_under_server_wins` assertion:
+    /// there is no longer any silent-overwrite cell for divergent content. Both
+    /// byte-sets must survive on disk (I-83 NEVER-SILENT-OVERWRITE).
     #[test]
-    fn stash_not_written_for_class_c_under_server_wins() {
+    fn class_c_divergence_no_shadow_now_stashes_r5() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let target = vaults.path().join(VAULT).join("02_Projects/Foo/normal.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, "old-local").unwrap();
+        std::fs::write(&target, "old-local-divergent").unwrap();
         let p = payload("02_Projects/Foo/normal.md", "server-canonical");
         let out = m.write(&p).unwrap();
         match out {
-            MaterializeOutcome::Wrote { path } => {
-                assert_eq!(path, target);
+            MaterializeOutcome::Stashed { stash_path } => {
+                // Loser (local) preserved verbatim in the stash.
+                assert!(stash_path.exists(), "stash file must exist");
+                let stash_content = std::fs::read_to_string(&stash_path).unwrap();
+                assert_eq!(stash_content, "old-local-divergent");
+                // Winner (server) materialized at the canonical path.
                 let cur = std::fs::read_to_string(&target).unwrap();
                 assert!(cur.contains("server-canonical"));
             }
-            other => panic!("expected Wrote (no stash), got {other:?}"),
+            other => panic!("expected Stashed (R5 always-stash), got {other:?}"),
         }
+        // Exactly one conflict-from sibling was written.
         let dir = target.parent().unwrap();
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(
-                !name.contains(".conflict-from-"),
-                "unexpected stash file: {name}"
-            );
-        }
+        let conflict_copies: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".conflict-from-"))
+            .collect();
+        assert_eq!(
+            conflict_copies.len(),
+            1,
+            "exactly one conflict copy expected, got {conflict_copies:?}"
+        );
     }
 
     // ---- integrity check --------------------------------------------------
@@ -1634,6 +2020,227 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.contains("ΓÇ") || n.contains("≡ƒ")),
             "CP437 mojibake detected on disk: {names:?}"
+        );
+    }
+
+    // ---- S511 (TKT-2dc9a17e): unified decide() R1-R5 ----------------------
+
+    use crate::sync_shadow::ShadowStore;
+
+    /// (vaults, ws, materializer-with-shadow, shadow) for the decide() tests.
+    fn mk_with_shadow(
+        mode: MaterializerMode,
+    ) -> (TempDir, TempDir, Materializer, Arc<ShadowStore>) {
+        let (v, w, m) = mk(mode, default_cfg());
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let m = m.with_shadow_store(shadow.clone());
+        (v, w, m, shadow)
+    }
+
+    /// PURE decide() truth table (R1-R5). This is the load-bearing decision and
+    /// must be exhaustively correct.
+    #[test]
+    fn decide_truth_table_r1_to_r5() {
+        // R1: local == server => Noop, regardless of shadow state.
+        assert_eq!(decide(true, false, false, false), Decision::Noop);
+        assert_eq!(decide(true, true, true, true), Decision::Noop);
+        // R5: shadow absent and local != server => Conflict.
+        assert_eq!(decide(false, false, false, false), Decision::Conflict);
+        // R2: shadow present, shadow == server, local != server => PreserveLocalEdit.
+        assert_eq!(
+            decide(false, true, true, false),
+            Decision::PreserveLocalEdit
+        );
+        // R3: shadow present, server moved (shadow != server), local == shadow => PullClean.
+        assert_eq!(decide(false, true, false, true), Decision::PullClean);
+        // R4: shadow present, server moved AND local moved (neither equals) => Conflict.
+        assert_eq!(decide(false, true, false, false), Decision::Conflict);
+    }
+
+    /// R2 end-to-end: shadow records the server hash as last-synced, the local
+    /// file has a genuine edit (diverges). write() must return
+    /// Skipped(LocalEditPreserved) and MUST NOT touch the file (the push
+    /// pipeline carries the edit up). This is the exact silent-revert the
+    /// operator hit (TKT-2dc9a17e).
+    #[test]
+    fn r2_local_edit_is_preserved_not_overwritten() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/edited.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/edited.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Server canonical the daemon would push down.
+        let server = payload("01_Inbox/edited.md", "server-body");
+        // Shadow says: the last thing we synced for this path WAS this server
+        // hash (the server has NOT moved since).
+        shadow.record(&rel, &server.sha256);
+        // The local file is a genuine user edit, diverging from the server.
+        let local_edit = "---\ntitle: Test\n---\n\nMY LOCAL EDIT, do not lose\n";
+        std::fs::write(&target, local_edit).unwrap();
+
+        let out = m.write(&server).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved),
+            "R2 must preserve the local edit, not overwrite it"
+        );
+        // The file on disk is STILL the local edit, untouched.
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            on_disk, local_edit,
+            "the local edit must survive verbatim (no silent revert)"
+        );
+        // No conflict copy was created (R2 is not a conflict, it is a push-up).
+        let dir = target.parent().unwrap();
+        assert!(
+            !std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".conflict-from-")),
+            "R2 must not write a conflict copy"
+        );
+    }
+
+    /// R3 end-to-end: local is exactly the last-synced bytes (untouched), only
+    /// the server moved => clean pull, server bytes written, NO stash.
+    #[test]
+    fn r3_clean_pull_no_stash() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/clean.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/clean.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // The local file holds the OLD server bytes (a prior materialization).
+        let old_bytes = "---\ntitle: Test\n---\n\nold server body\n";
+        std::fs::write(&target, old_bytes).unwrap();
+        let old_raw_sha = sha256_hex(old_bytes);
+        // Shadow records that OLD hash as the last-synced server hash, AND it is
+        // the local file's raw hash (local == shadow, untouched since sync).
+        shadow.record(&rel, &old_raw_sha);
+
+        // The server has moved on to new bytes (server != shadow).
+        let server = payload("01_Inbox/clean.md", "new server body");
+        let out = m.write(&server).unwrap();
+        match out {
+            MaterializeOutcome::Wrote { .. } => {}
+            other => panic!("expected clean Wrote (R3), got {other:?}"),
+        }
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert!(on_disk.contains("new server body"), "server bytes pulled");
+        // No conflict copy on a clean pull.
+        let dir = target.parent().unwrap();
+        assert!(
+            !std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".conflict-from-")),
+            "R3 clean pull must not stash"
+        );
+    }
+
+    /// R4 end-to-end: shadow present but BOTH sides moved (local edited AND
+    /// server advanced, neither equals the last-synced base) => true conflict:
+    /// stash the local loser, materialize the server winner, both preserved.
+    /// The stash filename carries the change_seq passed in.
+    #[test]
+    fn r4_both_moved_stashes_with_change_seq() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/both.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/both.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Last-synced base hash (neither current local nor current server).
+        shadow.record(&rel, &"0".repeat(64));
+        // Local diverged from base.
+        let local_edit = "---\ntitle: Test\n---\n\nlocal divergent edit\n";
+        std::fs::write(&target, local_edit).unwrap();
+        // Server diverged from base too.
+        let server = payload("01_Inbox/both.md", "server divergent body");
+
+        let out = m.write_with_change_seq(&server, 4242).unwrap();
+        match out {
+            MaterializeOutcome::Stashed { stash_path } => {
+                let name = stash_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(
+                    name.contains("both.conflict-from-") && name.contains("-4242.md"),
+                    "stash must be named by change_seq 4242, got {name}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&stash_path).unwrap(),
+                    local_edit,
+                    "loser (local) preserved verbatim in the stash"
+                );
+            }
+            other => panic!("expected Stashed (R4), got {other:?}"),
+        }
+        // Winner (server) at the canonical path.
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("server divergent body"));
+    }
+
+    /// D11: a CRLF (Windows) local file vs an LF (Unix) server body with the
+    /// SAME logical content must NOT be treated as a divergence. With the
+    /// shadow recording the server hash (R2 setup), a CRLF-only difference must
+    /// resolve as R1 NOOP (identical-after-normalization), not a false conflict
+    /// or a false local-edit.
+    #[test]
+    fn d11_crlf_vs_lf_is_not_a_divergence() {
+        let (vaults, _ws, m, _shadow) = mk_with_shadow(MaterializerMode::Live);
+        let target = vaults.path().join(VAULT).join("01_Inbox/eol.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Server LF body.
+        let server = payload("01_Inbox/eol.md", "line one\nline two\n");
+        // Local file: identical content but CRLF line endings + a leading BOM.
+        let server_bytes = server.enriched_body.clone().unwrap();
+        let crlf_local = format!("\u{feff}{}", server_bytes.replace('\n', "\r\n"));
+        std::fs::write(&target, &crlf_local).unwrap();
+
+        let out = m.write(&server).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal),
+            "CRLF/BOM-only difference must normalize to identical (R1), got {out:?}"
+        );
+        // The local CRLF file is left untouched (idempotent skip, no rewrite).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), crlf_local);
+    }
+
+    /// D13: soft_delete suffix carries nanosecond precision, so two deletes of
+    /// the same path within one second do not collide / clobber the first
+    /// preserved copy.
+    #[test]
+    fn d13_soft_delete_suffix_is_nanosecond_unique() {
+        let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
+        let shadow_dir = ws
+            .path()
+            .join(".lattice-runtime")
+            .join(SLUG)
+            .join("shadow")
+            .join(VAULT)
+            .join("01_Inbox");
+        // Two write+delete cycles on the SAME path, back to back (same second).
+        m.write(&payload("01_Inbox/d.md", "v1")).unwrap();
+        m.soft_delete(&format!("{VAULT}/01_Inbox/d.md")).unwrap();
+        m.write(&payload("01_Inbox/d.md", "v2")).unwrap();
+        m.soft_delete(&format!("{VAULT}/01_Inbox/d.md")).unwrap();
+
+        let deleted: Vec<String> = std::fs::read_dir(&shadow_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("d.md.deleted-"))
+            .collect();
+        assert_eq!(
+            deleted.len(),
+            2,
+            "both soft-deletes must be preserved (nanosecond-unique suffixes), got {deleted:?}"
         );
     }
 }

@@ -510,6 +510,18 @@ impl PushClient {
                     return PushOutcome::Failed(FailureReason::Forbidden);
                 }
                 Err(ApiError::Conflict { expected_hash }) => {
+                    // D4 (S511, TKT-2dc9a17e): the local push lost the server CAS
+                    // race (409). Before we consume/ack this journal entry (the
+                    // caller acks ConflictUnrecoverable), PRESERVE the local bytes
+                    // we tried to push as a `.conflict-from-*` sibling, so a local
+                    // edit that loses the race is never silently dropped (the
+                    // stash floor used to be pull-path-only). Best-effort: a stash
+                    // failure is logged and the conflict still surfaces, but we
+                    // never block on it. Only stash real content (a Delete carries
+                    // none).
+                    if !content_bytes.is_empty() {
+                        self.stash_local_on_conflict(&evt.path, &content_bytes);
+                    }
                     return PushOutcome::Failed(FailureReason::ConflictUnrecoverable {
                         expected_hash,
                     });
@@ -544,6 +556,37 @@ impl PushClient {
         PushOutcome::Failed(FailureReason::NetworkExhausted {
             last_error: last_err.unwrap_or_else(|| "unknown".to_string()),
         })
+    }
+
+    /// D4 (S511, TKT-2dc9a17e): preserve the local bytes that lost a server
+    /// CAS-409 race as a `<stem>.conflict-from-<device>-<seq>.md` sibling,
+    /// BEFORE the journal entry is acked/consumed, so a losing local edit is
+    /// never silently dropped. `change_seq` is unknown on a bare 409 (we only
+    /// get `expected_hash`), so the stash uses `0`; the conflict copy is then
+    /// excluded from sync by name (D5) and surfaced in the tray count.
+    /// Best-effort: any stash error is logged, never fatal (the conflict is
+    /// still surfaced to the caller).
+    fn stash_local_on_conflict(&self, wire_path: &str, local_bytes: &[u8]) {
+        let stasher = crate::conflict_stash::ConflictStash::new(
+            self.vault_root.clone(),
+            crate::conflict_stash::ConflictPolicy::NewerWins,
+        );
+        match stasher.write_stash(wire_path, local_bytes, &self.device_id, 0) {
+            Ok(stash) => {
+                tracing::warn!(
+                    path = %wire_path,
+                    stash = %stash.display(),
+                    "push_client: CAS-409 conflict, stashed losing local bytes before ack (S511 D4)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %wire_path,
+                    error = ?e,
+                    "push_client: CAS-409 conflict stash FAILED, local bytes may be at risk"
+                );
+            }
+        }
     }
 }
 
@@ -1226,6 +1269,56 @@ mod tests {
         // Conflict is terminal — event was ack'd (resolver handles refetch+replay).
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
+    }
+
+    /// D4 (S511, TKT-2dc9a17e): a local push that loses the server CAS race
+    /// (409) must PRESERVE the local bytes it tried to push as a
+    /// `.conflict-from-*` sibling BEFORE the journal entry is acked, so a losing
+    /// local edit is never silently dropped. Pre-S511 the 409 just returned
+    /// ConflictUnrecoverable and dropped the bytes.
+    #[tokio::test]
+    async fn cas_409_stashes_local_bytes_before_ack() {
+        let vault = TempDir::new().unwrap();
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv_hash"}"#)
+            .create_async()
+            .await;
+
+        let body = b"my local edit that lost the CAS race";
+        let (_d, journal) = make_journal_with(vec![evt("notes/raced.md", body)]);
+        let client =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf()).await;
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+        ));
+
+        // The local bytes were preserved as a conflict-from sibling under the
+        // vault root, NOT silently dropped.
+        let dir = vault.path().join("notes");
+        let stash: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".conflict-from-"))
+            .collect();
+        assert_eq!(
+            stash.len(),
+            1,
+            "CAS-409 must stash the losing local bytes, got {stash:?}"
+        );
+        let stashed = std::fs::read(dir.join(&stash[0])).unwrap();
+        assert_eq!(
+            stashed, body,
+            "stash must hold the exact local bytes pushed"
+        );
     }
 
     #[tokio::test]

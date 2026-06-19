@@ -39,9 +39,30 @@ use std::time::Duration;
 
 use tempfile::NamedTempFile;
 use tracing::warn;
+use unicode_normalization::UnicodeNormalization;
 
 /// Periodic flush cadence for [`ShadowStore::spawn_periodic_flush`].
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// D8 (S511, TKT-2dc9a17e): canonicalize a sync path to ONE fleet-wide form.
+///
+/// The data-loss amplifier: macOS persists filenames in NFD (decomposed),
+/// while ext4/NTFS store the bytes verbatim and the server's canonical form is
+/// NFC (precomposed). A non-ASCII note name therefore keys the shadow store
+/// differently across hosts, so `shadow.get()` misses, the reconcile backstop
+/// reads "shadow absent", treats the local copy as stale, and pulls-over a
+/// genuine local edit. Routing every KEY (shadow record/get, the reconcile
+/// manifest path, the push wire path) through this function makes the lookup
+/// normalization-invariant. We deliberately key in NFC but still WRITE to the
+/// platform-native on-disk path (NFD on macOS) so we never create a duplicate
+/// decomposed/precomposed file on disk; only the in-memory/wire KEY is NFC.
+///
+/// Also folds backslash to forward-slash so a Windows-origin path and a
+/// Unix-origin path for the same note collapse to one key. No em-dashes here
+/// or anywhere (house rule).
+pub fn canonical_sync_path(s: &str) -> String {
+    s.nfc().collect::<String>().replace('\\', "/")
+}
 
 /// Persistent per-file shadow-hash store: path → last-synced server hash.
 pub struct ShadowStore {
@@ -55,14 +76,14 @@ impl ShadowStore {
     /// logs a `warn!` — NEVER panics. The returned store is `dirty == false`
     /// (nothing to flush until something is recorded).
     pub fn load(path: PathBuf) -> Arc<ShadowStore> {
-        let map = match std::fs::read(&path) {
+        let raw = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
                         path = %path.display(),
                         error = %e,
-                        "shadow store: corrupt JSON — starting EMPTY (degrades to pull-on-drift)"
+                        "shadow store: corrupt JSON, starting EMPTY (degrades to pull-on-drift)"
                     );
                     HashMap::new()
                 }
@@ -72,30 +93,73 @@ impl ShadowStore {
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "shadow store: read failed — starting EMPTY"
+                    "shadow store: read failed, starting EMPTY"
                 );
                 HashMap::new()
             }
         };
+        // D8 (S511): one-time NFC key migration. Existing keys may be NFD
+        // (macOS-origin) or backslash-form (Windows-origin). Without this, the
+        // NFC cutover would make every non-ASCII key MISS on the first lookup,
+        // mass-Pull, and trigger the exact data-loss event. We re-key on load
+        // so the cutover is safe. dirty is set iff anything actually changed,
+        // so a clean ASCII store does not gratuitously rewrite to disk. On a
+        // key collision after normalization (an NFD and an NFC key for the same
+        // note both present) we keep the existing value, leaving the residual
+        // to converge via the always-stash path.
+        let mut map: HashMap<String, String> = HashMap::with_capacity(raw.len());
+        let mut migrated = false;
+        for (k, v) in raw.into_iter() {
+            let nk = canonical_sync_path(&k);
+            if nk != k {
+                migrated = true;
+            }
+            map.entry(nk).or_insert(v);
+        }
+        if migrated {
+            warn!(
+                path = %path.display(),
+                "shadow store: migrated existing keys to NFC canonical form (one-time, S511 D8)"
+            );
+        }
         Arc::new(ShadowStore {
             inner: Mutex::new(map),
             path,
-            dirty: AtomicBool::new(false),
+            dirty: AtomicBool::new(migrated),
         })
     }
 
-    /// Upsert `path → server_hash`. No I/O — sets the dirty flag so the next
-    /// `flush()` persists it.
+    /// Upsert `path -> server_hash`. No I/O, sets the dirty flag so the next
+    /// `flush()` persists it. D8 (S511): the key is normalized to NFC canonical
+    /// form so record/get are normalization-invariant, regardless of which OS
+    /// (NFD macOS vs verbatim ext4/NTFS) produced the path.
     pub fn record(&self, path: &str, server_hash: &str) {
+        let key = canonical_sync_path(path);
         if let Ok(mut m) = self.inner.lock() {
-            m.insert(path.to_string(), server_hash.to_string());
+            m.insert(key, server_hash.to_string());
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
-    /// The last-synced server hash recorded for `path`, if any.
+    /// The last-synced server hash recorded for `path`, if any. D8 (S511): the
+    /// lookup key is normalized to NFC so a get always hits the record() that
+    /// stored it, even across an NFD/NFC OS boundary.
     pub fn get(&self, path: &str) -> Option<String> {
-        self.inner.lock().ok().and_then(|m| m.get(path).cloned())
+        let key = canonical_sync_path(path);
+        self.inner.lock().ok().and_then(|m| m.get(&key).cloned())
+    }
+
+    /// Number of recorded entries. D9 (S511): the startup shadow-wipe fast-path
+    /// uses this to detect an empty/wiped shadow (fresh install, corrupt-load
+    /// reset, manual delete) so it can seed shadow=server BEFORE the first
+    /// reconcile decision and avoid a conflict-copy avalanche.
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// True iff the store has no recorded entries (see [`Self::len`]).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Persist the full map to `self.path` via atomic tmp+rename. No-op (and
@@ -229,5 +293,66 @@ mod tests {
             !path.exists(),
             "second flush after a clean flush must be a no-op"
         );
+    }
+
+    // ---- D8 (S511): NFC canonicalization + key migration ----
+
+    /// canonical_sync_path collapses NFD (decomposed) to NFC (precomposed) and
+    /// folds backslashes to forward slashes. The cafe-with-accent case is the
+    /// canonical cross-OS amplifier: macOS writes "e + combining acute"; the
+    /// server/ext4/NTFS store "e-acute" precomposed. Both MUST map to one key.
+    #[test]
+    fn canonical_sync_path_nfc_round_trip() {
+        let nfc = "Notes/Cafe\u{0301}.md".nfc().collect::<String>(); // precomposed cafe-acute
+        let nfd = "Notes/Cafe\u{0301}.md".nfd().collect::<String>(); // decomposed
+        assert_ne!(
+            nfc, nfd,
+            "NFD and NFC byte forms must differ for the test to matter"
+        );
+        assert_eq!(
+            canonical_sync_path(&nfc),
+            canonical_sync_path(&nfd),
+            "NFD input must canonicalize to the same key as NFC input"
+        );
+    }
+
+    #[test]
+    fn canonical_sync_path_folds_backslashes() {
+        assert_eq!(canonical_sync_path("Notes\\sub\\x.md"), "Notes/sub/x.md");
+    }
+
+    /// record(NFD key) then get(NFC key) must hit: the store is
+    /// normalization-invariant on both write and read.
+    #[test]
+    fn shadow_record_get_normalization_invariant() {
+        let dir = TempDir::new().unwrap();
+        let store = ShadowStore::load(dir.path().join("shadow.json"));
+        let nfd = "Notes/Cafe\u{0301}.md".nfd().collect::<String>();
+        let nfc = "Notes/Cafe\u{0301}.md".nfc().collect::<String>();
+        store.record(&nfd, "hash-nfd");
+        // Reading the precomposed (NFC) form must hit the NFD-recorded entry.
+        assert_eq!(store.get(&nfc), Some("hash-nfd".to_string()));
+        // And re-recording under the NFC key overwrites the SAME entry.
+        store.record(&nfc, "hash-nfc");
+        assert_eq!(store.get(&nfd), Some("hash-nfc".to_string()));
+    }
+
+    /// On load, an existing NFD key is migrated to NFC so the cutover does not
+    /// mass-miss. The migrated store reads dirty (so the re-keyed map persists).
+    #[test]
+    fn load_migrates_nfd_keys_to_nfc() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let nfd = "Notes/Cafe\u{0301}.md".nfd().collect::<String>();
+        let nfc = "Notes/Cafe\u{0301}.md".nfc().collect::<String>();
+        // Hand-write a store file with a decomposed key (simulating a
+        // macOS-origin shadow from an older daemon).
+        let mut m = HashMap::new();
+        m.insert(nfd.clone(), "h".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        let store = ShadowStore::load(path);
+        // The NFC lookup hits the migrated key.
+        assert_eq!(store.get(&nfc), Some("h".to_string()));
     }
 }

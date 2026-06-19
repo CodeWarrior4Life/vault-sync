@@ -710,6 +710,17 @@ impl VerifyRepair {
                 continue;
             }
 
+            // D5 (S511, TKT-2dc9a17e): conflict-copy stashes
+            // (`<stem>.conflict-from-<host>-<seq>.md`) must NEVER enter the
+            // reconcile manifest, or the backstop would push them up / re-fan
+            // them across hosts (multiplying conflict copies fleet-wide). They
+            // are local-only preservation siblings. Kept aligned with
+            // file_watcher's classify-time exclude.
+            if is_conflict_copy_rel(&rel_str) {
+                tracing::debug!(path = %rel_str, "verify_repair: conflict-copy excluded from manifest");
+                continue;
+            }
+
             // Substrate fence.
             if self.config.respect_substrate_fence {
                 if let PathClassification::Substrate { rule } = classify_path(&rel_str) {
@@ -797,7 +808,13 @@ pub fn roots_to_reconcile_pairs(
 }
 
 fn path_to_forward_slash(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+    // D8 (S511, TKT-2dc9a17e): canonicalize the manifest key to the ONE
+    // fleet-wide form (NFC + forward-slash) so the reconcile manifest path the
+    // server echoes back, the ShadowStore key, and the push wire path all agree
+    // across macOS (NFD on disk), Linux/ext4, and Windows/NTFS. Without this a
+    // non-ASCII filename keys the shadow differently per host, miss -> Pull ->
+    // silent revert.
+    crate::sync_shadow::canonical_sync_path(&p.to_string_lossy())
 }
 
 fn ext_allowed(path: &str, allowed: &[String]) -> bool {
@@ -805,6 +822,16 @@ fn ext_allowed(path: &str, allowed: &[String]) -> bool {
     allowed
         .iter()
         .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
+}
+
+/// D5 (S511): true iff the path's basename is a conflict-copy stash. Mirrors
+/// `file_watcher::is_conflict_copy`, using the same structural parser the
+/// conflict_stash module writes with so a legit note name is never excluded.
+fn is_conflict_copy_rel(rel: &str) -> bool {
+    rel.rsplit('/')
+        .next()
+        .map(|name| crate::conflict_stash::parse_conflict_filename(name).is_some())
+        .unwrap_or(false)
 }
 
 /// Match `prefix` either at the very start of `rel` (most common — e.g.
@@ -974,6 +1001,29 @@ mod tests {
             paths,
             vec!["notes/keeper.md"],
             "node_modules/ (root + nested) must be excluded from the reconcile manifest"
+        );
+    }
+
+    /// D5 (S511, TKT-2dc9a17e): conflict-copy stashes must never enter the
+    /// reconcile manifest (else the backstop pushes them up / re-fans them
+    /// across hosts, multiplying copies). A legit note that merely contains the
+    /// word "conflict" stays in the manifest.
+    #[tokio::test]
+    async fn manifest_excludes_conflict_copies() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "notes/x.conflict-from-trinity-123.md", b"loser");
+        write_file(v, "notes/x.conflict-from-cody-link-9-2.md", b"loser2");
+        write_file(v, "notes/My conflict notes.md", b"legit");
+        write_file(v, "notes/keeper.md", b"alpha");
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let m = vr.build_local_manifest().unwrap();
+        let mut paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["notes/My conflict notes.md", "notes/keeper.md"],
+            "conflict-from stashes excluded; legit 'conflict' note kept"
         );
     }
 

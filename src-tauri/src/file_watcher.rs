@@ -221,7 +221,26 @@ pub struct FileWatcher {
     /// can NEVER suppress a different file or a real content change. Bounded by
     /// the number of distinct paths edited this session (≈ vault size). A delete
     /// clears its entry so a later recreate re-enqueues.
+    ///
+    /// D6 (S511, TKT-2dc9a17e): this in-memory hash is NO LONGER sufficient on
+    /// its own. A push can be dropped (e.g. server HTTP 400 skip) WITHOUT being
+    /// accepted, yet the enqueued_hashes entry is never cleared, so a later edit
+    /// that reverts to that previously-enqueued-but-never-accepted content was
+    /// silently dropped. The dedup is now GATED on the ShadowStore's
+    /// last-server-ACCEPTED hash: an event is suppressed only when the current
+    /// sha equals BOTH the last-enqueued hash AND the shadow's last-accepted
+    /// hash for that path (i.e. the server has actually confirmed that content).
     enqueued_hashes: Arc<Mutex<HashMap<String, String>>>,
+    /// D6 (S511): shared shadow store, the source of the last-server-ACCEPTED
+    /// hash that gates the enqueue dedup (above). `None` keeps pre-S511 behavior
+    /// (enqueued_hashes-only dedup); the production wire-up always sets it.
+    shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// D7 (S511): shared liveness handle. The watcher loop heartbeats into it
+    /// each iteration (`mark_watcher_alive`) and sets the fence
+    /// (`set_watcher_fenced`) when the storm breaker trips, so the watchdog can
+    /// auto-recover a dead/fenced watcher REGARDLESS of pending count. `None`
+    /// keeps pre-S511 behavior (no heartbeat); the production wire-up sets it.
+    sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
 }
 
 impl FileWatcher {
@@ -243,7 +262,24 @@ impl FileWatcher {
             fenced: Arc::new(AtomicBool::new(false)),
             echo_guard: None,
             enqueued_hashes: Arc::new(Mutex::new(HashMap::new())),
+            shadow_store: None,
+            sync_health: None,
         })
+    }
+
+    /// D6 (S511): attach the shared shadow store so the enqueue dedup is gated
+    /// on the last-server-ACCEPTED hash (not the in-memory enqueued hash alone).
+    pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
+        self.shadow_store = Some(store);
+        self
+    }
+
+    /// D7 (S511): attach the shared liveness handle so the watcher loop
+    /// heartbeats and the storm-fence sets the watcher-fenced flag for the
+    /// auto-recovery watchdog.
+    pub fn with_sync_health(mut self, health: Arc<crate::sync_health::SyncHealth>) -> Self {
+        self.sync_health = Some(health);
+        self
     }
 
     /// Builder-style: attach the shared [`EchoGuard`](crate::echo_guard::EchoGuard)
@@ -259,6 +295,21 @@ impl FileWatcher {
     /// halts when this flips; exposed for tests + the loop's halt check.
     pub fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// D7 (S511): heartbeat the shared liveness handle (no-op if unwired).
+    fn mark_watcher_alive(&self) {
+        if let Some(h) = &self.sync_health {
+            h.mark_watcher_alive();
+        }
+    }
+
+    /// D7 (S511): publish the storm-fence into the shared liveness handle so the
+    /// watchdog auto-recovers a fenced watcher (no-op if unwired).
+    fn mark_watcher_fenced(&self) {
+        if let Some(h) = &self.sync_health {
+            h.set_watcher_fenced();
+        }
     }
 
     /// Record the outcome of a journal append for the storm breaker.
@@ -402,6 +453,20 @@ impl FileWatcher {
             return FilterDecision::DropExclude {
                 path: norm,
                 exclude_rule: "macos-junk".to_string(),
+            };
+        }
+
+        // (2d) D5 (S511, TKT-2dc9a17e): conflict-copy stashes
+        // (`<stem>.conflict-from-<host>-<seq>.md`) must NEVER be pushed back to
+        // the server or re-fanned to other hosts (which would re-conflict and
+        // multiply copies across the fleet). The materializer writes them as
+        // local-only preservation siblings; drop them here at classify so they
+        // are inert to sync. Matched by the structural filename parser so a
+        // legitimately-named note is never falsely excluded.
+        if is_conflict_copy(&norm) {
+            return FilterDecision::DropExclude {
+                path: norm,
+                exclude_rule: "conflict-copy".to_string(),
             };
         }
 
@@ -699,8 +764,20 @@ impl FileWatcher {
         // keep `vault_root`, config, journal, burst, device_id.
         let me = Arc::new(self);
         let task = tokio::spawn(async move {
+            // D7 (S511): periodic liveness heartbeat so an IDLE-but-alive watcher
+            // (quiet vault, no FS events) still stamps SyncHealth and is not
+            // mistaken for a dead/hung watch loop. 30s is well under the
+            // watcher-stale window (DEFAULT_WATCHER_STALE_SECS = 300s).
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+            // Stamp once immediately so the watchdog's staleness check arms from
+            // a known-alive baseline the moment the watcher starts.
+            me.mark_watcher_alive();
             loop {
                 tokio::select! {
+                    _ = heartbeat.tick() => {
+                        // Idle or busy, the loop is alive: stamp the heartbeat.
+                        me.mark_watcher_alive();
+                    }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             tracing::info!("file_watcher: shutdown signal received");
@@ -708,6 +785,8 @@ impl FileWatcher {
                         }
                     }
                     maybe = rx.recv() => {
+                        // An event batch arrived: the loop is alive.
+                        me.mark_watcher_alive();
                         match maybe {
                             None => break, // channel closed → debouncer dropped
                             Some(Ok(events)) => {
@@ -737,8 +816,14 @@ impl FileWatcher {
                                 // rather than hot-spin. The loud diagnostic was
                                 // already logged at the trip; this just stops.
                                 if me.is_fenced() {
+                                    // D7 (S511): publish the fence into SyncHealth
+                                    // so the watchdog AUTO-RECOVERS (restart =
+                                    // re-establish the watch) regardless of pending
+                                    // count. The old behavior just logged "restart
+                                    // the daemon" and nothing restarted.
+                                    me.mark_watcher_fenced();
                                     tracing::error!(
-                                        "file_watcher: storm circuit-breaker fenced — halting event loop (see the STORM CIRCUIT-BREAKER diagnostic above; restart the daemon after clearing the journal backlog)"
+                                        "file_watcher: storm circuit-breaker fenced, halting event loop; SyncHealth watcher_fenced set so the watchdog will auto-recover (restart). See the STORM CIRCUIT-BREAKER diagnostic above."
                                     );
                                     break;
                                 }
@@ -840,15 +925,35 @@ impl FileWatcher {
                 // watcher's own path means we can't suppress a different file.
                 // A delete clears the entry (handled below) so a recreate
                 // re-enqueues even if its bytes match the pre-delete content.
+                //
+                // D6 (S511, TKT-2dc9a17e): the dedup is now GATED on the
+                // ShadowStore's last-server-ACCEPTED hash, NOT the in-memory
+                // enqueued hash alone. An event is suppressed only when the
+                // current sha equals BOTH (a) the last-enqueued hash for this
+                // path AND (b) the shadow's last-accepted hash for this path.
+                // Rationale: a push can be DROPPED (e.g. server HTTP 400 skip)
+                // without ever being accepted, yet enqueued_hashes is never
+                // cleared, so a later edit reverting to that content used to be
+                // silently dropped (FM1 data loss). Requiring server-confirmed
+                // acceptance means un-accepted content is always re-enqueued.
+                // When no shadow store is wired, fall back to the prior
+                // enqueued-hash-only behavior (back-compat).
                 if let (Some(sha), Some(p)) = (&content_sha, write_path) {
-                    if self
+                    let enqueued_match = self
                         .enqueued_hashes
                         .lock()
                         .map(|m| m.get(p).map(String::as_str) == Some(sha.as_str()))
-                        .unwrap_or(false)
-                    {
+                        .unwrap_or(false);
+                    let shadow_confirms = match &self.shadow_store {
+                        // Suppress only if the server has ACCEPTED this exact
+                        // content for this path (its last-synced hash == current).
+                        Some(store) => store.get(p).as_deref() == Some(sha.as_str()),
+                        // No shadow store: preserve pre-S511 behavior.
+                        None => true,
+                    };
+                    if enqueued_match && shadow_confirms {
                         tracing::debug!(
-                            "file_watcher: skipping redundant no-op (content == last enqueued) for {p}"
+                            "file_watcher: skipping redundant no-op (content == last enqueued AND server-accepted) for {p}"
                         );
                         return;
                     }
@@ -929,7 +1034,26 @@ pub enum WatchEventKindHint {
 // ---------------------------------------------------------------------------
 
 fn normalize_path(p: &str) -> String {
-    p.replace('\\', "/")
+    // D8/D6c (S511, TKT-2dc9a17e): canonicalize the watcher-relative path to the
+    // ONE fleet-wide form (NFC + forward-slash) so the PUSH WIRE PATH and the
+    // ShadowStore KEY agree across macOS (NFD on disk), Linux/ext4, and
+    // Windows/NTFS. Without this a non-ASCII note name keyed the shadow
+    // differently per host, producing a shadow miss, a Pull, and a silent
+    // revert. APFS and NTFS are normalization-insensitive on lookup so reading
+    // back the NFC form still resolves the on-disk file; the server's canonical
+    // form is also NFC, so server-materialized files are NFC on disk everywhere.
+    crate::sync_shadow::canonical_sync_path(p)
+}
+
+/// D5 (S511): true iff the path's basename is a conflict-copy stash
+/// (`<stem>.conflict-from-<device>-<lsn>[-<n>].md`). Uses the same structural
+/// parser the conflict_stash module writes with, so a legit note name like
+/// `My conflict notes.md` is NOT matched (no `.conflict-from-<device>-<lsn>`).
+fn is_conflict_copy(rel: &str) -> bool {
+    rel.rsplit('/')
+        .next()
+        .map(|name| crate::conflict_stash::parse_conflict_filename(name).is_some())
+        .unwrap_or(false)
 }
 
 fn path_extension(p: &str) -> String {
@@ -1128,6 +1252,81 @@ mod tests {
             2,
             "a real edit (changed bytes) MUST enqueue"
         );
+    }
+
+    /// D6 (S511, TKT-2dc9a17e): with the shadow store wired, the enqueue dedup
+    /// suppresses a duplicate ONLY when the content is server-ACCEPTED (shadow
+    /// records it). A push that was NEVER accepted leaves the shadow unset, so a
+    /// later event re-enqueues instead of being silently dropped (FM1 fix). This
+    /// is the exact "revert to previously-enqueued-but-dropped content" hole.
+    #[tokio::test]
+    async fn d6_dedup_does_not_drop_edit_after_non_accepted_push() {
+        use crate::sync_shadow::ShadowStore;
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let w = make_watcher(&dir, vec![], vec![]).with_shadow_store(shadow.clone());
+
+        let rel = "01_Notes/note.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let bytes = b"---\ntitle: x\n---\nbody\n";
+        std::fs::write(&abs, bytes).unwrap();
+
+        // First event enqueues (records enqueued_hashes[p]=sha).
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.lock().unwrap().len(), 1, "first event enqueues");
+
+        // The push was NOT accepted: the shadow has NO record for this path.
+        // A second identical event must therefore NOT be suppressed (the content
+        // is not server-confirmed) and must re-enqueue.
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            2,
+            "D6: an un-accepted content must re-enqueue, not be silently dropped"
+        );
+
+        // Now simulate the server ACCEPTING that content (push_client records it
+        // in the shadow). A subsequent identical event IS a true no-op and is
+        // suppressed.
+        let sha = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(bytes))
+        };
+        shadow.record(rel, &sha);
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            2,
+            "once server-accepted, a redundant identical event is suppressed"
+        );
+    }
+
+    /// D5 (S511): a conflict-copy stash (`<stem>.conflict-from-<host>-<seq>.md`)
+    /// must be dropped at classify so it is never pushed/re-fanned. A legit note
+    /// name that merely contains the word "conflict" must still pass.
+    #[test]
+    fn d5_conflict_copy_is_excluded_but_legit_name_passes() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        for p in [
+            "01_Notes/note.conflict-from-trinity-123.md",
+            "01_Notes/note.conflict-from-cody-link-4242-2.md",
+            "deep/dir/x.conflict-from-neo-1.md",
+        ] {
+            match w.classify(&modified(p)) {
+                FilterDecision::DropExclude { exclude_rule, .. } => {
+                    assert_eq!(exclude_rule, "conflict-copy", "for {p}");
+                }
+                other => panic!("expected DropExclude(conflict-copy) for {p}, got {other:?}"),
+            }
+        }
+        // A legit note whose name merely contains "conflict" is NOT a stash.
+        match w.classify(&modified("01_Notes/My conflict resolution notes.md")) {
+            FilterDecision::Allow(_) => {}
+            other => panic!("legit 'conflict' note must pass, got {other:?}"),
+        }
     }
 
     /// A delete clears the remembered enqueue-hash, so recreating the file with

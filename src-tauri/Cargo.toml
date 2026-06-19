@@ -46,6 +46,17 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
 walkdir = "2"
+# D8 (S511, TKT-2dc9a17e): NFC canonicalization of all sync path boundaries
+# (shadow key, reconcile manifest, push wire path). macOS persists filenames
+# NFD; ext4/NTFS store bytes verbatim, so a non-ASCII filename desyncs the
+# shadow lookup across hosts, producing a shadow miss, a Pull, and a silent
+# revert. unicode-normalization gives us the NFC pass.
+unicode-normalization = "0.1"
+# D8/D12 (S511): dunce promoted from transitive to DIRECT so the Windows write
+# path can prefix \\?\ on the daemon's own materialize/stash targets (long-path
+# / CreateFileW on a host without LongPathsEnabled). No-op canonicalization on
+# non-Windows platforms, so it is safe to call unconditionally.
+dunce = "1"
 
 [dev-dependencies]
 mockito = "1"

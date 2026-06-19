@@ -203,6 +203,118 @@ pub async fn run_reconciliation_pass(
     result
 }
 
+/// D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path.
+///
+/// If the persistent shadow store loaded EMPTY (fresh install, corrupt-load
+/// reset, manual delete), then WITHOUT seeding every locally-present note would
+/// reach the materializer/reconcile decision with `shadow == None`, fall to
+/// R5 (unknown provenance => CONFLICT), and spawn a `.conflict-from-*` copy for
+/// each of ~28k notes: data-safe (both byte-sets preserved) but an O(N) conflict
+/// avalanche. To avoid it we seed `shadow = server` for every path the host
+/// ALREADY mirrors, BEFORE the first reconcile/SSE decision.
+///
+/// The `GET /api/sync/changes` feed is metadata-only (no content hash), so we
+/// cannot seed straight from it. Instead we build the local manifest and call
+/// `/reconcile-batch`: every `match` delta proves `local == server` and carries
+/// the server hash, so seeding `shadow[path] = server_hash` for matches is
+/// exactly correct and cannot mis-seed. `drift` / `missing-on-server` paths are
+/// deliberately left UNSEEDED so the always-stash path still preserves a genuine
+/// divergence (we never seed a hash we have not proven the local file equals).
+///
+/// Bounded: one manifest build + one reconcile-batch call (the same cost as a
+/// normal reconcile pass). Best-effort: any error is logged and swallowed, the
+/// shadow simply stays empty and the always-stash floor keeps the host safe.
+/// Returns the number of paths seeded.
+pub async fn seed_shadow_from_server_if_empty(
+    vault_root: PathBuf,
+    api: Arc<ApiClient>,
+    device_id: String,
+    shadow: Arc<crate::sync_shadow::ShadowStore>,
+) -> usize {
+    if !shadow.is_empty() {
+        return 0;
+    }
+    tracing::info!(
+        "reconciliation: shadow store empty at startup, seeding shadow=server for already-mirrored notes (D9 avalanche guard)"
+    );
+
+    // Build the local manifest via the SAME machinery the reconcile pass uses
+    // (RASP fence + excludes + extension gate applied identically). VerifyRepair
+    // requires a journal handle but seeding NEVER enqueues a push, so we hand it
+    // a throwaway journal in a temp dir that is dropped when this fn returns.
+    let scratch_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "reconciliation: D9 seed could not create scratch dir, skipping seed");
+            return 0;
+        }
+    };
+    let scratch_journal = match PushJournal::open(&scratch_dir.path().join("seed_scratch.jsonl")) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "reconciliation: D9 seed could not open scratch journal, skipping seed");
+            return 0;
+        }
+    };
+    let vr = VerifyRepair::new(
+        vault_root,
+        Arc::clone(&api),
+        Arc::new(Mutex::new(scratch_journal)),
+        device_id,
+        VerifyRepairConfig::default(),
+    );
+
+    let mut report = VerifyRepairReport::default();
+    let manifest = match vr.build_local_manifest_parallel(&mut report).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "reconciliation: D9 seed manifest build failed, skipping seed");
+            return 0;
+        }
+    };
+    if manifest.is_empty() {
+        return 0;
+    }
+
+    let req = crate::api_client::ReconcileBatchRequest {
+        paths: manifest
+            .iter()
+            .map(|m| crate::api_client::ReconcileBatchItem {
+                path: m.path.clone(),
+                fs_hash: m.content_hash.clone(),
+            })
+            .collect(),
+    };
+    let deltas = match api.reconcile_batch(&req).await {
+        Ok(r) => r.deltas,
+        Err(e) => {
+            tracing::warn!(error = %e, "reconciliation: D9 seed reconcile-batch failed, skipping seed");
+            return 0;
+        }
+    };
+
+    let mut seeded = 0usize;
+    for delta in &deltas {
+        // Only a `match` proves local == server. Seed its server hash so the
+        // first decision sees this path as in-sync (R1/R3), not R5-conflict.
+        if delta.state == "match" {
+            if let Some(h) = delta.server_hash.as_deref() {
+                shadow.record(&delta.path, h);
+                seeded += 1;
+            }
+        }
+    }
+    if let Err(e) = shadow.flush() {
+        tracing::warn!(error = %e, "reconciliation: D9 seed flush failed (will retry on periodic flush)");
+    }
+    tracing::info!(
+        seeded,
+        deltas = deltas.len(),
+        "reconciliation: D9 shadow seed complete"
+    );
+    seeded
+}
+
 /// B4 (Nexus Sync): pure helper that extracts `(root_path, subscriber_id)`
 /// pairs from the config's `sync_roots` list, applying the same fallback
 /// priority as `lib::effective_subscriber_id`:
@@ -486,6 +598,32 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, PathBuf::from("/vaults/Mainframe"));
         assert_eq!(pairs[0].1, "sub-legacy-123");
+    }
+
+    /// D9 (S511, TKT-2dc9a17e): the shadow-wipe seed is a NO-OP when the shadow
+    /// store already has entries (it only seeds an empty/wiped shadow), so a
+    /// warm shadow is never re-seeded and an existing local edit's provenance is
+    /// never overwritten by a blanket server-seed. Returns 0 and makes no API
+    /// call (the unreachable URL would error if it did).
+    #[tokio::test]
+    async fn d9_seed_is_noop_when_shadow_non_empty() {
+        let sdir = tempfile::tempdir().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("notes/already-known.md", "h");
+        assert!(!shadow.is_empty());
+
+        let vdir = tempfile::tempdir().unwrap();
+        let api = Arc::new(ApiClient::new("http://127.0.0.1:1", "vsk_test").unwrap());
+        let seeded = seed_shadow_from_server_if_empty(
+            vdir.path().to_path_buf(),
+            api,
+            "dev-test".to_string(),
+            shadow.clone(),
+        )
+        .await;
+        assert_eq!(seeded, 0, "non-empty shadow must not be re-seeded");
+        // The pre-existing entry is untouched.
+        assert_eq!(shadow.get("notes/already-known.md"), Some("h".to_string()));
     }
 
     /// B4: both roots have explicit subscriber IDs → no fallback needed.

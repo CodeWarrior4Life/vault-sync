@@ -207,12 +207,22 @@ impl ConflictStash {
         }
 
         match self.policy {
-            ConflictPolicy::ServerWins => StashDecision {
-                stash: false,
-                stash_path: None,
-                reason: "server-wins policy: local divergent revision silently overwritten"
-                    .to_string(),
-            },
+            // D3 (S511, TKT-2dc9a17e): there is NO safe no-stash cell for
+            // divergent content. The old `ServerWins => stash:false` arm encoded
+            // the silent overwrite the operator forbids (I-83 NEVER-SILENT-
+            // OVERWRITE). ServerWins now behaves like always-stash: a Class-C
+            // divergence is preserved, not silently reverted. (The live write()
+            // path is now divergence-driven and no longer routes through this
+            // policy at all; this keeps the standalone API safe too.)
+            ConflictPolicy::ServerWins => {
+                let stash_path = self.compute_stash_path(path, device_id, local_lsn.unwrap_or(0));
+                StashDecision {
+                    stash: true,
+                    stash_path: Some(stash_path),
+                    reason: "divergent local revision stashed before overwrite (no silent server-wins; S511 D3)"
+                        .to_string(),
+                }
+            }
             ConflictPolicy::Manual => {
                 let stash_path = self.compute_stash_path(path, device_id, local_lsn.unwrap_or(0));
                 StashDecision {
@@ -265,6 +275,22 @@ impl ConflictStash {
 
         let filename = format!("{stem}.conflict-from-{device_id}-{lsn}.md");
         self.vault_root.join(parent).join(filename)
+    }
+
+    /// D5 (S511): public accessor for the would-be stash path (pre-collision).
+    /// The materializer needs this to record the stash in the echo_guard BEFORE
+    /// `write_stash` is called, so the file_watcher recognizes the conflict-copy
+    /// write as an echo and never enqueues it as a push. The actual on-disk name
+    /// may gain a `-2`/`-3` collision suffix; for echo-keying the base name is
+    /// what the watcher first observes, and a suffixed copy is independently
+    /// excluded by the `*.conflict-from-*.md` name filter.
+    pub fn compute_stash_path_public(
+        &self,
+        original_path: &str,
+        device_id: &str,
+        lsn: u64,
+    ) -> PathBuf {
+        self.compute_stash_path(original_path, device_id, lsn)
     }
 
     /// Write the stashed (losing) revision to disk atomically.
@@ -459,16 +485,27 @@ mod tests {
         ConflictStash::new(PathBuf::from("vault"), policy)
     }
 
+    /// D3 (S511, TKT-2dc9a17e): ServerWins no longer has a silent-overwrite
+    /// cell. A Class-C divergence under ServerWins now STASHES (preserves the
+    /// loser) rather than dropping it. This flips the pre-S511 assertion.
     #[test]
-    fn decide_server_wins_class_c_no_stash() {
+    fn decide_server_wins_class_c_now_stashes() {
         let s = cs(ConflictPolicy::ServerWins);
         let d = s.decide("02_Projects/Foo/normal.md", Some(10), 20, "morpheus");
         assert!(
-            !d.stash,
-            "server-wins+C should NOT stash; reason={}",
+            d.stash,
+            "S511: server-wins+C MUST now stash (no silent overwrite); reason={}",
             d.reason
         );
-        assert!(d.stash_path.is_none());
+        let sp = d
+            .stash_path
+            .expect("class C under server-wins must produce a stash_path now");
+        let name = sp.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "normal.conflict-from-morpheus-10.md");
+        assert!(
+            !d.reason.contains("silently overwritten"),
+            "the misleading silent-overwrite reason text must be gone"
+        );
     }
 
     #[test]

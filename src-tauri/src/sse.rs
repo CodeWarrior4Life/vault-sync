@@ -1,5 +1,5 @@
 use crate::api_client::ApiClient;
-use crate::materializer::Materializer;
+use crate::materializer::{MaterializeOutcome, Materializer, SkipReason};
 use crate::scope::{is_safe_path, path_in_scope};
 use crate::tray_state::{ConnectionStatus, SharedTrayState};
 use eventsource_client::{Client, Error as SseError, SSE};
@@ -9,6 +9,20 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
+
+/// D2 (S511, TKT-2dc9a17e): extract a `u64` change_seq from the SSE envelope's
+/// `lsn`, which the server may send as an integer OR a stringified integer
+/// (the cache_writer stringifies via `str(...)`, the PG trigger emits BIGINT).
+/// Used to deterministically name any conflict stash by server change_seq so
+/// concurrent fleet writers converge on ONE filename instead of N copies.
+/// Returns 0 when absent or unparseable (a `0`-suffixed stash is still valid).
+fn change_seq_from_lsn(lsn: &Option<serde_json::Value>) -> u64 {
+    match lsn {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
+}
 
 fn default_op() -> String {
     "UPSERT".to_string()
@@ -32,10 +46,9 @@ struct Envelope {
     /// stringifies via str(...) but the PG trigger function (notify_vault_
     /// note_change) emits via `txid_current()` which is BIGINT, and any
     /// other future emitter could choose either format. `Value` accepts
-    /// anything serde-deserializable; we don't actually use lsn anywhere
-    /// in the daemon's hot path, just thread it through.
+    /// anything serde-deserializable. S511 D2: we now USE it as the server
+    /// change_seq to deterministically name conflict stashes.
     #[serde(default)]
-    #[allow(dead_code)]
     lsn: Option<serde_json::Value>,
 }
 
@@ -264,14 +277,63 @@ impl SseConsumer {
                         continue;
                     }
                     if env.op == "DELETE" {
+                        // D13 (S511): delete-vs-modify is resolved inside
+                        // soft_delete/the materializer; the consumer just
+                        // forwards the delete intent. Modification-beats-deletion
+                        // and the resurrection guard live below the daemon edge.
                         if let Err(e) = self.materializer.soft_delete(&env.path) {
                             error!("materializer soft_delete failed: {e}");
                         }
                     } else {
+                        // D2 (S511, TKT-2dc9a17e): thread the server change_seq
+                        // (from the SSE envelope lsn) into write() so a conflict
+                        // stash is named deterministically, and HONOR the rich
+                        // outcome instead of blindly trusting write() to overwrite.
+                        let change_seq = change_seq_from_lsn(&env.lsn);
                         match self.api.fetch_note(&env.path).await {
                             Ok(payload) => {
-                                if let Err(e) = self.materializer.write(&payload) {
-                                    error!("materializer write failed: {e}");
+                                match self
+                                    .materializer
+                                    .write_with_change_seq(&payload, change_seq)
+                                {
+                                    Ok(MaterializeOutcome::Skipped(
+                                        SkipReason::LocalEditPreserved,
+                                    )) => {
+                                        // R2: a genuine local edit. Do NOTHING here,
+                                        // the file_watcher/push pipeline carries the
+                                        // edit UP. NEVER overwrite it with the older
+                                        // server copy (the silent-revert bug).
+                                        warn!(
+                                            path = %env.path,
+                                            "sse: local edit preserved (R2), not overwritten; push pipeline will carry it up"
+                                        );
+                                    }
+                                    Ok(MaterializeOutcome::Stashed { stash_path }) => {
+                                        warn!(
+                                            path = %env.path,
+                                            stash = %stash_path.display(),
+                                            "sse: CONFLICT, stashed local revision then materialized server winner"
+                                        );
+                                    }
+                                    Ok(MaterializeOutcome::Wrote { .. })
+                                    | Ok(MaterializeOutcome::Skipped(_)) => {
+                                        debug!(path = %env.path, "sse: materialized server note");
+                                    }
+                                    Ok(MaterializeOutcome::IntegrityFailed {
+                                        expected_sha,
+                                        actual_sha,
+                                        ..
+                                    }) => {
+                                        error!(
+                                            path = %env.path,
+                                            expected = %expected_sha,
+                                            actual = %actual_sha,
+                                            "sse: materializer integrity check FAILED"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("materializer write failed: {e}");
+                                    }
                                 }
                             }
                             Err(e) => error!("body fetch failed for {}: {e}", env.path),

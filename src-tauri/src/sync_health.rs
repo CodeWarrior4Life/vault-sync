@@ -55,7 +55,7 @@
 //! Both env vars share the same reader trait as [`crate::reconciliation`]
 //! so tests do not touch process env.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,21 @@ pub struct SyncHealth {
     /// was called. We store the offset against `start` rather than the
     /// `Instant` itself so the atomic stays lock-free.
     last_progress_secs: AtomicU64,
+    /// D7 (S511, TKT-2dc9a17e): monotonic seconds since process start, last time
+    /// the FILE WATCHER loop iterated (`mark_watcher_alive`). A live OS process
+    /// with a DEAD/stuck watcher loop accepts no local edits but reports healthy
+    /// to a pending-only watchdog: this heartbeat makes a stale watcher visible.
+    /// Initialized to a sentinel meaning "watcher not yet started" so a host
+    /// before its first watch loop is NOT flagged stale.
+    last_watcher_alive_secs: AtomicU64,
+    /// D7: set true when the file_watcher's storm circuit-breaker trips. The
+    /// watchdog auto-recovers (restart) on this REGARDLESS of pending count,
+    /// because a fenced watcher will never drain on its own (the old behavior
+    /// logged "restart the daemon" and nothing did).
+    watcher_fenced: AtomicBool,
+    /// True once `mark_watcher_alive` has ever been called, so the watchdog's
+    /// staleness check does not fire during the pre-watch startup window.
+    watcher_started: AtomicBool,
     start: Instant,
 }
 
@@ -90,6 +105,9 @@ impl SyncHealth {
         Arc::new(Self {
             // Initialize as "just made progress" -- startup is not a stall.
             last_progress_secs: AtomicU64::new(0),
+            last_watcher_alive_secs: AtomicU64::new(0),
+            watcher_fenced: AtomicBool::new(false),
+            watcher_started: AtomicBool::new(false),
             start: Instant::now(),
         })
     }
@@ -110,6 +128,37 @@ impl SyncHealth {
         let last = self.last_progress_secs.load(Ordering::Relaxed);
         now.saturating_sub(last)
     }
+
+    /// D7 (S511): stamp "the file_watcher loop is alive" -- called once per
+    /// watcher event-loop iteration. Also marks the watcher as started so the
+    /// staleness check arms only after the first heartbeat.
+    pub fn mark_watcher_alive(&self) {
+        let secs = self.start.elapsed().as_secs();
+        self.last_watcher_alive_secs.store(secs, Ordering::Relaxed);
+        self.watcher_started.store(true, Ordering::Relaxed);
+    }
+
+    /// D7 (S511): seconds since the last `mark_watcher_alive`. Returns 0 when
+    /// the watcher has not started yet (no heartbeat to be stale against).
+    pub fn secs_since_watcher_alive(&self) -> u64 {
+        if !self.watcher_started.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let now = self.start.elapsed().as_secs();
+        let last = self.last_watcher_alive_secs.load(Ordering::Relaxed);
+        now.saturating_sub(last)
+    }
+
+    /// D7 (S511): mark the file_watcher storm circuit-breaker as fenced. The
+    /// watchdog auto-recovers on this regardless of pending count.
+    pub fn set_watcher_fenced(&self) {
+        self.watcher_fenced.store(true, Ordering::Relaxed);
+    }
+
+    /// D7 (S511): true iff the watcher storm-fence has tripped.
+    pub fn is_watcher_fenced(&self) -> bool {
+        self.watcher_fenced.load(Ordering::Relaxed)
+    }
 }
 
 /// Pure decision: should the watchdog declare the push pipeline stalled?
@@ -125,6 +174,57 @@ impl SyncHealth {
 /// behavior without spawning a tokio task or touching real time.
 pub fn is_stalled(pending: usize, secs_since_progress: u64, threshold_secs: u64) -> bool {
     pending > 0 && secs_since_progress >= threshold_secs
+}
+
+/// D7 (S511, TKT-2dc9a17e): default watcher-heartbeat staleness window. The
+/// watcher loop heartbeats on every event AND we drive a periodic liveness
+/// tick, so a watcher that has not stamped in this long is hung/dead. 300s is
+/// comfortably above any debounce/inotify latency yet well under the 15-min
+/// push-stall window, so a dead watcher surfaces fast.
+pub const DEFAULT_WATCHER_STALE_SECS: u64 = 300;
+
+/// D7 (S511): why the watchdog should fire. Distinguishes the push-pipeline
+/// stall (pending diffs, no drain) from the watcher-side failures (storm-fence
+/// tripped, or the watch loop went silent), which must recover REGARDLESS of
+/// pending count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryTrigger {
+    /// Push pipeline silent with pending diffs (the 2026-06-13 dormancy class).
+    PushStall,
+    /// The file_watcher storm circuit-breaker fenced; it will never auto-resume.
+    WatcherFenced,
+    /// The file_watcher loop heartbeat went stale (hung/dead watch task).
+    WatcherStale,
+}
+
+/// D7 (S511): pure combined recovery decision. Fires on ANY of:
+/// * a push stall (`pending > 0` and no progress within `progress_threshold`), OR
+/// * the watcher storm-fence tripped (`watcher_fenced`), OR
+/// * the watcher heartbeat stale (`secs_since_watcher_alive >= watcher_threshold`),
+///
+/// the last two REGARDLESS of pending count (a fenced/dead watcher accepts no
+/// local edits, so there may be zero pending and the pending-only check would
+/// never fire). Returns the first matching trigger, push-stall first so the
+/// existing dormancy semantics are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_trigger(
+    pending: usize,
+    secs_since_progress: u64,
+    progress_threshold: u64,
+    watcher_fenced: bool,
+    secs_since_watcher_alive: u64,
+    watcher_threshold: u64,
+) -> Option<RecoveryTrigger> {
+    if is_stalled(pending, secs_since_progress, progress_threshold) {
+        return Some(RecoveryTrigger::PushStall);
+    }
+    if watcher_fenced {
+        return Some(RecoveryTrigger::WatcherFenced);
+    }
+    if secs_since_watcher_alive >= watcher_threshold {
+        return Some(RecoveryTrigger::WatcherStale);
+    }
+    None
 }
 
 /// Read the stall threshold from env, falling back to the default. Treats
@@ -185,21 +285,39 @@ where
         // during the brief startup window before the push pipeline has run
         // its first drain_once.
         ticker.tick().await;
+        // D7 (S511): the watcher-staleness window. Read once at arm time; env
+        // override shares the threshold reader convention.
+        let watcher_threshold = DEFAULT_WATCHER_STALE_SECS;
         loop {
             ticker.tick().await;
             let pending = pending_fn().await;
             let elapsed = health.secs_since_progress();
-            if is_stalled(pending, elapsed, threshold.as_secs()) {
+            // D7: combined decision, fires on push-stall OR watcher-fenced OR
+            // watcher-heartbeat-stale (the latter two regardless of pending).
+            let fenced = health.is_watcher_fenced();
+            let watcher_idle = health.secs_since_watcher_alive();
+            if let Some(trigger) = recovery_trigger(
+                pending,
+                elapsed,
+                threshold.as_secs(),
+                fenced,
+                watcher_idle,
+                watcher_threshold,
+            ) {
                 let event = StallEvent {
                     pending,
                     secs_since_progress: elapsed,
                     recovery_will_restart: !recovery_disabled,
+                    trigger,
                 };
                 tracing::error!(
                     pending,
                     secs_since_progress = elapsed,
+                    watcher_fenced = fenced,
+                    secs_since_watcher_alive = watcher_idle,
+                    ?trigger,
                     recovery_disabled,
-                    "sync_health: STALL detected -- push pipeline silent with pending diffs"
+                    "sync_health: RECOVERY triggered (push stall, watcher fenced, or watcher heartbeat stale)"
                 );
                 on_stall(event);
                 // After a recovery action the process is going down (or
@@ -222,6 +340,9 @@ pub struct StallEvent {
     /// callback is expected to call `app.restart()` after notifying. `false`
     /// means notify + log only (kill-switched host).
     pub recovery_will_restart: bool,
+    /// D7 (S511): which signal triggered recovery (push stall vs watcher
+    /// fenced vs watcher stale). Lets the recovery callback log a precise cause.
+    pub trigger: RecoveryTrigger,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +434,88 @@ mod tests {
             ),
             "elapsed = threshold - 1 must NOT trip"
         );
+    }
+
+    // ------------- D7 recovery_trigger pure-decision tests -------------
+
+    /// D7 (S511, TKT-2dc9a17e): a fenced watcher MUST trigger recovery even with
+    /// ZERO pending diffs (a fenced watcher accepts no edits, so pending stays
+    /// 0, and the pending-only check would never fire). This is the regression
+    /// that previously logged "restart the daemon" and nothing restarted.
+    #[test]
+    fn recovery_trigger_fires_on_watcher_fenced_with_zero_pending() {
+        let t = recovery_trigger(
+            0, // no pending
+            0, // recent progress
+            DEFAULT_STALL_THRESHOLD_SECS,
+            true, // watcher FENCED
+            0,    // watcher heartbeat fresh
+            DEFAULT_WATCHER_STALE_SECS,
+        );
+        assert_eq!(t, Some(RecoveryTrigger::WatcherFenced));
+    }
+
+    /// D7: a stale watcher heartbeat MUST trigger recovery regardless of pending.
+    #[test]
+    fn recovery_trigger_fires_on_watcher_stale_with_zero_pending() {
+        let t = recovery_trigger(
+            0,
+            0,
+            DEFAULT_STALL_THRESHOLD_SECS,
+            false,
+            DEFAULT_WATCHER_STALE_SECS, // heartbeat exactly at the stale window
+            DEFAULT_WATCHER_STALE_SECS,
+        );
+        assert_eq!(t, Some(RecoveryTrigger::WatcherStale));
+    }
+
+    /// D7: the push-stall path is preserved and reported with its own trigger.
+    #[test]
+    fn recovery_trigger_push_stall_takes_priority() {
+        let t = recovery_trigger(
+            5,                            // pending diffs
+            DEFAULT_STALL_THRESHOLD_SECS, // no progress past threshold
+            DEFAULT_STALL_THRESHOLD_SECS,
+            true, // even with fenced also true
+            DEFAULT_WATCHER_STALE_SECS,
+            DEFAULT_WATCHER_STALE_SECS,
+        );
+        assert_eq!(
+            t,
+            Some(RecoveryTrigger::PushStall),
+            "push stall is reported first"
+        );
+    }
+
+    /// D7: a healthy daemon (no pending, fresh progress, watcher alive, not
+    /// fenced) MUST NOT trigger recovery.
+    #[test]
+    fn recovery_trigger_none_when_healthy() {
+        let t = recovery_trigger(
+            0,
+            0,
+            DEFAULT_STALL_THRESHOLD_SECS,
+            false,
+            0,
+            DEFAULT_WATCHER_STALE_SECS,
+        );
+        assert_eq!(t, None);
+    }
+
+    /// D7: SyncHealth watcher heartbeat + fence state-machine round-trips.
+    #[test]
+    fn sync_health_watcher_heartbeat_and_fence() {
+        let h = SyncHealth::new();
+        // Before any heartbeat, staleness reads 0 (watcher not started).
+        assert_eq!(h.secs_since_watcher_alive(), 0);
+        assert!(!h.is_watcher_fenced());
+        h.mark_watcher_alive();
+        assert!(
+            h.secs_since_watcher_alive() < 5,
+            "fresh heartbeat is near-zero"
+        );
+        h.set_watcher_fenced();
+        assert!(h.is_watcher_fenced());
     }
 
     // ------------- SyncHealth state-machine tests -------------
