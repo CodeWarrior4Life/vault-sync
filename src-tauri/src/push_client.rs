@@ -469,14 +469,44 @@ impl PushClient {
         };
         let content_b64 = B64.encode(&content_bytes);
 
+        // I29 (S513, TKT-2dc9a17e): backfill the CAS base from the shadow store.
+        //
+        // file_watcher emits real-time Create/Modify pushes with base_hash=None —
+        // it explicitly delegates base-sourcing to THIS layer (see
+        // file_watcher::to_push_event: "the push_client backfills base_hash by
+        // reading the materializer index before sending"). That backfill was never
+        // implemented: we sent "" for None. The server treats base "" + an
+        // existing row as a CAS conflict (sync_routes_p1 _cas_write_note_and_state:
+        // `if base_hash == "" && current is not None -> conflict`). So every
+        // real-time push of an already-synced note that genuinely diverged 409'd →
+        // D4 stash → conflict-copy avalanche on live start, AND a conflict copy on
+        // every steady-state local edit to an existing note.
+        //
+        // The shadow store holds our last-known server hash for the path (D9 seeds
+        // it = server on startup for match+drift; we record() it on every accepted
+        // push/pull below), so it IS the correct CAS base. Sending it makes the
+        // server see base == current → WRITE (operator-ratified local-wins-push-up
+        // for a genuine edit); identical content is already a server-side
+        // idempotent no-op; and a stale shadow (server truly moved since we synced)
+        // still 409s → correctly stashed as a REAL conflict. Pushes that already
+        // carry an explicit base (verify_repair::build_modify_push passes the
+        // reconcile delta's server_hash) are honored verbatim. Delete carries no
+        // meaningful base and a genuine new file has no shadow entry → "" → CREATE.
+        let backfilled_base: Option<String> = match (&evt.base_hash, &evt.action) {
+            (Some(b), _) => Some(b.clone()),
+            (None, PushAction::Delete) => None,
+            (None, _) => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
+        };
+
         let req = PushRequest {
             device_id: &self.device_id,
             path: &evt.path,
             content_b64: &content_b64,
-            // Server requires base_hash as a non-optional string. When the
-            // client has no known server base (None), send "" — server treats
-            // it as "no known base" (accept if absent, else 409 conflict).
-            base_hash: evt.base_hash.as_deref().unwrap_or(""),
+            // The server-side CAS base (checked against
+            // vault_reconcile_state.fs_hash). Prefer the event's explicit base
+            // (reconcile pushes), else the shadow-backfilled base (file_watcher
+            // pushes); "" only when we truly have no known base → server CREATEs.
+            base_hash: backfilled_base.as_deref().unwrap_or(""),
             action,
         };
 
@@ -1269,6 +1299,108 @@ mod tests {
         // Conflict is terminal — event was ack'd (resolver handles refetch+replay).
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
+    }
+
+    /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
+    /// delegates base-sourcing to the push_client (see file_watcher::to_push_event).
+    /// The push MUST backfill the CAS base from the shadow store (our last-known
+    /// server hash) — NOT send "". Sending "" made the server reject every
+    /// divergent already-synced-note push as a CAS conflict (base "" + row exists
+    /// → 409) → D4 stash → conflict-copy avalanche. With the shadow base on the
+    /// wire the server sees base == current → accepts (operator-ratified local
+    /// wins). This asserts the BASE ON THE WIRE is the shadow hash.
+    #[tokio::test]
+    async fn modify_with_none_base_backfills_cas_base_from_shadow() {
+        let server_hash = "a".repeat(64); // the shadow's last-known server hash
+        let mut srv = Server::new_async().await;
+        // The mock ONLY matches if the request carries base_hash == shadow hash;
+        // if the fix regresses to "" the request won't match → push not Sent.
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"base_hash":"{server_hash}"}}"#
+            )))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        // file_watcher-style event: base_hash=None, Modify, content differs from
+        // the shadow (a genuine local edit on an already-synced note).
+        let fw_evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: "notes/edited.md".to_string(),
+            action: PushAction::Modify,
+            base_hash: None,
+            content_sha: sha256_hex(b"new local body"),
+            content_bytes: Some(b"new local body".to_vec()),
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        };
+        let (_d, journal) = make_journal_with(vec![fw_evt]);
+
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("notes/edited.md", &server_hash);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_shadow_store(shadow);
+
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "shadow-backfilled base must let the push be accepted, got {:?}",
+            outcomes[0].1
+        );
+        m.assert_async().await; // proves base_hash on the wire == shadow hash
+    }
+
+    /// I29 corollary: a genuine NEW file (Modify/None base, NO shadow entry) must
+    /// still send base "" so the server CREATEs the row — the backfill must never
+    /// invent a base out of thin air.
+    #[tokio::test]
+    async fn modify_with_none_base_and_no_shadow_entry_sends_empty_base() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"base_hash":""}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let fw_evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: "notes/brand-new.md".to_string(),
+            action: PushAction::Modify,
+            base_hash: None,
+            content_sha: sha256_hex(b"brand new"),
+            content_bytes: Some(b"brand new".to_vec()),
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        };
+        let (_d, journal) = make_journal_with(vec![fw_evt]);
+
+        // Shadow store present but EMPTY (no entry for this path).
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_shadow_store(shadow);
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        m.assert_async().await;
     }
 
     /// D4 (S511, TKT-2dc9a17e): a local push that loses the server CAS race

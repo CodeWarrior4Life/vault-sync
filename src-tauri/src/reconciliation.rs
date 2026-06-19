@@ -294,13 +294,30 @@ pub async fn seed_shadow_from_server_if_empty(
     };
 
     let mut seeded = 0usize;
+    let mut seeded_drift = 0usize;
     for delta in &deltas {
-        // Only a `match` proves local == server. Seed its server hash so the
-        // first decision sees this path as in-sync (R1/R3), not R5-conflict.
-        if delta.state == "match" {
+        // S511 first-run convergence (operator-ratified local-wins-push-up).
+        // Seed shadow = the server's CURRENT hash for BOTH `match` AND `drift`:
+        //  - match (local == server): first decision is R1/R3 (in sync), no churn.
+        //  - drift (local != server): seeding shadow == server makes the first
+        //    decision R2 (genuine local edit) -> PUSH the local copy UP with the
+        //    CAS base = server's current hash (CAS passes, local wins), instead of
+        //    R5-CONFLICT. On a fleet that drifted while sync was down, R5 spawned a
+        //    ~1150-file conflict-copy avalanche and could not converge. This also
+        //    re-applies the operator's full local notes over server-side
+        //    frontmatter-stripped bodies. The rare "server had a newer copy from
+        //    another host" case is covered by the server version-history trigger
+        //    plus the pre-converge backups.
+        // `missing-on-server` has no server row to seed; the reconcile pass
+        // PUSH-creates it (base="").
+        let st = delta.state.as_str();
+        if st == "match" || st == "drift" {
             if let Some(h) = delta.server_hash.as_deref() {
                 shadow.record(&delta.path, h);
                 seeded += 1;
+                if st == "drift" {
+                    seeded_drift += 1;
+                }
             }
         }
     }
@@ -309,8 +326,9 @@ pub async fn seed_shadow_from_server_if_empty(
     }
     tracing::info!(
         seeded,
+        seeded_drift,
         deltas = deltas.len(),
-        "reconciliation: D9 shadow seed complete"
+        "reconciliation: D9 shadow seed complete (drift notes will push local-up to converge)"
     );
     seeded
 }
