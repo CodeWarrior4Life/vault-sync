@@ -544,12 +544,30 @@ impl Materializer {
             // last-synced server hash recorded in the shadow.
             let local_eq_shadow = shadow.as_deref() == Some(local_raw_sha.as_str());
 
-            match decide(
+            // S513 anti-strip guard (TKT-2dc9a17e): never let a pull/overwrite
+            // drop YAML frontmatter the local note holds. The server still
+            // serves frontmatter-stripped bodies for some notes; without this an
+            // R3 pull strips local SILENTLY and an R5 pull strips it (preserving
+            // a conflict copy). Gate the raw R1-R5 decision through the guard.
+            let raw_decision = decide(
                 local_eq_server,
                 shadow.is_some(),
                 shadow_eq_server,
                 local_eq_shadow,
-            ) {
+            );
+            let pull_would_strip = starts_with_frontmatter(&local_bytes)
+                && !starts_with_frontmatter(content_bytes);
+            if pull_would_strip
+                && matches!(raw_decision, Decision::PullClean | Decision::Conflict)
+            {
+                warn!(
+                    path = %payload.path,
+                    ?raw_decision,
+                    change_seq,
+                    "materializer ANTI-STRIP GUARD (S513): server version drops YAML frontmatter local holds — REFUSING pull, PRESERVING local (will push up)"
+                );
+            }
+            match guard_no_frontmatter_strip(raw_decision, pull_would_strip) {
                 Decision::Noop => {
                     info!(
                         path = %payload.path,
@@ -895,6 +913,43 @@ pub fn decide(
     // R4: shadow present, server moved, AND local moved too => both diverged
     // from the last-synced base => true conflict (stash the local loser).
     Decision::Conflict
+}
+
+/// True iff `content` begins with a YAML frontmatter fence (`---` on line 1),
+/// tolerating a leading UTF-8 BOM and CRLF. Cheap structural check — does NOT
+/// validate the YAML. Used only to detect the frontmatter-strip data-loss case.
+pub fn starts_with_frontmatter(content: &[u8]) -> bool {
+    let s = match std::str::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let no_bom = s.strip_prefix('\u{feff}').unwrap_or(s);
+    no_bom.starts_with("---\n") || no_bom.starts_with("---\r\n") || no_bom == "---"
+}
+
+/// S513 anti-strip guard (TKT-2dc9a17e). A pull/overwrite decision (R3
+/// `PullClean` or R4/R5 `Conflict`) that would OVERWRITE a local note holding
+/// YAML frontmatter with a server version that LACKS it is the frontmatter-strip
+/// data-loss vector: the server still serves frontmatter-stripped bodies for
+/// some notes, and a pull (R3 silently, R5 with a conflict copy) propagates that
+/// stripping into the local vault — the exact disaster this whole change exists
+/// to kill, reappearing on the PULL side. We refuse: downgrade to
+/// `PreserveLocalEdit` so the daemon keeps the full local copy and pushes it UP
+/// instead of pulling the stripped version DOWN. Structural + scope-independent:
+/// it holds no matter how many server bodies are stripped. The deliberate
+/// trade-off is that a *genuine* server-side frontmatter removal is not pulled
+/// (rare; erring toward preserving the owner's metadata is correct). Only gates
+/// the two overwriting decisions — Noop/PreserveLocalEdit are returned untouched.
+pub fn guard_no_frontmatter_strip(
+    decision: Decision,
+    pull_would_strip_frontmatter: bool,
+) -> Decision {
+    if pull_would_strip_frontmatter
+        && matches!(decision, Decision::PullClean | Decision::Conflict)
+    {
+        return Decision::PreserveLocalEdit;
+    }
+    decision
 }
 
 // ---------------------------------------------------------------------------
@@ -2056,6 +2111,50 @@ mod tests {
         assert_eq!(decide(false, true, false, true), Decision::PullClean);
         // R4: shadow present, server moved AND local moved (neither equals) => Conflict.
         assert_eq!(decide(false, true, false, false), Decision::Conflict);
+    }
+
+    /// S513 anti-strip guard (TKT-2dc9a17e): a pull/overwrite (R3 PullClean or
+    /// R4/R5 Conflict) that would DROP YAML frontmatter local holds MUST be
+    /// downgraded to PreserveLocalEdit (keep local, push up). Without this, the
+    /// server's frontmatter-stripped bodies propagate DOWN into local vaults via
+    /// pull. Noop/PreserveLocalEdit and the no-strip case pass through untouched.
+    #[test]
+    fn guard_downgrades_frontmatter_stripping_pulls() {
+        // strip=true: the two OVERWRITING decisions become PreserveLocalEdit.
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::PullClean, true),
+            Decision::PreserveLocalEdit,
+            "R3 silent pull that strips frontmatter must be refused"
+        );
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::Conflict, true),
+            Decision::PreserveLocalEdit,
+            "R5 conflict pull that strips frontmatter must be refused"
+        );
+        // strip=true but NON-overwriting decisions are untouched.
+        assert_eq!(guard_no_frontmatter_strip(Decision::Noop, true), Decision::Noop);
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::PreserveLocalEdit, true),
+            Decision::PreserveLocalEdit
+        );
+        // strip=false: zero behavior change (every decision passes through).
+        assert_eq!(guard_no_frontmatter_strip(Decision::PullClean, false), Decision::PullClean);
+        assert_eq!(guard_no_frontmatter_strip(Decision::Conflict, false), Decision::Conflict);
+        assert_eq!(guard_no_frontmatter_strip(Decision::Noop, false), Decision::Noop);
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::PreserveLocalEdit, false),
+            Decision::PreserveLocalEdit
+        );
+    }
+
+    #[test]
+    fn starts_with_frontmatter_detects_yaml_fence() {
+        assert!(starts_with_frontmatter(b"---\naliases: []\n---\nbody"));
+        assert!(starts_with_frontmatter(b"---\r\ntype: note\r\n---\r\nbody"));
+        assert!(starts_with_frontmatter("\u{feff}---\nx: 1\n---\n".as_bytes()));
+        assert!(!starts_with_frontmatter(b"> [!info] Contact Info\nno frontmatter here"));
+        assert!(!starts_with_frontmatter(b"# Heading\n\n---\nnot a leading fence"));
+        assert!(!starts_with_frontmatter(b""));
     }
 
     /// R2 end-to-end: shadow records the server hash as last-synced, the local
