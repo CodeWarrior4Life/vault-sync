@@ -30,23 +30,38 @@
 ///   intermediate segments between `prefix` and the file.
 ///
 /// Order matters only insofar as the first hit wins (we short-circuit).
-const SUBSTRATE_PATH_RULES: &[SubstrateRule] = &[
-    // Vault-wide pointer files (any depth, case-insensitive basename)
-    SubstrateRule::ExactSuffix("00_VAULT.md"),
-    SubstrateRule::ExactSuffix("CLAUDE.md"),
-    SubstrateRule::ExactSuffix("GEMINI.md"),
-    SubstrateRule::ExactSuffix("AGENTS.md"),
-    // Scoped pointer files — fence ONLY under 02_Projects/**
-    SubstrateRule::ScopedSuffix("02_Projects/", "Family.md"),
-    SubstrateRule::ScopedSuffix("02_Projects/", "Mission.md"),
-    // Substrate prefixes
-    SubstrateRule::PathPrefix("02_Projects/Protocols/"),
-    SubstrateRule::PathPrefix("_project/"),
-    SubstrateRule::PathPrefix("_rapport/people/"),
-    SubstrateRule::PathPrefix("_rapport/groups/"),
-    SubstrateRule::PathPrefix("_rapport/triage/"),
-];
+///
+/// S018 / "substrate must sync" (2026-06-20): the rule list is now EMPTY.
+///
+/// The daemon previously fenced substrate paths OUT of sync in both
+/// directions (never pushed, never materialized) to honor RASP's Substrate
+/// Layer Inviolability corollary. That was a categorical error: it conflated
+/// *transport* (faithfully replicating canonical bytes — exactly what RASP
+/// WANTS, "the substrate is the singular source of truth everywhere") with
+/// *mutation* (transforming content — what RASP actually forbids). Fencing
+/// substrate out of transport made every host carry a divergent copy — the
+/// precise divergence RASP exists to prevent.
+///
+/// Operator ruling: "substrate needs to move; the junk fence is important."
+/// So substrate now transports as ordinary CONTENT, protected by the same
+/// conflict-stash / newer-wins / anti-strip machinery as any note. The SERVER
+/// already accepts substrate (its baseline excludes are junk-only), so the
+/// fix is daemon-only and lives here: with no rules, `classify_path` always
+/// returns `Content` and every downstream consumer uniformly stops refusing
+/// substrate. `is_junk_path` (below) is UNCHANGED — the junk fence stays.
+///
+/// To revert (restore the substrate fence), repopulate this list with the
+/// `SubstrateRule` entries that were here historically — no consumer changes
+/// are needed because the `Substrate` classification path is still wired.
+const SUBSTRATE_PATH_RULES: &[SubstrateRule] = &[];
 
+/// Closed enumeration of substrate-path rule kinds. The runtime rule list
+/// (`SUBSTRATE_PATH_RULES`) is EMPTY ("substrate must sync", 2026-06-20), so no
+/// rule is ever constructed and substrate transports as content. The variants
+/// are kept (with the matcher arms in `classify_path`) so the fence is restored
+/// simply by repopulating the rule list — zero consumer-site changes. While the
+/// list is empty the variants are statically unconstructed, hence the allow.
+#[allow(dead_code)] // restored when SUBSTRATE_PATH_RULES is repopulated
 #[derive(Debug, Clone, Copy)]
 enum SubstrateRule {
     /// Path equals or ends with `/<literal>` (matches both root-level
@@ -81,10 +96,16 @@ impl SubstrateRule {
 /// Outcome of classifying a path against the RASP fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClassification {
-    /// Path is regular content — daemon may materialize.
+    /// Path is regular content — daemon may materialize. Since the substrate
+    /// fence was lifted ("substrate must sync"), `classify_path` ALWAYS returns
+    /// this; substrate transports as content.
     Content,
     /// Path is RASP-protected substrate. `rule` is the static label of the
     /// matching rule (suitable for structured log fields + tray counters).
+    /// Constructed only when `SUBSTRATE_PATH_RULES` has entries (currently
+    /// empty), so at runtime it never occurs — but it is still referenced by
+    /// `classify_path`'s matcher and every consumer's match arms, so the fence
+    /// is restored by repopulating the rule list without touching any consumer.
     Substrate { rule: &'static str },
 }
 
@@ -240,177 +261,117 @@ pub fn is_junk_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
-    // --- Preserved tests from v0.2.0 ---
+    // --- "substrate must sync" inversion (2026-06-20) ---
+    //
+    // The substrate fence is lifted: `SUBSTRATE_PATH_RULES` is empty, so EVERY
+    // path classifies as `Content` and `is_substrate_path` is always false.
+    // The former substrate paths (00_VAULT.md, CLAUDE.md, Protocols/, _project/,
+    // _rapport/{people,groups,triage}/, scoped Mission.md/Family.md) now
+    // transport as ordinary content. The tests below pin that inversion: each
+    // former-substrate path is now NOT substrate / IS content.
 
     #[test]
-    fn root_00_vault_is_substrate() {
-        assert!(is_substrate_path("00_VAULT.md"));
+    fn root_00_vault_is_content_now() {
+        assert!(!is_substrate_path("00_VAULT.md"));
     }
 
     #[test]
-    fn nested_00_vault_is_substrate() {
-        assert!(is_substrate_path("02_Projects/Nexus/00_VAULT.md"));
-        assert!(is_substrate_path("01_Inbox/00_VAULT.md"));
+    fn nested_00_vault_is_content_now() {
+        assert!(!is_substrate_path("02_Projects/Nexus/00_VAULT.md"));
+        assert!(!is_substrate_path("01_Inbox/00_VAULT.md"));
     }
 
     #[test]
-    fn mission_md_is_substrate_under_projects() {
-        // Mission.md is now SCOPED to 02_Projects/** (no longer matches at root).
-        assert!(is_substrate_path("02_Projects/Nexus/Mission.md"));
+    fn mission_md_under_projects_is_content_now() {
+        assert!(!is_substrate_path("02_Projects/Nexus/Mission.md"));
+        assert!(!is_substrate_path("02_Projects/Bar/Mission.md"));
+        assert!(!is_substrate_path("02_Projects/Foo/CLAUDE.md"));
     }
 
     #[test]
-    fn family_md_is_substrate_under_projects() {
-        // Same scoping change as Mission.md.
-        assert!(is_substrate_path("02_Projects/Grosse/Family.md"));
+    fn family_md_under_projects_is_content_now() {
+        assert!(!is_substrate_path("02_Projects/Grosse/Family.md"));
+        assert!(!is_substrate_path("02_Projects/Family.md"));
     }
 
     #[test]
-    fn protocols_dir_is_substrate() {
-        assert!(is_substrate_path("02_Projects/Protocols/foo.md"));
-        assert!(is_substrate_path("02_Projects/Protocols/sub/bar.md"));
+    fn protocols_dir_is_content_now() {
+        assert!(!is_substrate_path("02_Projects/Protocols/foo.md"));
+        assert!(!is_substrate_path("02_Projects/Protocols/sub/bar.md"));
+        assert!(!is_substrate_path("02_Projects/Protocols/anything.md"));
     }
 
     #[test]
-    fn project_dir_is_substrate() {
-        assert!(is_substrate_path("_project/anything.md"));
+    fn project_dir_is_content_now() {
+        assert!(!is_substrate_path("_project/anything.md"));
+        assert!(!is_substrate_path("_project/test.md"));
     }
 
     #[test]
-    fn rapport_people_dir_is_substrate() {
-        assert!(is_substrate_path("_rapport/people/cyril.md"));
-        assert!(is_substrate_path("_rapport/people/sub/x.md"));
+    fn rapport_people_dir_is_content_now() {
+        assert!(!is_substrate_path("_rapport/people/cyril.md"));
+        assert!(!is_substrate_path("_rapport/people/sub/x.md"));
+        assert!(!is_substrate_path("_rapport/people/alice.md"));
     }
 
     #[test]
-    fn rapport_non_fenced_subdirs_not_substrate() {
-        // people/groups/triage are fenced — other rapport dirs are content.
+    fn rapport_groups_is_content_now() {
+        assert!(!is_substrate_path("_rapport/groups/dev-team.md"));
+    }
+
+    #[test]
+    fn rapport_triage_is_content_now() {
+        assert!(!is_substrate_path("_rapport/triage/inbox.md"));
+    }
+
+    #[test]
+    fn rapport_non_fenced_subdirs_still_content() {
+        // These were always content and remain content.
         assert!(!is_substrate_path("_rapport/cards/foo.md"));
         assert!(!is_substrate_path("_rapport/conversations/x.md"));
     }
 
     #[test]
-    fn ordinary_content_not_substrate() {
+    fn pointer_files_are_content_now() {
+        // 00_VAULT/CLAUDE/GEMINI/AGENTS at any depth + any case: all content.
+        for p in [
+            "CLAUDE.md",
+            "02_Projects/Foo/CLAUDE.md",
+            "claude.md",
+            "GEMINI.md",
+            "02_Projects/Bar/GEMINI.md",
+            "gemini.md",
+            "AGENTS.md",
+            "02_Projects/Baz/AGENTS.md",
+            "agents.md",
+        ] {
+            assert!(!is_substrate_path(p), "{p} must be content now");
+        }
+    }
+
+    #[test]
+    fn ordinary_content_still_content() {
         assert!(!is_substrate_path(
             "02_Projects/Nexus/Specifications/foo.md"
         ));
         assert!(!is_substrate_path("01_Inbox/quick-note.md"));
         assert!(!is_substrate_path("03_Areas/Health/journal.md"));
         assert!(!is_substrate_path("Daily/2026-05-27.md"));
-    }
-
-    #[test]
-    fn name_collisions_not_caught() {
-        // 'Mission Statement.md' is NOT 'Mission.md'.
-        assert!(!is_substrate_path("Mission Statement.md"));
-        // 'Family History.md' is NOT 'Family.md'.
-        assert!(!is_substrate_path("Family History.md"));
-        // 'My 00_VAULT.md notes.md' is NOT 00_VAULT.md.
-        assert!(!is_substrate_path("My 00_VAULT.md notes.md"));
-    }
-
-    // --- New tests for v0.3 behavior ---
-
-    #[test]
-    fn claude_md_at_root_is_substrate() {
-        assert!(is_substrate_path("CLAUDE.md"));
-    }
-
-    #[test]
-    fn claude_md_nested_is_substrate() {
-        assert!(is_substrate_path("02_Projects/Foo/CLAUDE.md"));
-    }
-
-    #[test]
-    fn claude_md_lowercase_is_substrate() {
-        // Case-insensitive basename for pointer-class files.
-        assert!(is_substrate_path("claude.md"));
-    }
-
-    #[test]
-    fn gemini_md_is_substrate() {
-        assert!(is_substrate_path("GEMINI.md"));
-        assert!(is_substrate_path("02_Projects/Bar/GEMINI.md"));
-        assert!(is_substrate_path("gemini.md"));
-    }
-
-    #[test]
-    fn agents_md_is_substrate() {
-        assert!(is_substrate_path("AGENTS.md"));
-        assert!(is_substrate_path("02_Projects/Baz/AGENTS.md"));
-        assert!(is_substrate_path("agents.md"));
-    }
-
-    #[test]
-    fn rapport_groups_is_substrate() {
-        assert!(is_substrate_path("_rapport/groups/dev-team.md"));
-    }
-
-    #[test]
-    fn rapport_triage_is_substrate() {
-        assert!(is_substrate_path("_rapport/triage/inbox.md"));
-    }
-
-    #[test]
-    fn family_md_at_root_is_content_not_substrate() {
-        // NEW behavior — v0.2.0 fenced this; v0.3 scopes to 02_Projects/**.
-        assert!(!is_substrate_path("Family.md"));
-    }
-
-    #[test]
-    fn family_md_direct_under_projects_is_substrate() {
-        // 02_Projects/Family.md — direct child, still under prefix.
-        assert!(is_substrate_path("02_Projects/Family.md"));
-    }
-
-    #[test]
-    fn mission_md_at_root_is_content() {
-        // NEW behavior — root Mission.md no longer fenced.
+        // Root Mission.md / Family.md were already content; still content.
         assert!(!is_substrate_path("Mission.md"));
-    }
-
-    #[test]
-    fn mission_md_under_inbox_is_content() {
-        // Outside 02_Projects/** — content.
+        assert!(!is_substrate_path("Family.md"));
         assert!(!is_substrate_path("00_Inbox/Mission.md"));
     }
 
     #[test]
-    fn mission_md_under_projects_subdir_is_substrate() {
-        assert!(is_substrate_path("02_Projects/Bar/Mission.md"));
+    fn windows_backslash_paths_are_content_now() {
+        // Former-substrate paths with backslashes are now content too.
+        assert!(!is_substrate_path("02_Projects\\Foo\\Family.md"));
+        assert!(!is_substrate_path("02_Projects\\Protocols\\foo.md"));
+        assert!(!is_substrate_path("_rapport\\groups\\dev.md"));
     }
 
-    #[test]
-    fn windows_backslash_paths_normalized() {
-        // Backslash → forward slash before matching.
-        assert!(is_substrate_path("02_Projects\\Foo\\Family.md"));
-        assert!(is_substrate_path("02_Projects\\Protocols\\foo.md"));
-        assert!(is_substrate_path("_rapport\\groups\\dev.md"));
-    }
-
-    #[test]
-    fn family_collision_not_caught() {
-        // 'family-tree.md' is NOT 'Family.md'.
-        assert!(!is_substrate_path("family-tree.md"));
-        assert!(!is_substrate_path("02_Projects/Foo/family-tree.md"));
-    }
-
-    #[test]
-    fn protocols_anything_is_substrate() {
-        assert!(is_substrate_path("02_Projects/Protocols/anything.md"));
-    }
-
-    #[test]
-    fn project_underscore_dir_is_substrate() {
-        assert!(is_substrate_path("_project/test.md"));
-    }
-
-    #[test]
-    fn rapport_people_alice_is_substrate() {
-        assert!(is_substrate_path("_rapport/people/alice.md"));
-    }
-
-    // --- classify_path rule-attribution tests ---
+    // --- classify_path now always returns Content ---
 
     #[test]
     fn classify_returns_content_for_ordinary_paths() {
@@ -421,18 +382,26 @@ mod tests {
     }
 
     #[test]
-    fn classify_returns_rule_label_for_substrate() {
-        match classify_path("CLAUDE.md") {
-            PathClassification::Substrate { rule } => assert_eq!(rule, "CLAUDE.md"),
-            other => panic!("expected Substrate, got {:?}", other),
-        }
-        match classify_path("02_Projects/Foo/Family.md") {
-            PathClassification::Substrate { rule } => assert_eq!(rule, "Family.md"),
-            other => panic!("expected Substrate, got {:?}", other),
-        }
-        match classify_path("_rapport/triage/inbox.md") {
-            PathClassification::Substrate { rule } => assert_eq!(rule, "_rapport/triage/"),
-            other => panic!("expected Substrate, got {:?}", other),
+    fn classify_returns_content_for_former_substrate_paths() {
+        // The inversion: paths that USED to classify as Substrate now classify
+        // as Content on BOTH the push and pull sides (classify_path is the
+        // single source consumed by file_watcher push + materializer pull).
+        for p in [
+            "02_Projects/Protocols/foo.md",
+            "CLAUDE.md",
+            "02_Projects/Foo/Family.md",
+            "_rapport/triage/inbox.md",
+            "_project/x.md",
+            "00_VAULT.md",
+            // S477 vault-folder-prefixed variant:
+            "Mainframe/02_Projects/Protocols/foo.md",
+        ] {
+            assert_eq!(
+                classify_path(p),
+                PathClassification::Content,
+                "{p} must classify as Content (substrate fence lifted)"
+            );
+            assert!(!is_substrate_path(p), "{p} must not be substrate");
         }
     }
 
@@ -531,23 +500,22 @@ mod tests {
     }
 
     #[test]
-    fn still_excludes_substrate() {
-        // Substrate RASP rules are orthogonal to the junk fence — B3 must not
-        // disturb them. (.obsidian/ / .trash/ / .git/ are handled by
-        // file_watcher HARDCODED_EXCLUDES, not the RASP fence directly —
-        // these three use is_substrate_path which tests the RASP fence only.)
-        assert!(
-            is_substrate_path("_rapport/people/x"),
-            "_rapport/people is substrate"
-        );
-        assert!(
-            is_substrate_path("02_Projects/Protocols/foo.md"),
-            "Protocols dir is substrate"
-        );
-        assert!(
-            is_substrate_path("_project/anything.md"),
-            "_project/ is substrate"
-        );
+    fn junk_fence_unaffected_by_substrate_inversion() {
+        // The junk fence and the (now-lifted) substrate fence are orthogonal.
+        // Former-substrate paths are NOT junk — they sync as content. The junk
+        // fence itself (.obsidian/.trash/.git/etc.) is untouched by the
+        // "substrate must sync" change.
+        for p in [
+            "_rapport/people/x",
+            "02_Projects/Protocols/foo.md",
+            "_project/anything.md",
+        ] {
+            assert!(!is_junk_path(p), "{p} is content, not junk — must sync");
+            assert!(
+                !is_substrate_path(p),
+                "{p} is no longer substrate (fence lifted)"
+            );
+        }
     }
 
     #[test]

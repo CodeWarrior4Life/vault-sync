@@ -1028,7 +1028,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_excludes_substrate_paths() {
+    async fn manifest_includes_former_substrate_paths() {
+        // "substrate must sync" (2026-06-20): the substrate fence is lifted, so
+        // former-substrate files now appear in the reconcile manifest as
+        // ordinary content and substrate_refused_count stays 0.
         let vault = TempDir::new().unwrap();
         let v = vault.path();
         write_file(v, "00_VAULT.md", b"x");
@@ -1042,10 +1045,24 @@ mod tests {
         let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
         let mut report = VerifyRepairReport::default();
         let m = vr.build_local_manifest_with_report(&mut report).unwrap();
-        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["01_Inbox/note.md"]);
-        // 7 substrate files filtered out by RASP fence.
-        assert_eq!(report.substrate_refused_count, 7);
+        let mut paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "00_VAULT.md",
+                "01_Inbox/note.md",
+                "02_Projects/Foo/Family.md",
+                "02_Projects/Protocols/X.md",
+                "CLAUDE.md",
+                "_rapport/groups/dev.md",
+                "_rapport/people/alice/notes.md",
+                "_rapport/triage/inbox.md",
+            ],
+            "all former-substrate files now sync as content"
+        );
+        // No path is refused as substrate anymore.
+        assert_eq!(report.substrate_refused_count, 0);
     }
 
     #[tokio::test]
@@ -1138,7 +1155,7 @@ mod tests {
         write_file(v, "deep/a/b/c.canvas", b"{}");
         write_file(v, "ignored.png", b"img"); // extension-filtered
         write_file(v, ".obsidian/workspace.json", b"x"); // hardcoded exclude
-        write_file(v, "CLAUDE.md", b"x"); // substrate-refused
+        write_file(v, "CLAUDE.md", b"x"); // former substrate — now content (.md)
 
         let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
 
@@ -1155,8 +1172,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(seq, par, "parallel manifest differs from sequential");
-        // 20 .md + 1 .canvas survive.
-        assert_eq!(par.len(), 21);
+        // 20 .md + 1 .canvas + CLAUDE.md (former substrate, now content) survive.
+        assert_eq!(par.len(), 22);
         assert_eq!(
             seq_report.substrate_refused_count,
             par_report.substrate_refused_count
@@ -1366,7 +1383,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn substrate_refused_count_populated() {
+    async fn substrate_refused_count_is_zero_after_fence_lift() {
+        // "substrate must sync" (2026-06-20): substrate is no longer refused.
+        // Former-substrate files now manifest as content, so the counter is 0
+        // and every file appears.
         let vault = TempDir::new().unwrap();
         let v = vault.path();
         write_file(v, "CLAUDE.md", b"x");
@@ -1375,8 +1395,9 @@ mod tests {
         write_file(v, "ok.md", b"x");
         let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
         let mut report = VerifyRepairReport::default();
-        let _m = vr.build_local_manifest_with_report(&mut report).unwrap();
-        assert_eq!(report.substrate_refused_count, 3);
+        let m = vr.build_local_manifest_with_report(&mut report).unwrap();
+        assert_eq!(report.substrate_refused_count, 0);
+        assert_eq!(m.len(), 4, "all four files sync as content");
     }
 
     #[tokio::test]

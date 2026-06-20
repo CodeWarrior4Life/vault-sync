@@ -1409,33 +1409,31 @@ mod tests {
     }
 
     #[test]
-    fn substrate_path_drops() {
+    fn substrate_path_now_pushes_as_content() {
+        // "substrate must sync" (2026-06-20): the push fence is lifted, so
+        // former-substrate paths classify as Allow and push like any note.
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = modified("00_VAULT.md");
         match w.classify(&evt) {
-            FilterDecision::DropSubstrate { path, rule } => {
+            FilterDecision::Allow(WatchEvent::Modified { path }) => {
                 assert_eq!(path, "00_VAULT.md");
-                assert_eq!(rule, "00_VAULT.md");
             }
-            other => panic!("expected DropSubstrate, got {:?}", other),
+            other => panic!("expected Allow(Modified), got {:?}", other),
         }
     }
 
     #[test]
-    fn substrate_scoped_drops() {
+    fn substrate_scoped_now_pushes_as_content() {
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = modified("02_Projects/Foo/Family.md");
-        assert!(matches!(
-            w.classify(&evt),
-            FilterDecision::DropSubstrate { .. }
-        ));
+        assert!(matches!(w.classify(&evt), FilterDecision::Allow(_)));
     }
 
     #[test]
-    fn substrate_scoped_at_root_allows() {
-        // Family.md at vault root — Wave 1 RASP rebuild made this content.
+    fn family_md_at_root_allows() {
+        // Family.md at vault root was already content; still content.
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = modified("Family.md");
@@ -1446,10 +1444,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_drops() {
+    fn claude_md_now_pushes_as_content() {
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
-        // Multiple flavors.
+        // Multiple flavors — all push as content now.
         for p in &[
             "CLAUDE.md",
             "02_Projects/Foo/CLAUDE.md",
@@ -1458,8 +1456,8 @@ mod tests {
         ] {
             let evt = modified(p);
             assert!(
-                matches!(w.classify(&evt), FilterDecision::DropSubstrate { .. }),
-                "expected DropSubstrate for {p}"
+                matches!(w.classify(&evt), FilterDecision::Allow(_)),
+                "expected Allow for {p}"
             );
         }
     }
@@ -1627,30 +1625,33 @@ mod tests {
     }
 
     #[test]
-    fn rename_with_filtered_side_drops() {
-        // Source = substrate; destination = content. Drop the whole rename.
+    fn rename_former_substrate_source_now_allows() {
+        // "substrate must sync": former-substrate source is now content, so the
+        // rename passes through (both sides content).
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = renamed("02_Projects/Protocols/x.md", "02_Projects/Foo/x.md");
         match w.classify(&evt) {
-            FilterDecision::DropSubstrate { path, .. } => {
-                assert_eq!(path, "02_Projects/Protocols/x.md");
+            FilterDecision::Allow(WatchEvent::Renamed { old_path, new_path }) => {
+                assert_eq!(old_path, "02_Projects/Protocols/x.md");
+                assert_eq!(new_path, "02_Projects/Foo/x.md");
             }
-            other => panic!("expected DropSubstrate (source-side), got {:?}", other),
+            other => panic!("expected Allow(Renamed), got {:?}", other),
         }
     }
 
     #[test]
-    fn rename_destination_substrate_also_drops() {
-        // Symmetric: destination is substrate.
+    fn rename_former_substrate_destination_now_allows() {
+        // Symmetric: former-substrate destination is now content too.
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = renamed("02_Projects/Foo/x.md", "02_Projects/Protocols/x.md");
         match w.classify(&evt) {
-            FilterDecision::DropSubstrate { path, .. } => {
-                assert_eq!(path, "02_Projects/Protocols/x.md");
+            FilterDecision::Allow(WatchEvent::Renamed { old_path, new_path }) => {
+                assert_eq!(old_path, "02_Projects/Foo/x.md");
+                assert_eq!(new_path, "02_Projects/Protocols/x.md");
             }
-            other => panic!("expected DropSubstrate (dest-side), got {:?}", other),
+            other => panic!("expected Allow(Renamed), got {:?}", other),
         }
     }
 
@@ -1682,15 +1683,18 @@ mod tests {
     }
 
     #[test]
-    fn windows_backslash_substrate_still_drops() {
-        // RASP fence already handles backslashes, but verify end-to-end.
+    fn windows_backslash_former_substrate_now_allows() {
+        // Former-substrate path with backslashes normalizes and pushes as
+        // content ("substrate must sync"); the junk fence is unaffected.
         let dir = TempDir::new().unwrap();
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = modified("02_Projects\\Protocols\\foo.md");
-        assert!(matches!(
-            w.classify(&evt),
-            FilterDecision::DropSubstrate { .. }
-        ));
+        match w.classify(&evt) {
+            FilterDecision::Allow(WatchEvent::Modified { path }) => {
+                assert_eq!(path, "02_Projects/Protocols/foo.md");
+            }
+            other => panic!("expected Allow with normalized path, got {:?}", other),
+        }
     }
 
     #[test]
@@ -2041,7 +2045,9 @@ mod tests {
         let tray = make_shared_tray();
         let w = make_watcher(&dir, vec![], vec![]).with_tray_state(tray.clone());
 
-        // Substrate path → DropSubstrate.
+        // Former substrate path → now Allow (no substrate counter bump).
+        // "substrate must sync": substrate is content, the fence is lifted, so
+        // events_dropped_substrate stays 0.
         let _ = w.classify_and_count(&modified("00_VAULT.md"));
         // Extension drop.
         let _ = w.classify_and_count(&modified("notes/x.exe"));
@@ -2051,11 +2057,12 @@ mod tests {
         let _ = w.classify_and_count(&modified("notes/ok.md"));
 
         let s = tray.read().unwrap();
-        assert_eq!(s.events_dropped_substrate, 1);
+        // No event is dropped as substrate anymore.
+        assert_eq!(s.events_dropped_substrate, 0);
         assert_eq!(s.events_dropped_extension, 1);
         assert_eq!(s.events_dropped_excludes, 1);
         // events_filtered is the sum (each dropped event bumps the rollup).
-        assert_eq!(s.events_filtered, 3);
+        assert_eq!(s.events_filtered, 2);
     }
 
     // ---------- S477 §3.5 inotify-limit detection (Linux-only) ----------

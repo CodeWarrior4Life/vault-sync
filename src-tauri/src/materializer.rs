@@ -467,7 +467,12 @@ impl Materializer {
             return Err(MaterializerError::PathTraversal(payload.path.clone()));
         }
 
-        // 3. RASP substrate fence — refuse with rule label.
+        // 3. RASP substrate fence — LIFTED ("substrate must sync", 2026-06-20).
+        //    classify_path now always returns Content, so substrate paths fall
+        //    through and materialize byte-faithfully like any note, protected by
+        //    the same conflict-stash / newer-wins / anti-strip machinery below.
+        //    This branch is retained (never taken while the fence is empty) so
+        //    the fence can be restored by repopulating SUBSTRATE_PATH_RULES.
         if let PathClassification::Substrate { rule } = classify_path(&payload.path) {
             warn!(
                 rule = rule,
@@ -555,10 +560,9 @@ impl Materializer {
                 shadow_eq_server,
                 local_eq_shadow,
             );
-            let pull_would_strip = starts_with_frontmatter(&local_bytes)
-                && !starts_with_frontmatter(content_bytes);
-            if pull_would_strip
-                && matches!(raw_decision, Decision::PullClean | Decision::Conflict)
+            let pull_would_strip =
+                starts_with_frontmatter(&local_bytes) && !starts_with_frontmatter(content_bytes);
+            if pull_would_strip && matches!(raw_decision, Decision::PullClean | Decision::Conflict)
             {
                 warn!(
                     path = %payload.path,
@@ -806,6 +810,9 @@ impl Materializer {
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
         }
+        // RASP substrate fence — LIFTED (see write()'s step 3). classify_path
+        // always returns Content now, so substrate deletes proceed as content.
+        // Branch retained for fence restoration; never taken while rules empty.
         if let PathClassification::Substrate { rule: _ } = classify_path(path) {
             return Err(MaterializerError::SubstrateRefuse(path.into()));
         }
@@ -944,8 +951,7 @@ pub fn guard_no_frontmatter_strip(
     decision: Decision,
     pull_would_strip_frontmatter: bool,
 ) -> Decision {
-    if pull_would_strip_frontmatter
-        && matches!(decision, Decision::PullClean | Decision::Conflict)
+    if pull_would_strip_frontmatter && matches!(decision, Decision::PullClean | Decision::Conflict)
     {
         return Decision::PreserveLocalEdit;
     }
@@ -1437,32 +1443,42 @@ mod tests {
             .exists());
     }
 
-    // ---- substrate refusal -----------------------------------------------
+    // ---- substrate now materializes as content ---------------------------
+    //
+    // "substrate must sync" (2026-06-20): the materializer no longer refuses
+    // substrate paths. They write byte-faithfully like any note.
 
     #[test]
-    fn substrate_refusal_returns_skipped_with_rule_label() {
-        let (_v, _w, m) = mk(MaterializerMode::Live, default_cfg());
+    fn substrate_pointer_file_materializes_as_content() {
+        let (vaults, _w, m) = mk(MaterializerMode::Live, default_cfg());
         let out = m.write(&payload("00_VAULT.md", "x")).unwrap();
-        match out {
-            MaterializeOutcome::Skipped(SkipReason::SubstrateRefused { rule }) => {
-                assert_eq!(rule, "00_VAULT.md");
-            }
-            other => panic!("expected SubstrateRefused, got {other:?}"),
-        }
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "00_VAULT.md must materialize as content, got {out:?}"
+        );
+        let target = vaults.path().join(VAULT).join("00_VAULT.md");
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(written.contains("title: Test"), "frontmatter preserved");
+        assert!(written.ends_with("x"), "body written byte-faithfully");
     }
 
     #[test]
-    fn substrate_refusal_protocols_returns_rule() {
-        let (_v, _w, m) = mk(MaterializerMode::Live, default_cfg());
+    fn substrate_protocols_materializes_as_content() {
+        let (vaults, _w, m) = mk(MaterializerMode::Live, default_cfg());
         let out = m
             .write(&payload("02_Projects/Protocols/foo.md", "x"))
             .unwrap();
-        match out {
-            MaterializeOutcome::Skipped(SkipReason::SubstrateRefused { rule }) => {
-                assert_eq!(rule, "02_Projects/Protocols/");
-            }
-            other => panic!("expected SubstrateRefused, got {other:?}"),
-        }
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "Protocols/ note must materialize as content, got {out:?}"
+        );
+        let target = vaults
+            .path()
+            .join(VAULT)
+            .join("02_Projects/Protocols/foo.md");
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(written.contains("title: Test"), "frontmatter preserved");
+        assert!(written.ends_with("x"), "body written byte-faithfully");
     }
 
     // ---- idempotency + frontmatter normalization -------------------------
@@ -1795,12 +1811,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_refuses_rasp_substrate_path() {
+    fn delete_substrate_path_now_soft_deletes() {
+        // "substrate must sync": soft_delete no longer refuses substrate. With
+        // no target present it is a no-op Ok (same as any missing content path).
         let (_v, _w, m) = mk(MaterializerMode::Shadow, default_cfg());
-        assert!(matches!(
-            m.soft_delete("00_VAULT.md"),
-            Err(MaterializerError::SubstrateRefuse(_))
-        ));
+        assert!(m.soft_delete("00_VAULT.md").is_ok());
     }
 
     // ---- Wave 4: tray-state wire-up ---------------------------------------
@@ -2132,15 +2147,27 @@ mod tests {
             "R5 conflict pull that strips frontmatter must be refused"
         );
         // strip=true but NON-overwriting decisions are untouched.
-        assert_eq!(guard_no_frontmatter_strip(Decision::Noop, true), Decision::Noop);
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::Noop, true),
+            Decision::Noop
+        );
         assert_eq!(
             guard_no_frontmatter_strip(Decision::PreserveLocalEdit, true),
             Decision::PreserveLocalEdit
         );
         // strip=false: zero behavior change (every decision passes through).
-        assert_eq!(guard_no_frontmatter_strip(Decision::PullClean, false), Decision::PullClean);
-        assert_eq!(guard_no_frontmatter_strip(Decision::Conflict, false), Decision::Conflict);
-        assert_eq!(guard_no_frontmatter_strip(Decision::Noop, false), Decision::Noop);
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::PullClean, false),
+            Decision::PullClean
+        );
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::Conflict, false),
+            Decision::Conflict
+        );
+        assert_eq!(
+            guard_no_frontmatter_strip(Decision::Noop, false),
+            Decision::Noop
+        );
         assert_eq!(
             guard_no_frontmatter_strip(Decision::PreserveLocalEdit, false),
             Decision::PreserveLocalEdit
@@ -2151,9 +2178,15 @@ mod tests {
     fn starts_with_frontmatter_detects_yaml_fence() {
         assert!(starts_with_frontmatter(b"---\naliases: []\n---\nbody"));
         assert!(starts_with_frontmatter(b"---\r\ntype: note\r\n---\r\nbody"));
-        assert!(starts_with_frontmatter("\u{feff}---\nx: 1\n---\n".as_bytes()));
-        assert!(!starts_with_frontmatter(b"> [!info] Contact Info\nno frontmatter here"));
-        assert!(!starts_with_frontmatter(b"# Heading\n\n---\nnot a leading fence"));
+        assert!(starts_with_frontmatter(
+            "\u{feff}---\nx: 1\n---\n".as_bytes()
+        ));
+        assert!(!starts_with_frontmatter(
+            b"> [!info] Contact Info\nno frontmatter here"
+        ));
+        assert!(!starts_with_frontmatter(
+            b"# Heading\n\n---\nnot a leading fence"
+        ));
         assert!(!starts_with_frontmatter(b""));
     }
 

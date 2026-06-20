@@ -960,25 +960,29 @@ mod tests {
     // --- pre-journal filter / pure-function tests (no HTTP) ---
 
     #[tokio::test]
-    async fn substrate_path_skipped_without_http() {
-        // Even with a mock server, we expect zero HTTP calls.
+    async fn former_substrate_path_now_pushes() {
+        // "substrate must sync" (2026-06-20): the push fence is lifted, so a
+        // former-substrate path (00_VAULT.md) is pushed like any note — one
+        // HTTP call, accepted.
         let mut srv = Server::new_async().await;
         let m = srv
             .mock("POST", "/api/sync/push")
-            .expect(0)
+            .expect(1)
             .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
             .create_async()
             .await;
         let (_d, journal) = make_journal_with(vec![evt("00_VAULT.md", b"x")]);
         let client = make_client(&srv.url(), journal.clone()).await;
         let outcomes = client.drain_once().await;
         assert_eq!(outcomes.len(), 1);
-        match &outcomes[0].1 {
-            PushOutcome::Skipped(SkipReason::SubstrateRefused { rule }) => {
-                assert_eq!(*rule, "00_VAULT.md");
-            }
-            other => panic!("expected SubstrateRefused, got {other:?}"),
-        }
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "expected Sent (substrate pushes as content), got {:?}",
+            outcomes[0].1
+        );
         m.assert_async().await;
     }
 

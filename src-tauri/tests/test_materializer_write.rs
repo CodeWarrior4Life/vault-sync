@@ -6,7 +6,6 @@ use tempfile::TempDir;
 use vault_sync_daemon::api_client::NotePayload;
 use vault_sync_daemon::materializer::{
     MaterializeOutcome, Materializer, MaterializerConfig, MaterializerError, MaterializerMode,
-    SkipReason,
 };
 
 const VAULT: &str = "Mainframe";
@@ -103,10 +102,13 @@ fn write_rejects_path_traversal() {
 }
 
 #[test]
-fn write_refuses_rasp_substrate_paths() {
+fn write_materializes_former_substrate_paths_as_content() {
+    // "substrate must sync" (2026-06-20): the substrate fence is lifted. Paths
+    // that used to be refused now materialize byte-faithfully like any note,
+    // protected by the same conflict-stash / anti-strip machinery.
     let v = TempDir::new().unwrap();
     let w = TempDir::new().unwrap();
-    let m = mk(&v, &w, MaterializerMode::Live);
+    let m = mk(&v, &w, MaterializerMode::Shadow);
     for substrate in &[
         "00_VAULT.md",
         "02_Projects/Nexus/00_VAULT.md",
@@ -116,13 +118,23 @@ fn write_refuses_rasp_substrate_paths() {
         "_project/x.md",
         "_rapport/people/cyril.md",
     ] {
-        let out = m.write(&payload(substrate, "should never land")).unwrap();
+        let out = m.write(&payload(substrate, "should land now")).unwrap();
+        let expected = w
+            .path()
+            .join(".lattice-runtime")
+            .join(SLUG)
+            .join(format!("shadow/{substrate}"));
+        assert_eq!(
+            out,
+            MaterializeOutcome::Wrote {
+                path: expected.clone()
+            },
+            "expected Wrote on {substrate}, got {out:?}"
+        );
+        let written = std::fs::read_to_string(&expected).unwrap();
         assert!(
-            matches!(
-                out,
-                MaterializeOutcome::Skipped(SkipReason::SubstrateRefused { .. })
-            ),
-            "expected SubstrateRefused on {substrate}, got {out:?}"
+            written.contains("should land now"),
+            "{substrate} body must be written"
         );
     }
 }
@@ -161,12 +173,29 @@ fn delete_nothing_to_delete_is_not_error() {
 }
 
 #[test]
-fn delete_refuses_rasp_substrate_path() {
+fn delete_former_substrate_path_now_soft_deletes() {
+    // "substrate must sync": soft_delete no longer refuses substrate. After a
+    // write, the substrate path soft-deletes to a `.deleted-*` sibling like
+    // any content note.
     let v = TempDir::new().unwrap();
     let w = TempDir::new().unwrap();
     let m = mk(&v, &w, MaterializerMode::Shadow);
-    assert!(matches!(
-        m.soft_delete("00_VAULT.md"),
-        Err(MaterializerError::SubstrateRefuse(_))
-    ));
+    m.write(&payload("00_VAULT.md", "x")).unwrap();
+    m.soft_delete("00_VAULT.md").unwrap();
+    let shadow_dir = w.path().join(".lattice-runtime").join(SLUG).join("shadow/");
+    assert!(!shadow_dir.join("00_VAULT.md").exists());
+    let deleted: Vec<_> = std::fs::read_dir(&shadow_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("00_VAULT.md.deleted-")
+        })
+        .collect();
+    assert_eq!(
+        deleted.len(),
+        1,
+        "expected one .deleted-* file for substrate"
+    );
 }

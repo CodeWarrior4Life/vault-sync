@@ -273,9 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn should_backfill_skips_substrate() {
-        // 02_Projects/Protocols/ is a RASP substrate-fenced prefix.
-        assert!(!should_backfill(
+    fn should_backfill_pulls_former_substrate() {
+        // "substrate must sync" (2026-06-20): the fence is lifted, so a missing
+        // former-substrate path (02_Projects/Protocols/) IS backfilled.
+        assert!(should_backfill(
             "Mainframe/02_Projects/Protocols/p.md",
             false
         ));
@@ -287,25 +288,29 @@ mod tests {
     }
 
     /// R6 REGRESSION (red on old code — this module / `plan_backfill` did not
-    /// exist). A server-only canonical note (missing locally, safe,
-    /// non-substrate) MUST be planned for a pull, while a present note and a
-    /// substrate note are excluded. The pre-fix daemon enumerated NOTHING and
-    /// created ZERO files; this locks in the enumeration→filter core that
-    /// selects exactly the missing notes.
+    /// exist). A server-only canonical note (missing locally, safe) MUST be
+    /// planned for a pull, while a present note is excluded. The pre-fix daemon
+    /// enumerated NOTHING and created ZERO files; this locks in the
+    /// enumeration→filter core that selects exactly the missing notes.
+    /// "substrate must sync": former-substrate paths are now pulled too.
     #[test]
-    fn plan_backfill_selects_only_server_only_notes() {
+    fn plan_backfill_selects_server_only_notes_including_substrate() {
         let changes = vec![
             row("Mainframe/01_Notes/The Tselem Bridge.md", 10), // missing → pull
             row("Mainframe/01_Notes/already-here.md", 11),      // present → skip
-            row("Mainframe/02_Projects/Protocols/p.md", 12),    // substrate → skip
+            row("Mainframe/02_Projects/Protocols/p.md", 12),    // former substrate → pull
             row("../escape.md", 13),                            // unsafe → skip
         ];
         let present: HashSet<&str> = ["Mainframe/01_Notes/already-here.md"].into_iter().collect();
-        let plan = plan_backfill(&changes, |p| present.contains(p));
+        let mut plan = plan_backfill(&changes, |p| present.contains(p));
+        plan.sort();
         assert_eq!(
             plan,
-            vec!["Mainframe/01_Notes/The Tselem Bridge.md".to_string()],
-            "exactly the server-only, safe, non-substrate note must be pulled"
+            vec![
+                "Mainframe/01_Notes/The Tselem Bridge.md".to_string(),
+                "Mainframe/02_Projects/Protocols/p.md".to_string(),
+            ],
+            "all server-only, safe notes (incl. former substrate) must be pulled"
         );
     }
 
