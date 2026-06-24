@@ -905,6 +905,11 @@ pub fn decide(
     }
     // R5: shadow absent and local diverges from server. Unknown provenance,
     // NEVER assume server wins. Treat as concurrent => conflict (stash).
+    // (S514, TKT-d1a41f94: a global flip to local-wins here was reverted — it
+    // breaks legitimate new-host/stale-local catch-up [verify_repair] and the
+    // no-shadow case is fundamentally ambiguous. Local-wins for KNOWN paths is
+    // handled by the D9 shadow-seed making them R2; the conflict storm is fixed
+    // by idempotent stashing in conflict_stash::write_stash, not by this flip.)
     if !shadow_present {
         return Decision::Conflict;
     }
@@ -1599,11 +1604,13 @@ mod tests {
     }
 
     /// S511 D2/D3 (TKT-2dc9a17e): a Class-C local divergence with NO shadow
-    /// record (shadow absent => R5, unknown provenance) now ALWAYS stashes the
-    /// local loser before materializing the server winner. This flips the
-    /// pre-S511 `stash_not_written_for_class_c_under_server_wins` assertion:
-    /// there is no longer any silent-overwrite cell for divergent content. Both
-    /// byte-sets must survive on disk (I-83 NEVER-SILENT-OVERWRITE).
+    /// record (shadow absent => R5, unknown provenance) ALWAYS stashes the
+    /// local loser before materializing the server winner. There is no silent-
+    /// overwrite cell for divergent content; both byte-sets survive on disk
+    /// (I-83 NEVER-SILENT-OVERWRITE). S514 (TKT-d1a41f94) kept this behavior (a
+    /// local-wins flip broke catch-up) and instead made the stash IDEMPOTENT so
+    /// a recurring divergence yields ONE conflict copy, not the 209-file storm
+    /// (see conflict_stash::write_stash_idempotent_for_identical_content).
     #[test]
     fn class_c_divergence_no_shadow_now_stashes_r5() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -1614,11 +1621,9 @@ mod tests {
         let out = m.write(&p).unwrap();
         match out {
             MaterializeOutcome::Stashed { stash_path } => {
-                // Loser (local) preserved verbatim in the stash.
                 assert!(stash_path.exists(), "stash file must exist");
                 let stash_content = std::fs::read_to_string(&stash_path).unwrap();
                 assert_eq!(stash_content, "old-local-divergent");
-                // Winner (server) materialized at the canonical path.
                 let cur = std::fs::read_to_string(&target).unwrap();
                 assert!(cur.contains("server-canonical"));
             }

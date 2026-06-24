@@ -326,6 +326,14 @@ impl ConflictStash {
             )));
         }
 
+        // Idempotency (S514, TKT-d1a41f94): if a `*.conflict-from-*` sibling for
+        // this original already holds byte-identical content, return it instead
+        // of writing another. Without this, the same divergence recurring every
+        // reconcile cycle appended -2/-3/... endlessly (the 209-file storm).
+        if let Some(existing) = self.find_identical_stash(&base_path, local_content) {
+            return Ok(existing);
+        }
+
         // Collision-avoid: if base_path exists, try -2, -3, ...
         let final_path = self.resolve_collision(&base_path);
 
@@ -336,6 +344,31 @@ impl ConflictStash {
             .map_err(|e| StashError::Io(e.error))?;
 
         Ok(final_path)
+    }
+
+    /// Idempotency helper (S514, TKT-d1a41f94): return an existing
+    /// `<orig>.conflict-from-*` sibling whose bytes equal `content`, if any.
+    /// Keys off the original-note prefix (the part before `.conflict-from-`) so
+    /// it matches regardless of device/lsn/collision-suffix — the same losing
+    /// content is preserved exactly once, not re-stashed every reconcile pass.
+    fn find_identical_stash(&self, base_path: &Path, content: &[u8]) -> Option<PathBuf> {
+        let parent = base_path.parent()?;
+        let base_name = base_path.file_name()?.to_str()?;
+        let orig_prefix = base_name.split(".conflict-from-").next()?;
+        let needle = format!("{orig_prefix}.conflict-from-");
+        for entry in fs::read_dir(parent).ok()?.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(&needle) || !name.ends_with(".md") {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(entry.path()) {
+                if bytes == content {
+                    return Some(entry.path());
+                }
+            }
+        }
+        None
     }
 
     fn resolve_collision(&self, base: &Path) -> PathBuf {
@@ -645,6 +678,33 @@ mod tests {
         assert_eq!(fs::read(&p1).unwrap(), b"v1");
         assert_eq!(fs::read(&p2).unwrap(), b"v2");
         assert_eq!(fs::read(&p3).unwrap(), b"v3");
+    }
+
+    #[test]
+    fn write_stash_idempotent_for_identical_content() {
+        // S514 (TKT-d1a41f94): the same losing content recurring every reconcile
+        // cycle must be stashed ONCE, not piled into -2/-3/... (the 209-file storm).
+        let tmp = tempdir().unwrap();
+        let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::Manual);
+        fs::create_dir_all(tmp.path().join("notes")).unwrap();
+
+        let p1 = stash.write_stash("notes/x.md", b"loser", "morpheus", 1).unwrap();
+        // Same content, different device+lsn → reuse existing stash, no new file.
+        let p2 = stash.write_stash("notes/x.md", b"loser", "trinity", 99).unwrap();
+        assert_eq!(p1, p2, "identical content must reuse the existing stash");
+
+        let n = fs::read_dir(tmp.path().join("notes"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(n, 1, "exactly one stash file for identical content");
+
+        // Different content still gets its own file (genuine divergence preserved).
+        let p3 = stash
+            .write_stash("notes/x.md", b"different", "trinity", 100)
+            .unwrap();
+        assert_ne!(p1, p3);
     }
 
     #[test]
