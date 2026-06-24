@@ -490,12 +490,20 @@ impl PushClient {
         // idempotent no-op; and a stale shadow (server truly moved since we synced)
         // still 409s → correctly stashed as a REAL conflict. Pushes that already
         // carry an explicit base (verify_repair::build_modify_push passes the
-        // reconcile delta's server_hash) are honored verbatim. Delete carries no
-        // meaningful base and a genuine new file has no shadow entry → "" → CREATE.
-        let backfilled_base: Option<String> = match (&evt.base_hash, &evt.action) {
-            (Some(b), _) => Some(b.clone()),
-            (None, PushAction::Delete) => None,
-            (None, _) => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
+        // reconcile delta's server_hash) are honored verbatim. A DELETE ALSO has a
+        // meaningful base — the last-synced hash of the file being removed — so we
+        // shadow-backfill it too (S520, TKT-2c2e9d0f): the prior `Delete => None`
+        // sent base_hash="" which the server's delete-CAS refuses whenever a
+        // reconcile-state row exists (`base=="" && current!=None → 409`), so EVERY
+        // delete of an already-synced note 409'd as ConflictUnrecoverable and was
+        // dropped — deletes never propagated. With the shadow base: base==current →
+        // server deletes (tombstones); base!=current (server edited since we synced)
+        // → 409 → edit-beats-delete, no silent wipe; a never-synced file has no
+        // shadow → "" → server no-op. A genuine new file's CREATE still has no
+        // shadow → "" → CREATE, unchanged.
+        let backfilled_base: Option<String> = match &evt.base_hash {
+            Some(b) => Some(b.clone()),
+            None => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
         };
 
         let req = PushRequest {
@@ -1405,6 +1413,62 @@ mod tests {
         let outcomes = client.drain_once().await;
         assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
         m.assert_async().await;
+    }
+
+    /// S520 (TKT-2c2e9d0f): a DELETE of an already-synced note must backfill the
+    /// CAS base from the shadow (the last-known server hash), NOT send "". The
+    /// prior `Delete => None` sent base_hash="" which the server's delete-CAS
+    /// refuses whenever a reconcile-state row exists (base "" + row → 409), so
+    /// every delete of a synced note 409'd as ConflictUnrecoverable and was
+    /// dropped → deletes never propagated. This asserts the BASE ON THE WIRE for a
+    /// delete is the shadow hash, letting the server see base == current → delete.
+    #[tokio::test]
+    async fn delete_with_none_base_backfills_cas_base_from_shadow() {
+        let server_hash = "b".repeat(64); // shadow's last-known server hash
+        let mut srv = Server::new_async().await;
+        // Mock matches ONLY if the delete carries base_hash == shadow hash; a
+        // regression to "" would not match → push not Sent.
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"action":"delete","base_hash":"{server_hash}"}}"#
+            )))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":"","server_hash":null,"server_seq":null,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        // file_watcher-style delete event: base_hash=None, no content body.
+        let fw_evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: "notes/deleted.md".to_string(),
+            action: PushAction::Delete,
+            base_hash: None,
+            content_sha: String::new(),
+            content_bytes: None,
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        };
+        let (_d, journal) = make_journal_with(vec![fw_evt]);
+
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("notes/deleted.md", &server_hash);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_shadow_store(shadow);
+
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "shadow-backfilled delete base must let the delete be accepted, got {:?}",
+            outcomes[0].1
+        );
+        m.assert_async().await; // proves base_hash on the wire == shadow hash
     }
 
     /// D4 (S511, TKT-2dc9a17e): a local push that loses the server CAS race
