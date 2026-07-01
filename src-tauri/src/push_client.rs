@@ -483,8 +483,9 @@ impl PushClient {
         // every steady-state local edit to an existing note.
         //
         // The shadow store holds our last-known server hash for the path (D9 seeds
-        // it = server on startup for match+drift; we record() it on every accepted
-        // push/pull below), so it IS the correct CAS base. Sending it makes the
+        // it = server on startup for `match` ONLY — never `drift`, S531 fail-closed;
+        // we record() it on every accepted push/pull below), so it IS the correct
+        // CAS base. Sending it makes the
         // server see base == current → WRITE (operator-ratified local-wins-push-up
         // for a genuine edit); identical content is already a server-side
         // idempotent no-op; and a stale shadow (server truly moved since we synced)
