@@ -10,9 +10,18 @@
 //! One full-body push + one pull per CRLF file per pass - 18k files on
 //! Trinity = a permanent low-grade storm.
 //!
-//! With v0.4.28 (D1 + D3) the loop must die in ONE pull pass: the alignment
-//! rewrite converges the bytes, and the second pass is zero drift, zero
+//! With v0.4.28's D1 alignment rewrite, the loop must die in ONE pull pass:
+//! the rewrite converges the bytes, and the second pass is zero drift, zero
 //! pushes, zero pulls.
+//!
+//! This test is a D1-ONLY tripwire, not a D3 regression gate: the D3-bug
+//! shadow state (`shadow.record(&rel, &local_raw_sha)` below) is HAND-SEEDED
+//! to reproduce the v0.4.27 symptom, not derived by driving the actual D3
+//! `shadow_hash_for_ack` code path. It proves D1's alignment rewrite kills
+//! the alternation once that state exists, but says nothing about whether D3
+//! still produces that state today. The D3 gate — that `shadow_hash_for_ack`
+//! now records `server_hash` on Accepted instead of the local raw sha — is
+//! `push_client::tests::test_ack_materialize_rewrite_then_shadow`.
 
 use std::sync::Arc;
 use tempfile::TempDir;
