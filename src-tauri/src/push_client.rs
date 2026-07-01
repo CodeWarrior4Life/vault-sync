@@ -874,6 +874,13 @@ impl PushClient {
                 // the watcher's layer-2 dedup.
                 if let Some(map) = &self.enqueued_hashes {
                     if let Ok(mut m) = map.lock() {
+                        // Key-scheme note: the watcher's own enqueued_hashes
+                        // keys are already NFC+forward-slash (normalize_event
+                        // -> normalize_path -> canonical_sync_path). Re-applying
+                        // canonical_sync_path here is therefore idempotent — it
+                        // does not double-canonicalize, it just guarantees this
+                        // writer (push_client, not the watcher) agrees on the
+                        // same key form so the two producers never diverge.
                         m.insert(
                             crate::sync_shadow::canonical_sync_path(path),
                             canonical_sha.clone(),
@@ -1287,6 +1294,69 @@ mod tests {
             "steady state stays zero-write"
         );
         assert_eq!(fx.shadow.get(rel).as_deref(), Some(sha.as_str()));
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
+    /// Pre-Piece-1 compat (T7 review fold): a server that predates the D2
+    /// canonicalization contract omits `server_hash` from its Accepted
+    /// response entirely (JSON `null`), same as it always has. `needs_align`
+    /// must short-circuit false on `resp.server_hash.as_deref().is_some_and`
+    /// (None never satisfies is_some_and) - so process_event must NEVER call
+    /// ack_materialize_back / attempt a rewrite / fetch /note against such a
+    /// server. The shadow still advances via shadow_hash_for_ack's
+    /// content_hash fallback, so reconcile does not misclassify the file as
+    /// stale on the next pass.
+    #[tokio::test]
+    async fn test_pre_piece1_server_omits_server_hash_no_align() {
+        let body = b"local bytes, non-canonicalizing server\n";
+        let local_sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        // Pre-Piece-1 accepted body: server_hash is JSON null (field omitted
+        // by an old server would deserialize the same way via Option<String>).
+        let body_json = format!(
+            r#"{{"status":"accepted","seq":1,"content_hash":"{local_sha}","server_hash":null,"server_seq":1,"merged_content":null,"message":null}}"#
+        );
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(body_json)
+            .create_async()
+            .await;
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let rel = "notes/a.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, body)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+        let mtime_before = std::fs::metadata(&abs).unwrap().modified().unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            body,
+            "file untouched - no align attempted"
+        );
+        assert_eq!(
+            std::fs::metadata(&abs).unwrap().modified().unwrap(),
+            mtime_before,
+            "pre-Piece-1 compat path must be zero-write"
+        );
+        // shadow_hash_for_ack falls back to content_hash when server_hash is None.
+        assert_eq!(
+            fx.shadow.get(rel).as_deref(),
+            Some(local_sha.as_str()),
+            "shadow still advances via the content_hash fallback"
+        );
         m_push.assert_async().await;
         m_note.assert_async().await;
     }
