@@ -631,10 +631,21 @@ impl PushClient {
                     // canonicalized (or region-defended) our bytes. NOT keyed
                     // off Merged (M2: PushOutcome::Merged has no materialize
                     // consumer; ack-materialize is a NEW accepted-keyed
-                    // behavior). A non-canonicalizing server echoes our hash
-                    // (or omits server_hash) so this never fires against it -
-                    // backward compatibility is by construction. Deletes have
-                    // no local file to align.
+                    // behavior). Compat note (corrected, final-review fix
+                    // wave): a server that never rewrites bytes on accept
+                    // echoes our hash (or omits server_hash), so this stays
+                    // false against it - but that is NOT "any real server
+                    // today". Today's server legitimately returns
+                    // effective_hash != pushed on REGION-DEFENDED accepts
+                    // (splices bytes into a protected region we don't have
+                    // locally), so needs_align DOES fire there in normal
+                    // operation: local-canonicalize-and-verify fails (we
+                    // never had the spliced bytes to canonicalize), falls to
+                    // the /note fetch fallback, then a GUARDED rewrite
+                    // (write_aligned_bytes, including the anti-strip guard
+                    // above). That converges the file to the exact state the
+                    // pre-D2 daemon only reached indirectly, on its NEXT pull
+                    // pass. Deletes have no local file to align.
                     let needs_align = matches!(resp.status, PushStatus::Accepted)
                         && !matches!(evt.action, PushAction::Delete)
                         && resp
@@ -818,14 +829,24 @@ impl PushClient {
         server_hash: &str,
     ) {
         let Some(mat) = &self.materializer else {
-            // No write machinery wired: record the canonical hash so the next
-            // reconcile pass classifies PULL and the D1 alignment converges.
-            if let Some(sh) = &self.shadow_store {
-                sh.record(path, server_hash);
-            }
+            // No write machinery wired: record NOTHING. Recording server_hash
+            // here would be the INVERSE of what it looks like at first glance:
+            // the local file still holds the drained (pre-canonicalization)
+            // bytes, which diverge from server_hash. If we set
+            // shadow == server_hash while local != server_hash, the next
+            // reconcile pass's decide() sees shadow_eq_server == true and
+            // local_eq_server == false -> Decision::PreserveLocalEdit, i.e. it
+            // classifies this as a genuine LOCAL EDIT and pushes the stale
+            // drained bytes back UP - the opposite of convergence. Leaving the
+            // shadow at its prior (stale, pre-push) value means the next pass
+            // instead sees shadow_present with shadow != server (server moved)
+            // and, per R3/R5, resolves to a PULL (or conflict-then-pull),
+            // which is what actually converges the local file to the server's
+            // canonical bytes. Production always wires the materializer (see
+            // lib.rs); this arm is unreachable there but must not mislead.
             tracing::info!(
                 path,
-                "D2: server canonicalized push but no materializer wired - shadow recorded, pull converges next pass"
+                "D2: server canonicalized push but no materializer wired - shadow left stale (fail-closed), pull converges next pass"
             );
             return;
         };
@@ -1365,6 +1386,63 @@ mod tests {
         );
         m_push.assert_async().await;
         m_note.assert_async().await;
+    }
+
+    /// Final-review fix wave (piece1): the no-materializer fallback arm of
+    /// `ack_materialize_back` (`self.materializer` is `None` — never true in
+    /// production, see lib.rs, but must not mislead) must record NOTHING in
+    /// the shadow store, not `server_hash`. Recording `server_hash` while the
+    /// local file still holds the pre-canonicalization drained bytes would set
+    /// shadow == server with local != server, which decide() classifies as
+    /// R2 PreserveLocalEdit (a "genuine local edit" to push back UP) — the
+    /// inverse of convergence. Leaving the shadow at its prior value lets the
+    /// next reconcile pass fall to a PULL, which actually converges the file.
+    #[tokio::test]
+    async fn test_no_materializer_fallback_records_nothing_in_shadow() {
+        let body = b"drained pre-canonicalization bytes\n";
+        let drained_sha = sha256_hex(body);
+        let server_hash = sha256_hex(b"different canonical bytes the server stored\n");
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&server_hash))
+            .create_async()
+            .await;
+
+        let rel = "notes/a.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, body)]);
+
+        // No materializer wired (default PushClient::new) but a shadow store
+        // IS attached, so the fallback arm's (non-)recording is observable.
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let vault = TempDir::new().unwrap();
+        let abs = vault.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_shadow_store(shadow.clone());
+
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "server still ACCEPTED the push; got {:?}",
+            outcomes[0].1
+        );
+        assert!(
+            shadow.get(rel).is_none(),
+            "no-materializer fallback must record NOTHING (fail-closed -> PULL next pass), \
+             got {:?}",
+            shadow.get(rel)
+        );
+        // Sanity: drained_sha is genuinely not the server's canonical, i.e.
+        // this exercises needs_align == true, not the steady-state branch.
+        assert_ne!(drained_sha, server_hash);
+        m_push.assert_async().await;
     }
 
     /// D2 core (B2'b option i + B2'c + B2'd): server canonicalized our CRLF
