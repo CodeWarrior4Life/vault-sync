@@ -157,6 +157,18 @@ pub enum AlignOutcome {
     SkippedMissing,
     /// Materializer is configured in `Disabled` mode. Skipped.
     SkippedDisabled,
+    /// S513-class anti-strip guard (close-out, v0.4.28 final-review fix wave):
+    /// the CURRENT local file holds YAML frontmatter and `canonical_bytes` do
+    /// NOT. Rewriting would strip the local note's frontmatter — the exact
+    /// data-loss vector `guard_no_frontmatter_strip` already refuses on the
+    /// pull path (`write()`). This is the D2 fetch-fallback's own copy of that
+    /// guard: `ack_materialize_back`'s `/note` fetch fallback can hand back a
+    /// server body that lacks frontmatter for the same reason a pull can.
+    /// Rewrite SKIPPED; NOTHING is recorded in the shadow (stays stale — the
+    /// next reconcile pass falls to the fail-closed PULL path, which is itself
+    /// guarded by `guard_no_frontmatter_strip`, so it also refuses and the
+    /// local frontmatter-bearing copy survives to push up).
+    SkippedWouldStripFrontmatter,
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +914,24 @@ impl Materializer {
                 "aligned write: file changed between drain and ack (B2'a) - SKIPPING rewrite, pending push will converge"
             );
             return Ok(AlignOutcome::SkippedConcurrentEdit { current_sha });
+        }
+
+        // Anti-strip guard (S513-class close-out, final-review fix wave): the
+        // D2 fetch-fallback (`ack_materialize_back`'s `/note` GET when local
+        // canonicalization doesn't verify) can hand back `canonical_bytes`
+        // that lack YAML frontmatter the local note currently holds — the same
+        // stripped-body class `write()`'s pull path already guards against via
+        // `guard_no_frontmatter_strip`. A locally-canonicalized `canonical_bytes`
+        // can never trip this (canonicalization always preserves frontmatter
+        // presence), so this only fires on the fetch-fallback branch. Mirror
+        // the pull-path guard: refuse the rewrite, record NOTHING in the
+        // shadow (stays stale -> next pass falls to the guarded PULL path).
+        if starts_with_frontmatter(&current) && !starts_with_frontmatter(canonical_bytes) {
+            warn!(
+                path = %rel_path,
+                "aligned write ANTI-STRIP GUARD: canonical bytes (D2 fetch-fallback) drop YAML frontmatter local holds — REFUSING rewrite, shadow left stale"
+            );
+            return Ok(AlignOutcome::SkippedWouldStripFrontmatter);
         }
 
         // Capture the pre-write mtime: a content-identity rewrite must not
@@ -2579,5 +2609,71 @@ mod tests {
             2,
             "both soft-deletes must be preserved (nanosecond-unique suffixes), got {deleted:?}"
         );
+    }
+
+    // ---- write_aligned_bytes anti-strip guard (final-review fix wave, S513-class) ----
+
+    /// A frontmatter-bearing local file + frontmatterless `canonical_bytes`
+    /// (the D2 `/note` fetch-fallback shape) must SKIP the rewrite entirely:
+    /// file untouched on disk, nothing recorded in the shadow (stays stale so
+    /// the next reconcile pass falls to the guarded pull path).
+    #[test]
+    fn write_aligned_bytes_refuses_frontmatter_strip() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/fm.md");
+        let target = vaults.path().join(&rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let local_bytes = b"---\ntitle: keep me\n---\nbody\n".to_vec();
+        std::fs::write(&target, &local_bytes).unwrap();
+        let local_sha = hex::encode(Sha256::digest(&local_bytes));
+
+        // canonical_bytes lacks frontmatter entirely — the stripped-body shape.
+        let canonical_bytes = b"body\n".to_vec();
+        let canonical_sha = hex::encode(Sha256::digest(&canonical_bytes));
+
+        let out = m
+            .write_aligned_bytes(&rel, &canonical_bytes, &canonical_sha, &local_sha)
+            .unwrap();
+        assert_eq!(out, AlignOutcome::SkippedWouldStripFrontmatter);
+
+        // File untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), local_bytes);
+        // Shadow untouched (still absent — nothing recorded).
+        assert!(shadow.get(&rel).is_none());
+    }
+
+    /// Control: the normal CRLF/BOM-only alignment case (identical frontmatter
+    /// PRESENCE on both sides, only line-ending/BOM bytes differ) must still
+    /// rewrite through `write_aligned_bytes` — the new guard only trips on a
+    /// frontmatter-presence MISMATCH, never on a frontmatter-preserving byte
+    /// realignment.
+    #[test]
+    fn write_aligned_bytes_still_rewrites_crlf_with_frontmatter_on_both_sides() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/crlf.md");
+        let target = vaults.path().join(&rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let canonical_bytes = b"---\ntitle: x\n---\nline one\nline two\n".to_vec();
+        let canonical_sha = hex::encode(Sha256::digest(&canonical_bytes));
+        // Local: same logical content, CRLF line endings + BOM — frontmatter
+        // IS present on both sides (guard must not fire).
+        let local_bytes = format!(
+            "\u{feff}{}",
+            String::from_utf8(canonical_bytes.clone())
+                .unwrap()
+                .replace('\n', "\r\n")
+        )
+        .into_bytes();
+        std::fs::write(&target, &local_bytes).unwrap();
+        let local_sha = hex::encode(Sha256::digest(&local_bytes));
+
+        let out = m
+            .write_aligned_bytes(&rel, &canonical_bytes, &canonical_sha, &local_sha)
+            .unwrap();
+        assert_eq!(out, AlignOutcome::Rewrote { path: target.clone() });
+        assert_eq!(std::fs::read(&target).unwrap(), canonical_bytes);
+        assert_eq!(shadow.get(&rel).as_deref(), Some(canonical_sha.as_str()));
     }
 }
