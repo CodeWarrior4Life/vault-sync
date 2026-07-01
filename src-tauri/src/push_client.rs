@@ -191,6 +191,20 @@ impl PushClient {
         }
     }
 
+    /// S5 (v0.4.28): arm the min-version gate cooldown for `duration` from
+    /// now. Production always passes `Duration::from_secs(GATE_COOLDOWN_SECS)`;
+    /// tests can pass a short duration to prove expiry without a real sleep
+    /// through the 900s window. Write side of the poisoning-recovery pair
+    /// with the drain_once read check — both sides recover the same way so a
+    /// panic while holding this lock can never wedge the gate open or closed.
+    fn arm_gate_cooldown(&self, duration: Duration) {
+        let mut g = self
+            .gate_cooldown_until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = Some(std::time::Instant::now() + duration);
+    }
+
     /// Builder-style: attach a SharedTrayState so push outcomes update the
     /// tray menu / tooltip in near-real-time. Backwards-compatible.
     pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
@@ -615,12 +629,7 @@ impl PushClient {
                          This daemon is below the server's NEXUS_SYNC_MIN_DAEMON_VERSION. \
                          Standing down all pushes for the cooldown window; upgrade the daemon binary."
                     );
-                    if let Ok(mut g) = self.gate_cooldown_until.lock() {
-                        *g = Some(
-                            std::time::Instant::now()
-                                + Duration::from_secs(GATE_COOLDOWN_SECS),
-                        );
-                    }
+                    self.arm_gate_cooldown(Duration::from_secs(GATE_COOLDOWN_SECS));
                     return PushOutcome::Failed(FailureReason::UpgradeRequired { detail });
                 }
                 // HTTP 400 = permanent reject (e.g. path excluded by V9 baseline
@@ -1928,5 +1937,55 @@ mod tests {
             "gate cooldown must skip the drain tick entirely (no retry-loop)"
         );
         m.assert_async().await; // exactly ONE attempt total across both drains
+    }
+
+    /// S5 client half (v0.4.28), review follow-up: the existing 426 test only
+    /// proves the cooldown ENGAGES; nothing proved it CLEARS. Uses the
+    /// `arm_gate_cooldown(Duration)` seam to arm a short window instead of
+    /// the real 900s one, so the test can prove EXPIRY with a small real
+    /// sleep rather than mocking `Instant` or waiting 900s.
+    #[tokio::test]
+    async fn test_426_gate_cooldown_expires_after_window() {
+        let mut srv = Server::new_async().await;
+        // Two attempts expected: one is suppressed by the cooldown check
+        // never reaching the network, so only the pre-arm and post-expiry
+        // ticks actually hit the mock.
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","content_hash":"deadbeef"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"body\n")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        // Arm the cooldown directly via the injectable-duration seam — no
+        // need to force a real 426 response to get into the armed state.
+        client.arm_gate_cooldown(Duration::from_millis(50));
+
+        // Phase 1: tick during the window — suppressed, empty outcomes, no HTTP.
+        let outcomes = client.drain_once().await;
+        assert!(
+            outcomes.is_empty(),
+            "tick inside the cooldown window must be fully suppressed"
+        );
+
+        // Real sleep past the short window — cheap since it's 50ms, not 900s.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Phase 2: tick after expiry — journal drains normally.
+        let outcomes2 = client.drain_once().await;
+        assert_eq!(
+            outcomes2.len(),
+            1,
+            "tick after cooldown expiry must drain the journal normally"
+        );
+        assert!(
+            matches!(outcomes2[0].1, PushOutcome::Sent { .. }),
+            "expected Sent after cooldown expiry; got {:?}",
+            outcomes2[0].1
+        );
+        m.assert_async().await; // exactly ONE HTTP attempt (the post-expiry tick)
     }
 }
