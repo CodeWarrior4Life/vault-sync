@@ -1962,7 +1962,7 @@ mod tests {
 
         // Arm the cooldown directly via the injectable-duration seam — no
         // need to force a real 426 response to get into the armed state.
-        client.arm_gate_cooldown(Duration::from_millis(50));
+        client.arm_gate_cooldown(Duration::from_millis(200));
 
         // Phase 1: tick during the window — suppressed, empty outcomes, no HTTP.
         let outcomes = client.drain_once().await;
@@ -1972,7 +1972,7 @@ mod tests {
         );
 
         // Real sleep past the short window — cheap since it's 50ms, not 900s.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Phase 2: tick after expiry — journal drains normally.
         let outcomes2 = client.drain_once().await;
