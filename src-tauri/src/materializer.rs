@@ -2672,7 +2672,12 @@ mod tests {
         let out = m
             .write_aligned_bytes(&rel, &canonical_bytes, &canonical_sha, &local_sha)
             .unwrap();
-        assert_eq!(out, AlignOutcome::Rewrote { path: target.clone() });
+        assert_eq!(
+            out,
+            AlignOutcome::Rewrote {
+                path: target.clone()
+            }
+        );
         assert_eq!(std::fs::read(&target).unwrap(), canonical_bytes);
         assert_eq!(shadow.get(&rel).as_deref(), Some(canonical_sha.as_str()));
     }
