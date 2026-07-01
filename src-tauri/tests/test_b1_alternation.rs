@@ -23,15 +23,20 @@
 //! now records `server_hash` on Accepted instead of the local raw sha — is
 //! `push_client::tests::test_ack_materialize_rewrite_then_shadow`.
 
+use mockito::Server;
 use std::sync::Arc;
 use tempfile::TempDir;
-use vault_sync_daemon::api_client::NotePayload;
+use tokio::sync::Mutex;
+use vault_sync_daemon::api_client::{ApiClient, NotePayload};
 use vault_sync_daemon::echo_guard::EchoGuard;
 use vault_sync_daemon::materializer::{
     MaterializeOutcome, Materializer, MaterializerConfig, MaterializerMode, SkipReason,
 };
+use vault_sync_daemon::push_journal::PushJournal;
 use vault_sync_daemon::sync_shadow::ShadowStore;
-use vault_sync_daemon::verify_repair::{decide_direction, Direction};
+use vault_sync_daemon::verify_repair::{
+    decide_direction, Direction, VerifyRepair, VerifyRepairConfig,
+};
 
 const VAULT: &str = "Mainframe";
 
@@ -133,4 +138,120 @@ fn test_b1_alternation_regression() {
         mtime_before,
         "pass 2 must not touch the file (the eternal-alternation trace is dead)"
     );
+}
+
+/// Stronger B1' variant: drives the REAL `VerifyRepair::run` pull loop
+/// end-to-end against a mocked server, instead of hand-calling
+/// `decide_direction` + `Materializer::write` as the test above does.
+///
+/// Same D1-only caveat as `test_b1_alternation_regression`: the D3-bug
+/// shadow entry is still hand-seeded (`shadow.record`), not produced by
+/// driving `shadow_hash_for_ack`. What THIS test adds is proof that the
+/// production call path — `reconcile-batch` classify -> `decide_direction`
+/// -> pull -> `/api/sync/note` fetch -> `Materializer::write` (the alignment
+/// rewrite) -- converges with ZERO pushes, by mounting a push route with
+/// `expect(0)` (mockito fails the test if it's ever hit) alongside the
+/// reconcile-batch and note mocks that `VerifyRepair::run` actually calls.
+#[tokio::test]
+async fn test_b1_alternation_verify_repair_run_zero_pushes() {
+    let vault = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    let sdir = TempDir::new().unwrap();
+    let jdir = TempDir::new().unwrap();
+
+    let rel = "notes/storm.md";
+    let local_crlf = "storm line\r\nsecond line\r\n";
+    let server_lf = "storm line\nsecond line\n";
+    let local_raw_sha = sha256_hex(local_crlf.as_bytes());
+    let server_sha = sha256_hex(server_lf.as_bytes());
+
+    std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+    std::fs::write(vault.path().join(rel), local_crlf).unwrap();
+
+    // Same hand-seeded D3-bug residue as the test above: shadow holds the
+    // LOCAL raw sha, matching what the old (pre-D3-fix) Accepted arm used to
+    // record. This is what makes decide_direction choose Pull over Push for
+    // a "drift" delta instead of Noop.
+    let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+    shadow.record(rel, &local_raw_sha);
+
+    let mut srv = Server::new_async().await;
+    // reconcile-batch reports the CRLF-drifted note as drift, echoing the
+    // server's canonical hash.
+    let m_reconcile = srv
+        .mock("POST", "/api/sync/reconcile-batch")
+        .with_status(200)
+        .with_body(format!(
+            r#"{{"deltas":[{{"path":"{rel}","state":"drift","server_hash":"{server_sha}"}}]}}"#
+        ))
+        .create_async()
+        .await;
+    // /api/sync/note serves the canonical payload the pull fetches and
+    // materializes.
+    let note_body = format!(
+        r#"{{"path":"{rel}","frontmatter":{{}},"body":{body},"sha256":"{server_sha}","modified":"2026-07-01T00:00:00Z","enriched_body":{body}}}"#,
+        body = serde_json::to_string(server_lf).unwrap()
+    );
+    let m_note = srv
+        .mock("GET", "/api/sync/note")
+        .match_query(mockito::Matcher::UrlEncoded("path".into(), rel.into()))
+        .with_status(200)
+        .with_body(note_body)
+        .create_async()
+        .await;
+    // The whole point of D1: this must NEVER be hit. mockito fails the test
+    // if a request lands here.
+    let m_push = srv
+        .mock("POST", "/api/sync/push")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
+    let journal_path = jdir.path().join("push_journal.jsonl");
+    let journal = Arc::new(Mutex::new(PushJournal::open(&journal_path).unwrap()));
+    let mat = Materializer::new(
+        vault.path().to_path_buf(),
+        Some("shadow/".into()),
+        MaterializerMode::Live,
+        ws.path().to_path_buf(),
+        "sub-b1-vr".to_string(),
+        MaterializerConfig::default(),
+    )
+    .with_shadow_store(shadow.clone());
+
+    let vr = VerifyRepair::new(
+        vault.path().to_path_buf(),
+        api,
+        journal.clone(),
+        "trinity-sim".into(),
+        VerifyRepairConfig::default(),
+    )
+    .with_materializer(mat)
+    .with_shadow(shadow.clone());
+
+    let report = vr.run().await.unwrap();
+
+    assert_eq!(report.modify_count, 0, "drift-but-Pull must NOT push");
+    assert_eq!(report.add_count, 1, "the drift must resolve as one pull");
+    let j = journal.lock().await;
+    assert_eq!(
+        j.len(),
+        0,
+        "no push journaled — the alignment rewrite never enqueues a push"
+    );
+    drop(j);
+
+    // Local file converged to the server's canonical bytes, and the shadow
+    // now holds the server hash (no more residual D3-bug state).
+    assert_eq!(
+        std::fs::read(vault.path().join(rel)).unwrap(),
+        server_lf.as_bytes(),
+        "file must converge to canonical bytes via the real pull loop"
+    );
+    assert_eq!(shadow.get(rel).as_deref(), Some(server_sha.as_str()));
+
+    m_reconcile.assert_async().await;
+    m_note.assert_async().await;
+    m_push.assert_async().await;
 }
