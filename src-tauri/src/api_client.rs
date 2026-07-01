@@ -537,6 +537,16 @@ impl ApiClient {
 mod tests {
     use super::*;
 
+    /// v0.4.28 ship gate: the self-reported daemon_version (User-Agent + the
+    /// startup PATCH /subscribers/me the server's S5 min-version gate reads)
+    /// must be the Piece 1 version. Guards against shipping D1-D4 behavior
+    /// under a version string the gate would still reject.
+    #[test]
+    fn daemon_version_is_0_4_28() {
+        assert_eq!(daemon_version(), "0.4.28");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.28/"));
+    }
+
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
     /// response body (`{"deltas":[{path,state,server_hash?}]}`) and assert every
     /// state-vocabulary variant parses, including the optional `server_hash`.
