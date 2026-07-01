@@ -33,6 +33,12 @@ use crate::push_journal::{JournalCursor, PushAction, PushEvent, PushJournal};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
 
+/// S5 (v0.4.28): how long `drain_once` stands down after the server's
+/// min-daemon-version gate answers 426. Long enough to avoid a retry-loop
+/// against a gate only an upgrade can pass; short enough that a fleet-wide
+/// gate flip-back is picked up without a restart.
+const GATE_COOLDOWN_SECS: u64 = 900;
+
 /// Static configuration for the push client. Cheap to clone; cloned into
 /// each retry-loop spawn.
 #[derive(Debug, Clone)]
@@ -116,6 +122,11 @@ pub enum FailureReason {
     ConflictUnrecoverable { expected_hash: Option<String> },
     Unauthorized,
     Forbidden,
+    /// S5 (v0.4.28): the server's min-daemon-version gate answered HTTP 426.
+    /// Permanent until the daemon binary is upgraded. NOT acked (the edit
+    /// stays journaled); the push client enters a drain cooldown so it never
+    /// retry-loops against a gate that cannot pass.
+    UpgradeRequired { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +163,11 @@ pub struct PushClient {
     /// progress marker so the watchdog can distinguish "pipeline healthy"
     /// from "pipeline silent with pending diffs" (R1+R3).
     sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
+    /// S5 (v0.4.28): when Some(t) and now < t, drain_once returns immediately
+    /// without touching the journal or the network - the server's
+    /// min-daemon-version gate rejected us and only an upgrade (or gate
+    /// change) can help. Std mutex: held only for a read/write of an Option.
+    gate_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl PushClient {
@@ -171,6 +187,7 @@ impl PushClient {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -271,6 +288,23 @@ impl PushClient {
     /// ack/nack each in the journal. Returns the (event, outcome) pairs in
     /// drain order for the caller's tray/log layer.
     pub async fn drain_once(&self) -> Vec<(PushEvent, PushOutcome)> {
+        // S5 (v0.4.28): min-daemon-version gate cooldown. After a 426 we stand
+        // down entirely - no journal drain, no HTTP - until the window passes.
+        {
+            let until = *self
+                .gate_cooldown_until
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(until) = until {
+                if std::time::Instant::now() < until {
+                    tracing::debug!(
+                        "push_client: min-version gate cooldown active - skipping drain tick"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+
         let batch: Vec<(PushEvent, JournalCursor)> = {
             let mut j = self.journal.lock().await;
             match j.drain(self.config.batch_size) {
@@ -335,7 +369,8 @@ impl PushClient {
                 if let Ok(mut w) = tray.write() {
                     match &outcome {
                         PushOutcome::Sent { .. } => w.inc_uploads_sent(),
-                        PushOutcome::Failed(FailureReason::NetworkExhausted { .. }) => {
+                        PushOutcome::Failed(FailureReason::NetworkExhausted { .. })
+                        | PushOutcome::Failed(FailureReason::UpgradeRequired { .. }) => {
                             w.inc_uploads_failed()
                         }
                         _ => {}
@@ -566,6 +601,27 @@ impl PushClient {
                     return PushOutcome::Failed(FailureReason::ConflictUnrecoverable {
                         expected_hash,
                     });
+                }
+                // S5 (v0.4.28): the server's min-daemon-version gate rejected
+                // this daemon (HTTP 426). Fail LOUDLY, arm the drain cooldown,
+                // do NOT retry, do NOT ack (the caller leaves UpgradeRequired
+                // in the journal so the edit survives the upgrade).
+                Err(ApiError::UpgradeRequired { detail }) => {
+                    tracing::error!(
+                        path = %evt.path,
+                        detail = %detail,
+                        cooldown_secs = GATE_COOLDOWN_SECS,
+                        "SERVER MIN-DAEMON-VERSION GATE rejected this daemon (HTTP 426). \
+                         This daemon is below the server's NEXUS_SYNC_MIN_DAEMON_VERSION. \
+                         Standing down all pushes for the cooldown window; upgrade the daemon binary."
+                    );
+                    if let Ok(mut g) = self.gate_cooldown_until.lock() {
+                        *g = Some(
+                            std::time::Instant::now()
+                                + Duration::from_secs(GATE_COOLDOWN_SECS),
+                        );
+                    }
+                    return PushOutcome::Failed(FailureReason::UpgradeRequired { detail });
                 }
                 // HTTP 400 = permanent reject (e.g. path excluded by V9 baseline
                 // scope filter). Skip + ack so it never retry-storms (S481).
@@ -1051,6 +1107,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -1076,6 +1133,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -1097,6 +1155,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -1117,6 +1176,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -1778,6 +1838,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
@@ -1821,5 +1882,51 @@ mod tests {
             shadow_hash_for_ack(&PushStatus::Error, "local", Some("srv"), None),
             None
         );
+    }
+
+    /// S5 client half (v0.4.28): a gated daemon must fail LOUDLY and BACK OFF,
+    /// not retry-loop. Contract: exactly ONE HTTP attempt; outcome carries the
+    /// server detail; the journal entry is NOT acked (the local edit survives
+    /// for after the upgrade); the next drain tick inside the cooldown window
+    /// makes ZERO HTTP calls.
+    #[tokio::test]
+    async fn test_426_upgrade_required_fails_loudly_and_backs_off() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(426)
+            .with_body(
+                r#"{"detail":{"error":"daemon_version_below_minimum","minimum":"0.4.28","reported":"0.4.27"}}"#,
+            )
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"body\n")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PushOutcome::Failed(FailureReason::UpgradeRequired { detail }) => {
+                assert!(
+                    detail.contains("0.4.28"),
+                    "detail must name the required version: {detail}"
+                );
+            }
+            other => panic!("expected Failed(UpgradeRequired), got {other:?}"),
+        }
+        // NOT acked: the local edit stays journaled for after the upgrade.
+        assert_eq!(
+            journal.lock().await.len(),
+            1,
+            "426 must NOT ack - the edit is preserved, not dropped"
+        );
+        // Cooldown: the immediate next drain tick makes ZERO HTTP calls.
+        let outcomes2 = client.drain_once().await;
+        assert!(
+            outcomes2.is_empty(),
+            "gate cooldown must skip the drain tick entirely (no retry-loop)"
+        );
+        m.assert_async().await; // exactly ONE attempt total across both drains
     }
 }

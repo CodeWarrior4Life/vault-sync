@@ -52,6 +52,13 @@ pub enum ApiError {
     /// can fetch+merge+replay. Per R2 + mandate §5 push contract.
     #[error("conflict — base_hash mismatch (expected={expected_hash:?})")]
     Conflict { expected_hash: Option<String> },
+    /// HTTP 426 Upgrade Required — the server's Piece 1 min-daemon-version
+    /// gate (`NEXUS_SYNC_MIN_DAEMON_VERSION`, spec S5) rejected this daemon as
+    /// too old. PERMANENT until the binary is upgraded: the caller must fail
+    /// loudly and back off, NEVER retry-loop. `detail` is the raw response
+    /// body (the server names the required version in it).
+    #[error("upgrade required - server min-daemon-version gate rejected this daemon: {detail}")]
+    UpgradeRequired { detail: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -405,6 +412,16 @@ impl ApiClient {
                     retry_after_secs: retry,
                 })
             }
+            StatusCode::UPGRADE_REQUIRED => {
+                let detail: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect();
+                Err(ApiError::UpgradeRequired { detail })
+            }
             s => Err(ApiError::Server(s.as_u16())),
         }
     }
@@ -501,6 +518,16 @@ impl ApiClient {
                     retry_after_secs: retry,
                 })
             }
+            StatusCode::UPGRADE_REQUIRED => {
+                let detail: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect();
+                Err(ApiError::UpgradeRequired { detail })
+            }
             s => Err(ApiError::Server(s.as_u16())),
         }
     }
@@ -563,5 +590,66 @@ mod tests {
         // No device_id / manifest leftovers from the legacy contract.
         assert!(!j.contains("device_id"));
         assert!(!j.contains("manifest"));
+    }
+
+    /// S5 client half (v0.4.28): HTTP 426 from the server's min-daemon-version
+    /// gate must map to the DISTINCT ApiError::UpgradeRequired carrying the
+    /// server's detail body, not the generic Server(426) (which the push
+    /// client would treat as transient and retry-loop against a gate that can
+    /// never pass without an upgrade).
+    #[tokio::test]
+    async fn push_maps_426_to_upgrade_required() {
+        let mut srv = mockito::Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(426)
+            // The FROZEN server body shape (server plan Task 9). The mapping
+            // must tolerate any body, so the assertion is contains(), not parse.
+            .with_body(
+                r#"{"detail":{"error":"daemon_version_below_minimum","minimum":"0.4.28","reported":"0.4.27"}}"#,
+            )
+            .create_async()
+            .await;
+        let api = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        let req = PushRequest {
+            device_id: "dev",
+            path: "a.md",
+            content_b64: "eA==",
+            base_hash: "",
+            action: PushApiAction::Modify,
+        };
+        match api.push(&req).await {
+            Err(ApiError::UpgradeRequired { detail }) => {
+                assert!(
+                    detail.contains("0.4.28"),
+                    "detail must carry the server body naming the required version, got: {detail}"
+                );
+            }
+            other => panic!("expected UpgradeRequired, got {other:?}"),
+        }
+    }
+
+    /// Same mapping on the reconcile endpoint (the gate covers mutating +
+    /// reconcile endpoints, spec S5).
+    #[tokio::test]
+    async fn reconcile_batch_maps_426_to_upgrade_required() {
+        let mut srv = mockito::Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(426)
+            // reported:null exercises the fail-closed never-reported case.
+            .with_body(
+                r#"{"detail":{"error":"daemon_version_below_minimum","minimum":"0.4.28","reported":null}}"#,
+            )
+            .create_async()
+            .await;
+        let api = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        let req = ReconcileBatchRequest { paths: vec![] };
+        match api.reconcile_batch(&req).await {
+            Err(ApiError::UpgradeRequired { detail }) => {
+                assert!(detail.contains("0.4.28"), "got: {detail}");
+            }
+            other => panic!("expected UpgradeRequired, got {other:?}"),
+        }
     }
 }
