@@ -13,7 +13,8 @@ use tempfile::TempDir;
 use vault_sync_daemon::api_client::NotePayload;
 use vault_sync_daemon::echo_guard::EchoGuard;
 use vault_sync_daemon::materializer::{
-    MaterializeOutcome, Materializer, MaterializerConfig, MaterializerMode, SkipReason,
+    AlignOutcome, MaterializeOutcome, Materializer, MaterializerConfig, MaterializerMode,
+    SkipReason,
 };
 use vault_sync_daemon::sync_shadow::ShadowStore;
 
@@ -206,4 +207,139 @@ fn test_alignment_pull_respects_anti_strip() {
         local.as_bytes(),
         "local file must be untouched"
     );
+}
+
+/// D2a happy path: file still holds the drained bytes -> rewritten to the
+/// canonical bytes, shadow records the canonical sha AFTER the write, the
+/// write is echo-guarded, and the pre-write mtime is restored (an identity
+/// rewrite is not an edit).
+#[test]
+fn test_write_aligned_bytes_rewrites_and_records_shadow() {
+    let fx = fixture();
+    let rel = format!("{VAULT}/notes/d.md");
+    let drained = "text\r\n";
+    let canonical = "text\n";
+    let canonical_sha = sha256_hex(canonical.as_bytes());
+    let abs = fx.vault_root.join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, drained).unwrap();
+    let mtime_before = std::fs::metadata(&abs).unwrap().modified().unwrap();
+
+    let out = fx
+        .mat
+        .write_aligned_bytes(
+            &rel,
+            canonical.as_bytes(),
+            &canonical_sha,
+            &sha256_hex(drained.as_bytes()),
+        )
+        .unwrap();
+
+    assert_eq!(out, AlignOutcome::Rewrote { path: abs.clone() });
+    assert_eq!(std::fs::read(&abs).unwrap(), canonical.as_bytes());
+    assert_eq!(fx.shadow.get(&rel).as_deref(), Some(canonical_sha.as_str()));
+    assert!(
+        fx.echo.is_echo(&rel, &canonical_sha),
+        "aligned write must be echo-guarded"
+    );
+    assert_eq!(
+        std::fs::metadata(&abs).unwrap().modified().unwrap(),
+        mtime_before,
+        "identity rewrite must restore the pre-write mtime"
+    );
+}
+
+/// B2'a pre-rewrite guard: the file changed between drain and ack (a user
+/// edit mid-flight) -> rewrite SKIPPED, file untouched, shadow untouched.
+/// Without this guard the trace is total silent both-sides loss: ack rewrites
+/// the file to canonical(X1) destroying edit E2 locally, then the lazy push2
+/// reads canonical(X1) and destroys E2 on the server too.
+#[test]
+fn test_write_aligned_bytes_concurrent_edit_guard() {
+    let fx = fixture();
+    let rel = format!("{VAULT}/notes/e.md");
+    let drained = "original\r\n";
+    let edited = "the user edited this mid-flight\n";
+    let canonical = "original\n";
+    let abs = fx.vault_root.join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, edited).unwrap(); // disk already holds the NEW edit
+
+    let out = fx
+        .mat
+        .write_aligned_bytes(
+            &rel,
+            canonical.as_bytes(),
+            &sha256_hex(canonical.as_bytes()),
+            &sha256_hex(drained.as_bytes()), // what we drained (stale)
+        )
+        .unwrap();
+
+    assert_eq!(
+        out,
+        AlignOutcome::SkippedConcurrentEdit {
+            current_sha: sha256_hex(edited.as_bytes())
+        }
+    );
+    assert_eq!(
+        std::fs::read(&abs).unwrap(),
+        edited.as_bytes(),
+        "the mid-flight edit must be preserved"
+    );
+    assert_eq!(
+        fx.shadow.get(&rel),
+        None,
+        "write_aligned_bytes itself must not record shadow on a skip \
+         (the CALLER decides; see push_client D2)"
+    );
+}
+
+/// File vanished between drain and ack -> SkippedMissing, no shadow record.
+#[test]
+fn test_write_aligned_bytes_missing_file() {
+    let fx = fixture();
+    let rel = format!("{VAULT}/notes/gone.md");
+    let out = fx
+        .mat
+        .write_aligned_bytes(&rel, b"x\n", &sha256_hex(b"x\n"), &sha256_hex(b"x\r\n"))
+        .unwrap();
+    assert_eq!(out, AlignOutcome::SkippedMissing);
+    assert_eq!(fx.shadow.get(&rel), None);
+}
+
+/// B2'c ordering: a FAILING rewrite must leave the shadow UNRECORDED (stale
+/// -> next pass classifies PULL, the fail-closed direction). Recording first
+/// plus a persistently failing rewrite is the phantom-push-per-pass trap.
+#[cfg(unix)]
+#[test]
+fn test_write_aligned_bytes_failed_rewrite_leaves_shadow_stale() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let rel = format!("{VAULT}/notes/ro/f.md");
+    let drained = "text\r\n";
+    let canonical = "text\n";
+    let abs = fx.vault_root.join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, drained).unwrap();
+    // Make the parent dir read-only so the tmp-file creation fails.
+    let parent = abs.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let res = fx.mat.write_aligned_bytes(
+        &rel,
+        canonical.as_bytes(),
+        &sha256_hex(canonical.as_bytes()),
+        &sha256_hex(drained.as_bytes()),
+    );
+
+    // Restore perms FIRST so TempDir cleanup works even if asserts fail.
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(res.is_err(), "rewrite into a read-only dir must error");
+    assert_eq!(
+        fx.shadow.get(&rel),
+        None,
+        "B2'c: shadow must NOT be recorded when the rewrite failed"
+    );
+    assert_eq!(std::fs::read(&abs).unwrap(), drained.as_bytes());
 }

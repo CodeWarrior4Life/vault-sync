@@ -139,6 +139,26 @@ pub enum MaterializeOutcome {
     },
 }
 
+/// D2 (v0.4.28, B2'): outcome of an ack-materialize-back aligned write
+/// ([`Materializer::write_aligned_bytes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlignOutcome {
+    /// The local file was atomically rewritten to the canonical bytes and the
+    /// shadow store now records the canonical sha. Ordering (B2'c): rewrite
+    /// FIRST, shadow record SECOND - a crash between the two is benign (next
+    /// pass: raw match -> D1 Noop).
+    Rewrote { path: PathBuf },
+    /// Pre-rewrite guard tripped (B2'a): the file's current bytes no longer
+    /// hash to the bytes the caller drained/pushed - the user edited
+    /// mid-flight. Rewrite SKIPPED; the pending push of the newer edit
+    /// converges. `current_sha` is the file's current raw sha (diagnostics).
+    SkippedConcurrentEdit { current_sha: String },
+    /// The file no longer exists locally (deleted mid-flight). Skipped.
+    SkippedMissing,
+    /// Materializer is configured in `Disabled` mode. Skipped.
+    SkippedDisabled,
+}
+
 // ---------------------------------------------------------------------------
 // Materializer
 // ---------------------------------------------------------------------------
@@ -798,6 +818,129 @@ impl Materializer {
         } else {
             Ok(MaterializeOutcome::Wrote { path: target })
         }
+    }
+
+    /// D2 (v0.4.28, B2'): guarded ack-materialize-back write. After the server
+    /// ACCEPTS a push but returns a `server_hash` different from what we sent
+    /// (it canonicalized or region-defended the content), the push client
+    /// rewrites the local file to the canonical bytes THROUGH THIS ENTRY so
+    /// the rewrite rides the standard machinery: echo-guard record-before-
+    /// write (a bespoke path would re-trigger the watcher - the S492 feedback
+    /// loop), per-path advisory lock, atomic tmp+rename, pre-write mtime
+    /// restore (an identity rewrite is not an edit).
+    ///
+    /// Guards and ordering:
+    /// * B2'a pre-rewrite guard: re-reads the file INSIDE the lock and
+    ///   requires `sha256(file bytes) == expected_local_sha` (the sha of the
+    ///   bytes the caller actually drained and POSTed - NOT the enqueue-time
+    ///   `evt.content_sha`). Mismatch => `SkippedConcurrentEdit`, no write.
+    /// * B2'c ordering: the shadow records `canonical_sha` strictly AFTER a
+    ///   successful rename. Every error path returns BEFORE the record, so a
+    ///   failed rewrite leaves the shadow STALE => the next reconcile pass
+    ///   classifies PULL - the fail-closed direction (never the
+    ///   shadow==server + local-diverged phantom-push-per-pass trap).
+    /// * This method NEVER records the shadow on a skip; the caller decides
+    ///   (the push client records the server hash on SkippedConcurrentEdit so
+    ///   the pending push2 backfills the correct CAS base).
+    ///
+    /// `canonical_sha` MUST be the sha256 hex of `canonical_bytes` (the caller
+    /// verified it against the server's hash - unverified local
+    /// canonicalization is banned, B2'b).
+    pub fn write_aligned_bytes(
+        &self,
+        rel_path: &str,
+        canonical_bytes: &[u8],
+        canonical_sha: &str,
+        expected_local_sha: &str,
+    ) -> Result<AlignOutcome, MaterializerError> {
+        if matches!(self.mode, MaterializerMode::Disabled) {
+            info!(
+                "materializer_mode=disabled; skipping aligned write for {}",
+                rel_path
+            );
+            return Ok(AlignOutcome::SkippedDisabled);
+        }
+        if !is_safe_path(rel_path) {
+            return Err(MaterializerError::PathTraversal(rel_path.to_string()));
+        }
+        debug_assert_eq!(
+            hex::encode(Sha256::digest(canonical_bytes)),
+            canonical_sha,
+            "caller must pass the verified sha of canonical_bytes"
+        );
+
+        let target = self.target_for(rel_path);
+
+        // S492 echo-suppression: record BEFORE the disk write so the entry is
+        // present when the watcher observes the rename (same pattern as
+        // write()).
+        if let Some(g) = &self.echo_guard {
+            g.record(rel_path, canonical_sha);
+        }
+
+        // Same per-path lock write() takes: the read-compare-rename sequence
+        // must not interleave with a concurrent materialize of this path.
+        let lock = self.path_lock_for(&canonical_sync_path(rel_path));
+        let _path_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // B2'a: re-read and require the file still holds EXACTLY the drained
+        // bytes.
+        let current = match fs::read(&target) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(path = %rel_path, "aligned write: file vanished before ack - skipping");
+                return Ok(AlignOutcome::SkippedMissing);
+            }
+            Err(e) => return Err(MaterializerError::Io(e)),
+        };
+        let current_sha = hex::encode(Sha256::digest(&current));
+        if current_sha != expected_local_sha {
+            warn!(
+                path = %rel_path,
+                expected = %expected_local_sha,
+                actual = %current_sha,
+                "aligned write: file changed between drain and ack (B2'a) - SKIPPING rewrite, pending push will converge"
+            );
+            return Ok(AlignOutcome::SkippedConcurrentEdit { current_sha });
+        }
+
+        // Capture the pre-write mtime: a content-identity rewrite must not
+        // churn the note's modified ordering.
+        let pre_mtime = fs::metadata(&target).ok().and_then(|m| m.modified().ok());
+
+        // Atomic tmp+rename, same-dir (same pattern + platform handling as
+        // write() step 8).
+        let parent = target
+            .parent()
+            .expect("vault-relative target always has a parent");
+        fs::create_dir_all(parent)?;
+        let mut tmp = NamedTempFile::new_in(parent)?;
+        tmp.write_all(canonical_bytes)?;
+        tmp.flush()?;
+        atomic_persist(tmp, &target)?;
+
+        // Restore the pre-write mtime (best-effort, like restore_server_times).
+        if let Some(mtime) = pre_mtime {
+            let times = fs::FileTimes::new().set_modified(mtime);
+            match fs::File::options().write(true).open(&target) {
+                Ok(f) => {
+                    if let Err(e) = f.set_times(times) {
+                        warn!(path = %target.display(), error = %e, "aligned write: mtime restore failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(path = %target.display(), error = %e, "aligned write: reopen for mtime restore failed");
+                }
+            }
+        }
+
+        // B2'c: rewrite FIRST (above), record SECOND (here). Every error path
+        // returned before this line.
+        if let Some(sh) = &self.shadow_store {
+            sh.record(rel_path, canonical_sha);
+        }
+        info!(path = %rel_path, sha = %canonical_sha, "aligned write: local rewritten to server canonical bytes (D2)");
+        Ok(AlignOutcome::Rewrote { path: target })
     }
 
     /// Pick the canonical-root directory for the active mode.  Used by the
