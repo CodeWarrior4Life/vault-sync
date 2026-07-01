@@ -103,6 +103,8 @@ pub enum SkipReason {
     /// baseline scope filter). A 400 is a PERMANENT reject — skip + ack, never
     /// retry (S481: previously retry-stormed). Defense-in-depth: the fence
     /// (`is_junk_path`) should already keep these from being enqueued.
+    /// v0.4.28 (D4/M5a): HTTP 422 (non-UTF-8 / NUL content) is the same
+    /// permanent-reject class and carries `status: 422`.
     ServerRejected {
         status: u16,
     },
@@ -567,12 +569,18 @@ impl PushClient {
                 }
                 // HTTP 400 = permanent reject (e.g. path excluded by V9 baseline
                 // scope filter). Skip + ack so it never retry-storms (S481).
-                Err(ApiError::Server(400)) => {
+                // HTTP 422 = permanent reject too (D4/M5a, v0.4.28): the Piece 1
+                // server 422s non-UTF-8 / NUL content; re-sending the same bytes
+                // can never succeed. Before this arm, 422 fell into the generic
+                // transient arm -> 5 retries -> NetworkExhausted -> NOT acked ->
+                // journal-wedged, retried every drain tick forever.
+                Err(ApiError::Server(status @ (400 | 422))) => {
                     tracing::info!(
                         path = %evt.path,
-                        "push rejected HTTP 400 (permanent) — skip + ack, no retry"
+                        status,
+                        "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
-                    return PushOutcome::Skipped(SkipReason::ServerRejected { status: 400 });
+                    return PushOutcome::Skipped(SkipReason::ServerRejected { status });
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -1312,6 +1320,40 @@ mod tests {
         // Conflict is terminal — event was ack'd (resolver handles refetch+replay).
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
+    }
+
+    /// D4 (v0.4.28, M5a): HTTP 422 (non-UTF-8 / NUL content the server
+    /// permanently rejects) must behave exactly like 400 - permanent reject,
+    /// skip + ack, exactly ONE attempt, never the transient retry arm
+    /// (which wedged the journal: 5 retries -> NetworkExhausted -> not acked
+    /// -> retried every drain tick forever).
+    #[tokio::test]
+    async fn test_422_permanent_skip_and_ack() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(422)
+            .with_body(r#"{"detail":"content is not valid UTF-8"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/bad.md", b"x")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::ServerRejected { status: 422 }),
+            "422 must be a permanent ServerRejected skip"
+        );
+        // Acked: the journal entry is consumed, never retried.
+        assert_eq!(
+            journal.lock().await.len(),
+            0,
+            "422 outcome must be acked (journal drained)"
+        );
+        m.assert_async().await; // exactly one HTTP attempt
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
