@@ -879,6 +879,12 @@ fn spawn_push_pipeline(
         max_backoff_ms: 60_000,
         ..Default::default()
     };
+    // D2/B2'd (v0.4.28): ONE enqueue-dedup map shared by the file_watcher
+    // (reads+writes it at enqueue time) and the push_client (updates it after
+    // an ack-materialize-back rewrite).
+    let enqueued_hashes: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let push_client = push_client::PushClient::new(
         api_for_push,
         journal.clone(),
@@ -888,7 +894,11 @@ fn spawn_push_pipeline(
     )
     .with_tray_state(tray_state.clone())
     .with_shadow_store(shadow.clone())
-    .with_sync_health(sync_health.clone());
+    .with_sync_health(sync_health.clone())
+    // D2 (v0.4.28): ack-materialize-back rides the same materializer clone
+    // the reconcile backstop uses (echo-guarded + shadow-backed).
+    .with_materializer(materializer.clone())
+    .with_enqueued_hashes(enqueued_hashes.clone());
 
     // Never-fired shutdown channel — the push loop runs for the daemon's
     // lifetime. We hold the sender in the spawned task so it isn't dropped
@@ -1073,7 +1083,8 @@ fn spawn_push_pipeline(
             .with_tray_state(tray_state)
             .with_echo_guard(echo_guard)
             .with_shadow_store(shadow.clone())
-            .with_sync_health(sync_health.clone()),
+            .with_sync_health(sync_health.clone())
+            .with_enqueued_hashes(enqueued_hashes.clone()),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
             notify_user(

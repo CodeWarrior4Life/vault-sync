@@ -274,6 +274,18 @@ impl FileWatcher {
         self
     }
 
+    /// D2/B2'd (v0.4.28): REPLACE the internally-created enqueue-dedup map
+    /// with one shared with the push_client, so an ack-materialize-back
+    /// rewrite can advance `map[path]` to the canonical sha and a later touch
+    /// event with unchanged bytes is suppressed by the layer-2 dedup below
+    /// (enqueued_match && shadow_confirms) instead of emitting an idempotent
+    /// echo push. Backwards-compatible: without it the watcher keeps its own
+    /// private map (pre-v0.4.28 behavior).
+    pub fn with_enqueued_hashes(mut self, map: Arc<Mutex<HashMap<String, String>>>) -> Self {
+        self.enqueued_hashes = map;
+        self
+    }
+
     /// D7 (S511): attach the shared liveness handle so the watcher loop
     /// heartbeats and the storm-fence sets the watcher-fenced flag for the
     /// auto-recovery watchdog.
