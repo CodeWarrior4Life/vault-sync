@@ -68,7 +68,12 @@ fn test_b1_alternation_regression() {
     // ---- pass 1: reconcile classify -> PULL -> alignment rewrite ----
     // Server sees fs_hash=local_raw_sha != server_sha -> state "drift".
     // shadow(local_raw) != server -> Direction::Pull (verify_repair table).
-    let dir1 = decide_direction("drift", &local_raw_sha, Some(&server_sha), Some(&local_raw_sha));
+    let dir1 = decide_direction(
+        "drift",
+        &local_raw_sha,
+        Some(&server_sha),
+        Some(&local_raw_sha),
+    );
     assert_eq!(dir1, Direction::Pull, "pass 1 must classify PULL, not push");
 
     let payload = NotePayload {

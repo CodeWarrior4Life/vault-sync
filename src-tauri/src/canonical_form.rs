@@ -120,7 +120,11 @@ mod tests {
                     // Every non-error vector additionally asserts the fixpoint
                     // property: canonicalize(expected) == expected (spec §2.3).
                     let again = canonicalize(&out).expect("canonical output must re-canonicalize");
-                    assert_eq!(again, out, "vector {}: expected form is not a fixpoint", v.name);
+                    assert_eq!(
+                        again, out,
+                        "vector {}: expected form is not a fixpoint",
+                        v.name
+                    );
                 }
                 Err(e) => {
                     assert!(v.error, "vector {}: unexpected error {:?}", v.name, e);

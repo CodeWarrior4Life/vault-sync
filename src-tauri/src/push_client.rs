@@ -118,15 +118,21 @@ pub enum SkipReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureReason {
-    NetworkExhausted { last_error: String },
-    ConflictUnrecoverable { expected_hash: Option<String> },
+    NetworkExhausted {
+        last_error: String,
+    },
+    ConflictUnrecoverable {
+        expected_hash: Option<String>,
+    },
     Unauthorized,
     Forbidden,
     /// S5 (v0.4.28): the server's min-daemon-version gate answered HTTP 426.
     /// Permanent until the daemon binary is upgraded. NOT acked (the edit
     /// stays journaled); the push client enters a drain cooldown so it never
     /// retry-loops against a gate that cannot pass.
-    UpgradeRequired { detail: String },
+    UpgradeRequired {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
