@@ -316,6 +316,7 @@ impl SseConsumer {
                                         );
                                     }
                                     Ok(MaterializeOutcome::Wrote { .. })
+                                    | Ok(MaterializeOutcome::AlignedToCanonical { .. })
                                     | Ok(MaterializeOutcome::Skipped(_)) => {
                                         debug!(path = %env.path, "sse: materialized server note");
                                     }

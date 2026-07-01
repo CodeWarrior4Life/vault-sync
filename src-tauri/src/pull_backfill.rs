@@ -182,9 +182,9 @@ pub async fn run_pull_backfill(
 
         for outcome in outcomes {
             match outcome {
-                Ok(MaterializeOutcome::Wrote { .. }) | Ok(MaterializeOutcome::Stashed { .. }) => {
-                    stats.created += 1
-                }
+                Ok(MaterializeOutcome::Wrote { .. })
+                | Ok(MaterializeOutcome::Stashed { .. })
+                | Ok(MaterializeOutcome::AlignedToCanonical { .. }) => stats.created += 1,
                 Ok(MaterializeOutcome::Skipped(_)) => stats.refused_or_unsafe += 1,
                 Ok(MaterializeOutcome::IntegrityFailed { .. }) | Err(()) => stats.failed += 1,
             }

@@ -121,6 +121,14 @@ pub enum MaterializeOutcome {
     /// written.  `stash_path` is the sibling stash file.  The canonical was
     /// also written to its final path.
     Stashed { stash_path: PathBuf },
+    /// D1 (v0.4.28, B1' resolution): the local file was NORMALIZED-equal but
+    /// RAW-unequal to the server canonical (a CRLF/BOM-only delta). It was
+    /// rewritten in place to the server's exact canonical bytes through the
+    /// standard persist machinery (echo-guarded, per-path-locked, atomic
+    /// tmp+rename, timestamps restored). NO stash: normalized-equal means
+    /// zero content difference by construction. This is the "alignment pull"
+    /// that converges the fleet's CRLF corpus in one pull pass, zero pushes.
+    AlignedToCanonical { path: PathBuf },
     /// Write completed but the post-write integrity check failed.  The file
     /// is intentionally NOT deleted — the owner can inspect both the bad
     /// write and the resulting ticket.
@@ -535,6 +543,10 @@ impl Materializer {
         // frontmatter-normalized comparison (R1 idempotency basis). The stash is
         // now DIVERGENCE-driven (always preserve the loser), never policy-driven.
         let mut stash_path: Option<PathBuf> = None;
+        // D1 (v0.4.28): set when the Noop arm detects normalized-equal but
+        // raw-unequal - fall through to the persist machinery instead of
+        // returning, then report AlignedToCanonical.
+        let mut alignment_pull = false;
         if target.exists() {
             let local_bytes = fs::read(&target)?;
             let local_raw_sha = hex::encode(Sha256::digest(&local_bytes));
@@ -573,17 +585,41 @@ impl Materializer {
             }
             match guard_no_frontmatter_strip(raw_decision, pull_would_strip) {
                 Decision::Noop => {
+                    if local_bytes == content_bytes {
+                        // R1 byte-strict half: truly identical bytes. Nothing
+                        // to write; no mtime churn.
+                        info!(
+                            path = %payload.path,
+                            "materializer skip: local already identical to canonical (R1)"
+                        );
+                        // Record the synced server hash so the reconcile backstop
+                        // sees this path as in-sync-with-server, not a stale-pull
+                        // candidate.
+                        if let Some(sh) = &self.shadow_store {
+                            sh.record(&payload.path, &payload.sha256);
+                        }
+                        return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
+                    }
+                    // D1 (v0.4.28, B1'): normalized-equal but RAW-unequal - a
+                    // CRLF/BOM-only delta between local and the server
+                    // canonical. The old normalized-only Noop here is why the
+                    // pull leg could never converge byte-level drift while
+                    // every byte-strict comparer (server CAS, reconcile-batch
+                    // fs_hash) kept classifying it - the B1' alternation.
+                    // ALIGNMENT PULL: fall through to the persist machinery
+                    // below (echo-guard already recorded pre-write; the
+                    // per-path lock is held; atomic tmp+rename + timestamp
+                    // restore + shadow record all apply). NO stash - safe by
+                    // construction: normalized-equal means zero content
+                    // difference. The anti-strip guard is structurally
+                    // unaffected: normalized-equal implies identical
+                    // frontmatter presence.
                     info!(
                         path = %payload.path,
-                        "materializer skip: local already identical to canonical (R1)"
+                        change_seq,
+                        "materializer D1: normalized-equal but raw-unequal - ALIGNMENT PULL, rewriting local to server canonical bytes"
                     );
-                    // Record the synced server hash so the reconcile backstop
-                    // sees this path as in-sync-with-server, not a stale-pull
-                    // candidate.
-                    if let Some(sh) = &self.shadow_store {
-                        sh.record(&payload.path, &payload.sha256);
-                    }
-                    return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
+                    alignment_pull = true;
                 }
                 Decision::PreserveLocalEdit => {
                     // R2: shadow == server (server has NOT moved since we synced)
@@ -757,6 +793,8 @@ impl Materializer {
 
         if let Some(stash) = stash_path {
             Ok(MaterializeOutcome::Stashed { stash_path: stash })
+        } else if alignment_pull {
+            Ok(MaterializeOutcome::AlignedToCanonical { path: target })
         } else {
             Ok(MaterializeOutcome::Wrote { path: target })
         }
@@ -1542,6 +1580,14 @@ mod tests {
         );
     }
 
+    /// Superseded by D1 (v0.4.28): a local file whose ONLY delta from the
+    /// server canonical is the diff-stripped `updated:` frontmatter value is
+    /// normalized-equal but raw-unequal, so it is now an ALIGNMENT PULL
+    /// (rewritten to the server's exact bytes, including the newer
+    /// `updated:`) rather than a byte-preserving Noop skip. Per the brief's
+    /// precision note: `updated` is deliberately excluded from the identity
+    /// basis as churn-noise, and the server canonical is authoritative, so
+    /// converging local to the server's `updated:` value here is intended.
     #[test]
     fn frontmatter_only_rewrite_treated_as_identical() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -1572,13 +1618,18 @@ mod tests {
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
             created: None,
-            enriched_body: Some(serialized),
+            enriched_body: Some(serialized.clone()),
         };
         let out = m.write(&p).unwrap();
         assert_eq!(
             out,
-            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)
+            MaterializeOutcome::AlignedToCanonical {
+                path: target.clone()
+            }
         );
+        // D1: local is rewritten to the server's exact canonical bytes
+        // (newer `updated:` included) — no stash, zero content difference.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), serialized);
     }
 
     // ---- conflict stash ---------------------------------------------------
@@ -2321,11 +2372,14 @@ mod tests {
             .contains("server divergent body"));
     }
 
-    /// D11: a CRLF (Windows) local file vs an LF (Unix) server body with the
-    /// SAME logical content must NOT be treated as a divergence. With the
-    /// shadow recording the server hash (R2 setup), a CRLF-only difference must
-    /// resolve as R1 NOOP (identical-after-normalization), not a false conflict
-    /// or a false local-edit.
+    /// D11 (superseded by D1, v0.4.28): a CRLF (Windows) local file vs an LF
+    /// (Unix) server body with the SAME logical content must NOT be treated
+    /// as a divergence (no conflict, no false local-edit). Pre-D1 this
+    /// resolved as a NOOP skip leaving the CRLF file untouched forever (the
+    /// B1' alternation: every byte-strict comparer downstream kept seeing
+    /// drift). D1 splits R1 byte-strict: normalized-equal-but-raw-unequal is
+    /// now an ALIGNMENT PULL that rewrites local to the server's exact
+    /// canonical bytes, still with zero conflict/stash.
     #[test]
     fn d11_crlf_vs_lf_is_not_a_divergence() {
         let (vaults, _ws, m, _shadow) = mk_with_shadow(MaterializerMode::Live);
@@ -2342,11 +2396,14 @@ mod tests {
         let out = m.write(&server).unwrap();
         assert_eq!(
             out,
-            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal),
-            "CRLF/BOM-only difference must normalize to identical (R1), got {out:?}"
+            MaterializeOutcome::AlignedToCanonical {
+                path: target.clone()
+            },
+            "CRLF/BOM-only difference must normalize to identical (R1) and align, got {out:?}"
         );
-        // The local CRLF file is left untouched (idempotent skip, no rewrite).
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), crlf_local);
+        // D1: the local CRLF/BOM file is rewritten to the server's exact
+        // canonical bytes (no conflict, no stash — zero content difference).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), server_bytes);
     }
 
     /// D13: soft_delete suffix carries nanosecond precision, so two deletes of
