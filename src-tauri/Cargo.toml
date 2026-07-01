@@ -66,6 +66,8 @@ rstest = "0.23"
 # tick deterministically without real-time sleeps. Cargo unifies features
 # across normal+dev so this lights up `test-util` for the test build only.
 tokio = { version = "1", features = ["test-util"] }
+# Piece 1 (S535): property test for canonicalize() idempotency / fixpoint.
+proptest = "1"
 
 [features]
 default = []

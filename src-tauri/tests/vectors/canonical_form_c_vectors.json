@@ -1,0 +1,80 @@
+{
+  "description": "Canonical form C cross-language test vectors (Piece 1 spec section 2.3). Vendored identically in nexus (server/tests/vectors/) and vault-sync (src-tauri/tests/vectors/); each suite pins this file's sha256.",
+  "vectors": [
+    {
+      "name": "crlf",
+      "input_b64": "YQ0KYg0K",
+      "expect_b64": "YQpiCg=="
+    },
+    {
+      "name": "bare_cr",
+      "input_b64": "YQ1i",
+      "expect_b64": "YQpi"
+    },
+    {
+      "name": "cr_cr_lf",
+      "input_b64": "YQ0NCmI=",
+      "expect_b64": "YQoKYg=="
+    },
+    {
+      "name": "leading_bom",
+      "input_b64": "77u/YQo=",
+      "expect_b64": "YQo="
+    },
+    {
+      "name": "double_bom",
+      "input_b64": "77u/77u/YQ==",
+      "expect_b64": "YQ=="
+    },
+    {
+      "name": "interior_bom_preserved",
+      "input_b64": "Ye+7v2I=",
+      "expect_b64": "Ye+7v2I="
+    },
+    {
+      "name": "mixed",
+      "input_b64": "77u/YQ0KYg1jCg==",
+      "expect_b64": "YQpiCmMK"
+    },
+    {
+      "name": "empty",
+      "input_b64": "",
+      "expect_b64": ""
+    },
+    {
+      "name": "no_trailing_nl",
+      "input_b64": "YQ==",
+      "expect_b64": "YQ=="
+    },
+    {
+      "name": "already_canonical",
+      "input_b64": "YQpiCg==",
+      "expect_b64": "YQpiCg=="
+    },
+    {
+      "name": "lone_cr",
+      "input_b64": "DQ==",
+      "expect_b64": "Cg=="
+    },
+    {
+      "name": "crlf_eof",
+      "input_b64": "YQ0K",
+      "expect_b64": "YQo="
+    },
+    {
+      "name": "nfd_content_preserved",
+      "input_b64": "ZcyBCg==",
+      "expect_b64": "ZcyBCg=="
+    },
+    {
+      "name": "non_utf8",
+      "input_b64": "//5B",
+      "error": true
+    },
+    {
+      "name": "nul",
+      "input_b64": "YQBi",
+      "error": true
+    }
+  ]
+}

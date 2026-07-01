@@ -1,4 +1,5 @@
 pub mod api_client;
+pub mod canonical_form;
 pub mod commands;
 pub mod commands_vaults;
 pub mod config;
