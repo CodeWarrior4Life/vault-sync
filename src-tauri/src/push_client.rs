@@ -520,6 +520,18 @@ impl PushClient {
         };
         let content_b64 = B64.encode(&content_bytes);
 
+        // D2/D3 (v0.4.28): the sha of the bytes we ACTUALLY drained and will
+        // POST. NOT `evt.content_sha` - that is ENQUEUE-time, and pushes are
+        // lazy (file_watcher sets content_bytes: None; we read at drain time
+        // above), so the two can differ if the file changed in between.
+        // Deletes carry no body; keep the enqueue-time value ("") so delete
+        // shadow semantics are unchanged.
+        let drained_sha: String = if matches!(evt.action, PushAction::Delete) {
+            evt.content_sha.clone()
+        } else {
+            sha256_hex(&content_bytes)
+        };
+
         // I29 (S513, TKT-2dc9a17e): backfill the CAS base from the shadow store.
         //
         // file_watcher emits real-time Create/Modify pushes with base_hash=None —
@@ -584,7 +596,7 @@ impl PushClient {
                     if let Some(sh) = &self.shadow_store {
                         if let Some(h) = shadow_hash_for_ack(
                             &resp.status,
-                            &evt.content_sha,
+                            &drained_sha,
                             resp.server_hash.as_deref(),
                             resp.content_hash.as_deref(),
                         ) {
@@ -709,16 +721,19 @@ impl PushClient {
 /// Decide which hash (if any) to record into the ShadowStore for a push the
 /// server acked. Pure + table-tested.
 ///
-/// * `Accepted` → the local bytes we pushed are now the server's canonical →
-///   record `local_sha`.
-/// * `Merged` → the server merged a concurrent edit and its returned canonical
-///   differs from what we pushed → record the server's canonical
-///   (`server_hash`, falling back to `content_hash` if the server only echoes
-///   that field). If neither is present, fall back to `local_sha` so we still
-///   record SOMETHING (better an approximate marker than none — drift will
-///   self-correct on the next pass).
-/// * `ConflictMarkers` / `Error` → no clean canonical was established → record
-///   nothing.
+/// * `Accepted` (D3, v0.4.28) → record the SERVER's canonical hash
+///   (`server_hash`, falling back to `content_hash`, then `local_sha` for
+///   pre-Piece-1 servers that omit both). The Piece 1 server may have
+///   CANONICALIZED (or region-defended) what we sent, so the local sha is no
+///   longer guaranteed to be the canonical; recording it unconditionally was
+///   step 3 of the B1' eternal push/pull alternation (push_client.rs:656 in
+///   v0.4.27). With this change an idempotent accept of raw CRLF bytes
+///   records the canonical hash, so the next reconcile pass classifies the
+///   file as PULL (→ the D1 alignment rewrite) instead of ping-ponging.
+/// * `Merged` → the server merged a concurrent edit; record its returned
+///   canonical (`server_hash` → `content_hash` → `local_sha`). Unchanged.
+/// * `ConflictMarkers` / `Error` → no clean canonical was established →
+///   record nothing. Unchanged.
 fn shadow_hash_for_ack(
     status: &PushStatus,
     local_sha: &str,
@@ -726,8 +741,7 @@ fn shadow_hash_for_ack(
     content_hash: Option<&str>,
 ) -> Option<String> {
     match status {
-        PushStatus::Accepted => Some(local_sha.to_string()),
-        PushStatus::Merged => Some(
+        PushStatus::Accepted | PushStatus::Merged => Some(
             server_hash
                 .or(content_hash)
                 .unwrap_or(local_sha)
@@ -1858,31 +1872,45 @@ mod tests {
         );
     }
 
-    // --- shadow_hash_for_ack (fix/reconcile-server-wins-shadow) ---
+    // --- shadow_hash_for_ack (D3, v0.4.28 + fix/reconcile-server-wins-shadow) ---
 
     #[test]
     fn shadow_hash_for_ack_table() {
-        // Accepted → the pushed local hash is the new canonical.
+        // D3 (v0.4.28): Accepted with a server_hash records the SERVER's
+        // canonical hash, NOT the local sha. Recording the local sha here was
+        // step 3 of the B1' eternal alternation: idempotent-accept of raw CRLF
+        // bytes -> shadow=local -> next pass classifies PUSH again, forever.
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Accepted, "local", Some("srv"), Some("ch")),
+            Some("srv".to_string())
+        );
+        // Accepted, no server_hash -> content_hash (pre-Piece-1 server compat).
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Accepted, "local", None, Some("ch")),
+            Some("ch".to_string())
+        );
+        // Accepted, neither field -> the local sha (oldest-server compat; a
+        // non-canonicalizing server stored exactly what we sent).
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Accepted, "local", None, None),
             Some("local".to_string())
         );
-        // Merged → prefer server_hash.
+        // Merged -> prefer server_hash (unchanged behavior).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", Some("srv"), Some("ch")),
             Some("srv".to_string())
         );
-        // Merged, no server_hash → fall back to content_hash.
+        // Merged, no server_hash -> fall back to content_hash.
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", None, Some("ch")),
             Some("ch".to_string())
         );
-        // Merged, neither → fall back to local (record SOMETHING).
+        // Merged, neither -> fall back to local (record SOMETHING).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", None, None),
             Some("local".to_string())
         );
-        // ConflictMarkers / Error → record nothing.
+        // ConflictMarkers / Error -> record nothing (unchanged).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::ConflictMarkers, "local", Some("srv"), None),
             None
