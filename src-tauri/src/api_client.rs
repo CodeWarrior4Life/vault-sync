@@ -537,14 +537,15 @@ impl ApiClient {
 mod tests {
     use super::*;
 
-    /// v0.4.28 ship gate: the self-reported daemon_version (User-Agent + the
+    /// v0.4.29 ship gate: the self-reported daemon_version (User-Agent + the
     /// startup PATCH /subscribers/me the server's S5 min-version gate reads)
-    /// must be the Piece 1 version. Guards against shipping D1-D4 behavior
-    /// under a version string the gate would still reject.
+    /// must be the control-plane P0 version. Guards against shipping the
+    /// file-first token store + non-prompting launch gate under a version
+    /// string the fleet would mistake for 0.4.28.
     #[test]
-    fn daemon_version_is_0_4_28() {
-        assert_eq!(daemon_version(), "0.4.28");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.28/"));
+    fn daemon_version_is_0_4_29() {
+        assert_eq!(daemon_version(), "0.4.29");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.29/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
