@@ -45,6 +45,42 @@ pub fn notify_user(app: &tauri::AppHandle, title: &str, body: &str) {
     }
 }
 
+/// v0.4.29 control-plane P0 (Change 2): what the launch gate decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchDecision {
+    /// Spawn the SSE consumer + push pipelines.
+    pub start_sync: bool,
+    /// Show + focus the pairing wizard window.
+    pub show_wizard: bool,
+}
+
+/// v0.4.29 control-plane P0 (Change 2): pure, NON-PROMPTING launch gate.
+///
+/// Inputs:
+/// - `has_subscriber_config` — config.toml loads and carries a non-empty
+///   `subscriber_id`.
+/// - `has_persisted_token` — `token_store::has_persisted_token()` (process
+///   cache / token FILE only; by construction it can never invoke the OS
+///   keyring, so evaluating this gate can never hang the main thread on a
+///   macOS Keychain prompt — the pre-0.4.29 fatal-unattended failure).
+///
+/// Decision:
+/// - paired (config + token file) → headless: start sync, no wizard.
+/// - config but no token file → LEGACY (pre-0.4.29 keyring-only) install:
+///   still start sync — the async-path `token_store::load()` performs the
+///   one-time keyring→file migration OFF the main thread (worst case one
+///   final prompt, then never again). Not paired by the non-prompting
+///   predicate, so the wizard also shows (same as the old not-paired UX).
+///   Refusing to start sync here would strand every pre-0.4.29 host: the
+///   migration shim only runs when load() runs.
+/// - no config → pairing wizard only.
+pub fn launch_decision(has_subscriber_config: bool, has_persisted_token: bool) -> LaunchDecision {
+    LaunchDecision {
+        start_sync: has_subscriber_config,
+        show_wizard: !(has_subscriber_config && has_persisted_token),
+    }
+}
+
 /// S477 §3.2: enumerate immediate subdirectories of `vaults_root` for the
 /// wizard's Paired panel detected-vaults list. Pure stdlib + platform-agnostic.
 #[tauri::command]
@@ -138,15 +174,32 @@ pub fn run() {
             // Cyril S473: *"the dialog to enter the key should be the first
             // thing that comes up [...] since the app has no meaning without
             // a valid connection to the server"*.
-            let has_token = cfg_path.exists()
-                && config::Config::load_from(&cfg_path)
-                    .ok()
-                    .and_then(|c| token_store::load(&c.subscriber_id).ok().flatten())
-                    .is_some();
-            if has_token {
-                spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
+            //
+            // v0.4.29 control-plane P0 (Change 2): this gate used to call
+            // token_store::load() HERE, on the main thread — after an
+            // auto-update the new binary's signature is not in the macOS
+            // Keychain ACL, so that load threw a BLOCKING TouchID/password
+            // prompt (fatal unattended). The gate is now the pure,
+            // non-prompting launch_decision(): config subscriber_id +
+            // token_store::has_persisted_token (cache/file only — never the
+            // keyring). Any legacy keyring touch happens exclusively on the
+            // async sync paths, off the main thread.
+            let subscriber_id = if cfg_path.exists() {
+                config::Config::load_from(&cfg_path)
+                    .map(|c| c.subscriber_id)
+                    .unwrap_or_default()
             } else {
-                tracing::info!("no token persisted — opening pairing wizard");
+                String::new()
+            };
+            let decision = launch_decision(
+                !subscriber_id.is_empty(),
+                !subscriber_id.is_empty() && token_store::has_persisted_token(&subscriber_id),
+            );
+            if decision.start_sync {
+                spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
+            }
+            if decision.show_wizard {
+                tracing::info!("not paired (no persisted token file) — opening pairing wizard");
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
@@ -1390,6 +1443,56 @@ mod tests {
             "sub-top-level",
             "empty root.subscriber_id must fall back to cfg.subscriber_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_gate_tests {
+    use super::launch_decision;
+
+    /// v0.4.29 Change 2: paired (config subscriber_id + persisted token file)
+    /// → fully headless: sync starts, wizard stays hidden. This is the
+    /// unattended-auto-update invariant.
+    #[test]
+    fn paired_host_is_headless() {
+        let d = launch_decision(true, true);
+        assert!(d.start_sync, "paired host must start sync");
+        assert!(!d.show_wizard, "paired host must NOT show the wizard");
+    }
+
+    /// Legacy (pre-0.4.29) install: config exists but the token file hasn't
+    /// been migrated yet. Sync MUST still start — the async-path
+    /// token_store::load() performs the one-time keyring→file migration off
+    /// the main thread. Not paired by the non-prompting predicate → wizard
+    /// shows (matches the old not-paired UX; never a main-thread prompt).
+    #[test]
+    fn legacy_config_without_token_file_still_starts_sync() {
+        let d = launch_decision(true, false);
+        assert!(
+            d.start_sync,
+            "legacy keyring-only install must still start sync (migration path)"
+        );
+        assert!(
+            d.show_wizard,
+            "not paired by the non-prompting check → wizard"
+        );
+    }
+
+    /// Never paired: no subscriber_id config at all → wizard only.
+    #[test]
+    fn unpaired_host_shows_wizard_only() {
+        let d = launch_decision(false, false);
+        assert!(!d.start_sync, "no config → nothing to sync");
+        assert!(d.show_wizard, "no config → pairing wizard");
+    }
+
+    /// Degenerate: token file but no config (config deleted by hand). No
+    /// subscriber to sync under → wizard.
+    #[test]
+    fn token_without_config_shows_wizard() {
+        let d = launch_decision(false, true);
+        assert!(!d.start_sync);
+        assert!(d.show_wizard);
     }
 }
 
