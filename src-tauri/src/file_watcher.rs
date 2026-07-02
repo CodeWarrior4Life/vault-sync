@@ -274,6 +274,18 @@ impl FileWatcher {
         self
     }
 
+    /// D2/B2'd (v0.4.28): REPLACE the internally-created enqueue-dedup map
+    /// with one shared with the push_client, so an ack-materialize-back
+    /// rewrite can advance `map[path]` to the canonical sha and a later touch
+    /// event with unchanged bytes is suppressed by the layer-2 dedup below
+    /// (enqueued_match && shadow_confirms) instead of emitting an idempotent
+    /// echo push. Backwards-compatible: without it the watcher keeps its own
+    /// private map (pre-v0.4.28 behavior).
+    pub fn with_enqueued_hashes(mut self, map: Arc<Mutex<HashMap<String, String>>>) -> Self {
+        self.enqueued_hashes = map;
+        self
+    }
+
     /// D7 (S511): attach the shared liveness handle so the watcher loop
     /// heartbeats and the storm-fence sets the watcher-fenced flag for the
     /// auto-recovery watchdog.
@@ -1300,6 +1312,59 @@ mod tests {
             w.journal.lock().unwrap().len(),
             2,
             "once server-accepted, a redundant identical event is suppressed"
+        );
+    }
+
+    /// B2'd (v0.4.28): after an ack-materialize-back rewrite the push_client
+    /// sets enqueued_hashes[p] = canonical sha and the shadow records the same
+    /// sha. A LATER touch event (past the echo-guard TTL, so echo suppression
+    /// cannot help) with unchanged bytes must be suppressed by the layer-2
+    /// dedup - no idempotent echo push. This test drives the watcher with the
+    /// exact post-ack-materialize shared state.
+    #[tokio::test]
+    async fn b2d_touch_after_ack_materialize_is_deduped() {
+        use crate::sync_shadow::ShadowStore;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let enq: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let w = make_watcher(&dir, vec![], vec![])
+            .with_shadow_store(shadow.clone())
+            .with_enqueued_hashes(enq.clone());
+
+        let rel = "01_Notes/aligned.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let canonical = b"canonical body\n";
+        std::fs::write(&abs, canonical).unwrap();
+        let sha = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(canonical))
+        };
+
+        // Simulate the push_client's post-rewrite state (D2 B2'c + B2'd):
+        // shadow = canonical sha (recorded by write_aligned_bytes), shared
+        // enqueued_hashes[p] = canonical sha (recorded by ack_materialize_back).
+        shadow.record(rel, &sha);
+        enq.lock().unwrap().insert(rel.to_string(), sha.clone());
+
+        // A touch event past the echo TTL: unchanged bytes, no echo entry.
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            0,
+            "B2'd: a touch with unchanged canonical bytes must NOT enqueue a push"
+        );
+
+        // Control: a REAL edit must still enqueue.
+        std::fs::write(&abs, b"a real edit\n").unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            1,
+            "a genuine edit must never be suppressed"
         );
     }
 

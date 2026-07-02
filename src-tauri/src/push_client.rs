@@ -33,6 +33,12 @@ use crate::push_journal::{JournalCursor, PushAction, PushEvent, PushJournal};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
 
+/// S5 (v0.4.28): how long `drain_once` stands down after the server's
+/// min-daemon-version gate answers 426. Long enough to avoid a retry-loop
+/// against a gate only an upgrade can pass; short enough that a fleet-wide
+/// gate flip-back is picked up without a restart.
+const GATE_COOLDOWN_SECS: u64 = 900;
+
 /// Static configuration for the push client. Cheap to clone; cloned into
 /// each retry-loop spawn.
 #[derive(Debug, Clone)]
@@ -103,6 +109,8 @@ pub enum SkipReason {
     /// baseline scope filter). A 400 is a PERMANENT reject — skip + ack, never
     /// retry (S481: previously retry-stormed). Defense-in-depth: the fence
     /// (`is_junk_path`) should already keep these from being enqueued.
+    /// v0.4.28 (D4/M5a): HTTP 422 (non-UTF-8 / NUL content) is the same
+    /// permanent-reject class and carries `status: 422`.
     ServerRejected {
         status: u16,
     },
@@ -110,10 +118,21 @@ pub enum SkipReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureReason {
-    NetworkExhausted { last_error: String },
-    ConflictUnrecoverable { expected_hash: Option<String> },
+    NetworkExhausted {
+        last_error: String,
+    },
+    ConflictUnrecoverable {
+        expected_hash: Option<String>,
+    },
     Unauthorized,
     Forbidden,
+    /// S5 (v0.4.28): the server's min-daemon-version gate answered HTTP 426.
+    /// Permanent until the daemon binary is upgraded. NOT acked (the edit
+    /// stays journaled); the push client enters a drain cooldown so it never
+    /// retry-loops against a gate that cannot pass.
+    UpgradeRequired {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +169,24 @@ pub struct PushClient {
     /// progress marker so the watchdog can distinguish "pipeline healthy"
     /// from "pipeline silent with pending diffs" (R1+R3).
     sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
+    /// S5 (v0.4.28): when Some(t) and now < t, drain_once returns immediately
+    /// without touching the journal or the network - the server's
+    /// min-daemon-version gate rejected us and only an upgrade (or gate
+    /// change) can help. Std mutex: held only for a read/write of an Option.
+    gate_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// D2 (v0.4.28): write machinery for ack-materialize-back. The rewrite
+    /// MUST ride `Materializer::write_aligned_bytes` (per-path lock, echo
+    /// guard, atomic tmp+rename) - a bespoke write path would miss echo
+    /// suppression and re-trigger the watcher (the S492 feedback loop).
+    /// `None` = no rewrite (unit tests / degraded wiring); the shadow then
+    /// records the server hash so the next reconcile pass pulls (D1 aligns).
+    materializer: Option<crate::materializer::Materializer>,
+    /// D2/B2'd (v0.4.28): the file_watcher's enqueue-dedup map, SHARED (see
+    /// lib.rs spawn_push_pipeline). After an ack-materialize rewrite we set
+    /// `map[path] = canonical sha` so a later touch event past the echo TTL
+    /// is suppressed by the watcher's layer-2 dedup instead of emitting an
+    /// idempotent echo push.
+    enqueued_hashes: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>>,
 }
 
 impl PushClient {
@@ -169,7 +206,24 @@ impl PushClient {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         }
+    }
+
+    /// S5 (v0.4.28): arm the min-version gate cooldown for `duration` from
+    /// now. Production always passes `Duration::from_secs(GATE_COOLDOWN_SECS)`;
+    /// tests can pass a short duration to prove expiry without a real sleep
+    /// through the 900s window. Write side of the poisoning-recovery pair
+    /// with the drain_once read check — both sides recover the same way so a
+    /// panic while holding this lock can never wedge the gate open or closed.
+    fn arm_gate_cooldown(&self, duration: Duration) {
+        let mut g = self
+            .gate_cooldown_until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = Some(std::time::Instant::now() + duration);
     }
 
     /// Builder-style: attach a SharedTrayState so push outcomes update the
@@ -195,6 +249,25 @@ impl PushClient {
     /// (which would defeat the watchdog, so the production wire-up sets it).
     pub fn with_sync_health(mut self, health: Arc<crate::sync_health::SyncHealth>) -> Self {
         self.sync_health = Some(health);
+        self
+    }
+
+    /// D2 (v0.4.28): attach the materializer whose write machinery
+    /// ack-materialize-back rides. Backwards-compatible - without it, no
+    /// local rewrite happens (the shadow still records the server hash, so
+    /// convergence falls to the next reconcile pull).
+    pub fn with_materializer(mut self, m: crate::materializer::Materializer) -> Self {
+        self.materializer = Some(m);
+        self
+    }
+
+    /// D2/B2'd (v0.4.28): attach the enqueue-dedup map SHARED with the
+    /// file_watcher (see `FileWatcher::with_enqueued_hashes`).
+    pub fn with_enqueued_hashes(
+        mut self,
+        map: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Self {
+        self.enqueued_hashes = Some(map);
         self
     }
 
@@ -269,6 +342,23 @@ impl PushClient {
     /// ack/nack each in the journal. Returns the (event, outcome) pairs in
     /// drain order for the caller's tray/log layer.
     pub async fn drain_once(&self) -> Vec<(PushEvent, PushOutcome)> {
+        // S5 (v0.4.28): min-daemon-version gate cooldown. After a 426 we stand
+        // down entirely - no journal drain, no HTTP - until the window passes.
+        {
+            let until = *self
+                .gate_cooldown_until
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(until) = until {
+                if std::time::Instant::now() < until {
+                    tracing::debug!(
+                        "push_client: min-version gate cooldown active - skipping drain tick"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+
         let batch: Vec<(PushEvent, JournalCursor)> = {
             let mut j = self.journal.lock().await;
             match j.drain(self.config.batch_size) {
@@ -333,7 +423,8 @@ impl PushClient {
                 if let Ok(mut w) = tray.write() {
                     match &outcome {
                         PushOutcome::Sent { .. } => w.inc_uploads_sent(),
-                        PushOutcome::Failed(FailureReason::NetworkExhausted { .. }) => {
+                        PushOutcome::Failed(FailureReason::NetworkExhausted { .. })
+                        | PushOutcome::Failed(FailureReason::UpgradeRequired { .. }) => {
                             w.inc_uploads_failed()
                         }
                         _ => {}
@@ -469,6 +560,18 @@ impl PushClient {
         };
         let content_b64 = B64.encode(&content_bytes);
 
+        // D2/D3 (v0.4.28): the sha of the bytes we ACTUALLY drained and will
+        // POST. NOT `evt.content_sha` - that is ENQUEUE-time, and pushes are
+        // lazy (file_watcher sets content_bytes: None; we read at drain time
+        // above), so the two can differ if the file changed in between.
+        // Deletes carry no body; keep the enqueue-time value ("") so delete
+        // shadow semantics are unchanged.
+        let drained_sha: String = if matches!(evt.action, PushAction::Delete) {
+            evt.content_sha.clone()
+        } else {
+            sha256_hex(&content_bytes)
+        };
+
         // I29 (S513, TKT-2dc9a17e): backfill the CAS base from the shadow store.
         //
         // file_watcher emits real-time Create/Modify pushes with base_hash=None —
@@ -483,8 +586,9 @@ impl PushClient {
         // every steady-state local edit to an existing note.
         //
         // The shadow store holds our last-known server hash for the path (D9 seeds
-        // it = server on startup for match+drift; we record() it on every accepted
-        // push/pull below), so it IS the correct CAS base. Sending it makes the
+        // it = server on startup for `match` ONLY — never `drift`, S531 fail-closed;
+        // we record() it on every accepted push/pull below), so it IS the correct
+        // CAS base. Sending it makes the
         // server see base == current → WRITE (operator-ratified local-wins-push-up
         // for a genuine edit); identical content is already a server-side
         // idempotent no-op; and a stale shadow (server truly moved since we synced)
@@ -522,17 +626,61 @@ impl PushClient {
         for attempt in 0..self.config.max_retry_attempts {
             match self.api.push(&req).await {
                 Ok(resp) => {
-                    // fix/reconcile-server-wins-shadow: a push the server
-                    // accepts means the canonical server hash is now known —
-                    // record it so the reconcile backstop won't later mistake
-                    // this just-pushed file for a stale-pull candidate.
-                    // Accepted → our pushed local hash IS the canonical.
-                    // Merged → the server's returned canonical hash is.
-                    // ConflictMarkers / Error → no clean canonical, skip.
-                    if let Some(sh) = &self.shadow_store {
+                    // D2 trigger (v0.4.28, B2'): the server ACCEPTED but its
+                    // canonical hash differs from what we sent - it
+                    // canonicalized (or region-defended) our bytes. NOT keyed
+                    // off Merged (M2: PushOutcome::Merged has no materialize
+                    // consumer; ack-materialize is a NEW accepted-keyed
+                    // behavior). Compat note (corrected, final-review fix
+                    // wave): a server that never rewrites bytes on accept
+                    // echoes our hash (or omits server_hash), so this stays
+                    // false against it - but that is NOT "any real server
+                    // today". Today's server legitimately returns
+                    // effective_hash != pushed on REGION-DEFENDED accepts
+                    // (splices bytes into a protected region we don't have
+                    // locally), so needs_align DOES fire there in normal
+                    // operation: local-canonicalize-and-verify fails (we
+                    // never had the spliced bytes to canonicalize), falls to
+                    // the /note fetch fallback, then a GUARDED rewrite
+                    // (write_aligned_bytes, including the anti-strip guard
+                    // above). That converges the file to the exact state the
+                    // pre-D2 daemon only reached indirectly, on its NEXT pull
+                    // pass. Deletes have no local file to align.
+                    let needs_align = matches!(resp.status, PushStatus::Accepted)
+                        && !matches!(evt.action, PushAction::Delete)
+                        && resp
+                            .server_hash
+                            .as_deref()
+                            .is_some_and(|h| h != drained_sha);
+                    if needs_align {
+                        let server_hash = resp
+                            .server_hash
+                            .clone()
+                            .expect("needs_align checked is_some");
+                        self.ack_materialize_back(
+                            &evt.path,
+                            &content_bytes,
+                            &drained_sha,
+                            &server_hash,
+                        )
+                        .await;
+                    } else if let Some(sh) = &self.shadow_store {
+                        // fix/reconcile-server-wins-shadow + D3 (v0.4.28): a
+                        // push the server accepts means the canonical server
+                        // hash is now known - record it so the reconcile
+                        // backstop won't later mistake this just-pushed file
+                        // for a stale-pull candidate. D2/D3 reality (this is
+                        // the else-of-needs_align branch): Accepted with
+                        // server_hash == drained_sha means our pushed bytes
+                        // WERE already canonical, so the drained hash IS the
+                        // canonical to record; Merged records the server's
+                        // returned canonical instead. When needs_align is
+                        // true the D2 branch above owns recording (via
+                        // ack_materialize_back / write_aligned_bytes), not
+                        // this fallback.
                         if let Some(h) = shadow_hash_for_ack(
                             &resp.status,
-                            &evt.content_sha,
+                            &drained_sha,
                             resp.server_hash.as_deref(),
                             resp.content_hash.as_deref(),
                         ) {
@@ -564,14 +712,36 @@ impl PushClient {
                         expected_hash,
                     });
                 }
+                // S5 (v0.4.28): the server's min-daemon-version gate rejected
+                // this daemon (HTTP 426). Fail LOUDLY, arm the drain cooldown,
+                // do NOT retry, do NOT ack (the caller leaves UpgradeRequired
+                // in the journal so the edit survives the upgrade).
+                Err(ApiError::UpgradeRequired { detail }) => {
+                    tracing::error!(
+                        path = %evt.path,
+                        detail = %detail,
+                        cooldown_secs = GATE_COOLDOWN_SECS,
+                        "SERVER MIN-DAEMON-VERSION GATE rejected this daemon (HTTP 426). \
+                         This daemon is below the server's NEXUS_SYNC_MIN_DAEMON_VERSION. \
+                         Standing down all pushes for the cooldown window; upgrade the daemon binary."
+                    );
+                    self.arm_gate_cooldown(Duration::from_secs(GATE_COOLDOWN_SECS));
+                    return PushOutcome::Failed(FailureReason::UpgradeRequired { detail });
+                }
                 // HTTP 400 = permanent reject (e.g. path excluded by V9 baseline
                 // scope filter). Skip + ack so it never retry-storms (S481).
-                Err(ApiError::Server(400)) => {
+                // HTTP 422 = permanent reject too (D4/M5a, v0.4.28): the Piece 1
+                // server 422s non-UTF-8 / NUL content; re-sending the same bytes
+                // can never succeed. Before this arm, 422 fell into the generic
+                // transient arm -> 5 retries -> NetworkExhausted -> NOT acked ->
+                // journal-wedged, retried every drain tick forever.
+                Err(ApiError::Server(status @ (400 | 422))) => {
                     tracing::info!(
                         path = %evt.path,
-                        "push rejected HTTP 400 (permanent) — skip + ack, no retry"
+                        status,
+                        "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
-                    return PushOutcome::Skipped(SkipReason::ServerRejected { status: 400 });
+                    return PushOutcome::Skipped(SkipReason::ServerRejected { status });
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -626,6 +796,159 @@ impl PushClient {
             }
         }
     }
+
+    /// D2 (v0.4.28, B2'): ack-materialize-back. The server accepted our push
+    /// but stored DIFFERENT canonical bytes (server_hash != sha of the
+    /// drained bytes). Rewrite the local file to the canonical form so the
+    /// next pass is a byte-exact no-op instead of a one-pass drift.
+    ///
+    /// * Byte source (B2'b, option i - chosen): canonicalize the drained
+    ///   bytes locally and VERIFY sha256(local_canonical) == server_hash.
+    ///   Unverified local canonicalization is banned - it would itself be a
+    ///   new unstable-hash family member. On mismatch (dual-implementation
+    ///   drift, or a region-defense splice added bytes we don't have) fetch
+    ///   GET /note and use the served bytes, whose sha is verified against
+    ///   the payload's advertised hash (self-consistent by server S3).
+    /// * Guard + ordering live in `Materializer::write_aligned_bytes` (B2'a
+    ///   pre-rewrite re-read; B2'c rewrite-first-shadow-second).
+    /// * On SkippedConcurrentEdit we STILL record server_hash: it is
+    ///   factually the server's current canonical, it classifies the local
+    ///   edit as PUSH on the next reconcile pass, and it is the CAS base the
+    ///   already-pending push of that edit needs to be accepted (without it,
+    ///   push2 backfills a stale base and 409-stashes the user's edit).
+    /// * On rewrite FAILURE we record NOTHING: shadow stays stale -> next
+    ///   pass classifies PULL - the fail-closed direction (recording would
+    ///   arm the shadow==server phantom-push-per-pass trap).
+    /// * Never returns an error: every failure degrades to "converge on the
+    ///   next reconcile pass" and the push outcome stays what the server said.
+    async fn ack_materialize_back(
+        &self,
+        path: &str,
+        drained_bytes: &[u8],
+        drained_sha: &str,
+        server_hash: &str,
+    ) {
+        let Some(mat) = &self.materializer else {
+            // No write machinery wired: record NOTHING. Recording server_hash
+            // here would be the INVERSE of what it looks like at first glance:
+            // the local file still holds the drained (pre-canonicalization)
+            // bytes, which diverge from server_hash. If we set
+            // shadow == server_hash while local != server_hash, the next
+            // reconcile pass's decide() sees shadow_eq_server == true and
+            // local_eq_server == false -> Decision::PreserveLocalEdit, i.e. it
+            // classifies this as a genuine LOCAL EDIT and pushes the stale
+            // drained bytes back UP - the opposite of convergence. Leaving the
+            // shadow at its prior (stale, pre-push) value means the next pass
+            // instead sees shadow_present with shadow != server (server moved)
+            // and, per R3/R5, resolves to a PULL (or conflict-then-pull),
+            // which is what actually converges the local file to the server's
+            // canonical bytes. Production always wires the materializer (see
+            // lib.rs); this arm is unreachable there but must not mislead.
+            tracing::info!(
+                path,
+                "D2: server canonicalized push but no materializer wired - shadow left stale (fail-closed), pull converges next pass"
+            );
+            return;
+        };
+
+        // B2'b: local canonicalize + verify, else /note fetch fallback.
+        let canonical: Vec<u8> = match crate::canonical_form::canonicalize_bytes(drained_bytes) {
+            Ok(local_canon) if sha256_hex(local_canon.as_bytes()) == server_hash => {
+                local_canon.into_bytes()
+            }
+            _ => {
+                match self.api.fetch_note(path).await {
+                    Ok(payload) => {
+                        let bytes = payload.enriched_body.unwrap_or(payload.body).into_bytes();
+                        let fetched_sha = sha256_hex(&bytes);
+                        if fetched_sha != payload.sha256 {
+                            tracing::warn!(
+                                path,
+                                advertised = %payload.sha256,
+                                actual = %fetched_sha,
+                                "D2: /note served bytes do not hash to the advertised sha - skipping ack-materialize (pull converges next pass)"
+                            );
+                            return; // shadow stays stale -> PULL (fail-closed)
+                        }
+                        if fetched_sha != server_hash {
+                            // The server moved again since our push; its
+                            // CURRENT canonical is authoritative.
+                            tracing::debug!(
+                                path,
+                                "D2: server advanced past our push - aligning to its current canonical"
+                            );
+                        }
+                        bytes
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path,
+                            error = %e,
+                            "D2: /note fetch fallback failed - skipping ack-materialize (shadow stays stale, pull converges next pass)"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        let canonical_sha = sha256_hex(&canonical);
+
+        match mat.write_aligned_bytes(path, &canonical, &canonical_sha, drained_sha) {
+            Ok(crate::materializer::AlignOutcome::Rewrote { .. }) => {
+                // Rewrite happened FIRST; write_aligned_bytes recorded the
+                // shadow SECOND (B2'c). B2'd: update the shared enqueue-dedup
+                // so a later touch event past the echo TTL is suppressed by
+                // the watcher's layer-2 dedup.
+                if let Some(map) = &self.enqueued_hashes {
+                    if let Ok(mut m) = map.lock() {
+                        // Key-scheme note: the watcher's own enqueued_hashes
+                        // keys are already NFC+forward-slash (normalize_event
+                        // -> normalize_path -> canonical_sync_path). Re-applying
+                        // canonical_sync_path here is therefore idempotent — it
+                        // does not double-canonicalize, it just guarantees this
+                        // writer (push_client, not the watcher) agrees on the
+                        // same key form so the two producers never diverge.
+                        m.insert(
+                            crate::sync_shadow::canonical_sync_path(path),
+                            canonical_sha.clone(),
+                        );
+                    }
+                }
+                tracing::info!(
+                    path,
+                    sha = %canonical_sha,
+                    "D2: ack-materialize-back rewrote local to server canonical"
+                );
+            }
+            Ok(crate::materializer::AlignOutcome::SkippedConcurrentEdit { current_sha }) => {
+                // Ambiguity-resolution #1 (T6 deliberately does NOT record on
+                // skip; the caller must): the shadow MUST advance to the
+                // server's current canonical here even though the rewrite
+                // was skipped. It is load-bearing for the already-pending
+                // push of the user's mid-flight edit - that push backfills
+                // its CAS base from this shadow entry (I29), so leaving it
+                // stale would 409-stash the user's own edit against itself.
+                if let Some(sh) = &self.shadow_store {
+                    sh.record(path, server_hash);
+                }
+                tracing::info!(
+                    path,
+                    current = %current_sha,
+                    "D2: concurrent edit detected (B2'a) - rewrite SKIPPED, shadow=server, pending push converges"
+                );
+            }
+            Ok(other) => {
+                tracing::info!(path, outcome = ?other, "D2: ack-materialize skipped");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path,
+                    error = %e,
+                    "D2: ack-materialize rewrite FAILED - shadow left stale (pull converges next pass, B2'c fail-closed)"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,16 +958,19 @@ impl PushClient {
 /// Decide which hash (if any) to record into the ShadowStore for a push the
 /// server acked. Pure + table-tested.
 ///
-/// * `Accepted` → the local bytes we pushed are now the server's canonical →
-///   record `local_sha`.
-/// * `Merged` → the server merged a concurrent edit and its returned canonical
-///   differs from what we pushed → record the server's canonical
-///   (`server_hash`, falling back to `content_hash` if the server only echoes
-///   that field). If neither is present, fall back to `local_sha` so we still
-///   record SOMETHING (better an approximate marker than none — drift will
-///   self-correct on the next pass).
-/// * `ConflictMarkers` / `Error` → no clean canonical was established → record
-///   nothing.
+/// * `Accepted` (D3, v0.4.28) → record the SERVER's canonical hash
+///   (`server_hash`, falling back to `content_hash`, then `local_sha` for
+///   pre-Piece-1 servers that omit both). The Piece 1 server may have
+///   CANONICALIZED (or region-defended) what we sent, so the local sha is no
+///   longer guaranteed to be the canonical; recording it unconditionally was
+///   step 3 of the B1' eternal push/pull alternation (push_client.rs:656 in
+///   v0.4.27). With this change an idempotent accept of raw CRLF bytes
+///   records the canonical hash, so the next reconcile pass classifies the
+///   file as PULL (→ the D1 alignment rewrite) instead of ping-ponging.
+/// * `Merged` → the server merged a concurrent edit; record its returned
+///   canonical (`server_hash` → `content_hash` → `local_sha`). Unchanged.
+/// * `ConflictMarkers` / `Error` → no clean canonical was established →
+///   record nothing. Unchanged.
 fn shadow_hash_for_ack(
     status: &PushStatus,
     local_sha: &str,
@@ -652,8 +978,7 @@ fn shadow_hash_for_ack(
     content_hash: Option<&str>,
 ) -> Option<String> {
     match status {
-        PushStatus::Accepted => Some(local_sha.to_string()),
-        PushStatus::Merged => Some(
+        PushStatus::Accepted | PushStatus::Merged => Some(
             server_hash
                 .or(content_hash)
                 .unwrap_or(local_sha)
@@ -869,6 +1194,563 @@ mod tests {
         )
     }
 
+    // --- D2 (v0.4.28): ack-materialize-back fixtures ---
+
+    use crate::echo_guard::EchoGuard;
+    use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
+    use crate::sync_shadow::ShadowStore;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    struct AlignFx {
+        _vault: TempDir,
+        _ws: TempDir,
+        _sdir: TempDir,
+        vault_root: PathBuf,
+        shadow: Arc<ShadowStore>,
+        enq: Arc<StdMutex<HashMap<String, String>>>,
+    }
+
+    /// PushClient wired exactly like production (spawn_push_pipeline):
+    /// materializer (Live, echo-guarded, shadow-backed) + shared shadow +
+    /// shared enqueued_hashes map.
+    async fn make_align_client(
+        base_url: &str,
+        journal: Arc<Mutex<PushJournal>>,
+    ) -> (PushClient, AlignFx) {
+        let vault = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let enq: Arc<StdMutex<HashMap<String, String>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let mat = Materializer::new(
+            vault.path().to_path_buf(),
+            None,
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            MaterializerConfig {
+                device_id: "dev-test".into(),
+                ..Default::default()
+            },
+        )
+        .with_shadow_store(shadow.clone())
+        .with_echo_guard(Arc::new(EchoGuard::new()));
+        let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
+        let client = PushClient::new(
+            api,
+            journal,
+            "dev-test".into(),
+            config_for_test(),
+            vault.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone())
+        .with_materializer(mat)
+        .with_enqueued_hashes(enq.clone());
+        let vault_root = vault.path().to_path_buf();
+        (
+            client,
+            AlignFx {
+                _vault: vault,
+                _ws: ws,
+                _sdir: sdir,
+                vault_root,
+                shadow,
+                enq,
+            },
+        )
+    }
+
+    fn accepted_body(server_hash: &str) -> String {
+        format!(
+            r#"{{"status":"accepted","seq":1,"content_hash":"{server_hash}","server_hash":"{server_hash}","server_seq":1,"merged_content":null,"message":null}}"#
+        )
+    }
+
+    /// Lazy event (content_bytes: None) like the real file_watcher emits - the
+    /// push client reads the file from disk at drain time.
+    fn lazy_evt(path: &str, enqueue_sha_of: &[u8]) -> PushEvent {
+        PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: path.to_string(),
+            action: PushAction::Modify,
+            base_hash: Some("0".repeat(64)),
+            content_sha: sha256_hex(enqueue_sha_of),
+            content_bytes: None,
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        }
+    }
+
+    /// Steady state: server_hash == sha of the drained bytes -> NO rewrite, NO
+    /// /note fetch, shadow records the server hash (D3 path).
+    #[tokio::test]
+    async fn test_no_ack_materialize_when_hashes_equal() {
+        let body = b"already canonical\n";
+        let sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&sha))
+            .create_async()
+            .await;
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let rel = "notes/a.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, body)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+        let mtime_before = std::fs::metadata(&abs).unwrap().modified().unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(std::fs::read(&abs).unwrap(), body, "file untouched");
+        assert_eq!(
+            std::fs::metadata(&abs).unwrap().modified().unwrap(),
+            mtime_before,
+            "steady state stays zero-write"
+        );
+        assert_eq!(fx.shadow.get(rel).as_deref(), Some(sha.as_str()));
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
+    /// Pre-Piece-1 compat (T7 review fold): a server that predates the D2
+    /// canonicalization contract omits `server_hash` from its Accepted
+    /// response entirely (JSON `null`), same as it always has. `needs_align`
+    /// must short-circuit false on `resp.server_hash.as_deref().is_some_and`
+    /// (None never satisfies is_some_and) - so process_event must NEVER call
+    /// ack_materialize_back / attempt a rewrite / fetch /note against such a
+    /// server. The shadow still advances via shadow_hash_for_ack's
+    /// content_hash fallback, so reconcile does not misclassify the file as
+    /// stale on the next pass.
+    #[tokio::test]
+    async fn test_pre_piece1_server_omits_server_hash_no_align() {
+        let body = b"local bytes, non-canonicalizing server\n";
+        let local_sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        // Pre-Piece-1 accepted body: server_hash is JSON null (field omitted
+        // by an old server would deserialize the same way via Option<String>).
+        let body_json = format!(
+            r#"{{"status":"accepted","seq":1,"content_hash":"{local_sha}","server_hash":null,"server_seq":1,"merged_content":null,"message":null}}"#
+        );
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(body_json)
+            .create_async()
+            .await;
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let rel = "notes/a.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, body)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+        let mtime_before = std::fs::metadata(&abs).unwrap().modified().unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            body,
+            "file untouched - no align attempted"
+        );
+        assert_eq!(
+            std::fs::metadata(&abs).unwrap().modified().unwrap(),
+            mtime_before,
+            "pre-Piece-1 compat path must be zero-write"
+        );
+        // shadow_hash_for_ack falls back to content_hash when server_hash is None.
+        assert_eq!(
+            fx.shadow.get(rel).as_deref(),
+            Some(local_sha.as_str()),
+            "shadow still advances via the content_hash fallback"
+        );
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
+    /// Final-review fix wave (piece1): the no-materializer fallback arm of
+    /// `ack_materialize_back` (`self.materializer` is `None` — never true in
+    /// production, see lib.rs, but must not mislead) must record NOTHING in
+    /// the shadow store, not `server_hash`. Recording `server_hash` while the
+    /// local file still holds the pre-canonicalization drained bytes would set
+    /// shadow == server with local != server, which decide() classifies as
+    /// R2 PreserveLocalEdit (a "genuine local edit" to push back UP) — the
+    /// inverse of convergence. Leaving the shadow at its prior value lets the
+    /// next reconcile pass fall to a PULL, which actually converges the file.
+    #[tokio::test]
+    async fn test_no_materializer_fallback_records_nothing_in_shadow() {
+        let body = b"drained pre-canonicalization bytes\n";
+        let drained_sha = sha256_hex(body);
+        let server_hash = sha256_hex(b"different canonical bytes the server stored\n");
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&server_hash))
+            .create_async()
+            .await;
+
+        let rel = "notes/a.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, body)]);
+
+        // No materializer wired (default PushClient::new) but a shadow store
+        // IS attached, so the fallback arm's (non-)recording is observable.
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let vault = TempDir::new().unwrap();
+        let abs = vault.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_shadow_store(shadow.clone());
+
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "server still ACCEPTED the push; got {:?}",
+            outcomes[0].1
+        );
+        assert!(
+            shadow.get(rel).is_none(),
+            "no-materializer fallback must record NOTHING (fail-closed -> PULL next pass), \
+             got {:?}",
+            shadow.get(rel)
+        );
+        // Sanity: drained_sha is genuinely not the server's canonical, i.e.
+        // this exercises needs_align == true, not the steady-state branch.
+        assert_ne!(drained_sha, server_hash);
+        m_push.assert_async().await;
+    }
+
+    /// D2 core (B2'b option i + B2'c + B2'd): server canonicalized our CRLF
+    /// push. Local canonicalize verifies against server_hash -> rewrite from
+    /// LOCAL bytes (zero /note fetches), file becomes canonical, shadow ==
+    /// server_hash, enqueued_hashes[path] == canonical sha.
+    #[tokio::test]
+    async fn test_ack_materialize_rewrite_then_shadow() {
+        let drained = b"line one\r\nline two\r\n";
+        let canonical = b"line one\nline two\n";
+        let canon_sha = sha256_hex(canonical);
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&canon_sha))
+            .create_async()
+            .await;
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .expect(0) // local canonicalization verified - no fetch needed
+            .create_async()
+            .await;
+
+        let rel = "notes/crlf.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, drained)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, drained).unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            canonical,
+            "local must be rewritten to the server canonical bytes"
+        );
+        assert_eq!(fx.shadow.get(rel).as_deref(), Some(canon_sha.as_str()));
+        // B2'd: the shared enqueue-dedup map now holds the canonical sha so a
+        // later touch event (past the echo TTL) is layer-2 deduped.
+        assert_eq!(
+            fx.enq.lock().unwrap().get(rel).map(String::as_str),
+            Some(canon_sha.as_str()),
+            "enqueued_hashes must be updated to the canonical sha"
+        );
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
+    /// B2'c failing-rewrite half: the rewrite fails (read-only dir) -> the
+    /// shadow must stay UNRECORDED at the server hash (stale -> next pass
+    /// classifies PULL, fail-closed), and enqueued_hashes must not advance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ack_materialize_failed_rewrite_leaves_shadow_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let drained = b"x\r\n";
+        let canon_sha = sha256_hex(b"x\n");
+        let mut srv = Server::new_async().await;
+        let _m_push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(accepted_body(&canon_sha))
+            .create_async()
+            .await;
+
+        let rel = "notes/ro/g.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, drained)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, drained).unwrap();
+        let parent = abs.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcomes = client.drain_once().await;
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_ne!(
+            fx.shadow.get(rel).as_deref(),
+            Some(canon_sha.as_str()),
+            "B2'c: failed rewrite must NOT record shadow == server (phantom-push trap)"
+        );
+        assert!(
+            fx.enq.lock().unwrap().get(rel).is_none(),
+            "enqueued_hashes must not advance on a failed rewrite"
+        );
+        assert_eq!(std::fs::read(&abs).unwrap(), drained);
+    }
+
+    /// B2'a (the concurrent-edit guard test, spec-mandated): the file is
+    /// edited between drain and ack -> rewrite SKIPPED, the edit's bytes
+    /// survive, and the shadow records the SERVER hash (so the pending push2
+    /// backfills the correct CAS base and the drift classifies PUSH, never a
+    /// spurious 409-stash of the user's edit).
+    #[tokio::test]
+    async fn test_ack_materialize_concurrent_edit_guard() {
+        let drained = b"first version\r\n";
+        let edited = b"the user edited this mid-flight\n";
+        let canon_sha = sha256_hex(b"first version\n");
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&canon_sha))
+            .create_async()
+            .await;
+
+        let rel = "notes/edit.md";
+        // EAGER event (content_bytes embedded) so "drained bytes" = drained
+        // while the DISK already holds the newer edit - exactly the mid-flight
+        // edit race compressed into one drain.
+        let (_d, journal) = make_journal_with(vec![evt(rel, drained)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, edited).unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            edited,
+            "B2'a: the mid-flight edit must NEVER be overwritten"
+        );
+        assert_eq!(
+            fx.shadow.get(rel).as_deref(),
+            Some(canon_sha.as_str()),
+            "shadow records the server's current canonical (push2's CAS base)"
+        );
+        assert!(
+            fx.enq.lock().unwrap().get(rel).is_none(),
+            "enqueued_hashes must NOT advance past the edit (push2 must enqueue)"
+        );
+        m_push.assert_async().await;
+    }
+
+    /// B2'b fallback: local canonicalize does NOT reproduce server_hash (the
+    /// server region-defense spliced bytes we don't have) -> fetch /note,
+    /// verify served bytes hash to the advertised sha, write THOSE bytes.
+    #[tokio::test]
+    async fn test_ack_materialize_hash_verify_fallback() {
+        let drained = b"body only\r\n";
+        // The server spliced a managed region we don't have locally:
+        let server_body = "<!-- nx:begin -->\nmanaged\n<!-- nx:end -->\n\nbody only\n";
+        let server_sha = sha256_hex(server_body.as_bytes());
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&server_sha))
+            .create_async()
+            .await;
+        let note_json = serde_json::json!({
+            "path": "notes/defended.md",
+            "frontmatter": null,
+            "body": server_body,
+            "sha256": server_sha,
+            "modified": "2026-07-01T00:00:00Z",
+            "file_mtime": null,
+            "enriched_body": server_body,
+            "created": null,
+        })
+        .to_string();
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "path".into(),
+                "notes/defended.md".into(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(note_json)
+            .create_async()
+            .await;
+
+        let rel = "notes/defended.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, drained)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, drained).unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            server_body.as_bytes(),
+            "the /note-served bytes must be written"
+        );
+        assert_eq!(fx.shadow.get(rel).as_deref(), Some(server_sha.as_str()));
+        assert_eq!(
+            fx.enq.lock().unwrap().get(rel).map(String::as_str),
+            Some(server_sha.as_str())
+        );
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
+    /// B2'd (spec: test_ack_materialize_updates_enqueued_hashes): after an
+    /// ack-materialize rewrite, BOTH suppression inputs the file_watcher's
+    /// layer-2 dedup checks (enqueued_hashes[p] == sha AND shadow.get(p) ==
+    /// sha, file_watcher.rs:941-960) hold for the canonical sha, so a touch
+    /// event past the echo TTL with unchanged bytes cannot enqueue a push.
+    /// (The watcher-level end-to-end assertion is Task 8's
+    /// b2d_touch_after_ack_materialize_is_deduped.)
+    #[tokio::test]
+    async fn test_ack_materialize_updates_enqueued_hashes() {
+        let drained = b"t\r\n";
+        let canonical = b"t\n";
+        let canon_sha = sha256_hex(canonical);
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(accepted_body(&canon_sha))
+            .create_async()
+            .await;
+
+        let rel = "notes/touch.md";
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, drained)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, drained).unwrap();
+
+        client.drain_once().await;
+
+        let enqueued = fx.enq.lock().unwrap().get(rel).cloned();
+        let shadowed = fx.shadow.get(rel);
+        assert_eq!(enqueued.as_deref(), Some(canon_sha.as_str()));
+        assert_eq!(shadowed.as_deref(), Some(canon_sha.as_str()));
+        assert_eq!(std::fs::read(&abs).unwrap(), canonical);
+    }
+
+    /// Regression (T4 review): the event's ENQUEUE-time `content_sha` is a
+    /// snapshot of whatever the file held when the watcher observed it -
+    /// pushes are lazy (content_bytes: None), so by DRAIN time the file may
+    /// hold different bytes (a second, fast edit landed before the drain
+    /// tick). This proves the D2 ack-materialize path's basis is the DRAINED
+    /// sha (what was actually read off disk and POSTed), never the stale
+    /// enqueue-time `content_sha`:
+    /// * the server response is keyed off a hash of the DRAINED bytes
+    ///   (`accepted_body` echoes what `drain_once` actually sent — if the
+    ///   client used the enqueue-time sha anywhere in the request/compare
+    ///   path this mock's `server_hash` would not line up and the align
+    ///   would never trigger correctly);
+    /// * `write_aligned_bytes`'s pre-rewrite re-read (B2'a) is compared
+    ///   against `drained_sha`, not `evt.content_sha` — proven here because
+    ///   the on-disk bytes at drain time equal the DRAINED sha (not the
+    ///   enqueue-time one), so a rewrite keyed off the wrong basis would spin
+    ///   this into `SkippedConcurrentEdit` instead of `Rewrote`.
+    #[tokio::test]
+    async fn test_ack_materialize_uses_drained_sha_not_enqueue_time_sha() {
+        let stale_content_at_enqueue = b"version at enqueue time\r\n";
+        let drained = b"version at drain time\r\n"; // file changed before drain
+        let canonical = b"version at drain time\n";
+        let canon_sha = sha256_hex(canonical);
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&canon_sha))
+            .create_async()
+            .await;
+        let m_note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .expect(0) // local canonicalization verifies — no fetch needed
+            .create_async()
+            .await;
+
+        let rel = "notes/stale-enqueue.md";
+        // lazy_evt's content_sha reflects `stale_content_at_enqueue`, NOT the
+        // bytes that will actually be on disk at drain time.
+        let (_d, journal) = make_journal_with(vec![lazy_evt(rel, stale_content_at_enqueue)]);
+        let (client, fx) = make_align_client(&srv.url(), journal).await;
+        let abs = fx.vault_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        // The file on disk holds the NEWER (drained) content by the time
+        // drain_once reads it — the enqueue-time snapshot is stale.
+        std::fs::write(&abs, drained).unwrap();
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            canonical,
+            "rewrite must succeed (Rewrote, not SkippedConcurrentEdit) — proving the \
+             pre-rewrite guard compared against the DRAINED sha, not the stale enqueue-time sha"
+        );
+        assert_eq!(fx.shadow.get(rel).as_deref(), Some(canon_sha.as_str()));
+        assert_eq!(
+            fx.enq.lock().unwrap().get(rel).map(String::as_str),
+            Some(canon_sha.as_str())
+        );
+        m_push.assert_async().await;
+        m_note.assert_async().await;
+    }
+
     // opfix-vaultsync-dormancy: regression test for the progress-stamping
     // path. drain_once MUST stamp the SyncHealth progress marker whenever it
     // processed at least one event; without this stamp the watchdog cannot
@@ -1042,6 +1924,9 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -1067,6 +1952,9 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -1088,6 +1976,9 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -1108,6 +1999,9 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -1311,6 +2205,40 @@ mod tests {
         // Conflict is terminal — event was ack'd (resolver handles refetch+replay).
         let j = journal.lock().await;
         assert_eq!(j.len(), 0);
+    }
+
+    /// D4 (v0.4.28, M5a): HTTP 422 (non-UTF-8 / NUL content the server
+    /// permanently rejects) must behave exactly like 400 - permanent reject,
+    /// skip + ack, exactly ONE attempt, never the transient retry arm
+    /// (which wedged the journal: 5 retries -> NetworkExhausted -> not acked
+    /// -> retried every drain tick forever).
+    #[tokio::test]
+    async fn test_422_permanent_skip_and_ack() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(422)
+            .with_body(r#"{"detail":"content is not valid UTF-8"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/bad.md", b"x")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::ServerRejected { status: 422 }),
+            "422 must be a permanent ServerRejected skip"
+        );
+        // Acked: the journal entry is consumed, never retried.
+        assert_eq!(
+            journal.lock().await.len(),
+            0,
+            "422 outcome must be acked (journal drained)"
+        );
+        m.assert_async().await; // exactly one HTTP attempt
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
@@ -1735,6 +2663,9 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             sync_health: None,
+            gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            materializer: None,
+            enqueued_hashes: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
@@ -1745,31 +2676,45 @@ mod tests {
         );
     }
 
-    // --- shadow_hash_for_ack (fix/reconcile-server-wins-shadow) ---
+    // --- shadow_hash_for_ack (D3, v0.4.28 + fix/reconcile-server-wins-shadow) ---
 
     #[test]
     fn shadow_hash_for_ack_table() {
-        // Accepted → the pushed local hash is the new canonical.
+        // D3 (v0.4.28): Accepted with a server_hash records the SERVER's
+        // canonical hash, NOT the local sha. Recording the local sha here was
+        // step 3 of the B1' eternal alternation: idempotent-accept of raw CRLF
+        // bytes -> shadow=local -> next pass classifies PUSH again, forever.
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Accepted, "local", Some("srv"), Some("ch")),
+            Some("srv".to_string())
+        );
+        // Accepted, no server_hash -> content_hash (pre-Piece-1 server compat).
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Accepted, "local", None, Some("ch")),
+            Some("ch".to_string())
+        );
+        // Accepted, neither field -> the local sha (oldest-server compat; a
+        // non-canonicalizing server stored exactly what we sent).
+        assert_eq!(
+            shadow_hash_for_ack(&PushStatus::Accepted, "local", None, None),
             Some("local".to_string())
         );
-        // Merged → prefer server_hash.
+        // Merged -> prefer server_hash (unchanged behavior).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", Some("srv"), Some("ch")),
             Some("srv".to_string())
         );
-        // Merged, no server_hash → fall back to content_hash.
+        // Merged, no server_hash -> fall back to content_hash.
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", None, Some("ch")),
             Some("ch".to_string())
         );
-        // Merged, neither → fall back to local (record SOMETHING).
+        // Merged, neither -> fall back to local (record SOMETHING).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::Merged, "local", None, None),
             Some("local".to_string())
         );
-        // ConflictMarkers / Error → record nothing.
+        // ConflictMarkers / Error -> record nothing (unchanged).
         assert_eq!(
             shadow_hash_for_ack(&PushStatus::ConflictMarkers, "local", Some("srv"), None),
             None
@@ -1778,5 +2723,101 @@ mod tests {
             shadow_hash_for_ack(&PushStatus::Error, "local", Some("srv"), None),
             None
         );
+    }
+
+    /// S5 client half (v0.4.28): a gated daemon must fail LOUDLY and BACK OFF,
+    /// not retry-loop. Contract: exactly ONE HTTP attempt; outcome carries the
+    /// server detail; the journal entry is NOT acked (the local edit survives
+    /// for after the upgrade); the next drain tick inside the cooldown window
+    /// makes ZERO HTTP calls.
+    #[tokio::test]
+    async fn test_426_upgrade_required_fails_loudly_and_backs_off() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(426)
+            .with_body(
+                r#"{"detail":{"error":"daemon_version_below_minimum","minimum":"0.4.28","reported":"0.4.27"}}"#,
+            )
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"body\n")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PushOutcome::Failed(FailureReason::UpgradeRequired { detail }) => {
+                assert!(
+                    detail.contains("0.4.28"),
+                    "detail must name the required version: {detail}"
+                );
+            }
+            other => panic!("expected Failed(UpgradeRequired), got {other:?}"),
+        }
+        // NOT acked: the local edit stays journaled for after the upgrade.
+        assert_eq!(
+            journal.lock().await.len(),
+            1,
+            "426 must NOT ack - the edit is preserved, not dropped"
+        );
+        // Cooldown: the immediate next drain tick makes ZERO HTTP calls.
+        let outcomes2 = client.drain_once().await;
+        assert!(
+            outcomes2.is_empty(),
+            "gate cooldown must skip the drain tick entirely (no retry-loop)"
+        );
+        m.assert_async().await; // exactly ONE attempt total across both drains
+    }
+
+    /// S5 client half (v0.4.28), review follow-up: the existing 426 test only
+    /// proves the cooldown ENGAGES; nothing proved it CLEARS. Uses the
+    /// `arm_gate_cooldown(Duration)` seam to arm a short window instead of
+    /// the real 900s one, so the test can prove EXPIRY with a small real
+    /// sleep rather than mocking `Instant` or waiting 900s.
+    #[tokio::test]
+    async fn test_426_gate_cooldown_expires_after_window() {
+        let mut srv = Server::new_async().await;
+        // Two attempts expected: one is suppressed by the cooldown check
+        // never reaching the network, so only the pre-arm and post-expiry
+        // ticks actually hit the mock.
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","content_hash":"deadbeef"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"body\n")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        // Arm the cooldown directly via the injectable-duration seam — no
+        // need to force a real 426 response to get into the armed state.
+        client.arm_gate_cooldown(Duration::from_millis(200));
+
+        // Phase 1: tick during the window — suppressed, empty outcomes, no HTTP.
+        let outcomes = client.drain_once().await;
+        assert!(
+            outcomes.is_empty(),
+            "tick inside the cooldown window must be fully suppressed"
+        );
+
+        // Real sleep past the short window — cheap since it's 50ms, not 900s.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Phase 2: tick after expiry — journal drains normally.
+        let outcomes2 = client.drain_once().await;
+        assert_eq!(
+            outcomes2.len(),
+            1,
+            "tick after cooldown expiry must drain the journal normally"
+        );
+        assert!(
+            matches!(outcomes2[0].1, PushOutcome::Sent { .. }),
+            "expected Sent after cooldown expiry; got {:?}",
+            outcomes2[0].1
+        );
+        m.assert_async().await; // exactly ONE HTTP attempt (the post-expiry tick)
     }
 }

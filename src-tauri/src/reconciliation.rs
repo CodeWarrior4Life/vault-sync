@@ -225,6 +225,23 @@ pub async fn run_reconciliation_pass(
 /// normal reconcile pass). Best-effort: any error is logged and swallowed, the
 /// shadow simply stays empty and the always-stash floor keeps the host safe.
 /// Returns the number of paths seeded.
+/// D9 fail-closed seed gate (Highwater, S531): may the D9 empty-shadow seed
+/// record `shadow[path] = server_hash` for a reconcile-batch delta of this
+/// `state`?
+///
+/// ONLY `match` is seedable: a `match` delta proves the local file is byte-equal
+/// to the server, so `server_hash` IS the true last-synced baseline. Any other
+/// state (`drift`, `missing-on-server`, unknown) is NOT seedable — we have not
+/// proven local == server, so recording `server_hash` would FORGE a high-water
+/// mark and turn a stale local note into a phantom "local edit" that the
+/// reconcile pass then PUSHES up (the S528 storm that re-clobbered Keystone).
+/// Leaving those paths unseeded makes `decide_direction` fall to its fail-closed
+/// default (shadow absent => PULL / verify), never a mass-push.
+#[inline]
+pub fn seed_state_is_provable_match(state: &str) -> bool {
+    state == "match"
+}
+
 pub async fn seed_shadow_from_server_if_empty(
     vault_root: PathBuf,
     api: Arc<ApiClient>,
@@ -294,31 +311,39 @@ pub async fn seed_shadow_from_server_if_empty(
     };
 
     let mut seeded = 0usize;
-    let mut seeded_drift = 0usize;
+    let mut skipped_drift = 0usize;
     for delta in &deltas {
-        // S511 first-run convergence (operator-ratified local-wins-push-up).
-        // Seed shadow = the server's CURRENT hash for BOTH `match` AND `drift`:
-        //  - match (local == server): first decision is R1/R3 (in sync), no churn.
-        //  - drift (local != server): seeding shadow == server makes the first
-        //    decision R2 (genuine local edit) -> PUSH the local copy UP with the
-        //    CAS base = server's current hash (CAS passes, local wins), instead of
-        //    R5-CONFLICT. On a fleet that drifted while sync was down, R5 spawned a
-        //    ~1150-file conflict-copy avalanche and could not converge. This also
-        //    re-applies the operator's full local notes over server-side
-        //    frontmatter-stripped bodies. The rare "server had a newer copy from
-        //    another host" case is covered by the server version-history trigger
-        //    plus the pre-converge backups.
+        // FAIL-CLOSED seed (Highwater, S531): seed shadow = the server's current
+        // hash for `match` ONLY.
+        //  - match (local == server): local is PROVEN byte-equal to the server, so
+        //    seeding shadow == server_hash is exactly correct and cannot mis-seed.
+        //    First decision is R1/R3 (in sync), no churn.
+        //  - drift (local != server): DELIBERATELY LEFT UNSEEDED. We have NOT
+        //    proven the local file equals the server, so recording server_hash as
+        //    the last-synced baseline is a FORGED high-water mark. The prior
+        //    behavior (seed drift => shadow == server => `decide_direction` returns
+        //    Push) turned every stale local note into a "local edit" and mass-
+        //    PUSHED stale bodies UP. That is the S528 storm mechanism: it
+        //    re-clobbered the post-Keystone server (regions stripped, legacy blocks
+        //    re-introduced) whenever the local copy was the older one. With drift
+        //    UNSEEDED, shadow is absent for those paths, so `decide_direction`
+        //    falls to its fail-closed default (shadow absent OR shadow != server
+        //    => the server moved since we synced => PULL, server-wins). Genuine
+        //    local-only edits are still preserved: the materializer's S513
+        //    anti-strip guard refuses any pull that would drop frontmatter the
+        //    local note holds and pushes the local copy up instead, and true
+        //    two-sided divergence resolves to an R5 conflict sidecar (both bodies
+        //    kept). Empty baseline => PULL/verify, never mass-push.
         // `missing-on-server` has no server row to seed; the reconcile pass
         // PUSH-creates it (base="").
         let st = delta.state.as_str();
-        if st == "match" || st == "drift" {
+        if seed_state_is_provable_match(st) {
             if let Some(h) = delta.server_hash.as_deref() {
                 shadow.record(&delta.path, h);
                 seeded += 1;
-                if st == "drift" {
-                    seeded_drift += 1;
-                }
             }
+        } else if st == "drift" {
+            skipped_drift += 1;
         }
     }
     if let Err(e) = shadow.flush() {
@@ -326,9 +351,9 @@ pub async fn seed_shadow_from_server_if_empty(
     }
     tracing::info!(
         seeded,
-        seeded_drift,
+        skipped_drift,
         deltas = deltas.len(),
-        "reconciliation: D9 shadow seed complete (drift notes will push local-up to converge)"
+        "reconciliation: D9 shadow seed complete (match-only seed; drift left UNSEEDED => fail-closed PULL/verify, never mass-push)"
     );
     seeded
 }
@@ -642,6 +667,33 @@ mod tests {
         assert_eq!(seeded, 0, "non-empty shadow must not be re-seeded");
         // The pre-existing entry is untouched.
         assert_eq!(shadow.get("notes/already-known.md"), Some("h".to_string()));
+    }
+
+    /// S531 (Highwater): the D9 empty-shadow seed is FAIL-CLOSED — it may seed a
+    /// baseline ONLY for a `match` delta (proven local == server). `drift`,
+    /// `missing-on-server`, and any unknown state are NEVER seeded, so a wiped /
+    /// partial shadow can never forge a high-water mark that turns a stale local
+    /// note into a phantom "local edit" and mass-pushes it up (the S528 storm
+    /// that re-clobbered Keystone). Coupled with `decide_direction`: an unseeded
+    /// drift path has `shadow == None` => PULL (server-wins), never PUSH.
+    #[test]
+    fn d9_seed_gate_is_match_only_fail_closed() {
+        assert!(
+            seed_state_is_provable_match("match"),
+            "match proves local == server → seedable"
+        );
+        assert!(
+            !seed_state_is_provable_match("drift"),
+            "drift is NOT proven equal → must NOT seed (would forge baseline → storm)"
+        );
+        assert!(
+            !seed_state_is_provable_match("missing-on-server"),
+            "missing-on-server has no server baseline → must NOT seed"
+        );
+        assert!(
+            !seed_state_is_provable_match("weird"),
+            "unknown state → conservative, must NOT seed"
+        );
     }
 
     /// B4: both roots have explicit subscriber IDs → no fallback needed.

@@ -121,6 +121,14 @@ pub enum MaterializeOutcome {
     /// written.  `stash_path` is the sibling stash file.  The canonical was
     /// also written to its final path.
     Stashed { stash_path: PathBuf },
+    /// D1 (v0.4.28, B1' resolution): the local file was NORMALIZED-equal but
+    /// RAW-unequal to the server canonical (a CRLF/BOM-only delta). It was
+    /// rewritten in place to the server's exact canonical bytes through the
+    /// standard persist machinery (echo-guarded, per-path-locked, atomic
+    /// tmp+rename, timestamps restored). NO stash: normalized-equal means
+    /// zero content difference by construction. This is the "alignment pull"
+    /// that converges the fleet's CRLF corpus in one pull pass, zero pushes.
+    AlignedToCanonical { path: PathBuf },
     /// Write completed but the post-write integrity check failed.  The file
     /// is intentionally NOT deleted — the owner can inspect both the bad
     /// write and the resulting ticket.
@@ -129,6 +137,38 @@ pub enum MaterializeOutcome {
         expected_sha: String,
         actual_sha: String,
     },
+}
+
+/// D2 (v0.4.28, B2'): outcome of an ack-materialize-back aligned write
+/// ([`Materializer::write_aligned_bytes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlignOutcome {
+    /// The local file was atomically rewritten to the canonical bytes and the
+    /// shadow store now records the canonical sha. Ordering (B2'c): rewrite
+    /// FIRST, shadow record SECOND - a crash between the two is benign (next
+    /// pass: raw match -> D1 Noop).
+    Rewrote { path: PathBuf },
+    /// Pre-rewrite guard tripped (B2'a): the file's current bytes no longer
+    /// hash to the bytes the caller drained/pushed - the user edited
+    /// mid-flight. Rewrite SKIPPED; the pending push of the newer edit
+    /// converges. `current_sha` is the file's current raw sha (diagnostics).
+    SkippedConcurrentEdit { current_sha: String },
+    /// The file no longer exists locally (deleted mid-flight). Skipped.
+    SkippedMissing,
+    /// Materializer is configured in `Disabled` mode. Skipped.
+    SkippedDisabled,
+    /// S513-class anti-strip guard (close-out, v0.4.28 final-review fix wave):
+    /// the CURRENT local file holds YAML frontmatter and `canonical_bytes` do
+    /// NOT. Rewriting would strip the local note's frontmatter — the exact
+    /// data-loss vector `guard_no_frontmatter_strip` already refuses on the
+    /// pull path (`write()`). This is the D2 fetch-fallback's own copy of that
+    /// guard: `ack_materialize_back`'s `/note` fetch fallback can hand back a
+    /// server body that lacks frontmatter for the same reason a pull can.
+    /// Rewrite SKIPPED; NOTHING is recorded in the shadow (stays stale — the
+    /// next reconcile pass falls to the fail-closed PULL path, which is itself
+    /// guarded by `guard_no_frontmatter_strip`, so it also refuses and the
+    /// local frontmatter-bearing copy survives to push up).
+    SkippedWouldStripFrontmatter,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +575,10 @@ impl Materializer {
         // frontmatter-normalized comparison (R1 idempotency basis). The stash is
         // now DIVERGENCE-driven (always preserve the loser), never policy-driven.
         let mut stash_path: Option<PathBuf> = None;
+        // D1 (v0.4.28): set when the Noop arm detects normalized-equal but
+        // raw-unequal - fall through to the persist machinery instead of
+        // returning, then report AlignedToCanonical.
+        let mut alignment_pull = false;
         if target.exists() {
             let local_bytes = fs::read(&target)?;
             let local_raw_sha = hex::encode(Sha256::digest(&local_bytes));
@@ -573,17 +617,41 @@ impl Materializer {
             }
             match guard_no_frontmatter_strip(raw_decision, pull_would_strip) {
                 Decision::Noop => {
+                    if local_bytes == content_bytes {
+                        // R1 byte-strict half: truly identical bytes. Nothing
+                        // to write; no mtime churn.
+                        info!(
+                            path = %payload.path,
+                            "materializer skip: local already identical to canonical (R1)"
+                        );
+                        // Record the synced server hash so the reconcile backstop
+                        // sees this path as in-sync-with-server, not a stale-pull
+                        // candidate.
+                        if let Some(sh) = &self.shadow_store {
+                            sh.record(&payload.path, &payload.sha256);
+                        }
+                        return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
+                    }
+                    // D1 (v0.4.28, B1'): normalized-equal but RAW-unequal - a
+                    // CRLF/BOM-only delta between local and the server
+                    // canonical. The old normalized-only Noop here is why the
+                    // pull leg could never converge byte-level drift while
+                    // every byte-strict comparer (server CAS, reconcile-batch
+                    // fs_hash) kept classifying it - the B1' alternation.
+                    // ALIGNMENT PULL: fall through to the persist machinery
+                    // below (echo-guard already recorded pre-write; the
+                    // per-path lock is held; atomic tmp+rename + timestamp
+                    // restore + shadow record all apply). NO stash - safe by
+                    // construction: normalized-equal means zero content
+                    // difference. The anti-strip guard is structurally
+                    // unaffected: normalized-equal implies identical
+                    // frontmatter presence.
                     info!(
                         path = %payload.path,
-                        "materializer skip: local already identical to canonical (R1)"
+                        change_seq,
+                        "materializer D1: normalized-equal but raw-unequal - ALIGNMENT PULL, rewriting local to server canonical bytes"
                     );
-                    // Record the synced server hash so the reconcile backstop
-                    // sees this path as in-sync-with-server, not a stale-pull
-                    // candidate.
-                    if let Some(sh) = &self.shadow_store {
-                        sh.record(&payload.path, &payload.sha256);
-                    }
-                    return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
+                    alignment_pull = true;
                 }
                 Decision::PreserveLocalEdit => {
                     // R2: shadow == server (server has NOT moved since we synced)
@@ -757,9 +825,152 @@ impl Materializer {
 
         if let Some(stash) = stash_path {
             Ok(MaterializeOutcome::Stashed { stash_path: stash })
+        } else if alignment_pull {
+            Ok(MaterializeOutcome::AlignedToCanonical { path: target })
         } else {
             Ok(MaterializeOutcome::Wrote { path: target })
         }
+    }
+
+    /// D2 (v0.4.28, B2'): guarded ack-materialize-back write. After the server
+    /// ACCEPTS a push but returns a `server_hash` different from what we sent
+    /// (it canonicalized or region-defended the content), the push client
+    /// rewrites the local file to the canonical bytes THROUGH THIS ENTRY so
+    /// the rewrite rides the standard machinery: echo-guard record-before-
+    /// write (a bespoke path would re-trigger the watcher - the S492 feedback
+    /// loop), per-path advisory lock, atomic tmp+rename, pre-write mtime
+    /// restore (an identity rewrite is not an edit).
+    ///
+    /// Guards and ordering:
+    /// * B2'a pre-rewrite guard: re-reads the file INSIDE the lock and
+    ///   requires `sha256(file bytes) == expected_local_sha` (the sha of the
+    ///   bytes the caller actually drained and POSTed - NOT the enqueue-time
+    ///   `evt.content_sha`). Mismatch => `SkippedConcurrentEdit`, no write.
+    /// * B2'c ordering: the shadow records `canonical_sha` strictly AFTER a
+    ///   successful rename. Every error path returns BEFORE the record, so a
+    ///   failed rewrite leaves the shadow STALE => the next reconcile pass
+    ///   classifies PULL - the fail-closed direction (never the
+    ///   shadow==server + local-diverged phantom-push-per-pass trap).
+    /// * This method NEVER records the shadow on a skip; the caller decides
+    ///   (the push client records the server hash on SkippedConcurrentEdit so
+    ///   the pending push2 backfills the correct CAS base).
+    ///
+    /// `canonical_sha` MUST be the sha256 hex of `canonical_bytes` (the caller
+    /// verified it against the server's hash - unverified local
+    /// canonicalization is banned, B2'b).
+    pub fn write_aligned_bytes(
+        &self,
+        rel_path: &str,
+        canonical_bytes: &[u8],
+        canonical_sha: &str,
+        expected_local_sha: &str,
+    ) -> Result<AlignOutcome, MaterializerError> {
+        if matches!(self.mode, MaterializerMode::Disabled) {
+            info!(
+                "materializer_mode=disabled; skipping aligned write for {}",
+                rel_path
+            );
+            return Ok(AlignOutcome::SkippedDisabled);
+        }
+        if !is_safe_path(rel_path) {
+            return Err(MaterializerError::PathTraversal(rel_path.to_string()));
+        }
+        debug_assert_eq!(
+            hex::encode(Sha256::digest(canonical_bytes)),
+            canonical_sha,
+            "caller must pass the verified sha of canonical_bytes"
+        );
+
+        let target = self.target_for(rel_path);
+
+        // S492 echo-suppression: record BEFORE the disk write so the entry is
+        // present when the watcher observes the rename (same pattern as
+        // write()).
+        if let Some(g) = &self.echo_guard {
+            g.record(rel_path, canonical_sha);
+        }
+
+        // Same per-path lock write() takes: the read-compare-rename sequence
+        // must not interleave with a concurrent materialize of this path.
+        let lock = self.path_lock_for(&canonical_sync_path(rel_path));
+        let _path_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // B2'a: re-read and require the file still holds EXACTLY the drained
+        // bytes.
+        let current = match fs::read(&target) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(path = %rel_path, "aligned write: file vanished before ack - skipping");
+                return Ok(AlignOutcome::SkippedMissing);
+            }
+            Err(e) => return Err(MaterializerError::Io(e)),
+        };
+        let current_sha = hex::encode(Sha256::digest(&current));
+        if current_sha != expected_local_sha {
+            warn!(
+                path = %rel_path,
+                expected = %expected_local_sha,
+                actual = %current_sha,
+                "aligned write: file changed between drain and ack (B2'a) - SKIPPING rewrite, pending push will converge"
+            );
+            return Ok(AlignOutcome::SkippedConcurrentEdit { current_sha });
+        }
+
+        // Anti-strip guard (S513-class close-out, final-review fix wave): the
+        // D2 fetch-fallback (`ack_materialize_back`'s `/note` GET when local
+        // canonicalization doesn't verify) can hand back `canonical_bytes`
+        // that lack YAML frontmatter the local note currently holds — the same
+        // stripped-body class `write()`'s pull path already guards against via
+        // `guard_no_frontmatter_strip`. A locally-canonicalized `canonical_bytes`
+        // can never trip this (canonicalization always preserves frontmatter
+        // presence), so this only fires on the fetch-fallback branch. Mirror
+        // the pull-path guard: refuse the rewrite, record NOTHING in the
+        // shadow (stays stale -> next pass falls to the guarded PULL path).
+        if starts_with_frontmatter(&current) && !starts_with_frontmatter(canonical_bytes) {
+            warn!(
+                path = %rel_path,
+                "aligned write ANTI-STRIP GUARD: canonical bytes (D2 fetch-fallback) drop YAML frontmatter local holds — REFUSING rewrite, shadow left stale"
+            );
+            return Ok(AlignOutcome::SkippedWouldStripFrontmatter);
+        }
+
+        // Capture the pre-write mtime: a content-identity rewrite must not
+        // churn the note's modified ordering.
+        let pre_mtime = fs::metadata(&target).ok().and_then(|m| m.modified().ok());
+
+        // Atomic tmp+rename, same-dir (same pattern + platform handling as
+        // write() step 8).
+        let parent = target
+            .parent()
+            .expect("vault-relative target always has a parent");
+        fs::create_dir_all(parent)?;
+        let mut tmp = NamedTempFile::new_in(parent)?;
+        tmp.write_all(canonical_bytes)?;
+        tmp.flush()?;
+        atomic_persist(tmp, &target)?;
+
+        // Restore the pre-write mtime (best-effort, like restore_server_times).
+        if let Some(mtime) = pre_mtime {
+            let times = fs::FileTimes::new().set_modified(mtime);
+            match fs::File::options().write(true).open(&target) {
+                Ok(f) => {
+                    if let Err(e) = f.set_times(times) {
+                        warn!(path = %target.display(), error = %e, "aligned write: mtime restore failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(path = %target.display(), error = %e, "aligned write: reopen for mtime restore failed");
+                }
+            }
+        }
+
+        // B2'c: rewrite FIRST (above), record SECOND (here). Every error path
+        // returned before this line.
+        if let Some(sh) = &self.shadow_store {
+            sh.record(rel_path, canonical_sha);
+        }
+        info!(path = %rel_path, sha = %canonical_sha, "aligned write: local rewritten to server canonical bytes (D2)");
+        Ok(AlignOutcome::Rewrote { path: target })
     }
 
     /// Pick the canonical-root directory for the active mode.  Used by the
@@ -1542,6 +1753,14 @@ mod tests {
         );
     }
 
+    /// Superseded by D1 (v0.4.28): a local file whose ONLY delta from the
+    /// server canonical is the diff-stripped `updated:` frontmatter value is
+    /// normalized-equal but raw-unequal, so it is now an ALIGNMENT PULL
+    /// (rewritten to the server's exact bytes, including the newer
+    /// `updated:`) rather than a byte-preserving Noop skip. Per the brief's
+    /// precision note: `updated` is deliberately excluded from the identity
+    /// basis as churn-noise, and the server canonical is authoritative, so
+    /// converging local to the server's `updated:` value here is intended.
     #[test]
     fn frontmatter_only_rewrite_treated_as_identical() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -1572,13 +1791,18 @@ mod tests {
             modified: "2026-05-27T00:00:00Z".into(),
             file_mtime: None,
             created: None,
-            enriched_body: Some(serialized),
+            enriched_body: Some(serialized.clone()),
         };
         let out = m.write(&p).unwrap();
         assert_eq!(
             out,
-            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)
+            MaterializeOutcome::AlignedToCanonical {
+                path: target.clone()
+            }
         );
+        // D1: local is rewritten to the server's exact canonical bytes
+        // (newer `updated:` included) — no stash, zero content difference.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), serialized);
     }
 
     // ---- conflict stash ---------------------------------------------------
@@ -2321,11 +2545,14 @@ mod tests {
             .contains("server divergent body"));
     }
 
-    /// D11: a CRLF (Windows) local file vs an LF (Unix) server body with the
-    /// SAME logical content must NOT be treated as a divergence. With the
-    /// shadow recording the server hash (R2 setup), a CRLF-only difference must
-    /// resolve as R1 NOOP (identical-after-normalization), not a false conflict
-    /// or a false local-edit.
+    /// D11 (superseded by D1, v0.4.28): a CRLF (Windows) local file vs an LF
+    /// (Unix) server body with the SAME logical content must NOT be treated
+    /// as a divergence (no conflict, no false local-edit). Pre-D1 this
+    /// resolved as a NOOP skip leaving the CRLF file untouched forever (the
+    /// B1' alternation: every byte-strict comparer downstream kept seeing
+    /// drift). D1 splits R1 byte-strict: normalized-equal-but-raw-unequal is
+    /// now an ALIGNMENT PULL that rewrites local to the server's exact
+    /// canonical bytes, still with zero conflict/stash.
     #[test]
     fn d11_crlf_vs_lf_is_not_a_divergence() {
         let (vaults, _ws, m, _shadow) = mk_with_shadow(MaterializerMode::Live);
@@ -2342,11 +2569,14 @@ mod tests {
         let out = m.write(&server).unwrap();
         assert_eq!(
             out,
-            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal),
-            "CRLF/BOM-only difference must normalize to identical (R1), got {out:?}"
+            MaterializeOutcome::AlignedToCanonical {
+                path: target.clone()
+            },
+            "CRLF/BOM-only difference must normalize to identical (R1) and align, got {out:?}"
         );
-        // The local CRLF file is left untouched (idempotent skip, no rewrite).
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), crlf_local);
+        // D1: the local CRLF/BOM file is rewritten to the server's exact
+        // canonical bytes (no conflict, no stash — zero content difference).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), server_bytes);
     }
 
     /// D13: soft_delete suffix carries nanosecond precision, so two deletes of
@@ -2379,5 +2609,76 @@ mod tests {
             2,
             "both soft-deletes must be preserved (nanosecond-unique suffixes), got {deleted:?}"
         );
+    }
+
+    // ---- write_aligned_bytes anti-strip guard (final-review fix wave, S513-class) ----
+
+    /// A frontmatter-bearing local file + frontmatterless `canonical_bytes`
+    /// (the D2 `/note` fetch-fallback shape) must SKIP the rewrite entirely:
+    /// file untouched on disk, nothing recorded in the shadow (stays stale so
+    /// the next reconcile pass falls to the guarded pull path).
+    #[test]
+    fn write_aligned_bytes_refuses_frontmatter_strip() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/fm.md");
+        let target = vaults.path().join(&rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let local_bytes = b"---\ntitle: keep me\n---\nbody\n".to_vec();
+        std::fs::write(&target, &local_bytes).unwrap();
+        let local_sha = hex::encode(Sha256::digest(&local_bytes));
+
+        // canonical_bytes lacks frontmatter entirely — the stripped-body shape.
+        let canonical_bytes = b"body\n".to_vec();
+        let canonical_sha = hex::encode(Sha256::digest(&canonical_bytes));
+
+        let out = m
+            .write_aligned_bytes(&rel, &canonical_bytes, &canonical_sha, &local_sha)
+            .unwrap();
+        assert_eq!(out, AlignOutcome::SkippedWouldStripFrontmatter);
+
+        // File untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), local_bytes);
+        // Shadow untouched (still absent — nothing recorded).
+        assert!(shadow.get(&rel).is_none());
+    }
+
+    /// Control: the normal CRLF/BOM-only alignment case (identical frontmatter
+    /// PRESENCE on both sides, only line-ending/BOM bytes differ) must still
+    /// rewrite through `write_aligned_bytes` — the new guard only trips on a
+    /// frontmatter-presence MISMATCH, never on a frontmatter-preserving byte
+    /// realignment.
+    #[test]
+    fn write_aligned_bytes_still_rewrites_crlf_with_frontmatter_on_both_sides() {
+        let (vaults, _ws, m, shadow) = mk_with_shadow(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/crlf.md");
+        let target = vaults.path().join(&rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let canonical_bytes = b"---\ntitle: x\n---\nline one\nline two\n".to_vec();
+        let canonical_sha = hex::encode(Sha256::digest(&canonical_bytes));
+        // Local: same logical content, CRLF line endings + BOM — frontmatter
+        // IS present on both sides (guard must not fire).
+        let local_bytes = format!(
+            "\u{feff}{}",
+            String::from_utf8(canonical_bytes.clone())
+                .unwrap()
+                .replace('\n', "\r\n")
+        )
+        .into_bytes();
+        std::fs::write(&target, &local_bytes).unwrap();
+        let local_sha = hex::encode(Sha256::digest(&local_bytes));
+
+        let out = m
+            .write_aligned_bytes(&rel, &canonical_bytes, &canonical_sha, &local_sha)
+            .unwrap();
+        assert_eq!(
+            out,
+            AlignOutcome::Rewrote {
+                path: target.clone()
+            }
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), canonical_bytes);
+        assert_eq!(shadow.get(&rel).as_deref(), Some(canonical_sha.as_str()));
     }
 }

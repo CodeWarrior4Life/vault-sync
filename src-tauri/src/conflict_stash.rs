@@ -688,9 +688,13 @@ mod tests {
         let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::Manual);
         fs::create_dir_all(tmp.path().join("notes")).unwrap();
 
-        let p1 = stash.write_stash("notes/x.md", b"loser", "morpheus", 1).unwrap();
+        let p1 = stash
+            .write_stash("notes/x.md", b"loser", "morpheus", 1)
+            .unwrap();
         // Same content, different device+lsn → reuse existing stash, no new file.
-        let p2 = stash.write_stash("notes/x.md", b"loser", "trinity", 99).unwrap();
+        let p2 = stash
+            .write_stash("notes/x.md", b"loser", "trinity", 99)
+            .unwrap();
         assert_eq!(p1, p2, "identical content must reuse the existing stash");
 
         let n = fs::read_dir(tmp.path().join("notes"))
