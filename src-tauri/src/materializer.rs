@@ -624,11 +624,21 @@ impl Materializer {
                             path = %payload.path,
                             "materializer skip: local already identical to canonical (R1)"
                         );
-                        // Record the synced server hash so the reconcile backstop
-                        // sees this path as in-sync-with-server, not a stale-pull
-                        // candidate.
-                        if let Some(sh) = &self.shadow_store {
-                            sh.record(&payload.path, &payload.sha256);
+                        // B1 (S534): record ONLY in Live mode, and record the
+                        // LOCAL raw sha (`local_raw_sha` — what is actually on
+                        // disk), NOT the server hash. In Shadow/Disabled the
+                        // materialize write went to the shadow tree, not the
+                        // vault, so recording a baseline here forges the "vault
+                        // in sync" marker that verify_repair reads as
+                        // drift+shadow==server ⇒ PUSH ⇒ the re-push storm. Even
+                        // in Live, `local_raw_sha` is the honest on-disk value
+                        // (identical to the server bytes on this byte-strict
+                        // arm, but never a value the vault did not actually
+                        // hold). In non-Live we skip the record entirely.
+                        if matches!(self.mode, MaterializerMode::Live) {
+                            if let Some(sh) = &self.shadow_store {
+                                sh.record(&payload.path, &local_raw_sha);
+                            }
                         }
                         return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
                     }
@@ -817,10 +827,21 @@ impl Materializer {
         // The local file now equals the server's canonical bytes (we just wrote
         // them and integrity passed). Record the synced server hash for the
         // reconcile backstop's drift-direction decision. Reached only on the
-        // Wrote / Stashed success paths — IntegrityFailed returned above, so a
-        // failed write never records a (false) in-sync marker.
-        if let Some(sh) = &self.shadow_store {
-            sh.record(&payload.path, &payload.sha256);
+        // Wrote / Stashed / AlignedToCanonical success paths — IntegrityFailed
+        // returned above, so a failed write never records a (false) in-sync
+        // marker.
+        //
+        // B1 (S534): record ONLY in Live mode. In Shadow/Disabled the bytes
+        // landed in the shadow tree (or nowhere), NOT the vault, so recording
+        // shadow=server_hash here forges an "in-sync" baseline the VAULT never
+        // received. The reconcile pass walks the vault, reads that forged marker
+        // (shadow==server) against a still-stale vault file, and decides PUSH —
+        // re-pushing stale bytes forever (the client half of the storm). Only a
+        // genuine vault write earns the baseline marker.
+        if matches!(self.mode, MaterializerMode::Live) {
+            if let Some(sh) = &self.shadow_store {
+                sh.record(&payload.path, &payload.sha256);
+            }
         }
 
         if let Some(stash) = stash_path {
@@ -2161,6 +2182,43 @@ mod tests {
         let out = m.write(&p).unwrap();
         assert!(matches!(out, MaterializeOutcome::IntegrityFailed { .. }));
         assert_eq!(shadow.get(&p.path), None);
+    }
+
+    /// B1 (S534): a Shadow-mode write goes to the shadow tree, NOT the vault, so
+    /// it must NEVER record a shadow baseline. Recording shadow=server_hash there
+    /// forged the "vault in sync" marker verify_repair reads as drift+shadow==
+    /// server ⇒ PUSH ⇒ the storm. Covers BOTH record sites: the first write
+    /// (Wrote/post-write path) and the second identical write (R1 byte-strict
+    /// Noop path) — neither may record while in Shadow mode.
+    #[test]
+    fn b1_shadow_mode_write_does_not_record_baseline() {
+        use crate::sync_shadow::ShadowStore;
+        let dir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let (_v, _ws, m_base) = mk(MaterializerMode::Shadow, default_cfg());
+        let m = m_base.with_shadow_store(shadow.clone());
+        let p = payload("01_Inbox/foo.md", "hello");
+
+        // First write → shadow tree (post-write record site). Must NOT record.
+        let out = m.write(&p).unwrap();
+        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert_eq!(
+            shadow.get(&p.path),
+            None,
+            "shadow-mode write must NOT forge a vault baseline (post-write site)"
+        );
+
+        // Second identical write → R1 byte-strict Noop record site. Still none.
+        let out2 = m.write(&p).unwrap();
+        assert_eq!(
+            out2,
+            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)
+        );
+        assert_eq!(
+            shadow.get(&p.path),
+            None,
+            "shadow-mode R1 Noop must NOT forge a vault baseline (Noop site)"
+        );
     }
 
     // ---- B4: per-sync_root materializer tests --------------------------------

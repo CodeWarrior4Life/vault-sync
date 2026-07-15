@@ -85,7 +85,7 @@ use crate::api_client::{ApiClient, ApiError, ReconcileBatchItem, ReconcileBatchR
 use crate::push_journal::{
     new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
-use crate::rasp_fence::{classify_path, PathClassification};
+use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 
 const SAMPLE_CAP: usize = 50;
 
@@ -721,6 +721,19 @@ impl VerifyRepair {
                 continue;
             }
 
+            // B3 (S534): macOS junk — AppleDouble `._*` sidecars (at ANY depth)
+            // and `.DS_Store`. An `._Foo.md` ends in an allowed extension, so the
+            // ext gate below does NOT catch it; without this the reconcile walk
+            // enqueues AppleDouble/Finder tar artifacts for push. Reuses the same
+            // `rasp_fence::is_junk_path` the file_watcher applies at classify
+            // time, keeping the two enqueue paths aligned. The `._` check
+            // requires a literal underscore after the dot, so a legit
+            // `_Underscore.md` (and `.nx-<host>/` namespaces) are NOT excluded.
+            if is_junk_path(&rel_str) {
+                tracing::debug!(path = %rel_str, "verify_repair: macOS junk (AppleDouble/.DS_Store) excluded from manifest");
+                continue;
+            }
+
             // Substrate fence.
             if self.config.respect_substrate_fence {
                 if let PathClassification::Substrate { rule } = classify_path(&rel_str) {
@@ -1001,6 +1014,36 @@ mod tests {
             paths,
             vec!["notes/keeper.md"],
             "node_modules/ (root + nested) must be excluded from the reconcile manifest"
+        );
+    }
+
+    /// B3 (S534): macOS AppleDouble `._*` sidecars (root + nested) and
+    /// `.DS_Store` must NEVER enter the reconcile manifest — they are tar/Finder
+    /// artifacts that end in an allowed extension (`._Foo.md` ends in `.md`), so
+    /// the ext gate does not catch them; the reconcile walk would otherwise push
+    /// them. A legit `_Underscore.md` (single leading underscore, no dot) and a
+    /// normal `Foo.md` MUST still be manifested.
+    #[tokio::test]
+    async fn manifest_excludes_appledouble_and_dsstore() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        // AppleDouble sidecars — root + nested.
+        write_file(v, "._Bar.md", b"appledouble");
+        write_file(v, "04_Entities/._Foo.md", b"appledouble");
+        // .DS_Store — root + nested.
+        write_file(v, ".DS_Store", b"dsstore");
+        write_file(v, "04_Entities/.DS_Store", b"dsstore");
+        // Legit files that MUST survive.
+        write_file(v, "04_Entities/Foo.md", b"real");
+        write_file(v, "_Underscore.md", b"real");
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let m = vr.build_local_manifest().unwrap();
+        let mut paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["04_Entities/Foo.md", "_Underscore.md"],
+            "AppleDouble/.DS_Store excluded; legit `Foo.md` + `_Underscore.md` kept"
         );
     }
 
