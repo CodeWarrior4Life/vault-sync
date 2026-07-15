@@ -543,9 +543,9 @@ mod tests {
     /// version string the fleet would mistake for an older release. Bumped for
     /// the S534 B1/B3 shadow-forge fix + headless pair/set-mode CLI.
     #[test]
-    fn daemon_version_is_0_4_30() {
-        assert_eq!(daemon_version(), "0.4.30");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.30/"));
+    fn daemon_version_is_0_4_31() {
+        assert_eq!(daemon_version(), "0.4.31");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.31/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`

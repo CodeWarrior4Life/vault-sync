@@ -143,6 +143,13 @@ fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             validate_mode(&mode)?;
             Ok(CliCommand::SetMode { mode })
         }
+        // A leading FLAG (e.g. `--silent`, passed by the LaunchAgent / `open
+        // -a … --args --silent` / the updater relaunch) is NOT a headless
+        // subcommand — fall through to the normal GUI/daemon launch, which owns
+        // its own flag handling. Only a bare non-subcommand word is a typo and
+        // errors. (v0.4.31: v0.4.30 regressed here — `--silent` hit the error
+        // arm, so the daemon refused to start on every normal launch.)
+        Some(other) if other.starts_with('-') => Ok(CliCommand::Gui),
         Some(other) => Err(format!("unknown subcommand: {other}")),
     }
 }
@@ -388,6 +395,15 @@ mod tests {
     #[test]
     fn unknown_subcommand_errors() {
         assert!(parse_cli(&v(&["frobnicate"])).is_err());
+    }
+
+    #[test]
+    fn leading_flags_fall_through_to_gui() {
+        // v0.4.31 regression guard: the normal launch passes --silent; it must
+        // NOT be treated as a subcommand (that broke daemon startup in v0.4.30).
+        assert_eq!(parse_cli(&v(&["--silent"])).unwrap(), CliCommand::Gui);
+        assert_eq!(parse_cli(&v(&["--silent", "--foo"])).unwrap(), CliCommand::Gui);
+        assert_eq!(parse_cli(&v(&[])).unwrap(), CliCommand::Gui);
     }
 
     #[test]
