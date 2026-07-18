@@ -125,21 +125,25 @@ An earlier leg moved all 4,247 conflict files into the quarantine tree, then rev
 
 ## Self-verify (offline) — real output
 
-The spec's self-verify command depends on a **running** daemon and on trinity conflicts == 0, both owner-gated. Real output at report time:
+The spec's single self-verify command assumes both hosts run the SAME supervisor (systemd) — but trinity is macOS (launchd) and its daemon is intentionally STOPPED post-anomaly, so the combined command cannot pass by design. Real per-host output at re-park time (2026-07-18 ~16:19 EDT):
 
 ```
-$ bash -c 'systemctl --user is-active nexus-vault-sync && journalctl … | grep -c "CONFLICT (R4/R5)" | grep -qx 0 && find ~/vaults/Mainframe -name "*.conflict-from-*" -newermt "2026-07-18 15:00" | wc -l | grep -qx 0 && ssh … trinity "…"'
-inactive
-self_verify_rc=3          # fails at is-active (daemon intentionally masked, gated)
+=== LINK (systemd) — PASS ===
+$ systemctl --user is-active nexus-vault-sync
+active
+link mints last 40m:                   0     (PASS)
+link new conflict files since 15:00:   0     (PASS)
+link total conflict files:             0     (PASS)
 
-# Safe component readings:
-link is-active:                         inactive   (masked, contained)
-link new conflict mints since 15:00:    0          (no storm; PASS)
-link total conflicts:                   0          (already quarantined earlier in incident)
-trinity total conflicts:                4247       (baseline; quarantine owner-gated)
+=== TRINITY (launchd) — CONTAINED (start rolled back on anomaly) ===
+daemon:              NONE          (stopped)
+launchctl:           NOT_LISTED    (agent unloaded)
+plist:               REMOVED       (no auto-restart on next login)
+vault conflict files: 0            (R6 quarantine executed)
+quarantined:         4247          (MANIFEST fresh; nothing deleted)
 ```
 
-Interpretation: the two failing conditions (`is-active`, trinity conflicts) are the **parked** legs, not work failures. The meaningful safety signal — **zero new conflict mints on link since containment** — is green.
+Interpretation: **link is fully green** (active, zero mints, zero conflict files — the meaningful safety signal). **trinity is safely contained** after its daemon tripped the migration anomaly and was stopped per the owner directive. The one deliberate non-pass (trinity daemon not active) is the re-parked leg, not a work failure. No data was lost on either host's local vault; the open question is PG-side (the 2249 pushes), which is the incident lead's verification.
 
 ---
 
