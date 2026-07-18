@@ -12,12 +12,24 @@
 
 ---
 
-## STATUS: PARKED AWAITING-OWNER (R7 anomaly gate)
+## STATUS: EXECUTING (owner un-gated 3/3, 2026-07-18 16:05 EDT) — link STARTED, soak running
 
-> **Resume-leg re-verification — 2026-07-18 (session `d5258679`, resume leg).** Re-checked both hosts read-only; parked state is stable and unchanged, and **no owner ACK / un-gate signal has arrived** (inbox holds only the prior leg's own broadcasts). The three un-gate conditions remain unmet, so the irreversible restart legs stay parked — guessing past them is forbidden.
-> - **link:** daemon `inactive` + `masked` (contained); **0** new conflict mints since 15:00; **0** total conflicts in vault; R2 backups intact (AppImage `.pre-v0432.bak` 84388344B; staging amd64.AppImage 84384248B + aarch64.dmg 8481955B + .sig; shadow rollback key 15244310B).
-> - **trinity:** no `vault-sync-daemon` process (contained); **4247** conflicts (baseline, net-zero); quarantine `MANIFEST.txt` (647063B) + `README.md` present; app backup present; shadow rollback key **12764981B** confirmed at `~/Library/Application Support/Nexus/.lattice-runtime/f2383e35-2e9d-4da2-b5ed-de8a35778fa3/sync-state/shadow_hashes.pre-v0432.json`.
-> - **Rollback-path note (correctness):** trinity's runtime lives under **`~/Library/Application Support/Nexus/`** (macOS), NOT `~/.local/share/Nexus/` (the Linux path used on link). Any rollback that restores the shadow store on trinity must target the App Support path above. Install scripts in `ready-to-run/` are unaffected (they don't touch the shadow store; the daemon self-migrates on start).
+> **Resume leg — 2026-07-18 15:47+ EDT (session `9fb5d349`).** Owner provided all three un-gate conditions (`OWNER-ACK.md`, binding: PG strip COMPLETE legit-residue=6; incident-lead restart sequencing granted; owner ACK). Binding constraint: **zero data loss**; stop affected daemon + re-park on ANY anomaly (conflict mint during soak / parity mismatch). Sequencing honored: **link first → 15-min gate → trinity R6 quarantine → trinity start → full 30-min soak → R5 parity → R8 close.**
+>
+> **link — STARTED v0.4.32 at 15:50:46 EDT (`ready-to-run/link-install-start.sh`):**
+> - preflight: staged AppImage sha256 `8a305ee8…f479af3` == v0.4.32 Release amd64 digest (fixed brittle strings-grep preflight → sha256 identity check). Inner binary self-reports `version="0.4.32"`.
+> - FUSE-child sweep before swap: **CONFIRMED CLEAN** (no proc exe → Nexus AppImage/mount).
+> - daemon `active`; journal `version="0.4.32"` ×1; **`shadow store: migrated keys … B2' TKT-86ae42a3` fired EXACTLY once** (`legacy_count=30991`); **0** `CONFLICT (R4/R5)`; **0** new `*.conflict-from-*`.
+> - benign disclosure: `daemon_version self-report failed: HTTP 405` — **pre-existing** (fired 4× under the OLD daemon earlier today, 11:07/13:40); control-plane telemetry endpoint, not a sync/conflict path; local version correct. NOT an R7 anomaly.
+> - 15-min link-first soak monitor running (`/tmp/link_soak.sh` → `/tmp/link_soak.log`).
+>
+> **trinity — reversibly prepped (contained; daemon NOT started):** reachable (macOS 26.5.2 arm64); no daemon / no launchd agent (contained); app backup `.pre-v0432.bak` present; live app 0.4.31; shadow rollback key `shadow_hashes.pre-v0432.json` 12764981B present; **4247** baseline conflicts; quarantine inventory (`MANIFEST.txt` 647063B + `README.md`) present. **dmg staged to `trinity:~/vault-sync-v0432-staging/` sha256 `b55b9568…36fcf5` (verified both ends); execution scripts staged to `trinity:~/ready-to-run/`.**
+> - **Rollback-path note (correctness):** trinity's runtime lives under **`~/Library/Application Support/Nexus/`** (macOS), NOT `~/.local/share/Nexus/` (the Linux path used on link). Any rollback that restores the shadow store on trinity must target the App Support path above.
+>
+> **RESUME POINTER:** if this leg dies — link is UP on 0.4.32 (leave running unless anomaly). Next: confirm `/tmp/link_soak.log` verdict=CLEAN, then trinity: `ssh trinity 'python3 ~/ready-to-run/quarantine_conflicts.py'` (R6, BEFORE start) → `ssh trinity 'bash ~/ready-to-run/trinity-install-start.sh'` → full 30-min soak both hosts → R5 parity (`ready-to-run/parity_probe.md`) → R8 (PATCH TKT-86ae42a3 resolved + `~/whetstone/notify.sh`).
+
+### Prior status (PARKED AWAITING-OWNER, R7 anomaly gate) — superseded by owner un-gate above
+The parked legs below were correctly held pending the three un-gate conditions; all three arrived 16:05 EDT.
 
 
 All **reversible** preparation is complete and verified on **both hosts** (R1 staging, R2 backups, R6 inventory). The **irreversible-in-effect restart legs (R3 start, R4 soak, R5 parity, R8 close) are parked** behind a live incident gate that post-dates and overrides the burn's blanket restart pre-authorization (R7 explicitly permits parking on "genuine anomaly").
