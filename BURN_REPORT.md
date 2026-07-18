@@ -14,6 +14,12 @@
 
 ## STATUS: PARKED AWAITING-OWNER (R7 anomaly gate)
 
+> **Resume-leg re-verification — 2026-07-18 (session `d5258679`, resume leg).** Re-checked both hosts read-only; parked state is stable and unchanged, and **no owner ACK / un-gate signal has arrived** (inbox holds only the prior leg's own broadcasts). The three un-gate conditions remain unmet, so the irreversible restart legs stay parked — guessing past them is forbidden.
+> - **link:** daemon `inactive` + `masked` (contained); **0** new conflict mints since 15:00; **0** total conflicts in vault; R2 backups intact (AppImage `.pre-v0432.bak` 84388344B; staging amd64.AppImage 84384248B + aarch64.dmg 8481955B + .sig; shadow rollback key 15244310B).
+> - **trinity:** no `vault-sync-daemon` process (contained); **4247** conflicts (baseline, net-zero); quarantine `MANIFEST.txt` (647063B) + `README.md` present; app backup present; shadow rollback key **12764981B** confirmed at `~/Library/Application Support/Nexus/.lattice-runtime/f2383e35-2e9d-4da2-b5ed-de8a35778fa3/sync-state/shadow_hashes.pre-v0432.json`.
+> - **Rollback-path note (correctness):** trinity's runtime lives under **`~/Library/Application Support/Nexus/`** (macOS), NOT `~/.local/share/Nexus/` (the Linux path used on link). Any rollback that restores the shadow store on trinity must target the App Support path above. Install scripts in `ready-to-run/` are unaffected (they don't touch the shadow store; the daemon self-migrates on start).
+
+
 All **reversible** preparation is complete and verified on **both hosts** (R1 staging, R2 backups, R6 inventory). The **irreversible-in-effect restart legs (R3 start, R4 soak, R5 parity, R8 close) are parked** behind a live incident gate that post-dates and overrides the burn's blanket restart pre-authorization (R7 explicitly permits parking on "genuine anomaly").
 
 **Why parked (the anomaly, R7):** an active P0 incident (the same conflict storm this fix targets) currently forbids restarting `nexus-vault-sync` on link. Two independent, current signals:
@@ -119,7 +125,7 @@ Interpretation: the two failing conditions (`is-active`, trinity conflicts) are 
 
 ## Rollback (if a started v0.4.32 ever misbehaves)
 
-Per host: stop daemon -> restore `Nexus-Vault-Sync.AppImage.pre-v0432.bak` (link) / `Nexus Vault Sync.app.pre-v0432.bak` (trinity) over the live path -> restore `shadow_hashes.pre-v0432.json` over `shadow_hashes.json` -> re-mask (link) / unload LaunchAgent (trinity). Vault rollback if needed: `~/vault-backup-pre-v0432/` holds a full point-in-time tree. trinity quarantine (if later executed) reverses via its README. **Nothing in this burn requires PG rollback** (no PG writes were made).
+Per host: stop daemon -> restore `Nexus-Vault-Sync.AppImage.pre-v0432.bak` (link) / `Nexus Vault Sync.app.pre-v0432.bak` (trinity) over the live path -> restore `shadow_hashes.pre-v0432.json` over `shadow_hashes.json` -> re-mask (link) / unload LaunchAgent (trinity). **Exact shadow-store paths:** link `~/.local/share/Nexus/.lattice-runtime/a6f8219e-2fcb-4a9a-a2c6-0d3471919d1c/sync-state/`; trinity `~/Library/Application Support/Nexus/.lattice-runtime/f2383e35-2e9d-4da2-b5ed-de8a35778fa3/sync-state/` (macOS App Support, NOT `.local/share`). Vault rollback if needed: `~/vault-backup-pre-v0432/` holds a full point-in-time tree. trinity quarantine (if later executed) reverses via its README. **Nothing in this burn requires PG rollback** (no PG writes were made).
 
 ---
 
