@@ -13,8 +13,12 @@ echo ">> preflight"
 test -f "$SRC" || { echo "FATAL: staged AppImage missing: $SRC"; exit 1; }
 test -f "$HOME/Applications/Nexus-Vault-Sync.AppImage.pre-v0432.bak" || { echo "FATAL: R2 binary backup missing"; exit 1; }
 test -f "$BACKUP_UNIT" || { echo "FATAL: pre-mask unit backup missing: $BACKUP_UNIT"; exit 1; }
-# sanity: staged binary really is 0.4.32
-grep -aqx . <(strings -n 6 "$SRC" 2>/dev/null | grep -aoE '0\.4\.32' | head -1) || { echo "FATAL: staged binary is not 0.4.32"; exit 1; }
+# sanity: staged AppImage is byte-identical to the v0.4.32 Release asset.
+# (strings-grep on the compressed squashfs payload false-negatives; sha256 is the
+#  authoritative identity check — matches `gh release view v0.4.32` amd64 digest.)
+EXPECT_SHA=8a305ee83739708b67450d0adc84a9db4f112c514dc0a5f01ec11bd23f479af3
+ACTUAL_SHA="$(sha256sum "$SRC" | awk '{print $1}')"
+[ "$ACTUAL_SHA" = "$EXPECT_SHA" ] || { echo "FATAL: staged AppImage sha256 mismatch (got $ACTUAL_SHA want $EXPECT_SHA)"; exit 1; }
 
 echo ">> 1. swap binary (backup already at *.pre-v0432.bak)"
 install -m 0755 "$SRC" "$APP"
