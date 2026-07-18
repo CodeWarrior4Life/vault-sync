@@ -16,3 +16,6 @@ Same text persisted in the ticket body (verified) as `OWNER RESPONSE (2026-07-18
 
 ## ADDENDUM (16:55 EDT): trinity anomaly verdict — PROCEED
 Data audit: ZERO loss (300-sample: 213 byte-equal, 86 never-in-PG, 1 pre-existing live-note lag). Remedy applied: vault_name = "Mainframe" added to trinity config (backup .pre-v0432-vaultname.bak). Final legs: reinstall plist only (app already 0.4.32; do NOT re-run the buggy dmg-mount block), load -w + kickstart, verify migration line fires NONZERO, joint 30-min soak, R5 parity, R8 close. Zero-mint or re-park.
+
+## ADDENDUM 2 (17:20 EDT): wave-2 audit CLEAN — FINAL PROCEED
+200/200 sampled wave-2 pushes byte-identical to pre-deploy canonical snapshot. Zero regressions. Anti-strip refusals = S513 designed healing. Link restarted. Execute final legs: trinity plist start (migration NOT expected to re-fire — already migrated), joint 30-min soak (zero mints hard gate + push-volume decay gate; ping-pong = stop + re-park), R5 parity, R8 close.
