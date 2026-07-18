@@ -12,9 +12,24 @@
 
 ---
 
-## STATUS: link DONE (0.4.32, clean) · trinity RE-PARKED AWAITING INCIDENT-LEAD (R7 anomaly: config drift → 2249 PG pushes)
+## STATUS: link DONE (0.4.32, clean) · trinity RE-PARKED AWAITING OWNER/INCIDENT-LEAD (SECOND anomaly: config-remedied migration fired 11734 ✓ but the daemon STILL mass-pushed 2326 stale-replica notes to PG)
 
-> **Resume leg — 2026-07-18 16:07→16:20 EDT (session `2d1a2846`).** Owner un-gated 3/3 (`OWNER-ACK.md`). Executed the owner's sequencing. **link is UP on 0.4.32 and verified clean** (incident-lead gate PASSED 16:07). **trinity started, immediately tripped a genuine R7 anomaly, was STOPPED + contained per the owner's binding zero-data-loss directive.** Restart legs for trinity are re-parked pending incident-lead PG verification. LINK LEFT RUNNING (healthy, gate passed) — see the propagation flag below.
+> **Resume leg — 2026-07-18 16:35→16:47 EDT (session `32d4c981`, conductor `tkt-8a70148c-32d4`).** Acted on the un-gate embedded in the ticket body: **owner ACK 16:05 + incident-lead PROCEED verdict 16:55** (both recorded in `OWNER-ACK.md`; the incident lead's config remedy was independently VERIFIED present on trinity before I touched anything — `vault_name = "Mainframe"` at config.toml:7 + `.pre-v0432-vaultname.bak`). Restored trinity's pristine pre-v0432 shadow, installed the launchd plist, started the daemon. **The migration fixed the R5 storm exactly as designed — `migrated keys legacy_count=11734` ×1, version 0.4.32, ZERO CONFLICT (R4/R5) mints — but trinity re-detonated the mass-push through a DIFFERENT code path: 2326 `push accepted` to PG + 1794 ANTI-STRIP GUARD + 3588 R2-preserve-local + 8 CAS-409 stashes, all in ~2.5 min.** Per the owner's binding zero-data-loss directive (STOP on any anomaly / conflict mint) the daemon was STOPPED + contained. Re-parked awaiting owner/incident-lead. LINK LEFT RUNNING (healthy, backed up) but is ACTIVELY PROPAGATING trinity's pushes — see the escalated flag below.
+
+### SECOND ANOMALY (restart 2026-07-18 16:41 EDT) — the migration fix is necessary but NOT sufficient for trinity
+**What happened:** with the incident-lead config remedy in place (`vault_name`) and the pristine shadow restored, the B2' migration fired correctly (`legacy_count=11734`, ×1) and there were **0 R4/R5 conflict mints** — the conflict *storm* is genuinely fixed. But within 2.5 minutes the 0.4.32 daemon:
+- **`push accepted` × 2326** (all `seq=0`) — a mass push of trinity's LOCAL bytes to canonical PG, nearly identical in scale to the first anomaly's 2249.
+- **`ANTI-STRIP GUARD (S513)` × 1794** — "server version drops YAML frontmatter local holds — REFUSING pull, PRESERVING local (will push up)". Trinity holds fuller/older versions than PG for ~1794 notes and is pushing them UP over PG's shorter current rows.
+- **`R2: local edit diverges, server unchanged since last sync, PRESERVING local` × 3588.**
+- **`push_client: CAS-409 conflict, stashed losing local bytes` × 8** — 8 new `*.conflict-from-*` files minted (NOT via R4/R5). Quarantined (see below), vault back to 0.
+
+**ROOT CAUSE (second-order, distinct from the config drift): trinity is a long-offline STALE REPLICA whose local vault + shadow diverge from the PG canonical that advanced while it was down** (link's live daemon + the incident lead's 8,920-row sentinel strip TODAY). The v0.4.32 migration only cures the *shadow-key-namespace* orphaning (→ R5 storm). It does nothing about content divergence: on boot the daemon evaluates each note, and where trinity-local ≠ PG it applies R2/anti-strip-guard "preserve local, push up" and asserts trinity's stale bytes onto PG. `base_hash:null` on the pushes = blind pushes, so CAS rarely rejects → they land.
+
+**DATA-SAFETY (unverifiable from trinity — incident-lead's lane, three-writers rule):** the 1794 anti-strip-guard pushes are the risk subset — where PG's row was INTENTIONALLY shorter (e.g. post-sentinel-strip) trinity has now reverted it. The first anomaly's 300-sample audit found zero loss (mostly never-in-PG / byte-equal); this second push must be audited the same way, with focus on the 1794 anti-strip paths vs today's strip set. Forensic lists saved on trinity (see resume pointer).
+
+**⚠⚠ ESCALATED PROPAGATION FLAG:** **link is LIVE and CONFIRMED propagating** — 21 materializations + 1 anti-strip-guard on link in the 6 min after trinity's boot, i.e. link is converging its FS toward the (possibly-reverted) PG rows trinity just pushed. Link is clean (0 mints, 0 conflict files) and fully backed up (`~/vault-backup-pre-v0432/`), so recoverable, and stopping link won't un-clobber PG. Left running per the incident lead's explicitly-owned "decide on link quiescence" call — but the incident lead should assess PG integrity and decide on link quiescence URGENTLY.
+
+**THE FIX TRINITY ACTUALLY NEEDS (owner/incident-lead decision, NOT executable by this burn):** a reconciliation-direction decision before trinity's daemon runs again. Options: (a) **pull-only bootstrap** — reset trinity's local `~/vaults/Mainframe` to match PG canonical (server-wins) before starting, so there is nothing stale to push; (b) a daemon first-boot **server-wins reconcile** mode for a long-offline replica; (c) accept trinity's pushes as authoritative ONLY after a PG-side audit confirms trinity holds the better bytes. Restarting the daemon as-is will reproduce the mass-push every time.
 
 ### link — DONE, verified clean (leave running)
 - daemon `active`+`enabled`; journal `version="0.4.32"`; **`shadow store: migrated keys` fired EXACTLY once** (`legacy_count=30991`); **0** `CONFLICT (R4/R5)` mints since boot; **0** conflict files in vault; only **15** boot pushes (normal reconcile). Config carries `vault_name = "Mainframe"`.
@@ -64,10 +79,10 @@ Every row cites real code at commit `1e2ee68` (paths under `src-tauri/src/`) or 
 | **R2b** copy `shadow_hashes.json` -> `.pre-v0432.json` (rollback key) | link subscriber `a6f8219e-…919d1c`; trinity subscriber `f2383e35-…778fa3` | **Conforms** | link: `shadow_hashes.pre-v0432.json` sha256 `4bf75d69…f51fe` (15244310B, == live). trinity: sha256 `49bd0638…1bdd5` (12764981B, == live). |
 | **R2c** vault snapshot (btrfs subvol snapshot if subvolume, else rsync `--link-dest`) | link `~/vaults/Mainframe` is btrfs but **NOT a subvolume** -> fallback path taken | **Conforms (via specified fallback)** | link: `rsync -a --link-dest` -> `~/vault-backup-pre-v0432/` (118829 files; hardlinked — inode `8073213` links=2 verified; combined real du 35G = 1x). trinity (APFS): `rsync -a --link-dest` -> `~/vault-backup-pre-v0432/` (107135 files, 37G, rc=0). |
 | **R3** daemons STOPPED+MASKED (containment); unmask/start ONLY after binary in place; trinity gets supervisor + start | link `nexus-vault-sync.service` **active+enabled** on 0.4.32; trinity daemon **STOPPED + plist removed** (re-contained after anomaly) | **link DONE** · **trinity RE-CONTAINED** (start rolled back) | link unmasked+started, verified clean. trinity: launchd LaunchAgent was installed+loaded, daemon ran (PID 88682, 0.4.32), then **unloaded + plist removed** after the migration anomaly (see STATUS). No process, not listed. **GAP (G2):** "systemd unit" is impossible on macOS — launchd LaunchAgent is the correct supervisor (`ready-to-run/com.lattice.nexus-vault-sync.plist`). |
-| **R4** post-start: migration log once; version 0.4.32; 30-min zero-mint soak; reconcile completes | link: running v0.4.32; trinity: started-then-stopped | **link PASS** · **trinity FAIL (anomaly)** | **link:** `migrated keys` ×1 (legacy_count=30991), version 0.4.32, 0 mints, 0 conflict files, incident-lead gate PASSED. **trinity:** version 0.4.32 ✓ but **`migrated keys` fired 0×** (expected ~11734) — R4 acceptance FAILS. 0 CONFLICT mints (storm not re-detonated) but 2249 dormant notes pushed to PG. Root cause = missing `vault_name` (see STATUS). Daemon stopped; re-parked. |
+| **R4** post-start: migration log once; version 0.4.32; 30-min zero-mint soak; reconcile completes | link: running v0.4.32; trinity: started-then-stopped ×2 | **link PASS** · **trinity FAIL (2nd anomaly)** | **link:** `migrated keys` ×1 (legacy_count=30991), version 0.4.32, 0 mints, 0 conflict files, incident-lead gate PASSED. **trinity (restart 16:41, config-remedied):** version 0.4.32 ✓, `migrated keys` ×1 legacy_count=**11734** ✓ (config remedy WORKED), **0 CONFLICT (R4/R5) mints** ✓ — the storm is genuinely fixed. BUT R4 soak FAILS: **2326 `push accepted` + 1794 ANTI-STRIP GUARD + 8 CAS-409 stashes** in 2.5 min = stale-replica mass-push (see SECOND ANOMALY). Daemon STOPPED + contained. |
 | **R5** Verified Parity Protocol E2E probes both directions | Requires a running daemon + choke-point write path | **PARKED** | Probe plan authored (`ready-to-run/parity_probe.md`). Cannot execute without a live daemon (start gated). Would also touch PG `vault_notes` — forbidden during the active PG incident. |
 | **R6** quarantine trinity's 4,247 `*.conflict-from-*` -> `~/.local/share/Nexus/quarantine/conflict-storm-2026-07-18/` (rel tree + MANIFEST + README), never delete | `trinity:~/.local/share/Nexus/quarantine/conflict-storm-2026-07-18/` | **DONE** | **EXECUTED** (owner-sequenced, before start): `MOVED=4247 ERRORS=0`, `TOTAL_BYTES=28832230`; vault conflict files → **0**; quarantine tree = 4247 files + fresh `MANIFEST.txt` + `README.md` (reverse procedure). Nothing deleted. |
-| **R7** pre-authorized unattended install/restart; park only on genuine anomaly | trinity: migration no-op + 2249 unexpected PG pushes | **Invoked (parked on genuine anomaly)** | The 2249-note PG push + migration-0 is a genuine anomaly under the owner's binding zero-data-loss constraint. Affected daemon STOPPED + contained per R7/owner directive. Rollback intact (R2). link (clean) left running; propagation flagged. |
+| **R7** pre-authorized unattended install/restart; park only on genuine anomaly | trinity: migration OK (11734) but 2326 unexpected PG pushes (2nd anomaly) | **Invoked twice (parked on genuine anomaly)** | 1st anomaly (16:07): migration-0 + 2249 pushes → config-drift root cause. Incident lead remedied config + verdict PROCEED (16:55). 2nd anomaly (16:41): migration now fires 11734 ✓ / 0 R4/R5 mints ✓ but daemon STILL mass-pushed 2326 stale-replica notes (anti-strip/R2/CAS path). Genuine anomaly under zero-data-loss → daemon STOPPED + contained. Rollback intact (R2 + `.post-anomaly.bak` shadow). link (clean, backed up) left running; propagation CONFIRMED + escalated. |
 | **R8** on SUCCESS: PATCH TKT-86ae42a3 -> resolved + TG completion | success gate not reached (trinity failed R4) | **PARKED (correctly not done)** | Not a success state; ticket NOT patched, no premature TG "done". This report is the owner/incident-lead handoff. |
 
 ### Fix-code review (the v0.4.32 change under test) — CONFORMS
@@ -128,22 +143,22 @@ An earlier leg moved all 4,247 conflict files into the quarantine tree, then rev
 The spec's single self-verify command assumes both hosts run the SAME supervisor (systemd) — but trinity is macOS (launchd) and its daemon is intentionally STOPPED post-anomaly, so the combined command cannot pass by design. Real per-host output at re-park time (2026-07-18 ~16:19 EDT):
 
 ```
-=== LINK (systemd) — PASS ===
+=== LINK (systemd) — PASS (16:47 EDT) ===
 $ systemctl --user is-active nexus-vault-sync
 active
 link mints last 40m:                   0     (PASS)
-link new conflict files since 15:00:   0     (PASS)
 link total conflict files:             0     (PASS)
+[NOTE: link is propagating trinity's pushes — 21 materializations in the 6 min post-anomaly]
 
-=== TRINITY (launchd) — CONTAINED (start rolled back on anomaly) ===
+=== TRINITY (launchd) — CONTAINED (2nd start rolled back on mass-push anomaly, 16:47 EDT) ===
 daemon:              NONE          (stopped)
 launchctl:           NOT_LISTED    (agent unloaded)
 plist:               REMOVED       (no auto-restart on next login)
-vault conflict files: 0            (R6 quarantine executed)
-quarantined:         4247          (MANIFEST fresh; nothing deleted)
+vault conflict files: 0            (8 CAS-409 stashes quarantined)
+quarantined:         4255          (4247 storm + 8 restart CAS-409; nothing deleted)
 ```
 
-Interpretation: **link is fully green** (active, zero mints, zero conflict files — the meaningful safety signal). **trinity is safely contained** after its daemon tripped the migration anomaly and was stopped per the owner directive. The one deliberate non-pass (trinity daemon not active) is the re-parked leg, not a work failure. No data was lost on either host's local vault; the open question is PG-side (the 2249 pushes), which is the incident lead's verification.
+Interpretation: **link is green** (active, zero mints, zero conflict files) but is READ-SIDE PROPAGATING trinity's 2326 pushes (21 pulls in 6 min) — recoverable (full FS backup) and incident-lead-owned. **trinity is safely contained** after its SECOND start tripped a stale-replica mass-push (2326 to PG) and was stopped per the owner directive. Migration itself is proven fixed (11734 ×1, 0 R4/R5 mints). No data lost on either LOCAL vault; the open question is PG-side (2326 pushes, esp. the 1794 anti-strip reversions), the incident lead's verification.
 
 ---
 
@@ -157,9 +172,9 @@ Per host: stop daemon -> restore `Nexus-Vault-Sync.AppImage.pre-v0432.bak` (link
 
 | Criterion | State | Evidence |
 |---|---|---|
-| v0.4.32 self-reported (both hosts) | **link ✓** (journal); **trinity ✓** (bundle+journal, before stop) | R1/R4 rows |
-| migration log line observed | **link ✓ ×1 (30991)**; **trinity ✗ 0×** (missing `vault_name`) | STATUS / G4 |
-| 30-min soak zero conflict mints | **link ✓ (0 mints)**; **trinity: soak not run** (stopped on anomaly) | R4 row |
+| v0.4.32 self-reported (both hosts) | **link ✓** (journal); **trinity ✓** (bundle+journal, both boots) | R1/R4 rows |
+| migration log line observed | **link ✓ ×1 (30991)**; **trinity ✓ ×1 (11734)** after config remedy | STATUS / SECOND ANOMALY |
+| 30-min soak zero conflict mints | **link ✓ (0 R4/R5 mints)**; **trinity ✗** — 0 R4/R5 mints but 2326 stale-replica pushes + 8 CAS-409 stashes → stopped before soak | R4 row / SECOND ANOMALY |
 | parity probes byte-exact both directions | **NOT RUN** (trinity parked; blocked on PG verification) | `ready-to-run/parity_probe.md` |
 | backups recorded | **DONE** both hosts | R2 section, sha256s |
 | trinity quarantine manifest written | **DONE (executed)** — 4247 moved, vault→0, MANIFEST fresh | R6 row |
@@ -186,9 +201,14 @@ Per host: stop daemon -> restore `Nexus-Vault-Sync.AppImage.pre-v0432.bak` (link
 - All three asks remain owner/incident-lead decisions; answers to be relayed on arrival.
 - **Trinity leg (session 2d1a2846, 16:07→16:20 EDT):** owner un-gated 3/3 → executed sequencing. link verified clean (left running). trinity R6 executed, daemon started, hit the migration/push anomaly, STOPPED + contained. Broadcast to fleet: anomaly + root cause (missing `vault_name`) + 2249-push PG-verification ask + **link propagation warning**. Ticket parked `status=open` / `whetstone_state=awaiting-owner` (owner-gate responder will page). Memory recorded: `v0432-trinity-vault-name-configdrift`.
 
-### RESUME POINTER (for the next leg)
-- **link:** DONE on 0.4.32 — do NOT touch. **trinity:** daemon STOPPED, plist REMOVED, R6 quarantine done (vault conflicts=0), backups intact.
-- **BLOCKED ON:** incident-lead PG verification of trinity's 2249 boot-pushes (clobber check vs today's sentinel-strip set) + link-propagation assessment.
-- **Then retry trinity (deterministic):** (1) add `vault_name = "Mainframe"` to `trinity:~/Library/Application Support/Nexus/vault-sync/config.toml`; (2) `cp shadow_hashes.pre-v0432.json shadow_hashes.json` in `…/f2383e35-…/sync-state/`; (3) re-install plist (`ready-to-run/com.lattice.nexus-vault-sync.plist`) + `launchctl load -w`; (4) verify `migrated keys` ×1 (legacy_count≈11734) + NO push flood + 0 CONFLICT mints BEFORE soak; (5) 30-min joint soak → R5 parity → R8. The `trinity-install-start.sh` mount-parse bug is fixed on-branch.
+### RESUME POINTER (for the next leg) — updated 2026-07-18 16:47 EDT after the SECOND anomaly
+- **link:** UP on 0.4.32, green (0 mints, 0 conflicts) — do NOT reinstall/restart. It IS read-side propagating trinity's pushes (recoverable; incident-lead owns quiescence).
+- **trinity:** daemon STOPPED, plist REMOVED, app at 0.4.32, config has `vault_name` (remedied), shadow currently = pristine pre-v0432 (I restored it; migration already re-ran on boot). 8 restart CAS-409 stashes quarantined; vault conflicts=0; quarantine total 4255. Backups intact: app `.pre-v0432.bak`, shadow `.pre-v0432.json` (pristine rollback) + `.post-anomaly.bak` (this restart's shadow) + `.bak-s534-legacystrip`.
+- **THE MIGRATION IS PROVEN FIXED** (11734 ×1, 0 R4/R5 mints). The remaining blocker is NOT the migration — it is trinity's stale-replica content divergence causing a 2326-note mass-push on every boot.
+- **BLOCKED ON (owner/incident-lead decision — NOT executable by this burn):**
+  1. **PG audit** of trinity's 2326 pushes (16:41 boot), esp. the **1794 ANTI-STRIP GUARD** paths vs today's sentinel-strip set — did any revert an intentional PG change? Forensic lists on trinity: `~/.local/share/Nexus/quarantine/trinity-restart-anomaly-2026-07-18-1641/` → `pushed-paths-2326.txt`, `anti-strip-guard-paths.txt`, `nexus-vault-sync.err.log.restart-boot`. Restore any clobbered PG rows from `cypher/link:~/backups/vault_notes_sentinel_backup_20260718.jsonl`.
+  2. **link quiescence** decision (it's propagating those pushes into link's FS).
+  3. **Reconciliation-direction decision for trinity** so a restart does NOT mass-push again — pick one: (a) pull-only bootstrap (reset trinity `~/vaults/Mainframe` to PG canonical BEFORE start), (b) daemon server-wins first-boot mode for a long-offline replica, or (c) accept trinity pushes as authoritative after the PG audit blesses them.
+- **DO NOT** simply re-run the plist + start again — it will reproduce the 2326 mass-push. The next start must be preceded by one of the three reconciliation strategies above.
 
 *Standing rules honored: work confined to this worktree; no push/merge; the one anomaly was stopped and contained per the owner's zero-data-loss directive; no em-dashes.*
