@@ -591,12 +591,27 @@ fn spawn_sse_consumer(
         // every pull), the push_client (records on every accepted push), and the
         // reconcile backstop (reads to decide push-vs-pull on drift). Lives under
         // the per-subscriber sync-state runtime dir, beside last_event_id.
-        let shadow = sync_shadow::ShadowStore::load(
+        // B2' (TKT-86ae42a3): pass the sync-root basenames so the store can
+        // (a) migrate pre-v0.4.28 vaults-root-relative keys
+        // (`Mainframe/01_Notes/x.md`) to the post-B2 sync-root-relative form
+        // and (b) keep get/record shape-invariant. Without this, the B2
+        // path-shape cutover orphaned the entire pre-0.4.28 sync history and
+        // every dormant-but-divergent note fell to R5 conflict — the
+        // 07-15..07-18 conflict-file storm.
+        let vault_folders: Vec<String> = watch_roots
+            .iter()
+            .filter_map(|(root, _)| {
+                root.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .collect();
+        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(
             commands::resolve_workspace_root()
                 .join(".lattice-runtime")
                 .join(&cfg.subscriber_id)
                 .join("sync-state")
                 .join("shadow_hashes.json"),
+            vault_folders,
         );
         sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
         // D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path. If the shadow store
