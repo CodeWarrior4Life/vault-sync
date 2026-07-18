@@ -1331,10 +1331,7 @@ fn find_frontmatter_end(s: &str) -> Option<FrontmatterEnd> {
     let mut cursor = after_open;
     let bytes = s.as_bytes();
     while cursor < bytes.len() {
-        let line_end = match bytes[cursor..].iter().position(|&b| b == b'\n') {
-            Some(p) => cursor + p,
-            None => return None,
-        };
+        let line_end = cursor + bytes[cursor..].iter().position(|&b| b == b'\n')?;
         let mut line = &s[cursor..line_end];
         if line.ends_with('\r') {
             line = &line[..line.len() - 1];

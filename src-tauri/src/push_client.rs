@@ -1061,10 +1061,7 @@ fn find_frontmatter_end(s: &str) -> Option<FrontmatterEnd> {
     let bytes = s.as_bytes();
     while cursor < bytes.len() {
         // Find the next line start.
-        let line_end = match bytes[cursor..].iter().position(|&b| b == b'\n') {
-            Some(p) => cursor + p,
-            None => return None,
-        };
+        let line_end = cursor + bytes[cursor..].iter().position(|&b| b == b'\n')?;
         let mut line = &s[cursor..line_end];
         // Trim trailing \r.
         if line.ends_with('\r') {
