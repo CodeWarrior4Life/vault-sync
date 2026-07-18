@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- trinity launchd LaunchAgent for vault-sync-daemon (S535-equivalent supervisor).
+     macOS has no systemd; this is the correct Restart=always + RunAtLoad analogue.
+     Install: cp to ~/Library/LaunchAgents/ then `launchctl load -w <path>`.
+     Requires a GUI login session (Aqua) — the Tauri/GTK daemon needs a display.
+     Confirm the ExecStart binary path after the 0.4.32 .app is in place. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lattice.nexus-vault-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Nexus Vault Sync.app/Contents/MacOS/vault-sync-daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/Users/cyril/Library/Logs/nexus-vault-sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/cyril/Library/Logs/nexus-vault-sync.err.log</string>
+</dict>
+</plist>
