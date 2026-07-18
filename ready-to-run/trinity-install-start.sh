@@ -13,8 +13,12 @@ test -f "$DMG" || { echo "FATAL: dmg missing on trinity: $DMG (scp from link:~/v
 test -d "${APPDST}.pre-v0432.bak" || { echo "FATAL: R2 app backup missing"; exit 1; }
 
 echo ">> 1. mount dmg"
-MNT="$(hdiutil attach "$DMG" -nobrowse -readonly | tail -1 | awk '{print $NF}')"
-echo "mounted at $MNT"
+# NOTE: the mount point can contain spaces (e.g. /Volumes/Nexus Vault Sync).
+# awk '{print $NF}' splits on that space and returns only the last word ("Sync"),
+# which then makes rm/cp target a bogus path. Capture from /Volumes/ to EOL instead.
+MNT="$(hdiutil attach "$DMG" -nobrowse -readonly | tail -1 | sed -E 's#.*(/Volumes/.*)#\1#')"
+echo "mounted at [$MNT]"
+test -d "$MNT/Nexus Vault Sync.app" || { echo "FATAL: app bundle not found at mount [$MNT]"; hdiutil detach "$MNT" 2>/dev/null || true; exit 1; }
 
 echo ">> 2. replace app (backup already at *.pre-v0432.bak)"
 rm -rf "$APPDST"
