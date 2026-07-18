@@ -83,7 +83,10 @@ fn main() {
     // GUI window (operator ask: "start this on my own with the settings
     // desired"). Help flags print usage to stdout and exit 0.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("--help" | "-h" | "help")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--help" | "-h" | "help")
+    ) {
         print!("{USAGE}");
         std::process::exit(0);
     }
@@ -306,8 +309,15 @@ mod tests {
     #[test]
     fn pair_parses_all_flags() {
         let args = v(&[
-            "pair", "--url", "https://nexus.example", "--token", "vsk_abc", "--root",
-            "/Vaults/Mainframe", "--mode", "live",
+            "pair",
+            "--url",
+            "https://nexus.example",
+            "--token",
+            "vsk_abc",
+            "--root",
+            "/Vaults/Mainframe",
+            "--mode",
+            "live",
         ]);
         assert_eq!(
             parse_cli(&args),
@@ -323,7 +333,13 @@ mod tests {
     #[test]
     fn pair_token_optional_defaults_none() {
         let args = v(&[
-            "pair", "--url", "https://n", "--root", "/v", "--mode", "shadow",
+            "pair",
+            "--url",
+            "https://n",
+            "--root",
+            "/v",
+            "--mode",
+            "shadow",
         ]);
         assert_eq!(
             parse_cli(&args),
@@ -339,12 +355,7 @@ mod tests {
     #[test]
     fn pair_flag_order_independent_and_eq_form() {
         // Flags in a different order, and the `--flag=value` form.
-        let args = v(&[
-            "pair",
-            "--mode=disabled",
-            "--root=/v",
-            "--url=https://n",
-        ]);
+        let args = v(&["pair", "--mode=disabled", "--root=/v", "--url=https://n"]);
         assert_eq!(
             parse_cli(&args),
             Ok(CliCommand::Pair {
@@ -370,7 +381,15 @@ mod tests {
 
     #[test]
     fn pair_invalid_mode_errors() {
-        let args = v(&["pair", "--url", "https://n", "--root", "/v", "--mode", "bogus"]);
+        let args = v(&[
+            "pair",
+            "--url",
+            "https://n",
+            "--root",
+            "/v",
+            "--mode",
+            "bogus",
+        ]);
         assert!(parse_cli(&args).is_err());
     }
 
@@ -378,7 +397,9 @@ mod tests {
     fn set_mode_parses() {
         assert_eq!(
             parse_cli(&v(&["set-mode", "live"])),
-            Ok(CliCommand::SetMode { mode: "live".into() })
+            Ok(CliCommand::SetMode {
+                mode: "live".into()
+            })
         );
     }
 
@@ -402,7 +423,10 @@ mod tests {
         // v0.4.31 regression guard: the normal launch passes --silent; it must
         // NOT be treated as a subcommand (that broke daemon startup in v0.4.30).
         assert_eq!(parse_cli(&v(&["--silent"])).unwrap(), CliCommand::Gui);
-        assert_eq!(parse_cli(&v(&["--silent", "--foo"])).unwrap(), CliCommand::Gui);
+        assert_eq!(
+            parse_cli(&v(&["--silent", "--foo"])).unwrap(),
+            CliCommand::Gui
+        );
         assert_eq!(parse_cli(&v(&[])).unwrap(), CliCommand::Gui);
     }
 

@@ -600,10 +600,7 @@ fn spawn_sse_consumer(
         // 07-15..07-18 conflict-file storm.
         let vault_folders: Vec<String> = watch_roots
             .iter()
-            .filter_map(|(root, _)| {
-                root.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
+            .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
         let shadow = sync_shadow::ShadowStore::load_with_vault_folders(
             commands::resolve_workspace_root()

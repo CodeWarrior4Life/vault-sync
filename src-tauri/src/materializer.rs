@@ -2048,7 +2048,10 @@ mod tests {
             std::fs::read_to_string(sync_root.join("01_Notes/storm.md")).unwrap(),
             "local edit\n"
         );
-        for entry in std::fs::read_dir(sync_root.join("01_Notes")).unwrap().flatten() {
+        for entry in std::fs::read_dir(sync_root.join("01_Notes"))
+            .unwrap()
+            .flatten()
+        {
             assert!(
                 !entry
                     .file_name()
@@ -2394,7 +2397,10 @@ mod tests {
 
         // First write → shadow tree (post-write record site). Must NOT record.
         let out = m.write(&p).unwrap();
-        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
         assert_eq!(
             shadow.get(&p.path),
             None,
