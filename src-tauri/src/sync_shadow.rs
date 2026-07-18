@@ -69,13 +69,54 @@ pub struct ShadowStore {
     inner: Mutex<HashMap<String, String>>,
     path: PathBuf,
     dirty: AtomicBool,
+    /// B2' (TKT-86ae42a3, 2026-07-18 conflict storm): the vault folder names
+    /// (sync-root basenames, NFC) whose prefix must be STRIPPED off keys.
+    /// Before v0.4.28 every pipeline keyed this store with vaults-root-relative
+    /// paths (`Mainframe/01_Notes/x.md`); B2 (v0.4.28) moved every pipeline to
+    /// sync-root-relative paths (`01_Notes/x.md`) but never migrated the keys,
+    /// so the reconcile leg read `shadow absent` for the ENTIRE pre-B2 sync
+    /// history and R5-stashed a conflict copy per divergent path (2,395 mints
+    /// on link on 07-18 alone). Canonical key form is sync-root-relative.
+    vault_folders: Vec<String>,
 }
 
 impl ShadowStore {
+    /// Load the store from `path` with NO vault-folder awareness (tests /
+    /// callers that already pass canonical sync-root-relative keys).
+    pub fn load(path: PathBuf) -> Arc<ShadowStore> {
+        Self::load_with_vault_folders(path, Vec::new())
+    }
+
+    /// Canonicalize a key: NFC + slash-fold (D8), then strip a leading
+    /// `<vault_folder>/` segment if it names a known vault folder (B2').
+    /// Makes record/get shape-invariant: a legacy prefixed caller and a
+    /// current sync-root-relative caller hit the SAME entry.
+    ///
+    /// Known limitation (documented, safe): a note whose vault-relative path
+    /// genuinely starts with a segment equal to the vault folder name
+    /// (`<vault>/Mainframe/x.md`) aliases with `x.md`. A wrong alias degrades
+    /// to the always-stash floor (one conflict copy), never silent loss.
+    fn canon_key(&self, path: &str) -> String {
+        let k = canonical_sync_path(path);
+        if let Some((first, rest)) = k.split_once('/') {
+            if !rest.is_empty() && self.vault_folders.iter().any(|f| f == first) {
+                return rest.to_string();
+            }
+        }
+        k
+    }
+
     /// Load the store from `path`. A missing OR corrupt file starts EMPTY and
     /// logs a `warn!` — NEVER panics. The returned store is `dirty == false`
-    /// (nothing to flush until something is recorded).
-    pub fn load(path: PathBuf) -> Arc<ShadowStore> {
+    /// (nothing to flush until something is recorded or a migration re-keyed).
+    ///
+    /// `vault_folders` are the sync-root basenames (e.g. `["Mainframe"]`).
+    /// Legacy pre-v0.4.28 keys carrying that prefix are migrated to the
+    /// canonical sync-root-relative form ON LOAD (one-time, B2'), exactly like
+    /// the D8 NFC migration below — without it, the B2 path-shape cutover
+    /// orphans the entire prior sync history and every dormant-but-divergent
+    /// note falls to R5 conflict (the 07-15..07-18 conflict storm).
+    pub fn load_with_vault_folders(path: PathBuf, vault_folders: Vec<String>) -> Arc<ShadowStore> {
         let raw = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
                 Ok(m) => m,
@@ -107,25 +148,56 @@ impl ShadowStore {
         // key collision after normalization (an NFD and an NFC key for the same
         // note both present) we keep the existing value, leaving the residual
         // to converge via the always-stash path.
+        let vault_folders: Vec<String> = vault_folders
+            .into_iter()
+            .map(|f| canonical_sync_path(&f))
+            .filter(|f| !f.is_empty())
+            .collect();
+        // Two-phase migration so the collision policy is deterministic and
+        // CURRENT-era values always win:
+        //   1. Keys already in canonical form (NFC + no vault prefix) insert
+        //      first — these were written by current (post-B2) code.
+        //   2. Keys that re-key under migration (NFD → NFC, and/or a legacy
+        //      `<vault>/` prefix stripped) fill remaining gaps via or_insert —
+        //      a legacy value NEVER overwrites a current one. A stale shadow
+        //      value can only degrade to the always-stash floor (one conflict
+        //      copy), never to a silent overwrite, so gap-fill is safe.
+        let strip = |k: &str| -> String {
+            if let Some((first, rest)) = k.split_once('/') {
+                if !rest.is_empty() && vault_folders.iter().any(|f| f == first) {
+                    return rest.to_string();
+                }
+            }
+            k.to_string()
+        };
         let mut map: HashMap<String, String> = HashMap::with_capacity(raw.len());
+        let mut legacy: Vec<(String, String)> = Vec::new();
         let mut migrated = false;
         for (k, v) in raw.into_iter() {
-            let nk = canonical_sync_path(&k);
+            let nk = strip(&canonical_sync_path(&k));
             if nk != k {
                 migrated = true;
+                legacy.push((nk, v));
+            } else {
+                map.insert(nk, v);
             }
+        }
+        let legacy_count = legacy.len();
+        for (nk, v) in legacy {
             map.entry(nk).or_insert(v);
         }
         if migrated {
             warn!(
                 path = %path.display(),
-                "shadow store: migrated existing keys to NFC canonical form (one-time, S511 D8)"
+                legacy_count,
+                "shadow store: migrated keys to canonical form (NFC, S511 D8 + vault-prefix strip, B2' TKT-86ae42a3)"
             );
         }
         Arc::new(ShadowStore {
             inner: Mutex::new(map),
             path,
             dirty: AtomicBool::new(migrated),
+            vault_folders,
         })
     }
 
@@ -134,7 +206,7 @@ impl ShadowStore {
     /// form so record/get are normalization-invariant, regardless of which OS
     /// (NFD macOS vs verbatim ext4/NTFS) produced the path.
     pub fn record(&self, path: &str, server_hash: &str) {
-        let key = canonical_sync_path(path);
+        let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             m.insert(key, server_hash.to_string());
             self.dirty.store(true, Ordering::Relaxed);
@@ -145,7 +217,7 @@ impl ShadowStore {
     /// lookup key is normalized to NFC so a get always hits the record() that
     /// stored it, even across an NFD/NFC OS boundary.
     pub fn get(&self, path: &str) -> Option<String> {
-        let key = canonical_sync_path(path);
+        let key = self.canon_key(path);
         self.inner.lock().ok().and_then(|m| m.get(&key).cloned())
     }
 
@@ -335,6 +407,85 @@ mod tests {
         // And re-recording under the NFC key overwrites the SAME entry.
         store.record(&nfc, "hash-nfc");
         assert_eq!(store.get(&nfd), Some("hash-nfc".to_string()));
+    }
+
+    // ---- B2' (TKT-86ae42a3): vault-prefix key migration + shape invariance ----
+
+    /// THE 07-18 conflict-storm regression. A pre-v0.4.28 store keyed
+    /// `Mainframe/01_Notes/x.md`; post-B2 pipelines look up `01_Notes/x.md`.
+    /// Without the prefix migration the lookup misses, the reconcile leg reads
+    /// "shadow absent", and R5 mints a conflict copy per divergent path.
+    /// This test FAILS on pre-fix code (get returns None).
+    #[test]
+    fn load_migrates_vault_prefixed_keys_to_sync_root_relative() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let mut m = HashMap::new();
+        m.insert(
+            "Mainframe/01_Notes/legacy.md".to_string(),
+            "h-legacy".to_string(),
+        );
+        m.insert("01_Notes/current.md".to_string(), "h-current".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        let store = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        assert_eq!(
+            store.get("01_Notes/legacy.md"),
+            Some("h-legacy".to_string()),
+            "pre-B2 prefixed key must be readable via the current sync-root-relative shape"
+        );
+        assert_eq!(
+            store.get("01_Notes/current.md"),
+            Some("h-current".to_string())
+        );
+    }
+
+    /// Collision policy: when BOTH namespaces hold the same note, the
+    /// current-era (unprefixed) value wins — legacy gap-fills only.
+    #[test]
+    fn vault_prefix_migration_current_value_wins_on_collision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let mut m = HashMap::new();
+        m.insert("Mainframe/x.md".to_string(), "h-legacy".to_string());
+        m.insert("x.md".to_string(), "h-current".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        let store = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        assert_eq!(store.get("x.md"), Some("h-current".to_string()));
+        assert_eq!(
+            store.get("Mainframe/x.md"),
+            Some("h-current".to_string()),
+            "prefixed lookup must alias to the same canonical entry"
+        );
+    }
+
+    /// Runtime shape-invariance: record under one shape, get under the other.
+    #[test]
+    fn record_get_invariant_across_vault_prefix_shapes() {
+        let dir = TempDir::new().unwrap();
+        let store = ShadowStore::load_with_vault_folders(
+            dir.path().join("shadow.json"),
+            vec!["Mainframe".into()],
+        );
+        store.record("Mainframe/01_Notes/y.md", "h1");
+        assert_eq!(store.get("01_Notes/y.md"), Some("h1".to_string()));
+        store.record("01_Notes/y.md", "h2");
+        assert_eq!(store.get("Mainframe/01_Notes/y.md"), Some("h2".to_string()));
+    }
+
+    /// Without vault_folders (plain load), behavior is unchanged: prefixed
+    /// keys stay prefixed (no accidental stripping when folders are unknown).
+    #[test]
+    fn plain_load_leaves_prefixed_keys_untouched() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let mut m = HashMap::new();
+        m.insert("Mainframe/x.md".to_string(), "h".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let store = ShadowStore::load(path);
+        assert_eq!(store.get("Mainframe/x.md"), Some("h".to_string()));
+        assert_eq!(store.get("x.md"), None);
     }
 
     /// On load, an existing NFD key is migrated to NFC so the cutover does not

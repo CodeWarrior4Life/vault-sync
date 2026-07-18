@@ -107,6 +107,13 @@ pub enum SkipReason {
     /// it; the file_watcher/push pipeline carries the edit UP. This is the
     /// exact case the daemon used to silently revert.
     LocalEditPreserved,
+    /// Conflict-storm circuit breaker OPEN (TKT-86ae42a3): this write resolved
+    /// to an R4/R5 Conflict, but the materializer already minted
+    /// `conflict_storm_threshold` stashes inside the sliding window — a mass
+    /// server-side divergence event, not organic concurrent editing. The local
+    /// file is left UNTOUCHED (no stash, no overwrite); reconcile retries
+    /// after the window (or after the operator resolves the divergence source).
+    ConflictStormBreakerOpen,
 }
 
 /// Outcome of a single `write()` call.
@@ -232,6 +239,17 @@ pub struct MaterializerConfig {
     /// Device identifier used when writing stash files
     /// (`<stem>.conflict-from-<device_id>-<lsn>.md`).
     pub device_id: String,
+    /// Conflict-storm circuit breaker (TKT-86ae42a3): maximum R4/R5 conflict
+    /// stashes this materializer may mint inside `conflict_storm_window_secs`.
+    /// Past the threshold, further Conflict decisions are SKIPPED (local left
+    /// untouched, no stash, no overwrite — fail-closed toward local) and
+    /// surfaced as `SkipReason::ConflictStormBreakerOpen`. A mass server-side
+    /// divergence event (07-16 consolidation: 483 files; 07-18 D-8 sentinel
+    /// contamination: 2,422 files) can then never again mint thousands of
+    /// conflict copies. `0` disables the breaker.
+    pub conflict_storm_threshold: u32,
+    /// Sliding window (seconds) for `conflict_storm_threshold`.
+    pub conflict_storm_window_secs: u64,
 }
 
 impl Default for MaterializerConfig {
@@ -241,6 +259,8 @@ impl Default for MaterializerConfig {
             conflict_policy: ConflictPolicy::ServerWins,
             strip_frontmatter_fields_for_diff: vec!["updated".into()],
             device_id: "unknown-device".to_string(),
+            conflict_storm_threshold: 50,
+            conflict_storm_window_secs: 600,
         }
     }
 }
@@ -300,6 +320,11 @@ pub struct Materializer {
     /// backfill) of one Materializer contend on the SAME lock per path. Coarse
     /// outer mutex only guards the small registry HashMap, never the I/O.
     path_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Conflict-storm circuit breaker state (TKT-86ae42a3): timestamps of
+    /// recent conflict-stash mints, pruned to the config window. `Arc`-shared
+    /// so every clone (SSE consumer, reconcile backstop, pull backfill) counts
+    /// against ONE budget — the storm arrived through the reconcile clone.
+    conflict_mints: Arc<Mutex<std::collections::VecDeque<std::time::Instant>>>,
 }
 
 impl Clone for Materializer {
@@ -316,6 +341,7 @@ impl Clone for Materializer {
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
             shadow_store: self.shadow_store.clone(),
             path_locks: self.path_locks.clone(),
+            conflict_mints: self.conflict_mints.clone(),
         }
     }
 }
@@ -348,7 +374,36 @@ impl Materializer {
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
             shadow_store: None,
             path_locks: Arc::new(Mutex::new(HashMap::new())),
+            conflict_mints: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
+    }
+
+    /// Conflict-storm circuit breaker (TKT-86ae42a3). Called on every R4/R5
+    /// Conflict decision BEFORE stashing. Prunes mints older than the window,
+    /// then either admits this mint (recording it, returns `false`) or reports
+    /// the breaker OPEN (returns `true`). Threshold 0 disables the breaker.
+    fn conflict_breaker_open(&self) -> bool {
+        let threshold = self.config.conflict_storm_threshold;
+        if threshold == 0 {
+            return false;
+        }
+        let window = std::time::Duration::from_secs(self.config.conflict_storm_window_secs);
+        let now = std::time::Instant::now();
+        let mut mints = self
+            .conflict_mints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while mints
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > window)
+        {
+            mints.pop_front();
+        }
+        if mints.len() >= threshold as usize {
+            return true;
+        }
+        mints.push_back(now);
+        false
     }
 
     /// Builder-style: attach the shared persistent
@@ -685,6 +740,26 @@ impl Materializer {
                     );
                 }
                 Decision::Conflict => {
+                    // Conflict-storm circuit breaker (TKT-86ae42a3): a mass
+                    // server-side divergence event (consolidation, managed-
+                    // region contamination, a bulk server rewrite) resolves
+                    // THOUSANDS of paths to Conflict in minutes. Organic
+                    // concurrent editing never does. Past the threshold we
+                    // refuse the whole write: local untouched, no stash, no
+                    // overwrite — fail-closed toward local bytes; reconcile
+                    // retries after the window.
+                    if self.conflict_breaker_open() {
+                        warn!(
+                            path = %payload.path,
+                            change_seq,
+                            threshold = self.config.conflict_storm_threshold,
+                            window_secs = self.config.conflict_storm_window_secs,
+                            "materializer CONFLICT-STORM BREAKER OPEN: refusing conflict mint, local preserved, pull skipped (mass server-side divergence suspected)"
+                        );
+                        return Ok(MaterializeOutcome::Skipped(
+                            SkipReason::ConflictStormBreakerOpen,
+                        ));
+                    }
                     // R4 (both moved) / R5 (shadow absent, unknown provenance):
                     // ALWAYS-STASH-THEN-RESOLVE, regardless of Class or policy.
                     // Stash the LOSER (local bytes) FIRST, atomically, BEFORE any
@@ -1256,10 +1331,7 @@ fn find_frontmatter_end(s: &str) -> Option<FrontmatterEnd> {
     let mut cursor = after_open;
     let bytes = s.as_bytes();
     while cursor < bytes.len() {
-        let line_end = match bytes[cursor..].iter().position(|&b| b == b'\n') {
-            Some(p) => cursor + p,
-            None => return None,
-        };
+        let line_end = cursor + bytes[cursor..].iter().position(|&b| b == b'\n')?;
         let mut line = &s[cursor..line_end];
         if line.ends_with('\r') {
             line = &line[..line.len() - 1];
@@ -1908,6 +1980,127 @@ mod tests {
         }
     }
 
+    // ---- TKT-86ae42a3: conflict-storm regression + circuit breaker ---------
+
+    /// THE 07-18 storm regression, end-to-end through write(). Prod shape
+    /// (post-B2): vaults_root IS the sync root and payload paths are
+    /// sync-root-relative. The shadow store still holds the pre-v0.4.28
+    /// vaults-root-relative key (`Mainframe/...`) whose value equals the
+    /// CURRENT server hash — i.e. the server has NOT moved since last sync and
+    /// the local file carries a genuine edit. Correct verdict: R2
+    /// LocalEditPreserved. Pre-fix code missed the prefixed key
+    /// (`shadow_present=false`), fell to R5, and minted a conflict stash —
+    /// 2,395 times on link on 2026-07-18. This test FAILS on pre-fix code.
+    #[test]
+    fn b2_prefix_migrated_shadow_prevents_r5_conflict_storm() {
+        let vaults_tmp = TempDir::new().unwrap();
+        let ws_tmp = TempDir::new().unwrap();
+        let sync_root = vaults_tmp.path().join("Mainframe");
+        std::fs::create_dir_all(sync_root.join("01_Notes")).unwrap();
+
+        let server_body = "server canonical body\n";
+        let p = NotePayload {
+            path: "01_Notes/storm.md".into(),
+            frontmatter: serde_json::Value::Null,
+            body: server_body.into(),
+            sha256: sha256_hex(server_body),
+            modified: "2026-07-18T00:00:00Z".into(),
+            file_mtime: None,
+            created: None,
+            enriched_body: Some(server_body.to_string()),
+        };
+        // Local diverges from the server canonical: a genuine local edit.
+        std::fs::write(sync_root.join("01_Notes/storm.md"), "local edit\n").unwrap();
+
+        // Pre-B2 shadow file: legacy vault-prefixed key, value == the CURRENT
+        // server hash (server unchanged since we last synced).
+        let shadow_file = ws_tmp.path().join("shadow.json");
+        let mut legacy = std::collections::HashMap::new();
+        legacy.insert("Mainframe/01_Notes/storm.md".to_string(), p.sha256.clone());
+        std::fs::write(&shadow_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load_with_vault_folders(
+            shadow_file,
+            vec!["Mainframe".into()],
+        );
+
+        let m = Materializer::new(
+            sync_root.clone(),
+            Some("shadow/".to_string()),
+            MaterializerMode::Live,
+            ws_tmp.path().to_path_buf(),
+            SLUG.to_string(),
+            default_cfg(),
+        )
+        .with_shadow_store(shadow);
+
+        let out = m.write(&p).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved),
+            "R2 must preserve the local edit via the migrated shadow key; \
+             pre-fix code read shadow_present=false and R5-minted a conflict stash"
+        );
+        // Local bytes untouched, and NO conflict stash sibling was minted.
+        assert_eq!(
+            std::fs::read_to_string(sync_root.join("01_Notes/storm.md")).unwrap(),
+            "local edit\n"
+        );
+        for entry in std::fs::read_dir(sync_root.join("01_Notes"))
+            .unwrap()
+            .flatten()
+        {
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".conflict-from-"),
+                "no conflict stash may be minted for a genuine local edit"
+            );
+        }
+    }
+
+    /// Circuit breaker: with threshold N, a mass-divergence event (many
+    /// distinct paths resolving to R5 Conflict) mints at most N stashes; the
+    /// rest are refused with local bytes left untouched.
+    #[test]
+    fn conflict_storm_breaker_caps_mints() {
+        let cfg = MaterializerConfig {
+            conflict_storm_threshold: 3,
+            conflict_storm_window_secs: 600,
+            ..default_cfg()
+        };
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = vaults.path().join(VAULT).join("01_Notes");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut stashed = 0;
+        let mut refused = 0;
+        for i in 0..5 {
+            let rel = format!("01_Notes/mass-{i}.md");
+            // Divergent local, NO shadow store attached => R5 Conflict.
+            std::fs::write(dir.join(format!("mass-{i}.md")), "local bytes").unwrap();
+            match m.write(&payload(&rel, "server bytes")).unwrap() {
+                MaterializeOutcome::Stashed { .. } => stashed += 1,
+                MaterializeOutcome::Skipped(SkipReason::ConflictStormBreakerOpen) => {
+                    refused += 1;
+                    // Refused => local file untouched.
+                    assert_eq!(
+                        std::fs::read_to_string(dir.join(format!("mass-{i}.md"))).unwrap(),
+                        "local bytes"
+                    );
+                }
+                other => panic!("expected Stashed or breaker-open, got {other:?}"),
+            }
+        }
+        assert_eq!((stashed, refused), (3, 2), "threshold must cap the mints");
+        let stash_files = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(stash_files, 3, "exactly threshold stash files on disk");
+    }
+
     #[test]
     fn integrity_check_disabled_writes_anyway() {
         let cfg = MaterializerConfig {
@@ -2201,7 +2394,10 @@ mod tests {
 
         // First write → shadow tree (post-write record site). Must NOT record.
         let out = m.write(&p).unwrap();
-        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "got {out:?}");
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
         assert_eq!(
             shadow.get(&p.path),
             None,
