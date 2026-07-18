@@ -184,5 +184,11 @@ Per host: stop daemon -> restore `Nexus-Vault-Sync.AppImage.pre-v0432.bak` (link
 - Dispatcher `whetstone-link` reply (`decision=escalate-to-owner`): hold posture confirmed; reversible prep only; **inventory-only** for trinity; restart nothing; asks escalated to owner.
 - Broadcast honest correction: trinity quarantine executed-then-reversed; net-zero vault change.
 - All three asks remain owner/incident-lead decisions; answers to be relayed on arrival.
+- **Trinity leg (session 2d1a2846, 16:07→16:20 EDT):** owner un-gated 3/3 → executed sequencing. link verified clean (left running). trinity R6 executed, daemon started, hit the migration/push anomaly, STOPPED + contained. Broadcast to fleet: anomaly + root cause (missing `vault_name`) + 2249-push PG-verification ask + **link propagation warning**. Ticket parked `status=open` / `whetstone_state=awaiting-owner` (owner-gate responder will page). Memory recorded: `v0432-trinity-vault-name-configdrift`.
 
-*Standing rules honored: work confined to this worktree; no push/merge; nothing irreversible; no em-dashes.*
+### RESUME POINTER (for the next leg)
+- **link:** DONE on 0.4.32 — do NOT touch. **trinity:** daemon STOPPED, plist REMOVED, R6 quarantine done (vault conflicts=0), backups intact.
+- **BLOCKED ON:** incident-lead PG verification of trinity's 2249 boot-pushes (clobber check vs today's sentinel-strip set) + link-propagation assessment.
+- **Then retry trinity (deterministic):** (1) add `vault_name = "Mainframe"` to `trinity:~/Library/Application Support/Nexus/vault-sync/config.toml`; (2) `cp shadow_hashes.pre-v0432.json shadow_hashes.json` in `…/f2383e35-…/sync-state/`; (3) re-install plist (`ready-to-run/com.lattice.nexus-vault-sync.plist`) + `launchctl load -w`; (4) verify `migrated keys` ×1 (legacy_count≈11734) + NO push flood + 0 CONFLICT mints BEFORE soak; (5) 30-min joint soak → R5 parity → R8. The `trinity-install-start.sh` mount-parse bug is fixed on-branch.
+
+*Standing rules honored: work confined to this worktree; no push/merge; the one anomaly was stopped and contained per the owner's zero-data-loss directive; no em-dashes.*
