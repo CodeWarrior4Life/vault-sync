@@ -2,7 +2,7 @@
 type: incident
 created: "2026-07-18T15:10:00-04:00"
 tags: [nexus-sync, vault-sync, incident, p0, conflict-storm]
-status: fix-shipped-deploy-pending
+status: resolved
 ticket: TKT-86ae42a3
 session: nexus-9cb6
 related:
@@ -69,3 +69,6 @@ Stop daemon → restore prior AppImage from backup → restore pre-migration `sh
 2. **Link deploy trap (2026-06-14, cost 2 silent non-deploys):** the AppImage's FUSE child escapes the unit cgroup and survives restarts; the NEW instance exits via the tauri single-instance plugin (logs "starting version=X" then dies) → old version silently keeps running. Procedure: `systemctl --user stop nexus-vault-sync` → kill any survivor by `/proc/*/exe` path (NEVER `pkill -f vault-sync` — self-match, exit 144) → verify ZERO vault-sync exes remain → install → unmask → start → CONFIRM the running `/proc/*/exe` is the NEW binary AND the v0.4.32 "shadow store: migrated keys" line appears (count==1 daemon).
 3. **Dispatcher verify.cmd caveat:** the seeded verify command uses `systemctl --user` over ssh for trinity — invalid on Darwin. If the mechanical verify fails ONLY on that, the deploy may still be good; re-verify trinity with `pgrep -f -i vault.sync` + conflict-count 0 + version self-report, document in BURN_REPORT.md, and park with that evidence rather than rolling back.
 4. Trinity paths: vault `~/vaults/Mainframe` (confirmed live); quarantine target `~/.local/share/Nexus/quarantine/` may not exist on macOS — use `~/Library/Application Support/Nexus/quarantine/conflict-storm-2026-07-18/` if the XDG path is absent, record which.
+
+## RESOLUTION (2026-07-18 17:45 EDT)
+Both hosts live + verified on v0.4.32. Trinity needed two extra rounds: (1) config drift — `config.toml` missing `vault_name = "Mainframe"` disabled the B2' migration (fixed, backup kept; v0.4.33 hardening filed: guard/park when vault_folders is empty but the store holds prefixed keys); (2) stale-replica catch-up pushes (2,326 + 2,858) — audited 620 samples across all waves against the pre-deploy snapshot: ALL byte-identical, zero regressions (anti-strip refusals = S513 designed healing). Verified Parity Protocol PASSED both hosts (push+pull byte-exact, sha256-matched probes, cleaned after; daemon delete-propagation confirmed live). Tickets TKT-86ae42a3 + TKT-8a70148c resolved. Whetstone ops notes: burn legs die at wait-points (4 legs; incident lead bridged the gates inline); tickets API ignores `body_append` (use full-body PATCH); trinity launchd label = `com.lattice.vaultsync-daemon` (not the plist filename the burn drafted); link daemon self-report → HTTP 405 (server route, open); link weld timer was found INACTIVE and re-armed (TKT-82a8bb2c interim still required on 0.4.32).
