@@ -30,3 +30,6 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# machine-local build shim (dbus pkg-config for headless build in distrobox); not a deliverable
+.buildshim/

@@ -73,7 +73,7 @@ fn payload(rel: &str, canonical: &str) -> NotePayload {
         frontmatter: serde_json::Value::Null,
         body: canonical.to_string(),
         sha256: sha256_hex(canonical.as_bytes()),
-        modified: "2026-07-01T00:00:00Z".to_string(),
+        modified: Some("2026-07-01T00:00:00Z".to_string()),
         file_mtime: None,
         enriched_body: Some(canonical.to_string()),
         created: None,

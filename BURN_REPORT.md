@@ -49,3 +49,35 @@ enriched_body: str           content_hash: str
 **Net pre-fix state:** R1, R2, R3 all GAP. R4 repro half satisfied. R5 is an honored constraint. The three GAPs are independent code paths (stash naming, response decode, reconcile accounting) but AR-003 is the reason the other two stayed invisible: it rounds the two persistent failures down to a clean summary.
 
 ---
+
+## Fix (implemented on `whetstone/vaultsync-pull-defect-pair`)
+
+### AR-008 -- length-safe stash names (`conflict_stash.rs`)
+
+- `build_stash_filename(original_path, stem, device, lsn) -> StashFilename` (`conflict_stash.rs`): builds the natural `<stem>.conflict-from-<device>-<lsn>.md`; if that basename exceeds the cross-platform component cap it replaces the stem with `<truncated-stem>.<sha256(path)[..16]>` and flags `hashed = true`.
+- `STASH_BASENAME_MAX = 250` and `basename_fits()` enforce BOTH the 255-byte (Linux) and 255-UTF-16-unit (macOS/Windows) component limits, with headroom for the `-2/-3` collision suffix.
+- The hash is derived from the FULL original path, so the same note deterministically maps to the same stash base -- the S514 idempotency + collision-reuse logic keeps working for long paths (proved by `ar008_long_path_stash_is_still_idempotent`).
+- `write_stash` now records a manifest line in `<vault_root>/.sync-conflict-stash-manifest.jsonl` (dot-prefixed, Obsidian-invisible) mapping the bounded stash back to its original note path, device, lsn, ts. Best-effort: a manifest write failure never fails the stash (the losing bytes are the load-bearing artifact).
+- Short (normal) names are UNCHANGED -- no manifest, verbatim readable name (`stash_filename_short_names_unchanged_no_manifest`).
+
+### AR-009 -- diagnosable pull decode + contract fix (`api_client.rs`)
+
+- **Contract fix:** `NotePayload.modified` changed from `String` to `#[serde(default)] Option<String>`. The live server returns `modified: null` for this Daily note; `String` made serde reject it. `Option` matches the already-optional `file_mtime`/`created`; no code reads the field.
+- **Diagnosability:** new `ApiError::Decode { context, status, content_type, body_len, request_id, serde_error, body_sample }` and a `decode_json()` helper that reads the raw body, then deserializes, and on failure captures HTTP status, content-type, body length, a request-id (`x-request-id`/`x-correlation-id`/`cf-ray`), and the structural serde error (field position + expected/found type). `fetch_note` now decodes through it.
+- **No content leak:** a `body_sample` is attached ONLY when the content-type is not JSON (an HTML/proxy error page is diagnostic, not note content, and is capped at 256 bytes). A JSON structural mismatch means the body IS the note, so it is never sampled -- the serde position/type carries the signal.
+- **Not in-sync until verified:** a fetch that returns `ApiError::Decode` is an error, so AR-003 counts it as a failed pull (still-divergent, RED). The materializer's existing post-write integrity check (`materializer.rs:861-869`) still hash-verifies any bytes that do materialize.
+
+### AR-003 -- failure-honest reconcile accounting (`verify_repair.rs`, `reconciliation.rs`, new `retry_ledger.rs`)
+
+- `VerifyRepairReport` gains `pulls_attempted / pulls_succeeded / pulls_failed / pulls_deferred / still_divergent` + `unresolved_paths_sample`, plus `cycle_red()` and `soak_eligible()`.
+- `classify_pull_outcome()` (pure, table-tested) maps each pull result to Succeeded / Failed (Err or IntegrityFailed) / Deferred (conflict-storm breaker). The pull loop tallies all five counts; `add_count` now equals `pulls_succeeded` (a failed pull can no longer inflate it). The no-materializer path now counts pulls as DEFERRED (RED), not a silent green.
+- The `reconciliation.rs` pass-complete summary now emits `pulls_attempted/succeeded/failed/deferred`, `still_divergent`, `retry_ledger_pending`, and an explicit `cycle=RED|green` + `soak_eligible` verdict; a RED cycle also emits a WARN naming the unresolved sample. The 00:58-style false green is now structurally impossible: any failed/deferred pull sets `cycle_red()` true.
+- **Durable retry state:** new `retry_ledger.rs` -- a JSON-persisted, thread-safe ledger keyed by note path (`record_failure` on fail/defer, `clear` on success). It survives daemon restarts (`state_is_durable_across_reload`), caps error strings, and loads-empty on corruption. Wired into `run_reconciliation_pass` at `<config_dir>/reconcile-retry-ledger.json` (NOT in the vault). It is an observability layer on top of the already-idempotent rescan; a persistence failure is logged, never fatal.
+
+### Scope discipline / what the fix does NOT touch
+
+- No change to `decide_direction`, shadow logic, push pipeline, conflict-storm breaker thresholds, or the SSE consumer.
+- `ChangeRow.modified` (a different struct) stays `String`.
+- Other `.json().await?` decode sites are left as-is; `decode_json` is available for later adoption. Only `fetch_note` (the reviewed AR-009 path) was rerouted, to keep the sync-daemon blast radius minimal.
+
+---

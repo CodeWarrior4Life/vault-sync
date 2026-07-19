@@ -24,8 +24,88 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
+
+/// AR-008 (TKT-c41c2225): maximum length of a single path COMPONENT (basename)
+/// that is safe on every platform the daemon runs on:
+///   * Linux ext4/xfs/btrfs: 255 BYTES per component (ENAMETOOLONG / os error 36).
+///   * macOS APFS/HFS+:       255 UTF-16 code units per component.
+///   * Windows NTFS:          255 UTF-16 code units per component.
+/// We enforce BOTH the byte budget and the UTF-16 budget so a stash filename is
+/// portable regardless of which host mints it (fleet-shared vault). Kept a few
+/// bytes under 255 to leave room for the `-2`/`-3` collision suffix.
+const STASH_BASENAME_MAX: usize = 250;
+
+/// Human-readable prefix budget (bytes) preserved from the original stem in a
+/// hash-bounded name, so a truncated stash is still recognizable at a glance.
+const STASH_PREFIX_BUDGET: usize = 48;
+
+/// Does `name` fit within the cross-platform component limit (bytes AND UTF-16)?
+fn basename_fits(name: &str) -> bool {
+    name.len() <= STASH_BASENAME_MAX && name.encode_utf16().count() <= STASH_BASENAME_MAX
+}
+
+/// Truncate `s` to at most `max_bytes`, never splitting a UTF-8 char.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Result of building a stash basename: the on-disk `filename` plus whether it
+/// was hash-bounded (a bounded name has no reversible mapping to the original
+/// note path, so `write_stash` records a manifest entry for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StashFilename {
+    filename: String,
+    hashed: bool,
+}
+
+/// AR-008 core: build a length-safe `<...>.conflict-from-<device>-<lsn>.md`
+/// basename for `original_path`.
+///
+/// The natural name is `<stem>.conflict-from-<device>-<lsn>.md`. When that fits
+/// the cross-platform component limit we use it verbatim (unchanged behavior
+/// for the overwhelming majority of notes). When the stem is pathologically
+/// long (the live failure: an X-note title of ~230+ UTF-8 bytes of mathematical-
+/// bold glyphs), we replace the stem with a bounded, deterministic token:
+///
+///   `<truncated-stem>.<sha256(original_path)[..16]>.conflict-from-<device>-<lsn>.md`
+///
+/// The hash is derived from the FULL original path, so the same note always maps
+/// to the same stash base (idempotency + collision reuse keep working), and the
+/// manifest maps the hashed name back to the original path for the resolver UI.
+fn build_stash_filename(original_path: &str, stem: &str, device_id: &str, lsn: u64) -> StashFilename {
+    let natural = format!("{stem}.conflict-from-{device_id}-{lsn}.md");
+    if basename_fits(&natural) {
+        return StashFilename {
+            filename: natural,
+            hashed: false,
+        };
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(original_path.as_bytes());
+    let full = hasher.finalize();
+    let short_hash: String = full.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let prefix = truncate_on_char_boundary(stem, STASH_PREFIX_BUDGET);
+    // Worst case: 48(prefix)+1+16(hash)+15(".conflict-from-")+device+1+20(lsn u64)+3
+    // Device ids are bounded config values (host slugs). If a deployment ever
+    // used a pathological device id we still keep the whole name under the cap
+    // by construction (prefix+hash+lsn are all bounded); device is the only
+    // remaining variable, bounded in practice to a short host slug.
+    let filename = format!("{prefix}.{short_hash}.conflict-from-{device_id}-{lsn}.md");
+    StashFilename {
+        filename,
+        hashed: true,
+    }
+}
 
 /// Parsed result of a `<stem>.conflict-from-<device>-<lsn>[-<n>].md` filename.
 ///
@@ -273,8 +353,10 @@ impl ConflictStash {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".to_string());
 
-        let filename = format!("{stem}.conflict-from-{device_id}-{lsn}.md");
-        self.vault_root.join(parent).join(filename)
+        // AR-008: length-safe basename (hash-bounded when the natural name would
+        // exceed the cross-platform component limit).
+        let built = build_stash_filename(&rel, &stem, device_id, lsn);
+        self.vault_root.join(parent).join(built.filename)
     }
 
     /// D5 (S511): public accessor for the would-be stash path (pre-collision).
@@ -343,7 +425,67 @@ impl ConflictStash {
         tmp.persist(&final_path)
             .map_err(|e| StashError::Io(e.error))?;
 
+        // AR-008: if the basename was hash-bounded, its name no longer reveals
+        // the original note path. Record a manifest mapping so the tray/resolver
+        // (and a human) can recover which note this stash belongs to. Best-effort:
+        // the stash file is the load-bearing artifact and must never be lost to a
+        // manifest write failure, so a manifest error is logged, not propagated.
+        let rel = original_path.replace('\\', "/");
+        let stem = Path::new(&rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string());
+        if build_stash_filename(&rel, &stem, device_id, local_lsn).hashed {
+            if let Err(e) = self.record_stash_manifest(&rel, &final_path, device_id, local_lsn) {
+                tracing::warn!(
+                    original = %rel,
+                    stash = %final_path.display(),
+                    error = %e,
+                    "AR-008: stash written but manifest mapping could not be recorded"
+                );
+            }
+        }
+
         Ok(final_path)
+    }
+
+    /// AR-008: relative path (from `vault_root`) of the append-only manifest that
+    /// maps hash-bounded stash filenames back to their original note path. Dot-
+    /// prefixed so Obsidian ignores it (R8 convention).
+    pub const MANIFEST_RELPATH: &'static str = ".sync-conflict-stash-manifest.jsonl";
+
+    /// Append one `{original, stash, device, lsn, ts}` mapping line to the
+    /// manifest under `vault_root`. JSONL so concurrent writers append cleanly
+    /// and a partial line never corrupts prior entries.
+    fn record_stash_manifest(
+        &self,
+        original_path: &str,
+        stash_path: &Path,
+        device_id: &str,
+        lsn: u64,
+    ) -> Result<(), StashError> {
+        let stash_rel = stash_path
+            .strip_prefix(&self.vault_root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| stash_path.to_string_lossy().into_owned());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = serde_json::json!({
+            "original": original_path,
+            "stash": stash_rel,
+            "device": device_id,
+            "lsn": lsn,
+            "ts": ts,
+        });
+        let manifest_path = self.vault_root.join(Self::MANIFEST_RELPATH);
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest_path)?;
+        writeln!(f, "{line}")?;
+        Ok(())
     }
 
     /// Idempotency helper (S514, TKT-d1a41f94): return an existing
@@ -795,6 +937,133 @@ mod tests {
         fs::write(tmp.path().join("a/b/foo.conflict-from-bar-1.txt"), b"x").unwrap(); // wrong ext
 
         assert_eq!(stash.unresolved_count().unwrap(), 3);
+    }
+
+    // ----- AR-008 (TKT-c41c2225) length-safe stash name tests -----
+
+    /// The EXACT live-journal failing path (03_Media/Social/X/...). On v0.4.32
+    /// the natural stash basename exceeds the 255-byte component limit and
+    /// `write_stash` died with `File name too long (os error 36)` every reconcile
+    /// cycle. This asserts the write now SUCCEEDS with a length-safe basename and
+    /// a manifest entry mapping it back to the original path.
+    ///
+    /// RED ON OLD CODE: the unbounded `{stem}.conflict-from-...` name is > 255
+    /// bytes, so `tmp.persist()` returns ENAMETOOLONG and this `.unwrap()` panics.
+    #[test]
+    fn regression_ar008_long_x_note_path_stashes_length_safe() {
+        let live_path = "03_Media/Social/X/@theblacktruth/@Lemelson - 𝗖𝗵𝗿𝗶𝘀𝘁𝗶𝗮𝗻 𝗭𝗶𝗼𝗻𝗶𝘀𝗺 𝗘𝗫𝗣𝗢𝗦𝗘𝗗 - 𝗛𝗼𝘄 𝗮 𝗛𝗲𝗿𝗲𝘀𝘆 𝗛𝗶𝗷𝗮𝗰𝗸𝗲𝗱 𝗔𝗺𝗲𝗿𝗶𝗰𝗮 𝗘𝗽 𝟰𝟭 A war is.md";
+        // Precondition: the natural (unbounded) basename really would overflow.
+        let stem = Path::new(live_path).file_stem().unwrap().to_string_lossy();
+        let natural = format!("{stem}.conflict-from-link-12345.md");
+        assert!(
+            natural.len() > STASH_BASENAME_MAX,
+            "fixture must exceed the component cap to be a real regression (natural={} bytes)",
+            natural.len()
+        );
+
+        let tmp = tempdir().unwrap();
+        let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::ServerWins);
+        let result = stash
+            .write_stash(live_path, b"local divergent bytes", "link", 12345)
+            .expect("AR-008: long-path stash must succeed, not ENAMETOOLONG");
+
+        assert!(result.exists(), "stash file must exist at {result:?}");
+        assert_eq!(fs::read(&result).unwrap(), b"local divergent bytes");
+
+        // The on-disk basename is length-safe on every platform.
+        let name = result.file_name().unwrap().to_string_lossy();
+        assert!(
+            basename_fits(&name),
+            "basename must fit the cross-platform limit: {} bytes / {} utf16 units",
+            name.len(),
+            name.encode_utf16().count()
+        );
+        // It is still recognizable as a conflict stash and parseable-ish.
+        assert!(name.contains(".conflict-from-link-12345.md"));
+
+        // Manifest maps the hashed name back to the original note path.
+        let manifest = fs::read_to_string(tmp.path().join(ConflictStash::MANIFEST_RELPATH))
+            .expect("manifest must be written for a hash-bounded stash");
+        assert!(
+            manifest.contains(live_path),
+            "manifest must record the original path; got: {manifest}"
+        );
+        assert!(manifest.contains("\"device\":\"link\""));
+    }
+
+    /// Linux 255-BYTE component limit: an all-ASCII stem far over the cap.
+    #[test]
+    fn stash_filename_length_safe_linux_bytes() {
+        let long_stem = "a".repeat(400);
+        let path = format!("notes/{long_stem}.md");
+        let built = build_stash_filename(&path, &long_stem, "morpheus", 999);
+        assert!(built.hashed, "over-cap stem must be hash-bounded");
+        assert!(
+            built.filename.len() <= STASH_BASENAME_MAX,
+            "byte length {} exceeds cap",
+            built.filename.len()
+        );
+    }
+
+    /// macOS/Windows 255-UTF-16-UNIT limit: astral glyphs are 2 UTF-16 units
+    /// each (and 4 UTF-8 bytes), so a stem heavy in them must be bounded on both
+    /// axes.
+    #[test]
+    fn stash_filename_length_safe_macos_windows_utf16() {
+        // 200 mathematical-bold 'A' (U+1D5D4): 4 bytes / 2 utf16 units each.
+        let long_stem = "\u{1D5D4}".repeat(200);
+        assert!(long_stem.encode_utf16().count() > STASH_BASENAME_MAX);
+        let path = format!("notes/{long_stem}.md");
+        let built = build_stash_filename(&path, &long_stem, "trinity", 7);
+        assert!(built.hashed);
+        assert!(
+            built.filename.len() <= STASH_BASENAME_MAX
+                && built.filename.encode_utf16().count() <= STASH_BASENAME_MAX,
+            "must fit BOTH byte and utf16 caps: {} bytes / {} utf16",
+            built.filename.len(),
+            built.filename.encode_utf16().count()
+        );
+    }
+
+    /// A normal-length note keeps its verbatim, human-readable stash name and
+    /// writes NO manifest entry (unchanged behavior, no regression for the 99.9%).
+    #[test]
+    fn stash_filename_short_names_unchanged_no_manifest() {
+        let built = build_stash_filename("notes/normal.md", "normal", "morpheus", 42);
+        assert!(!built.hashed);
+        assert_eq!(built.filename, "normal.conflict-from-morpheus-42.md");
+
+        let tmp = tempdir().unwrap();
+        let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::Manual);
+        fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        stash
+            .write_stash("notes/normal.md", b"x", "morpheus", 42)
+            .unwrap();
+        assert!(
+            !tmp.path().join(ConflictStash::MANIFEST_RELPATH).exists(),
+            "a short (non-hashed) stash must not write a manifest"
+        );
+    }
+
+    /// Idempotency (S514) must survive the AR-008 change: the same long-path
+    /// divergence recurring every cycle is stashed exactly once, not piled into
+    /// -2/-3/... The hash is deterministic per original path so reuse still keys.
+    #[test]
+    fn ar008_long_path_stash_is_still_idempotent() {
+        let live_path = "03_Media/Social/X/@theblacktruth/@Lemelson - 𝗖𝗵𝗿𝗶𝘀𝘁𝗶𝗮𝗻 𝗭𝗶𝗼𝗻𝗶𝘀𝗺 𝗘𝗫𝗣𝗢𝗦𝗘𝗗 - 𝗛𝗼𝘄 𝗮 𝗛𝗲𝗿𝗲𝘀𝘆 𝗛𝗶𝗷𝗮𝗰𝗸𝗲𝗱 𝗔𝗺𝗲𝗿𝗶𝗰𝗮 𝗘𝗽 𝟰𝟭 A war is.md";
+        let tmp = tempdir().unwrap();
+        let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::ServerWins);
+        let p1 = stash.write_stash(live_path, b"loser", "link", 1).unwrap();
+        // Same content, different device+lsn -> reuse the existing stash.
+        let p2 = stash.write_stash(live_path, b"loser", "trinity", 99).unwrap();
+        assert_eq!(p1, p2, "identical content must reuse the single stash");
+        let parent = p1.parent().unwrap();
+        let n = fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(n, 1, "exactly one long-path stash for identical content");
     }
 
     // ----- parse_conflict_filename tests -----

@@ -33,6 +33,68 @@ pub fn user_agent_string() -> String {
     )
 }
 
+/// AR-009 (TKT-c41c2225): deserialize a `200 OK` body into `T`, and on failure
+/// produce a fully diagnosable `ApiError::Decode` instead of reqwest's opaque
+/// "error decoding response body".
+///
+/// Forensics captured (no note-content leak): HTTP status, content-type, body
+/// length, a request-id header if present, and the structural serde error
+/// (field position + expected/found type). A bounded raw `body_sample` is
+/// attached ONLY when the content-type is not JSON -- an HTML/proxy error page
+/// is diagnostic and is not user content; a JSON structural mismatch means the
+/// body IS the note, so it is never sampled.
+pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    context: &'static str,
+) -> Result<T, ApiError> {
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // request-id, in preference order (server, then generic, then cloudflare).
+    let request_id = ["x-request-id", "x-correlation-id", "cf-ray"]
+        .iter()
+        .find_map(|h| {
+            resp.headers()
+                .get(*h)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| format!("{h}={s}"))
+        });
+    // Read the raw bytes ourselves so a decode failure keeps the forensics
+    // (reqwest's `.json()` consumes the body and discards them).
+    let bytes = resp.bytes().await?;
+    let body_len = bytes.len();
+    match serde_json::from_slice::<T>(&bytes) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let is_json = content_type.starts_with("application/json");
+            let body_sample = if is_json {
+                // The body is the (structurally-bad) note payload -- do NOT
+                // sample it; the serde position/type carries the signal.
+                None
+            } else {
+                // Non-JSON (HTML/proxy error page) -- a bounded prefix is safe
+                // and diagnostic. Cap at 256 bytes, lossy-decoded.
+                const SAMPLE_CAP: usize = 256;
+                let end = bytes.len().min(SAMPLE_CAP);
+                Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+            };
+            Err(ApiError::Decode {
+                context,
+                status,
+                content_type,
+                body_len,
+                request_id,
+                serde_error: e.to_string(),
+                body_sample,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("unauthorized — token rejected")]
@@ -47,6 +109,31 @@ pub enum ApiError {
     RateLimited { retry_after_secs: u64 },
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
+    /// AR-009 (TKT-c41c2225): the transport succeeded (HTTP 200) but the body
+    /// could not be deserialized into the expected type. The bare
+    /// `reqwest::Error` for this case Displays only as "error decoding response
+    /// body", which is undiagnosable in a log. This variant captures the
+    /// forensics WITHOUT leaking note content: HTTP status, content-type,
+    /// body length, a request-id if the server/proxy set one, and the
+    /// structural serde error (which names the field position + the
+    /// expected-vs-found type, e.g. `invalid type: null, expected a string at
+    /// line 1 column 4523` -- a position, never the note body). A bounded raw
+    /// `body_sample` is attached ONLY when the content-type is NOT JSON (an
+    /// HTML/proxy error page is diagnostic and is not user content); for a
+    /// JSON structural mismatch the body IS the note, so no sample is taken.
+    #[error(
+        "decode error in {context}: HTTP {status} content-type={content_type} body_len={body_len} request_id={request_id:?} serde=({serde_error}){}",
+        body_sample.as_ref().map(|s| format!(" sample={s:?}")).unwrap_or_default()
+    )]
+    Decode {
+        context: &'static str,
+        status: u16,
+        content_type: String,
+        body_len: usize,
+        request_id: Option<String>,
+        serde_error: String,
+        body_sample: Option<String>,
+    },
     /// 409 Conflict — base_hash CAS mismatch on push. Server returns the
     /// hash it expected (current server-side content_hash) so the client
     /// can fetch+merge+replay. Per R2 + mandate §5 push contract.
@@ -87,7 +174,16 @@ pub struct NotePayload {
     pub frontmatter: serde_json::Value,
     pub body: String,
     pub sha256: String,
-    pub modified: String,
+    // AR-009 (TKT-c41c2225): the server returns `modified: null` for notes whose
+    // vault_notes.modified column is NULL (observed live on the 2026-07-04 Daily
+    // note). Typed as a non-optional `String`, serde rejected `null` and every
+    // fetch of such a note failed with the opaque "error decoding response body",
+    // failing the server-wins pull every reconcile cycle. `Option` + serde(default)
+    // matches the already-optional `file_mtime`/`created` and is back-compatible
+    // with servers that send a real string. No code reads this field (it is
+    // metadata only; the materializer restores times from `file_mtime`/`created`).
+    #[serde(default)]
+    pub modified: Option<String>,
     // Server returns file_mtime as a unix-timestamp float (vault_notes.file_mtime
     // is double precision), e.g. 1779300968.264 — NOT a string. Typing this as
     // Option<String> made every /api/sync/note body-fetch fail serde decode
@@ -308,7 +404,10 @@ impl ApiClient {
             .send()
             .await?;
         match resp.status() {
-            StatusCode::OK => Ok(resp.json().await?),
+            // AR-009: decode via the diagnosable helper, not `.json().await?`.
+            // A structural mismatch now yields ApiError::Decode with forensics
+            // instead of the opaque "error decoding response body".
+            StatusCode::OK => decode_json(resp, "fetch_note").await,
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound(path.to_string())),

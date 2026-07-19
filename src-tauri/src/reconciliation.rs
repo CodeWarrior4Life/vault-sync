@@ -152,6 +152,15 @@ pub async fn run_reconciliation_pass(
     // fix/reconcile-server-wins-shadow: wire the materializer (executes
     // server-wins pulls for stale-local drift) + shadow store (decides
     // push-vs-pull) into the backstop.
+    // AR-003 (TKT-c41c2225): durable retry ledger for failed/deferred pulls,
+    // stored beside the daemon config (NOT in the vault). Loaded per pass; state
+    // persists across passes and daemon restarts.
+    let ledger_path = crate::config::default_config_path()
+        .parent()
+        .map(|d| d.join("reconcile-retry-ledger.json"))
+        .unwrap_or_else(|| PathBuf::from("reconcile-retry-ledger.json"));
+    let retry_ledger = Arc::new(crate::retry_ledger::RetryLedger::load(ledger_path));
+
     let vr = VerifyRepair::new(
         vault_root,
         api,
@@ -160,7 +169,8 @@ pub async fn run_reconciliation_pass(
         VerifyRepairConfig::default(),
     )
     .with_materializer(materializer)
-    .with_shadow(shadow);
+    .with_shadow(shadow)
+    .with_retry_ledger(Arc::clone(&retry_ledger));
 
     tracing::info!("reconciliation: pass starting");
     let result = vr.run().await;
@@ -174,15 +184,37 @@ pub async fn run_reconciliation_pass(
             // VerifyRepairReport.add_count = Pull actions = server-only paths
             // VerifyRepairReport.modify_count = Push actions = local-only or
             //   hash-mismatch paths
+            // AR-003 (TKT-c41c2225): failure-honest summary. The pre-fix line
+            // emitted `pulls_pending=<successes>` and looked green even when
+            // every pull failed. Now it carries attempted/succeeded/failed/
+            // deferred/still-divergent and an explicit RED verdict; a RED cycle
+            // is INELIGIBLE for the P2-E3 three-cycle soak.
+            let cycle_red = report.cycle_red();
             tracing::info!(
                 files_scanned = report.files_scanned,
                 files_in_sync = report.files_in_sync,
-                pulls_pending = report.add_count,
+                pulls_attempted = report.pulls_attempted,
+                pulls_succeeded = report.pulls_succeeded,
+                pulls_failed = report.pulls_failed,
+                pulls_deferred = report.pulls_deferred,
+                still_divergent = report.still_divergent,
                 pushes_queued = report.modify_count,
                 substrate_refused = report.substrate_refused_count,
+                retry_ledger_pending = retry_ledger.len(),
+                cycle = if cycle_red { "RED" } else { "green" },
+                soak_eligible = report.soak_eligible(),
                 elapsed_ms = report.elapsed_ms,
                 "reconciliation: pass complete"
             );
+            if cycle_red {
+                tracing::warn!(
+                    failed = report.pulls_failed,
+                    deferred = report.pulls_deferred,
+                    still_divergent = report.still_divergent,
+                    sample = ?report.unresolved_paths_sample,
+                    "reconciliation: cycle is RED — unresolved divergence remains; NOT counting toward soak"
+                );
+            }
             if let Ok(mut w) = tray_state.write() {
                 w.note_recon_pass(report.add_count as u64, report.modify_count as u64);
             }

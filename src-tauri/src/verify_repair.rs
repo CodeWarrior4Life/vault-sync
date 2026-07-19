@@ -190,6 +190,40 @@ pub struct VerifyRepairReport {
     pub extension_filtered_count: usize,
     pub errors: Vec<(String, String)>,
     pub elapsed_ms: u64,
+
+    // ---- AR-003 (TKT-c41c2225): failure-honest pull accounting ----
+    /// Server-wins pulls this pass attempted to execute (== `pulls_succeeded +
+    /// pulls_failed + pulls_deferred`).
+    pub pulls_attempted: usize,
+    /// Pulls that fetched, materialized, and hash-verified (or resolved to a
+    /// legitimate no-write in-sync state). The divergence is gone.
+    pub pulls_succeeded: usize,
+    /// Pulls that ERRORED (fetch/decode/materialize/integrity). The item is
+    /// still divergent and is kept in the durable retry ledger.
+    pub pulls_failed: usize,
+    /// Pulls DEFERRED by a guard (conflict-storm breaker open). Retriable next
+    /// pass; still divergent for now.
+    pub pulls_deferred: usize,
+    /// Paths still divergent at end-of-pass (`pulls_failed + pulls_deferred`).
+    pub still_divergent: usize,
+    /// Sample of paths that failed or were deferred (for the log/tray, capped).
+    pub unresolved_paths_sample: Vec<String>,
+}
+
+impl VerifyRepairReport {
+    /// AR-003: a cycle is RED (NOT eligible for the P2-E3 three-cycle soak) if
+    /// any pull failed OR any divergence remains unresolved after the pass. A
+    /// summary line like `pulls_pending=0` is meaningless for closure unless
+    /// this is false.
+    pub fn cycle_red(&self) -> bool {
+        self.pulls_failed > 0 || self.still_divergent > 0
+    }
+
+    /// Inverse of [`cycle_red`]: this pass observed complete convergence of every
+    /// attempted pull and may count toward the soak.
+    pub fn soak_eligible(&self) -> bool {
+        !self.cycle_red()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -256,6 +290,39 @@ pub fn decide_direction(
     }
 }
 
+/// AR-003 (TKT-c41c2225): classification of one server-wins pull's result for
+/// failure-honest accounting. PURE (table-tested) so the RED-cycle gate can be
+/// reasoned about without a live server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullResultClass {
+    /// Server bytes materialized + hash-verified, OR resolved to a legitimate
+    /// in-sync no-write. The divergence is gone.
+    Succeeded,
+    /// Errored (fetch/decode/materialize/integrity). Still divergent; retried
+    /// and kept in the durable retry ledger.
+    Failed,
+    /// Deferred by a guard (conflict-storm breaker open). Still divergent;
+    /// retried next pass.
+    Deferred,
+}
+
+/// Classify a single pull result. `Err` (fetch/materialize) and a post-write
+/// integrity failure are FAILED; a conflict-storm-breaker skip is DEFERRED;
+/// every other outcome (Wrote / Stashed / AlignedToCanonical, or a benign
+/// Skipped such as IdenticalToLocal / LocalEditPreserved / DisabledMode) is a
+/// resolved SUCCEEDED state.
+pub fn classify_pull_outcome(
+    res: &Result<crate::materializer::MaterializeOutcome, String>,
+) -> PullResultClass {
+    use crate::materializer::{MaterializeOutcome as O, SkipReason as S};
+    match res {
+        Err(_) => PullResultClass::Failed,
+        Ok(O::IntegrityFailed { .. }) => PullResultClass::Failed,
+        Ok(O::Skipped(S::ConflictStormBreakerOpen)) => PullResultClass::Deferred,
+        Ok(_) => PullResultClass::Succeeded,
+    }
+}
+
 pub struct VerifyRepair {
     vault_root: PathBuf,
     api: Arc<ApiClient>,
@@ -270,6 +337,11 @@ pub struct VerifyRepair {
     /// to tell a genuine local edit (push) from a stale materialization (pull).
     /// `None` ⇒ every drift falls to PULL (the safe mirror-host default).
     shadow: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// AR-003 (TKT-c41c2225): durable retry ledger. Failed/deferred pulls are
+    /// recorded here and cleared on success, so failed items keep durable retry
+    /// state across daemon restarts (not just implicit next-scan retry). `None`
+    /// in unit tests that don't exercise persistence.
+    retry_ledger: Option<Arc<crate::retry_ledger::RetryLedger>>,
 }
 
 impl VerifyRepair {
@@ -288,7 +360,14 @@ impl VerifyRepair {
             config,
             materializer: None,
             shadow: None,
+            retry_ledger: None,
         }
+    }
+
+    /// Builder: attach the durable retry ledger (AR-003).
+    pub fn with_retry_ledger(mut self, ledger: Arc<crate::retry_ledger::RetryLedger>) -> Self {
+        self.retry_ledger = Some(ledger);
+        self
     }
 
     /// Builder: attach the materializer used to EXECUTE server-wins pulls.
@@ -488,41 +567,85 @@ impl VerifyRepair {
                         .collect()
                         .await;
 
-                    let mut pulled = 0usize;
+                    // AR-003: failure-honest accounting. Distinguish succeeded
+                    // (materialized + verified) from failed (errored) from
+                    // deferred (breaker), and keep failed/deferred items in the
+                    // durable retry ledger. `add_count` remains the SUCCEEDED
+                    // count for tray/dialog back-compat.
+                    report.pulls_attempted = pull_count;
                     for (path, res) in results {
-                        match res {
-                            Ok(outcome) => {
-                                tracing::info!(path = %path, ?outcome, "reconciliation: pulled (server-wins)");
-                                pulled += 1;
+                        match classify_pull_outcome(&res) {
+                            PullResultClass::Succeeded => {
+                                tracing::info!(path = %path, outcome = ?res.as_ref().ok(), "reconciliation: pulled (server-wins)");
+                                report.pulls_succeeded += 1;
                                 if report.add_paths_sample.len() < SAMPLE_CAP {
-                                    report.add_paths_sample.push(path);
+                                    report.add_paths_sample.push(path.clone());
+                                }
+                                if let Some(l) = &self.retry_ledger {
+                                    l.clear(&path);
                                 }
                             }
-                            Err(e) => {
+                            PullResultClass::Deferred => {
+                                let reason = match &res {
+                                    Ok(o) => format!("{o:?}"),
+                                    Err(e) => e.clone(),
+                                };
+                                tracing::warn!(path = %path, reason = %reason, "reconciliation: pull DEFERRED (still divergent, will retry)");
+                                report.pulls_deferred += 1;
+                                if report.unresolved_paths_sample.len() < SAMPLE_CAP {
+                                    report.unresolved_paths_sample.push(path.clone());
+                                }
+                                if let Some(l) = &self.retry_ledger {
+                                    l.record_failure(&path, &format!("deferred: {reason}"));
+                                }
+                            }
+                            PullResultClass::Failed => {
+                                let e = match res {
+                                    Err(e) => e,
+                                    Ok(o) => format!("{o:?}"),
+                                };
                                 tracing::warn!(path = %path, error = %e, "reconciliation: pull failed");
-                                report.errors.push((path, e));
+                                report.pulls_failed += 1;
+                                report.errors.push((path.clone(), e.clone()));
+                                if report.unresolved_paths_sample.len() < SAMPLE_CAP {
+                                    report.unresolved_paths_sample.push(path.clone());
+                                }
+                                if let Some(l) = &self.retry_ledger {
+                                    l.record_failure(&path, &e);
+                                }
                             }
                         }
                     }
-                    report.add_count = pulled;
+                    report.still_divergent = report.pulls_failed + report.pulls_deferred;
+                    report.add_count = report.pulls_succeeded;
+                    // AR-003: emit the FULL accounting. `cycle=RED` when any pull
+                    // did not converge; such a cycle must never count toward the
+                    // P2-E3 soak.
                     tracing::info!(
-                        requested = pull_count,
-                        pulled,
+                        attempted = report.pulls_attempted,
+                        succeeded = report.pulls_succeeded,
+                        failed = report.pulls_failed,
+                        deferred = report.pulls_deferred,
+                        still_divergent = report.still_divergent,
+                        cycle = if report.cycle_red() { "RED" } else { "green" },
                         "reconciliation: server-wins pull pass complete"
                     );
                 }
                 None => {
-                    // No materializer (unit tests / dry-run): count the intent
-                    // but do NOT push these stale-local paths. Surfacing the
-                    // count keeps the no-silent-skip contract.
+                    // No materializer (unit tests / dry-run): these stale-local
+                    // paths are UNRESOLVED (not executed) — count them as
+                    // deferred so the cycle is honestly RED, never a false green.
                     let n = pending_pulls.len();
                     tracing::info!(
                         pending_pulls = n,
-                        "reconciliation: {n} stale-local pull(s) detected but no materializer wired — not executed, not pushed"
+                        "reconciliation: {n} stale-local pull(s) detected but no materializer wired — deferred (cycle RED)"
                     );
-                    report.add_count = n;
+                    report.pulls_attempted = n;
+                    report.pulls_deferred = n;
+                    report.still_divergent = n;
+                    report.add_count = 0;
                     for p in pending_pulls.into_iter().take(SAMPLE_CAP) {
-                        report.add_paths_sample.push(p);
+                        report.unresolved_paths_sample.push(p);
                     }
                 }
             }
@@ -1614,6 +1737,167 @@ mod tests {
         // Local file now holds the server canonical bytes.
         let on_disk = std::fs::read_to_string(vault.path().join("notes/a.md")).unwrap();
         assert_eq!(on_disk, server_body);
+    }
+
+    // ─── AR-003 (TKT-c41c2225) failure-honest accounting ─────────────────
+
+    #[test]
+    fn classify_pull_outcome_table() {
+        use crate::materializer::{MaterializeOutcome as O, SkipReason as S};
+        use std::path::PathBuf;
+        // Errored fetch/materialize → Failed.
+        assert_eq!(
+            classify_pull_outcome(&Err("fetch: decode".into())),
+            PullResultClass::Failed
+        );
+        // Post-write integrity failure → Failed.
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::IntegrityFailed {
+                path: PathBuf::from("x.md"),
+                expected_sha: "a".into(),
+                actual_sha: "b".into()
+            })),
+            PullResultClass::Failed
+        );
+        // Conflict-storm breaker skip → Deferred.
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::ConflictStormBreakerOpen))),
+            PullResultClass::Deferred
+        );
+        // Materialized → Succeeded.
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Wrote {
+                path: PathBuf::from("x.md")
+            })),
+            PullResultClass::Succeeded
+        );
+        // Benign skip (local edit preserved) → Succeeded (resolved, no pull).
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::LocalEditPreserved))),
+            PullResultClass::Succeeded
+        );
+    }
+
+    #[test]
+    fn report_cycle_red_semantics() {
+        let mut r = VerifyRepairReport::default();
+        assert!(!r.cycle_red(), "empty pass is green");
+        assert!(r.soak_eligible());
+
+        r.pulls_attempted = 3;
+        r.pulls_succeeded = 3;
+        assert!(!r.cycle_red(), "all-succeeded is green");
+
+        r.pulls_failed = 1;
+        r.still_divergent = 1;
+        assert!(r.cycle_red(), "any failure is RED");
+        assert!(!r.soak_eligible(), "RED cycle is NOT soak-eligible");
+
+        // Deferred-only (breaker) is still RED / not soak-eligible.
+        let mut d = VerifyRepairReport::default();
+        d.pulls_attempted = 1;
+        d.pulls_deferred = 1;
+        d.still_divergent = 1;
+        assert!(d.cycle_red());
+    }
+
+    /// End-to-end regression for the live 00:58 false-green: a drift whose
+    /// server-wins pull FAILS (the fetch decodes badly) must produce a RED cycle
+    /// with failed=1 / still_divergent=1 and add_count=0 (NOT a clean summary),
+    /// and the failed item must land in the durable retry ledger.
+    ///
+    /// RED ON OLD CODE: pre-fix `VerifyRepairReport` had no
+    /// pulls_failed/still_divergent/cycle_red, `add_count` counted only
+    /// successes, and there was no retry ledger — this test does not compile.
+    #[tokio::test]
+    async fn regression_ar003_failed_pull_is_red_not_false_green() {
+        let vault = TempDir::new().unwrap();
+        write_file(vault.path(), "notes/a.md", b"stale-local-bytes");
+
+        let mut srv = Server::new_async().await;
+        let _rec = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
+            )
+            .create_async()
+            .await;
+        // fetch_note returns 200 JSON that is MISSING the required `body` field →
+        // decode fails → the pull fails (mirrors the live decode defect class).
+        let _note = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "path".into(),
+                "notes/a.md".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"path":"notes/a.md","frontmatter":{},"sha256":"deadbeef"}"#)
+            .create_async()
+            .await;
+
+        let ws = TempDir::new().unwrap();
+        let (vr, _journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let mat = crate::materializer::Materializer::new(
+            vault.path().to_path_buf(),
+            Some("shadow/".into()),
+            crate::materializer::MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            crate::materializer::MaterializerConfig::default(),
+        );
+        let ledger_dir = TempDir::new().unwrap();
+        let ledger = std::sync::Arc::new(crate::retry_ledger::RetryLedger::load(
+            ledger_dir.path().join("ledger.json"),
+        ));
+        let vr = vr
+            .with_materializer(mat)
+            .with_retry_ledger(std::sync::Arc::clone(&ledger));
+        let report = vr.run().await.unwrap();
+
+        assert_eq!(report.pulls_attempted, 1);
+        assert_eq!(report.pulls_succeeded, 0);
+        assert_eq!(report.pulls_failed, 1, "the bad-decode pull must be FAILED");
+        assert_eq!(report.still_divergent, 1);
+        assert_eq!(report.add_count, 0, "a failed pull must NOT inflate add_count");
+        assert!(report.cycle_red(), "a failed pull makes the cycle RED");
+        assert!(!report.soak_eligible());
+        assert!(!report.errors.is_empty());
+        // Durable retry state recorded for the failed item.
+        assert_eq!(ledger.len(), 1, "failed item must be in the retry ledger");
+        assert_eq!(ledger.pending()[0].path, "notes/a.md");
+        // Local bytes untouched (server winner never materialized).
+        let on_disk = std::fs::read_to_string(vault.path().join("notes/a.md")).unwrap();
+        assert_eq!(on_disk, "stale-local-bytes");
+    }
+
+    /// A drift with NO materializer wired must report the pull as DEFERRED and
+    /// the cycle as RED (the pre-fix code counted it under add_count and looked
+    /// green).
+    #[tokio::test]
+    async fn ar003_no_materializer_drift_is_deferred_and_red() {
+        let vault = TempDir::new().unwrap();
+        write_file(vault.path(), "notes/a.md", b"stale-local-bytes");
+        let mut srv = Server::new_async().await;
+        let _rec = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
+            )
+            .create_async()
+            .await;
+        let (vr, _journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        // No materializer, no shadow → drift resolves to PULL but cannot execute.
+        let report = vr.run().await.unwrap();
+        assert_eq!(report.pulls_attempted, 1);
+        assert_eq!(report.pulls_deferred, 1);
+        assert_eq!(report.pulls_succeeded, 0);
+        assert_eq!(report.add_count, 0);
+        assert!(report.cycle_red(), "unexecuted pull → RED, not false green");
     }
 
     // ─── helper-fn micro-tests ───────────────────────────────────────────

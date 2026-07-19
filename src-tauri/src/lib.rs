@@ -18,6 +18,7 @@ pub mod push_journal;
 pub mod rasp_fence;
 pub mod reconciliation;
 pub mod redflag;
+pub mod retry_ledger;
 pub mod scope;
 pub mod sse;
 pub mod sync_health;
