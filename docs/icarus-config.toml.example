@@ -14,10 +14,12 @@
 
 nexus_url = "https://nexus.obsidian-inc.com"
 
-# ISSUED BY THE SERVER at enrollment (R2). This is icarus's OWN subscriber id
-# from POST /api/sync/subscribers/issue-token -- NOT link's
-# (a6f8219e-2fcb-4a9a-a2c6-0d3471919d1c). Placeholder below; replace on issue.
-subscriber_id = "REPLACE-WITH-ICARUS-SUBSCRIBER-ID"
+# ISSUED BY THE SERVER at enrollment (R2). This is icarus's OWN subscriber id from
+# POST /admin/api/vault-sync/subscribers (Bearer NEXUS_API_KEY, read_only:true) --
+# NOT link's (a6f8219e-...). Live value: c7702ee9-efcb-43df-b69e-c28fd992ff90.
+# (The ticket's /api/sync/subscribers/issue-token route gates on X-Admin-Password
+# and cannot set read_only -- see runbook §2.)
+subscriber_id = "c7702ee9-efcb-43df-b69e-c28fd992ff90"
 
 # On Fedora Atomic, /home/cyril -> /var/home/cyril (symlink), so this resolves
 # to /var/home/cyril/vaults, matching R3's target /var/home/cyril/vaults/Mainframe.

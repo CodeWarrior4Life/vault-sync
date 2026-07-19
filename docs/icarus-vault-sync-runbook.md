@@ -1,10 +1,7 @@
 # icarus Vault Sync Enrollment Runbook (TKT-9d927317)
 
 Enroll icarus as a Nexus Sync subscriber with a live Mainframe copy, running the
-FIXED daemon v0.4.32 ONLY. This runbook is the owner-executable procedure. The
-burn itself prepared and verified everything reversible and PARKED before the
-irreversible enrollment (D8). Nothing below was executed against a live tree by
-the burn except read-only state checks.
+FIXED daemon v0.4.32 ONLY.
 
 Spec anchor: `02_Projects/Nexus/_Children/vault-sync/Specifications/2026-05-20 Nexus Vault Sync - Unified Design Spec v2 - Rule Engine + Scope + BRAT.md`
 Topology: `02_Projects/Lattice/Topology/icarus.md`
@@ -14,26 +11,55 @@ Topology: `02_Projects/Lattice/Topology/icarus.md`
 
 ---
 
-## 0. STOP-FIRST GATE (read before doing anything)
+## STATUS: ENROLLED PULL-ONLY, DAEMON STOPPED (2026-07-19)
 
-Do NOT begin enrollment until BOTH of these are cleared by the owner:
+The owner (composer `vaults-c094` under operator delegation, S67, 2026-07-19)
+CLEARED the section-0 gate with a BINDING verdict: **enroll icarus PULL-ONLY,
+seeded via rsync from link's on-disk vault; icarus must be INCAPABLE of pushing;
+a live seeded copy with sync-pending is acceptable for night one.**
 
-1. **Fleet reconcile-direction is unresolved.** link's v0.4.32 deploy cured the
+This burn EXECUTED the owner-authorized enrollment:
+
+1. **rsync --archive seed** from link's on-disk vault (`/var/home/cyril/vaults/Mainframe`,
+   the v0.4.32-clean copy) → icarus. Faithful copy (no excludes; link has no `.git`).
+2. **Server-enforced pull-only subscriber.** icarus registered via
+   `POST /admin/api/vault-sync/subscribers` (Bearer `NEXUS_API_KEY`) with
+   **`read_only: true`** — the server's push route rejects any push from a
+   read_only subscriber with `403 subscriber is read-only`
+   (`sync_routes_p1.py:1395`). This is STRONGER than a daemon-side flag: even if
+   the daemon is later started, icarus CANNOT push. `materializer_mode: live`,
+   `route: ""`. subscriber_id `c7702ee9-efcb-43df-b69e-c28fd992ff90`.
+3. **v0.4.32 binary + systemd unit installed** on icarus, mirroring link exactly
+   (sha256 `8a305ee8…`), but the unit is left **STOPPED and DISABLED** with a
+   documented enable-command (section "Enable command" below), per the owner's
+   night-one instruction. A stopped daemon plus a server-side read_only flag =
+   two independent layers making icarus incapable of pushing tonight.
+
+Because the daemon binary has NO pull-only mode (the push pipeline is spawned
+unconditionally per sync_root — `lib.rs:702`; `materializer_mode=disabled` only
+skips WRITES, not pushes — `materializer.rs:552`), the pull-only guarantee is
+carried by the **server-side `read_only` flag** + the stopped/disabled unit.
+
+Enrollment explicitly does **NOT** claim THESEUS P2-E3 progress: a read-only
+consumer cannot worsen convergence (owner verdict 3).
+
+---
+
+## 0. HISTORICAL: the STOP-FIRST GATE (now cleared)
+
+Before the owner's 2026-07-19 verdict, enrollment was gated on two blockers.
+Retained for the record; both are RESOLVED by the pull-only decision above.
+
+1. **Fleet reconcile-direction was unresolved.** link's v0.4.32 deploy cured the
    shadow-key storm but trinity re-detonated a mass-push as a long-offline STALE
    REPLICA (2326 pushes via the anti-strip / R2-preserve-local path), and link is
    propagating it (TKT-8a70148c BURN_REPORT). PG is therefore a CONTESTED
-   canonical right now. A fresh subscriber that backfills from a contested PG
-   inherits the contest.
-2. **THESEUS adversarial review (2026-07-19) says the Nexus Sync gate is NOT
-   closeable**: six active conflict artifacts remain (incl. `CLAUDE.conflict-from-*`),
-   live link reconcile logs `requested=2 pulled=0` with failures yet falsely
-   reports files_in_sync, long-path/response-decode pulls fail persistently.
+   canonical. → RESOLVED: icarus seeds from link's on-disk copy (not a cold PG
+   backfill) AND is server-side read_only, so it cannot push the contest onward.
+2. **THESEUS adversarial review (2026-07-19) said the Nexus Sync gate is NOT
+   closeable.** → RESOLVED for icarus: a read-only consumer adds no push traffic
+   and cannot compound the open conflict set (owner verdict 3).
    (`02_Projects/Lattice Meta/Specifications/THESEUS - Nexus Sync Adversarial Review and P2-E3 Burn Intake (2026-07-19).md`)
-
-Enrolling icarus now would add a fourth replica to a system that is mid-incident.
-Clear 1 and 2 first, OR make the explicit owner decision to enroll icarus as a
-PULL-ONLY / read-mostly replica seeded from link's on-disk vault (not from PG) so
-it cannot push a divergent view up.
 
 ---
 
@@ -77,36 +103,72 @@ journal line, not that field.
 
 ---
 
-## 2. Issue the subscriber token (R2) -- OWNER-GATED
+## 2. Register the subscriber (R2) -- EXECUTED as read_only (pull-only)
 
-This mutates server state (creates a subscriber) and is therefore owner-gated.
-Names only below; no secret values in this repo/report/ticket.
+**IMPORTANT correction to the ticket:** the ticket named
+`POST /api/sync/subscribers/issue-token` with Bearer `NEXUS_API_KEY`. That route
+actually gates on the `X-Admin-Password` header (`require_admin`,
+`sync_routes_p1.py:105`) AND cannot set `read_only`. The route that (a) accepts
+`Bearer NEXUS_API_KEY` (via `require_admin_auth` → `_check_admin_auth`,
+`admin_routes.py:199`; `_api_key` = legacy `NEXUS_API_KEY`, `auth.py:89`) AND
+(b) can set `read_only: true` is:
 
 ```bash
 # on link, admin key sourced at runtime from ~/whetstone/.env (key name: NEXUS_API_KEY)
 set +o history
 source ~/whetstone/.env   # provides NEXUS_API_URL, NEXUS_API_KEY
-curl -sS -X POST "$NEXUS_API_URL/api/sync/subscribers/issue-token" \
-  -H "Authorization: Bearer $NEXUS_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"label":"icarus","platform":"linux-x86_64"}'
-# response carries: subscriber_id + one-time token
+curl -sS -X POST "$NEXUS_API_URL/admin/api/vault-sync/subscribers" \
+  -H "Authorization: Bearer $NEXUS_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"host":"icarus","device_label":"icarus …","route":"",
+       "materializer_mode":"live","pull_attachments":true,"read_only":true}'
+# response carries: subscriber_id + plaintext_token (shown ONCE, never stored server-side)
 ```
 
-Place the results on icarus ONLY:
-- `subscriber_id` -> `~/.config/nexus-vault-sync/config.toml` (0644) per the template
-  `docs/icarus-config.toml.example`. Keep `vault_name = "Mainframe"` (R3 footgun).
-- token -> `~/.config/nexus-vault-sync/token-<subscriber_id>.bin`, `chmod 600`.
-  The daemon's pairing flow writes this file at 0600 automatically
-  (`token_store.rs:123-133`); if placing by hand, set 0600 explicitly.
+`read_only:true` is the server-enforced pull-only guarantee: `push_file` rejects
+a read_only subscriber with `403 subscriber is read-only`
+(`sync_routes_p1.py:1392-1396`).
 
-The token must NEVER appear in a report, repo, ticket, or log. Verify:
+Placed on icarus ONLY (done by this burn):
+- `subscriber_id` (`c7702ee9-efcb-43df-b69e-c28fd992ff90`) →
+  `~/.config/nexus-vault-sync/config.toml` (0644) per `docs/icarus-config.toml.example`,
+  `vault_name = "Mainframe"` (R3 footgun locked).
+- token → `~/.config/nexus-vault-sync/token-<subscriber_id>.bin`, `chmod 600`.
+  The token was piped over ssh via **stdin only** (never in argv, never to disk on
+  link, never printed). `token_store::load` reads this file first
+  (`token_store.rs:188-213`, trailing `\n` trimmed).
+
+The token NEVER appears in a report, repo, ticket, or log. Verified:
 
 ```bash
 ssh cyril@100.70.246.59 'stat -c "%a %n" ~/.config/nexus-vault-sync/config.toml \
   ~/.config/nexus-vault-sync/token-*.bin'
-# expect: 644 config.toml ; 600 token-*.bin
+# observed: 644 config.toml ; 600 token-c7702ee9-….bin (47 bytes = "vsk_"+urlsafe(32))
 ```
+
+To revoke (reversible unwind of the registration):
+```bash
+curl -sS -X DELETE "$NEXUS_API_URL/admin/api/vault-sync/subscribers/c7702ee9-efcb-43df-b69e-c28fd992ff90" \
+  -H "Authorization: Bearer $NEXUS_API_KEY"
+```
+
+---
+
+## 2b. Enable command (OWNER — start the pull-only daemon when ready)
+
+The v0.4.32 daemon is installed on icarus but **stopped + disabled** tonight.
+When the owner decides to bring it live (coordinating reboot-proofing with the
+storage burn per its rail), enable it in one motion and immediately watch the
+R3 rails (section 4):
+
+```bash
+ssh cyril@100.70.246.59 'loginctl enable-linger cyril; systemctl --user enable --now nexus-vault-sync'
+# then watch (section 4):
+ssh cyril@100.70.246.59 'journalctl --user -u nexus-vault-sync -f'
+```
+
+Even enabled, icarus is server-side `read_only` → it will PULL/materialize but
+every push attempt is rejected 403. The R3 STOP rail still applies to any
+icarus-attributed conflict *copy* minted during the first materialization pass.
 
 ---
 
@@ -116,18 +178,19 @@ icarus current state (read-only, burn time): vault ABSENT, `/var/home` = nvme1n1
 930G total / 880G free (ample; R3 said FireCuda 916G -- confirm the vault lands on
 the intended physical disk). Target: `/var/home/cyril/vaults/Mainframe`.
 
-Preferred seed = rsync from link's on-disk vault (NOT a cold PG backfill), so
-icarus starts byte-aligned with a real host and the daemon has minimal work:
+Seed = rsync `--archive` from link's on-disk vault (NOT a cold PG backfill), so
+icarus starts byte-aligned with a real host. **EXECUTED** this leg (link has no
+`.git`, so no exclude needed — a faithful copy gives exact parity):
 
 ```bash
 ssh cyril@100.70.246.59 'mkdir -p /var/home/cyril/vaults'
-# dry-run first
-rsync -aHn --delete --exclude '.git/' /home/cyril/vaults/Mainframe/ \
-  cyril@100.70.246.59:/var/home/cyril/vaults/Mainframe/ | tail
-# then real
-rsync -aH --delete --exclude '.git/' /home/cyril/vaults/Mainframe/ \
+rsync -aH --stats /var/home/cyril/vaults/Mainframe/ \
   cyril@100.70.246.59:/var/home/cyril/vaults/Mainframe/
+# result: 118,926 regular files, 36,572,142,040 bytes, 0 deleted, exit 0
 ```
+
+Parity verified (R5, §6): count 118,926/118,926, size 35G/35G, `rsync -aHn`
+dry-run diff = 0 file deltas, sha256 spot-parity 20/20.
 
 ---
 
@@ -238,12 +301,18 @@ atomic-renames; daemon shadow/state lives outside the vault under `~/.config` /
 ### `02_Projects/Lattice/Topology/icarus.md` addition (draft)
 ```
 ## Vault Sync
-- Role: Nexus Sync subscriber (v0.4.32), live Mainframe replica.
-- Enrolled: <DATE> (TKT-9d927317). Subscriber id: <icarus subscriber_id>.
-- Binary: ~/Applications/Nexus-Vault-Sync.AppImage (sha256 8a305ee8...), systemd
-  --user unit nexus-vault-sync.service + 10-desktop-env.conf drop-in, linger on.
-- Vault: /var/home/cyril/vaults/Mainframe (nvme1n1p3). Config vault_name=Mainframe (mandatory).
-- Rails: STOP on any *.conflict-from-icarus-*.md mint; R4 dot-dir gap open fleet-wide.
+- Role: Nexus Sync subscriber (v0.4.32), live Mainframe replica, PULL-ONLY (read_only).
+- Enrolled: 2026-07-19 (TKT-9d927317). Subscriber id: c7702ee9-efcb-43df-b69e-c28fd992ff90.
+  Server read_only=true, materializer_mode=live, route="" (first read_only subscriber in fleet).
+- Binary: ~/Applications/Nexus-Vault-Sync.AppImage (sha256 8a305ee8..., == link v0.4.32),
+  systemd --user unit nexus-vault-sync.service + 10-desktop-env.conf drop-in.
+- Night-one state: seeded (rsync --archive from link, 118,926 files/35G, parity 20/20),
+  daemon STOPPED + DISABLED. Enable: `systemctl --user enable --now nexus-vault-sync`
+  (+ `loginctl enable-linger cyril`) after coordinating reboot-proof with the storage burn.
+- Vault: /var/home/cyril/vaults/Mainframe (nvme1n1p3 = FireCuda root, enumeration flip).
+  Config vault_name=Mainframe (mandatory footgun guard).
+- Rails: server read_only rejects all pushes (403); STOP on any *.conflict-from-icarus-*.md
+  mint once enabled; R4 dot-dir gap open fleet-wide (v0.4.33).
 ```
 
 ### Memory-Vault Pairing update (draft)
@@ -256,5 +325,6 @@ memory `[[v0432-trinity-vault-name-configdrift]]` (the footgun this runbook guar
 
 ## Owner action (one line)
 
-Clear the section-0 stop gate (fleet reconcile-direction + THESEUS blockers), then
-run sections 1-6 to enroll icarus; STOP on any icarus-attributed conflict.
+Enrollment is DONE (pull-only, seeded, daemon stopped). Only remaining owner step,
+when ready: `ssh cyril@100.70.246.59 'loginctl enable-linger cyril; systemctl --user enable --now nexus-vault-sync'`
+(coordinate reboot-proof with the storage burn), then watch the §4 rails.

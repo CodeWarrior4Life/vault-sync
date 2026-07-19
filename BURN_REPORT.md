@@ -4,111 +4,135 @@
 **Burn:** icarus-vault-sync-subscriber (Operation Whetstone)
 **Title:** Icarus build-out 5/5: enroll icarus as Nexus Sync subscriber with live Mainframe copy (v0.4.32 fixed daemon ONLY)
 **Branch (this worktree):** `whetstone/icarus-vault-sync-subscriber`
-**Repo:** vault-sync (Tauri/Rust daemon) -- worktree correctly bound (full `src-tauri/src/*.rs` present)
-**Reviewed commit:** `60766af` (v0.4.32 fix wave HEAD); tests added at `20c87c7`
-**Burn host:** link. **Target:** icarus (`cyril@100.70.246.59`).
-**Written:** 2026-07-19 01:38 EDT
+**Repo:** vault-sync (Tauri/Rust daemon)
+**Reviewed commit:** `60766af` (v0.4.32 fix wave HEAD); tests at `20c87c7`
+**Burn host:** link (`hostname=link`, verified). **Target:** icarus (`cyril@100.70.246.59`, `hostname=icarus`).
+**Written:** 2026-07-19 01:38 EDT (leg 0) / updated 2026-07-19 02:3x EDT (leg 1, post owner-verdict execution)
 **Spec anchor:** `02_Projects/Nexus/_Children/vault-sync/Specifications/2026-05-20 Nexus Vault Sync - Unified Design Spec v2 - Rule Engine + Scope + BRAT.md`
 
 ---
 
-## Status: PARKED AWAITING-OWNER (D8 hard gate)
+## Status: ENROLLED PULL-ONLY, DAEMON STOPPED (owner-directed, EXECUTED)
 
-The GOAL (icarus becomes a live subscriber) is, by definition, a **deploy +
-subscriber registration + distribution** -- every part of it is on the burn's
-OWNER-GATED list (D8). So this burn did all the REVERSIBLE work (review, runbook,
-config template, regression/guard tests, read-only state capture) and PARKED
-before the irreversible enrollment. icarus was never mutated; only read.
+The owner (composer `vaults-c094` under operator delegation, S67, 2026-07-19)
+returned BINDING verdicts on all five parked decisions and cleared the D8 gate for
+a SCOPED enrollment: **icarus PULL-ONLY, rsync-seeded from link's on-disk vault,
+INCAPABLE of pushing; a live seeded copy with sync-pending is acceptable for night
+one; a push-capable divergent subscriber is not.**
 
-Two independent conditions make parking not just procedural but SUBSTANTIVE -- it
-would be unsafe to enroll icarus right now even if D8 allowed it:
+This leg EXECUTED exactly that scope:
 
-1. **Fleet reconcile-direction is contested.** link's v0.4.32 deploy fixed the
-   shadow-key storm but trinity re-detonated a mass-push as a long-offline STALE
-   REPLICA (2326 `push accepted` via the anti-strip / R2-preserve-local path), and
-   link is propagating it (TKT-8a70148c BURN_REPORT; my memory
-   `[[v0432-trinity-vault-name-configdrift]]`). PG is a CONTESTED canonical. A
-   fresh subscriber backfilling from it inherits the contest.
-2. **THESEUS adversarial review (2026-07-19, `vaults-d0ba`)** declares the Nexus
-   Sync gate NOT closeable: six active conflict artifacts remain
-   (incl. `CLAUDE.conflict-from-*`), live link reconcile logs `requested=2 pulled=0`
-   with failures yet FALSELY reports files_in_sync, long-path/response-decode pulls
-   fail persistently.
+1. **Live Mainframe copy on icarus** via `rsync --archive` from link's v0.4.32-clean
+   on-disk vault (118,926 files / 36,572,142,040 bytes, exit 0, 0 deleted).
+   Parity vs link: **118,926 / 118,926 files, 35G / 35G, dry-run diff = 0 deltas,
+   sha256 spot-parity 20/20.**
+2. **Server-enforced pull-only subscriber.** icarus registered with
+   **`read_only: true`** (subscriber_id `c7702ee9-efcb-43df-b69e-c28fd992ff90`,
+   `materializer_mode: live`, `route: ""`). The server's push route rejects a
+   read_only subscriber with `403 subscriber is read-only`
+   (`sync_routes_p1.py:1392-1396`) — icarus CANNOT push even if the daemon runs.
+   It is the fleet's first read_only subscriber.
+3. **v0.4.32 daemon installed, STOPPED + DISABLED.** Exact-artifact copy of link's
+   AppImage (sha256 `8a305ee8…`) + systemd user unit + drop-in mirrored verbatim,
+   then left inactive/disabled with a documented enable-command
+   (runbook §2b). Two independent layers make icarus incapable of pushing tonight:
+   the server `read_only` flag + the stopped/disabled unit.
 
-**Owner action (one line):** Clear the reconcile-direction + THESEUS blockers (or
-decide icarus enrolls PULL-ONLY seeded from link's on-disk vault, not PG), then run
-`docs/icarus-vault-sync-runbook.md` sections 1-6; STOP on any icarus-attributed conflict.
+Enrollment explicitly does **NOT** claim THESEUS P2-E3 progress (owner verdict 3):
+a read-only consumer cannot worsen convergence.
+
+**Remaining owner action (one line):** when ready (coordinating reboot-proof with
+the storage burn), bring the pull-only daemon live:
+`ssh cyril@100.70.246.59 'loginctl enable-linger cyril; systemctl --user enable --now nexus-vault-sync'`
+then watch the R3 rails (runbook §4). A stopped seeded copy is a complete,
+owner-accepted night-one state; enabling is optional and reversible.
 
 ---
 
 ## Requirement Review Table
 
-Every row cites real code/config/state at the reviewed commit. "GAP" = does not
-conform; "PREP" = reversible prep complete, live execution owner-gated; "UNVERIFIED"
-= cannot verify without the owner-gated enrollment.
+Every row cites real code/config/state at the reviewed commit and the live result
+of the executed enrollment. "CONFORMS" = requirement met; "GAP (deferred)" = known
+gap the owner explicitly deferred; "N/A tonight" = moot because the daemon is stopped.
 
-| Req | Evidence (file:line / command) | Verdict | Notes |
+| Req | Evidence (file:line / command / live result) | Verdict | Notes |
 |---|---|---|---|
-| **R1** Mirror link's known-good v0.4.32 install | link: `~/.config/systemd/user/nexus-vault-sync.service` (user unit) + `.d/10-desktop-env.conf`; binary `/home/cyril/Applications/Nexus-Vault-Sync.AppImage` (84384248 B, sha256 `8a305ee8...`, mtime Jul 18 15:50); config `~/.config/nexus-vault-sync/config.toml`; `src-tauri/Cargo.toml:3` version="0.4.32"; `tauri.conf.json` version 0.4.32 | **PREP / CONFORMS** | Full parity table + exact-artifact copy (NOT `install.sh` latest-tag) in runbook s1. Version proof = journal `version="0.4.32"`; on-disk `daemon_version` field is a stale self-report ("0.4.20" on link) and must not be trusted. |
-| **R2** Subscriber registration via server API; token -> 0600 config only | endpoint `POST /api/sync/subscribers/issue-token`; admin key name `NEXUS_API_KEY` present in `~/whetstone/.env` (name only, value not read); token path `token_store.rs:115-118` (`token-<subscriber_id>.bin`), mode `token_store.rs:123-133` `set_mode(0o600)`; pairing `pairing.rs:46-68` | **PREP** | Executing the POST mutates server state = owner-gated. Runbook s2 has the exact command (names only). link layout confirms design: `config.toml` 0644 (no secret) + `token-*.bin` 0600. |
-| **R3** Vault target `/var/home/cyril/vaults/Mainframe`; backfill rails; STOP on conflict mint | icarus read-only: vault ABSENT, `/var/home` nvme1n1p3 930G/880G free; footgun `config.rs:119-137` (empty sync_roots + no vault_name -> bare-parent root); test `test_r3_vault_name_synthesis.rs` | **PREP** | Space ample (R3 said FireCuda 916G; actual nvme1n1p3 880G free -- confirm intended disk). vault_name=Mainframe MANDATORY (footgun locked by 3 passing tests). Backfill rails + before/during/after capture in runbook s4. Backfill is live-only -> owner-gated. |
-| **R4/R8** Conflict/temp/quarantine material under dot-prefixed dirs invisible to Obsidian | `conflict_stash.rs:264-278` writes `<vault_root>/<dir>/<stem>.conflict-from-<device>-<lsn>.md` (VISIBLE sibling `.md`); `test_r8_conflict_visibility.rs` characterizes + `#[ignore]`d R4 spec fails on current code | **GAP** | v0.4.32 conflict copies are VISIBLE in Obsidian. THESEUS flagged these exact `CLAUDE.conflict-from-*` artifacts. Fix is fleet-wide (diverges every host's binary) + owner-gated -> NOT made in this burn. Config lines that would honor R4: none exist; there is no dot-dir stash option. Temp files: `NamedTempFile` in note dir, atomic-renamed; daemon state lives outside vault under `~/.config`/`~/.local`. |
-| **R5** Completion proof (file-count/tree parity, sha256 20/20, SYNC-VERIFY canary, reboot survival) | procedures in runbook s6; acceptance verify-cmd output below | **UNVERIFIED** | All five proofs require the enrolled daemon + populated vault, both owner-gated. Reproducible commands provided. Cannot be produced by a parked burn. |
-| **R6** Heavy self-documentation runbook + proposed icarus.md / Memory-Vault-Pairing updates | `docs/icarus-vault-sync-runbook.md`; `docs/icarus-config.toml.example`; drafts in runbook s8 | **CONFORMS** | Install steps, token issuance (names only), backfill timeline/metrics template, rails/rollback, parity evidence, morning follow-up drafts all present. |
+| **R1** Mirror link's known-good v0.4.32 install | icarus `~/Applications/Nexus-Vault-Sync.AppImage` sha256 `8a305ee83739708b67450d0adc84a9db4f112c514dc0a5f01ec11bd23f479af3` **== link's**; `src-tauri/Cargo.toml` `version = "0.4.32"`; systemd user unit + `10-desktop-env.conf` drop-in copied verbatim; `~/.config/nexus-vault-sync/config.toml` 0644 + `token-*.bin` 0600 | **CONFORMS** | Exact-artifact copy (NOT `install.sh` latest-tag). Version proof = sha256 identity to link's journal-verified v0.4.32 (TKT-8a70148c) + Cargo 0.4.32. On-disk `daemon_version` field is a stale self-report (owner verdict 5: note, trust journal). |
+| **R2** Subscriber registration via server API; token → 0600 config only | `POST /admin/api/vault-sync/subscribers` (Bearer `NEXUS_API_KEY` via `admin_routes.py:199`, `auth.py:89`); token piped over ssh stdin → `token-c7702ee9-….bin` **0600, 47 bytes**; config.toml **0644**, no secret; subscriber_id in config only | **CONFORMS** | Ticket named `/api/sync/subscribers/issue-token` (Bearer key) — that route actually gates on `X-Admin-Password` (`sync_routes_p1.py:105`) AND can't set read_only. Corrected to the admin route that accepts the key AND sets `read_only:true`. Token never in report/repo/ticket/log/argv/disk-on-link. |
+| **R3** Vault target `/var/home/cyril/vaults/Mainframe`; backfill rails; STOP on conflict mint | `df /var/home` = nvme1n1p3 930G/884G free (owner verdict 4: FireCuda root, nvme1n1 is the documented enumeration flip); config `vault_name = "Mainframe"` (footgun locked, `test_r3_vault_name_synthesis.rs`); **icarus-attributed conflict files = 0** (daemon never ran) | **CONFORMS** | No backfill risk window tonight: daemon stopped + server read_only. The seeded copy inherited 6 pre-existing `*.conflict-from-*` copies from link (link/other-host attributed, faithfully archived; NONE icarus-attributed). R3 STOP rail documented for the enable step (runbook §4). |
+| **R4/R8** Conflict/temp/quarantine under dot-prefixed dirs invisible to Obsidian | `conflict_stash.rs:264-278` writes VISIBLE sibling `<dir>/<stem>.conflict-from-<device>-<lsn>.md`; no dot-dir stash option exists in config; `test_r8_conflict_visibility.rs` (`#[ignore]`d R4 spec fails on current code) | **GAP (deferred)** | Owner verdict 2: R4 dot-dir binary change is OUT OF SCOPE tonight (fleet binary change), test spec noted for the v0.4.33 wave, left committed. Config lines that would honor R4: **none exist**. Moot tonight (stopped daemon writes nothing). |
+| **R5** Completion proof (count/size parity, sha256 20/20, canary, reboot) | count 118,926/118,926; size 35G/35G; `rsync -aHn` dry-run = **0 file deltas**; **sha256 20/20 match**; canary + reboot = deferred to enable step | **CONFORMS (seed proofs) / DEFERRED (live proofs)** | Seed parity fully proven (below). SYNC-VERIFY canary "flowing FROM icarus" is impossible AND undesired for a read_only/stopped subscriber (it cannot push) — canary applies only if the owner later makes it read-write. Reboot-survival coordinates with the storage burn per owner (deferred to enable). |
+| **R6** Heavy self-documentation | `docs/icarus-vault-sync-runbook.md` (executed-state + enable-command §2b + rails/rollback + parity); `docs/icarus-config.toml.example`; morning drafts §8 | **CONFORMS** | Runbook updated to executed reality; icarus.md + Memory-Vault-Pairing drafts present for morning review. |
 
 ---
 
 ## Self-verify output (real, pasted)
 
-**Acceptance verify-cmd (exact ticket command, read-only against icarus):**
+**Acceptance verify-cmd (exact ticket command):**
 ```
 $ ssh -o BatchMode=yes -o ConnectTimeout=8 cyril@100.70.246.59 \
     'systemctl is-active nexus-vault-sync 2>/dev/null || systemctl --user is-active nexus-vault-sync; \
-     test -d /var/home/cyril/vaults/Mainframe/02_Projects && echo VAULT_PRESENT || echo VAULT_ABSENT'
+     test -d /var/home/cyril/vaults/Mainframe/02_Projects && echo VAULT_PRESENT'
 inactive
 inactive
-VAULT_ABSENT
+VAULT_PRESENT
 ```
-Interpretation: RED, and CORRECTLY so -- daemon not active, vault not present,
-because enrollment is owner-gated and was not executed. This line goes GREEN only
-after the owner runs the runbook.
+Interpretation: **VAULT_PRESENT** (live copy landed); daemon **inactive** by design
+(owner's pull-only night-one verdict). The ticket's "daemon active" acceptance is
+intentionally deferred to the owner enable step — a stopped seeded copy is the
+owner-accepted state.
 
-**icarus full read-only state (burn time):**
+**Daemon state (must be stopped + disabled tonight):**
 ```
-HOST=icarus ; daemon-not-active ; VAULT_ABSENT ; no-appimage
-/dev/nvme1n1p3  930G  49G  880G  6%  /var/home
-~/.config/systemd/user writable: yes
+$ ssh … 'systemctl --user is-active nexus-vault-sync; systemctl --user is-enabled nexus-vault-sync'
+is-active: inactive
+is-enabled: disabled
 ```
 
-**Regression/guard tests (verified GREEN offline on link):**
-The full worktree crate does not build on link: `keyring` (feature
-`sync-secret-service`) pulls `libdbus-sys`, whose build.rs needs `dbus-1` dev
-headers; only the runtime `libdbus-1.so.3` is present (`pkg-config --exists dbus-1`
-= MISSING, no `/usr/include/dbus-1.0`). The two modules under test
-(`config`, `conflict_stash`) have zero keyring/dbus deps, so they were verified via
-a path-include scratch crate (`/tmp/vs-scratch`, lib name `vault_sync_daemon`,
-same source files, no worktree Cargo.toml change):
+**R1 version proof (exact-artifact identity):**
 ```
-running 34 tests   (config + conflict_stash inline tests)
-test result: ok. 34 passed; 0 failed; 0 ignored
-     Running tests/test_r3_vault_name_synthesis.rs
-running 3 tests
-test result: ok. 3 passed; 0 failed; 0 ignored
-     Running tests/test_r8_conflict_visibility.rs
-running 2 tests
-test result: ok. 1 passed; 0 failed; 1 ignored
+icarus AppImage sha256: 8a305ee83739708b67450d0adc84a9db4f112c514dc0a5f01ec11bd23f479af3
+link   AppImage sha256: 8a305ee83739708b67450d0adc84a9db4f112c514dc0a5f01ec11bd23f479af3
+src-tauri/Cargo.toml:   version = "0.4.32"
 ```
-R4 desired-state spec fails on current code (executable record of the gap):
+
+**R2 secret hygiene:**
 ```
-$ cargo test --test test_r8_conflict_visibility -- --ignored
-test r4_conflict_material_must_live_under_dot_prefixed_dir ... FAILED
-  R4: conflict material must live under a dot-prefixed dir invisible to Obsidian;
-  got "02_Projects/Foo/Note.conflict-from-icarus-42.md"
-test result: FAILED. 0 passed; 1 failed
+$ ssh … 'stat -c "%a %n" ~/.config/nexus-vault-sync/config.toml ~/.config/nexus-vault-sync/token-*.bin'
+644 /home/cyril/.config/nexus-vault-sync/config.toml
+600 /home/cyril/.config/nexus-vault-sync/token-c7702ee9-efcb-43df-b69e-c28fd992ff90.bin
 ```
-`rustfmt --check` clean on both new test files. In the real worktree these
-compile once `dbus-1` dev headers exist (owner/CI); they reference only
-`vault_sync_daemon::config` and `::conflict_stash`, which exist unchanged.
+Server-side read_only confirmed via admin list: `host: icarus | read_only: True | materializer_mode: live | route: '' | revoked: None`.
+
+**R3 conflict rail:**
+```
+$ ssh … 'find /var/home/cyril/vaults/Mainframe -name "*.conflict-from-icarus-*.md" | wc -l'
+0
+$ ssh … 'find /var/home/cyril/vaults/Mainframe -name "*.conflict-from-*" | wc -l'
+6        # inherited from link's seed (link/other-host attributed; NONE icarus)
+```
+
+**R5 seed parity (rsync --stats + comparison):**
+```
+Number of files: 133,299 (reg: 118,926, dir: 14,373)
+Number of regular files transferred: 118,926
+Number of deleted files: 0
+Total transferred file size: 36,572,142,040 bytes
+RSYNC_EXIT=0
+
+LINK:   118926 files, 35G
+ICARUS: 118926 files, 35G
+
+$ rsync -aHn --itemize-changes link:/…/Mainframe/ icarus:/…/Mainframe/  → 0 file deltas
+$ 20 random .md, sha256 both hosts, diff  → PARITY 20/20 — all hashes match
+```
+
+**Regression/guard tests (verified GREEN offline on link, prior leg):**
+`config` + `conflict_stash` inline tests + `test_r3_vault_name_synthesis.rs` (3/3)
+pass via a path-include scratch crate (the full worktree can't build on link:
+`keyring`/`libdbus-sys` build.rs needs `dbus-1` dev headers, only the runtime
+`.so.3` is present). `test_r8_conflict_visibility.rs` R4 spec `#[ignore]`d and
+FAILS on current code — the executable record of the R4 gap deferred to v0.4.33.
 
 ---
 
@@ -116,54 +140,53 @@ compile once `dbus-1` dev headers exist (owner/CI); they reference only
 
 | Acceptance item | State | Evidence |
 |---|---|---|
-| verify-cmd green (daemon active + vault present) | **RED (expected, owner-gated)** | Pasted above; goes green after runbook run |
-| v0.4.32 version proof pasted | **DONE (artifact-level)** | Cargo.toml/tauri.conf 0.4.32; link AppImage sha256 `8a305ee8...`; journal-version method documented (runtime proof = post-enrollment) |
-| zero icarus-attributed conflict files during backfill (measured) | **UNVERIFIED** | No backfill run (owner-gated); rails + baseline (`*.conflict-from-icarus-*.md` count) in runbook s4 |
-| sha256 spot-parity 20/20 | **UNVERIFIED** | Procedure in runbook s6; needs populated vault |
-| R8 dot-dir compliance shown | **GAP SHOWN** | conflict_stash.rs:264-278 + failing R4 spec test; config lines that would honor R4 do not exist |
-| survived reboot | **UNVERIFIED** | Procedure in runbook s6 |
-| token never exposed | **DONE** | No token issued/read; only key/subscriber NAMES appear in repo/report |
+| verify-cmd green (daemon active + vault present) | **VAULT_PRESENT ✓ ; daemon stopped by design** | Pasted above; goes fully green at the owner enable step |
+| v0.4.32 version proof pasted | **DONE** | icarus AppImage sha256 == link v0.4.32; Cargo 0.4.32 |
+| zero icarus-attributed conflict files during backfill | **DONE (0)** | daemon never ran; measured 0 `*.conflict-from-icarus-*.md` |
+| sha256 spot-parity 20/20 | **DONE (20/20)** | pasted above |
+| R8 dot-dir compliance shown | **GAP SHOWN (deferred v0.4.33)** | `conflict_stash.rs:264-278` + failing R4 spec; owner verdict 2 |
+| survived reboot | **DEFERRED to enable step** | daemon stopped tonight; reboot-proof coordinates with storage burn |
+| token never exposed | **DONE** | 0600 file; stdin-only transfer; only names/ids in repo/report |
 
 ---
 
-## What this burn built
+## What this burn did (leg 1, owner-authorized execution)
 
-- `docs/icarus-vault-sync-runbook.md` -- full owner-executable enrollment runbook (R6): stop-gate, install parity, token issuance (names only), vault seed, backfill rails, R4 gap, completion proofs, rollback table, morning follow-up drafts.
-- `docs/icarus-config.toml.example` -- chmod-644 config template mirroring link's shape with icarus identity + mandatory `vault_name`; token stays in a separate 0600 file.
-- `src-tauri/tests/test_r3_vault_name_synthesis.rs` -- 3 guard tests locking the vault_name -> sync-root synthesis (the mass-push footgun).
-- `src-tauri/tests/test_r8_conflict_visibility.rs` -- characterization of the visible-sibling conflict copy + an `#[ignore]`d R4 spec that fails on current code.
-- Read-only ground-truth capture of link (known-good install) and icarus (clean slate).
+- rsync `--archive` seeded a full live Mainframe copy onto icarus (parity-verified).
+- Registered icarus as a **server-enforced read_only (pull-only) subscriber** via the
+  admin API; placed the token in a 0600 file and the subscriber_id in a 0644 config
+  (`vault_name = "Mainframe"` mandatory).
+- Installed the exact v0.4.32 AppImage + systemd unit/drop-in mirroring link, left
+  **stopped + disabled** with a documented enable-command.
+- Updated the runbook to executed reality; refreshed this report with live evidence.
 
-## What this burn did NOT do (owner-gated, D8)
+## What this burn did NOT do (still owner-gated / out of scope)
 
-- No AppImage copy/install on icarus. No systemd unit installed/started on icarus.
-- No `POST /api/sync/subscribers/issue-token` (no subscriber created; no token issued).
-- No vault seed/rsync to icarus. No backfill. No reboot. No push/merge/deploy/deletion.
-- No daemon source change (would diverge the binary from link's known-good; R1 + owner-gated).
+- Did NOT start or enable the daemon (owner enable step; reboot-proof coordination
+  with the storage burn).
+- Did NOT change the daemon source / diverge the binary from link (R1 + owner verdict 2:
+  R4 dot-dir fix is a v0.4.33 fleet change).
+- Did NOT push/merge/deploy/delete. Did NOT touch PG data beyond creating the one
+  read_only subscriber row the owner authorized (reversible via the DELETE in runbook §2).
 
 ---
 
-## Open decisions flagged for owner
+## Open decisions — RESOLVED by owner (2026-07-19)
 
-1. **Reconcile-direction (blocking).** Resolve trinity's stale-replica mass-push /
-   contested PG before adding icarus, OR enroll icarus PULL-ONLY seeded from link's
-   on-disk vault so it cannot push a divergent view. This is the single biggest gate.
-2. **R4 dot-dir gap (fleet-wide).** Decide whether conflict copies move under a
-   dot-prefixed dir (e.g. `.nexus-conflicts/`) invisible to Obsidian. Affects every
-   host's binary; needs ratification. `test_r8_conflict_visibility.rs` has the spec ready.
-3. **THESEUS blockers.** The 2026-07-19 review says the sync gate is not closeable;
-   enrolling a new subscriber into a mid-incident system compounds it.
-4. **Physical disk for the vault.** R3 says FireCuda 916G; icarus's `/var/home` is
-   nvme1n1p3 (880G free). Confirm the Mainframe copy lands on the intended disk.
-5. **Version-proof field.** The on-disk `config.toml` `daemon_version` is a stale
-   self-report (link shows 0.4.20 while running 0.4.32). Consider having the daemon
-   rewrite it on boot, or drop the field; trust the journal line meanwhile.
+1. **Reconcile-direction** → PULL-ONLY approved (option b). Seeded from link's on-disk
+   copy; server read_only. DONE.
+2. **R4 dot-dir gap** → out of scope tonight; v0.4.33 wave; test left committed. NOTED.
+3. **THESEUS compounding** → resolved by (1); enrollment does not claim P2-E3. NOTED.
+4. **Disk** → FireCuda root `/var/home` (nvme1n1p3, 884G free) confirmed intended;
+   nvme1n1 name is the documented enumeration flip. CONFIRMED.
+5. **Stale `daemon_version`** → note only, trust journal. NOTED.
 
 ---
 
 ## Commits on this branch (this burn)
 
 - `20c87c7` test(icarus): R3 vault_name-synthesis guard + R4/R8 conflict-visibility spec
-- (docs + report committed in the following checkpoint)
+- `9f2461a` docs(icarus): enrollment runbook + config template + BURN_REPORT
+- (leg-1 execution: runbook + report refresh committed in the following checkpoint)
 
 Prior commits `60766af..1e2ee68` are the v0.4.32 fix wave (pre-existing on branch).
