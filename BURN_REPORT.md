@@ -1,166 +1,169 @@
-# BURN_REPORT -- TKT-cc4ede6b / opfix-vaultsync-dormancy
+# BURN_REPORT -- TKT-9d927317 / icarus-vault-sync-subscriber
 
-**Ticket:** TKT-cc4ede6b
-**Burn:** opfix-vaultsync-dormancy
-**Title:** Operation Fix: vault-sync-daemon silent-dormancy auto-recovery
-**Branch (this worktree):** `whetstone/opfix-vaultsync-dormancy` on `/var/home/cyril/projects/vault-sync`
-**Base commit:** `d9bab1d` (vault-sync main)
-**Spec anchor:** `02_Projects/Lattice/lattice-vault-sync/Specifications/2026-05-12 Lattice Vault Sync - Unified Design Spec v1.md`
-**Incident reference:** 2026-06-13 nexus-vault-sync 14h+ silent dormancy
-
----
-
-## Status: parked AWAITING-OWNER
-
-Two dispatcher misconfigurations block the burn from satisfying its full acceptance criteria autonomously. Both are setup-time issues, not work-quality issues. The review, fix code, and regression tests are complete and committed; the owner must clear the blockers before the binary can ship.
-
-### Blockers
-
-**B1. Burn worktree seeded against the wrong repository.**
-The dispatcher created `/var/home/cyril/Burns/TKT-cc4ede6b` as a worktree of `/var/home/cyril/projects/nexus-sync` (the Obsidian plugin distribution repo, single compiled `main.js` plus manifest, no Rust source). The spec anchor and all R1..R5 requirements target the Tauri daemon in `/var/home/cyril/projects/vault-sync` (Rust, `src-tauri/src/`). I created a sibling worktree `/var/home/cyril/Burns/TKT-cc4ede6b-vault-sync` on a same-named branch of the correct repo and did the work there. The owner needs to point the dispatcher at the right repo for future opfix-vaultsync-* burns.
-
-**B2. Build toolchain absent on burn host.**
-`cargo`, `rustc`, and `rustup` are not installed on this host. The burn requires "Self-verify offline (cargo test); paste real output into BURN_REPORT.md." I cannot satisfy that constraint here. The fix is implemented in source; the regression tests are written and structurally red-on-old-code (the `sync_health` module does not exist on the pre-fix tree, so the test file fails to compile). The owner needs to run `cargo test -p vault-sync-daemon sync_health` and `cargo test -p vault-sync-daemon push_client::tests::drain_once_stamps` on a host with Rust installed.
-
-### Owner action (one line)
-
-Verify the fix compiles and tests pass (`cargo test` in `/var/home/cyril/Burns/TKT-cc4ede6b-vault-sync/src-tauri/`), then build + sign + ship the AppImage from this branch and restart `nexus-vault-sync.service`.
+**Ticket:** TKT-9d927317
+**Burn:** icarus-vault-sync-subscriber (Operation Whetstone)
+**Title:** Icarus build-out 5/5: enroll icarus as Nexus Sync subscriber with live Mainframe copy (v0.4.32 fixed daemon ONLY)
+**Branch (this worktree):** `whetstone/icarus-vault-sync-subscriber`
+**Repo:** vault-sync (Tauri/Rust daemon) -- worktree correctly bound (full `src-tauri/src/*.rs` present)
+**Reviewed commit:** `60766af` (v0.4.32 fix wave HEAD); tests added at `20c87c7`
+**Burn host:** link. **Target:** icarus (`cyril@100.70.246.59`).
+**Written:** 2026-07-19 01:38 EDT
+**Spec anchor:** `02_Projects/Nexus/_Children/vault-sync/Specifications/2026-05-20 Nexus Vault Sync - Unified Design Spec v2 - Rule Engine + Scope + BRAT.md`
 
 ---
 
-## R1..R5 Review Table
+## Status: PARKED AWAITING-OWNER (D8 hard gate)
 
-Every row cites real code at the reviewed commit (`d9bab1d`, vault-sync main). File paths are relative to `/var/home/cyril/projects/vault-sync/`.
+The GOAL (icarus becomes a live subscriber) is, by definition, a **deploy +
+subscriber registration + distribution** -- every part of it is on the burn's
+OWNER-GATED list (D8). So this burn did all the REVERSIBLE work (review, runbook,
+config template, regression/guard tests, read-only state capture) and PARKED
+before the irreversible enrollment. icarus was never mutated; only read.
 
-| Req | File:Line evidence (pre-fix HEAD) | Verdict | Evidence |
+Two independent conditions make parking not just procedural but SUBSTANTIVE -- it
+would be unsafe to enroll icarus right now even if D8 allowed it:
+
+1. **Fleet reconcile-direction is contested.** link's v0.4.32 deploy fixed the
+   shadow-key storm but trinity re-detonated a mass-push as a long-offline STALE
+   REPLICA (2326 `push accepted` via the anti-strip / R2-preserve-local path), and
+   link is propagating it (TKT-8a70148c BURN_REPORT; my memory
+   `[[v0432-trinity-vault-name-configdrift]]`). PG is a CONTESTED canonical. A
+   fresh subscriber backfilling from it inherits the contest.
+2. **THESEUS adversarial review (2026-07-19, `vaults-d0ba`)** declares the Nexus
+   Sync gate NOT closeable: six active conflict artifacts remain
+   (incl. `CLAUDE.conflict-from-*`), live link reconcile logs `requested=2 pulled=0`
+   with failures yet FALSELY reports files_in_sync, long-path/response-decode pulls
+   fail persistently.
+
+**Owner action (one line):** Clear the reconcile-direction + THESEUS blockers (or
+decide icarus enrolls PULL-ONLY seeded from link's on-disk vault, not PG), then run
+`docs/icarus-vault-sync-runbook.md` sections 1-6; STOP on any icarus-attributed conflict.
+
+---
+
+## Requirement Review Table
+
+Every row cites real code/config/state at the reviewed commit. "GAP" = does not
+conform; "PREP" = reversible prep complete, live execution owner-gated; "UNVERIFIED"
+= cannot verify without the owner-gated enrollment.
+
+| Req | Evidence (file:line / command) | Verdict | Notes |
 |---|---|---|---|
-| **R1** Liveness vs progress; pending diffs + no progress = UNHEALTHY | `src-tauri/src/tray_state.rs:60-65, 75, 162-165, 181-187`; `src-tauri/src/push_client.rs:243-302`; `src-tauri/src/lib.rs:262-273` | **GAP** | `TrayState.last_event_at` tracks SSE/FS event arrival only; `TrayState.uploads_last_at` tracks last push attempt timestamp but NO code compares `uploads_pending > 0` against staleness of `uploads_last_at` to declare a stall. The updater path at `lib.rs:262-273` reads these for restart-on-idle gating, NOT for dormancy detection. `push_client.drain_once` (push_client.rs:290-300) updates `uploads_pending` after each drain but does not stamp a "I just made progress" timestamp anywhere reachable by a watchdog. The shadow store (`sync_shadow.rs`) records per-file hashes but has no global "last push activity" notion. Conclusion: liveness and progress are NOT distinguished. |
-| **R2** Auto-recovery on progress-stall, NOT silent log line | `src-tauri/src/lib.rs:947-989` (redflag monitor); `src-tauri/src/lib.rs:188-211` (should_restart_now, staged-update path only); `src-tauri/src/lib.rs:39-43` (notify_user, only fired on startup failures) | **GAP** | The only auto-restart logic is `should_restart_now` calling `app.restart()` (lib.rs:284-285) and it gates exclusively on `update_staged` (lib.rs:198-200). The redflag monitor (lib.rs:967-968) explicitly logs `"redflag.md removed; tray cleared. Restart daemon to resume sync."` -- manual restart, no recovery. `notify_user` is called for startup failures (lib.rs:383-387, 415-419, 736-741, 753-757, 765-769, 783-787, 868-873, 901-906, 925-933, 937-942) but never for runtime stall detection because no detector exists. Conclusion: recovery is manual; no visible owner-facing alert on stall. |
-| **R3** sync-health-monitor verifies PROGRESS, not process liveness | `src-tauri/src/lib.rs:546-562` (60s conflict refresh); `src-tauri/src/lib.rs:981-989` (60s redflag monitor); `src-tauri/src/reconciliation.rs:282-329` (recon backstop); `src-tauri/src/lib.rs:217-296` (auto-updater 5min loop) | **GAP** | None of the four long-running tasks above check push-pipeline progress. The conflict-refresh task scans on-disk stash siblings. The redflag monitor checks for `redflag.md`. The reconciliation backstop runs a full verify_repair every 10min but does NOT compare its last-run timestamp against expected cadence to detect "I have not run in N minutes despite pending diffs." The auto-updater literally ticks every 5 minutes (lib.rs:222 `CHECK_INTERVAL: Duration = Duration::from_secs(300)`) regardless of sync state -- this is the task that kept logging during the 14h dormancy. No external `sync-health-monitor` exists in this repo (verified via repository-wide grep). Conclusion: no in-process health monitor verifies push progress. |
-| **R4** Root cause: engine quiet while updater ticks (panicked task does not crash process) | `src-tauri/src/lib.rs:818-822` (push_client spawn, no panic catch); `src-tauri/src/lib.rs:546-562` (conflict refresh spawn, no panic catch); `src-tauri/src/lib.rs:982-988` (redflag monitor spawn, no panic catch); `src-tauri/src/lib.rs:226-295` (auto-updater spawn) | **GAP** | Every `tauri::async_runtime::spawn(async move { ... })` site at lib.rs:226, 552, 818, 982 is unawaited -- a panic inside any of these futures is captured silently in the `JoinHandle` and never observed. The push_client spawn at lib.rs:821 even contains a `tracing::warn!("push_client.run_loop returned (unexpected for a forever loop)")` line that fires ONLY on clean return; a panic skips this line entirely (the warn lives AFTER the awaited run_loop call). The auto-updater task is structurally independent (its own spawn) so it keeps ticking when the push_client task dies. This is exactly the 2026-06-13 symptom shape. Conclusion: engine can silently die while process stays up. |
-| **R5** No pending edit lost during stall/recovery; change detection on content hash, never mtime alone | `src-tauri/src/file_watcher.rs:476, 503, 546` (sha256 on Create/Modify/Rename); `src-tauri/src/file_watcher.rs:910-914` plus test at `1532-1551` (Modify(Metadata(_)) dropped); `src-tauri/src/push_journal.rs` (jsonl append-only, survives restart); `src-tauri/src/sync_shadow.rs:89-99` (per-file hash markers, persisted) | **CONFORMS** | `FileWatcher::to_push_event` computes `content_sha: sha256_hex(&bytes)` for every Create/Modify/Rename. The classify path drops `Modify(Metadata(_))` events -- i.e. atime/mtime/permission/ownership-only changes are filtered out (confirmed by test `is_mutating_kind_drops_access_and_metadata` at file_watcher.rs:1532-1551). The push journal is jsonl-append-only and persisted; a daemon restart re-reads pending events. The shadow store keys on hash, not mtime. Conclusion: compliant. Any fix MUST preserve this; the watchdog's recovery action is `app.restart()` which re-opens the same on-disk journal, so no pending edit is lost. |
-
-### Net pre-fix state
-
-R1, R2, R3, R4 all GAP. R5 conforms and the fix preserves it. The four GAPs are coupled: a watchdog that observes pending diffs + no progress timestamp (R1+R3) + acts via `app.restart()` (R2) + indirectly catches panicked spawn tasks because they stop stamping progress (R4) closes all four with one mechanism.
+| **R1** Mirror link's known-good v0.4.32 install | link: `~/.config/systemd/user/nexus-vault-sync.service` (user unit) + `.d/10-desktop-env.conf`; binary `/home/cyril/Applications/Nexus-Vault-Sync.AppImage` (84384248 B, sha256 `8a305ee8...`, mtime Jul 18 15:50); config `~/.config/nexus-vault-sync/config.toml`; `src-tauri/Cargo.toml:3` version="0.4.32"; `tauri.conf.json` version 0.4.32 | **PREP / CONFORMS** | Full parity table + exact-artifact copy (NOT `install.sh` latest-tag) in runbook s1. Version proof = journal `version="0.4.32"`; on-disk `daemon_version` field is a stale self-report ("0.4.20" on link) and must not be trusted. |
+| **R2** Subscriber registration via server API; token -> 0600 config only | endpoint `POST /api/sync/subscribers/issue-token`; admin key name `NEXUS_API_KEY` present in `~/whetstone/.env` (name only, value not read); token path `token_store.rs:115-118` (`token-<subscriber_id>.bin`), mode `token_store.rs:123-133` `set_mode(0o600)`; pairing `pairing.rs:46-68` | **PREP** | Executing the POST mutates server state = owner-gated. Runbook s2 has the exact command (names only). link layout confirms design: `config.toml` 0644 (no secret) + `token-*.bin` 0600. |
+| **R3** Vault target `/var/home/cyril/vaults/Mainframe`; backfill rails; STOP on conflict mint | icarus read-only: vault ABSENT, `/var/home` nvme1n1p3 930G/880G free; footgun `config.rs:119-137` (empty sync_roots + no vault_name -> bare-parent root); test `test_r3_vault_name_synthesis.rs` | **PREP** | Space ample (R3 said FireCuda 916G; actual nvme1n1p3 880G free -- confirm intended disk). vault_name=Mainframe MANDATORY (footgun locked by 3 passing tests). Backfill rails + before/during/after capture in runbook s4. Backfill is live-only -> owner-gated. |
+| **R4/R8** Conflict/temp/quarantine material under dot-prefixed dirs invisible to Obsidian | `conflict_stash.rs:264-278` writes `<vault_root>/<dir>/<stem>.conflict-from-<device>-<lsn>.md` (VISIBLE sibling `.md`); `test_r8_conflict_visibility.rs` characterizes + `#[ignore]`d R4 spec fails on current code | **GAP** | v0.4.32 conflict copies are VISIBLE in Obsidian. THESEUS flagged these exact `CLAUDE.conflict-from-*` artifacts. Fix is fleet-wide (diverges every host's binary) + owner-gated -> NOT made in this burn. Config lines that would honor R4: none exist; there is no dot-dir stash option. Temp files: `NamedTempFile` in note dir, atomic-renamed; daemon state lives outside vault under `~/.config`/`~/.local`. |
+| **R5** Completion proof (file-count/tree parity, sha256 20/20, SYNC-VERIFY canary, reboot survival) | procedures in runbook s6; acceptance verify-cmd output below | **UNVERIFIED** | All five proofs require the enrolled daemon + populated vault, both owner-gated. Reproducible commands provided. Cannot be produced by a parked burn. |
+| **R6** Heavy self-documentation runbook + proposed icarus.md / Memory-Vault-Pairing updates | `docs/icarus-vault-sync-runbook.md`; `docs/icarus-config.toml.example`; drafts in runbook s8 | **CONFORMS** | Install steps, token issuance (names only), backfill timeline/metrics template, rails/rollback, parity evidence, morning follow-up drafts all present. |
 
 ---
 
-## Fix
+## Self-verify output (real, pasted)
 
-One new module plus small wire-up in three existing files. Committed on this branch.
-
-### New: `src-tauri/src/sync_health.rs`
-
-- `SyncHealth` (Arc-shared, lock-free atomic counter): `mark_progress()` from the push hot path; `secs_since_progress()` from the watchdog.
-- `is_stalled(pending, secs_since_progress, threshold_secs) -> bool` -- pure decision, `pending > 0 && secs_since_progress >= threshold_secs`. Extracted as `pub fn` for boundary tests.
-- `read_threshold(env)` / `is_recovery_disabled(env)` reuse the `EnvReader` + `MapEnv` trait already defined by `reconciliation.rs` (so tests don't touch process env).
-- `spawn_progress_stall_watchdog(...)` -- 60s tick; pending closure is async (production wires it to the `tokio::sync::Mutex<PushJournal>` lock); on a fired stall calls `on_stall(event)` which the production wiring builds to `tracing::error!` + `app.emit("sync_stalled", ...)` + `notify_user(...)` + `app.restart()`. Tunables: `VAULT_SYNC_STALL_THRESHOLD_SECS` (default 900) and `VAULT_SYNC_DISABLE_STALL_WATCHDOG`.
-
-### Changed: `src-tauri/src/push_client.rs`
-
-- New field `sync_health: Option<Arc<SyncHealth>>` on `PushClient`.
-- New builder `with_sync_health(...)`.
-- In `drain_once`, after the post-drain pending snapshot: stamp `mark_progress()` if the loop processed at least one event OR the journal is now empty (the "caught up" case, so a healthy idle daemon does not look stalled).
-
-### Changed: `src-tauri/src/lib.rs`
-
-- `pub mod sync_health;` registered alphabetically between `sse` and `sync_shadow`.
-- `let sync_health = sync_health::SyncHealth::new();` created once per daemon, shared across all sync_roots.
-- Threaded into `spawn_push_pipeline(..., sync_health)` and onto the PushClient via `.with_sync_health(...)`.
-- After the push-loop spawn, `spawn_progress_stall_watchdog(...)` is started with: 60s tick, env-configured threshold, env-configured kill switch, async pending closure that locks the journal and reads `len()`, and an on-stall closure that emits the `sync_stalled` Tauri event, calls `notify_user(...)`, and calls `app.restart()` to bring up a fresh process with healthy tasks.
-
-### Changed: `src-tauri/Cargo.toml`
-
-- Added `tokio = { version = "1", features = ["test-util"] }` to `[dev-dependencies]` so `tokio::time::advance` + `start_paused = true` are available for the deterministic watchdog tests. Cargo unifies features across normal+dev so this lights up `test-util` for the test build only.
-
-### Why `app.restart()` is the right recovery primitive
-
-Re-spawning the panicked task in place would require restructuring the spawn site (a `loop { spawn_run_loop().await; tracing::error!("re-spawning"); }` wrapper). That works for explicit task panics but does NOT help for a deadlock inside the task. A full `app.restart()` re-initializes every spawned task from a known-good state and re-opens the persistent push journal, losing zero pending edits (jsonl-append-only). The same primitive is used by the staged-update apply path (lib.rs:284-285), so it is already proven on the production tray-resident daemon. The cost is a few seconds of downtime per detected stall, far cheaper than 14h.
-
-### What the fix does NOT change
-
-- `file_watcher.rs` content-hash logic (R5 stays compliant).
-- `push_journal.rs` persistence (pending edits survive the restart).
-- `sync_shadow.rs` per-file markers (no change to direction-decision logic).
-- The auto-updater path (`spawn_updater_check`), left untouched; the watchdog operates alongside it.
-
----
-
-## Regression tests
-
-All test methods listed below sit on the burn branch and would FAIL on `main` (commit `d9bab1d`) because the `sync_health` module + `with_sync_health` builder do not exist there. The test files do not compile against pre-fix HEAD.
-
-### `src-tauri/src/sync_health.rs` (#[cfg(test)] mod tests)
-
-- `regression_2026_06_13_pending_with_14h_no_progress_is_stalled` -- the canonical scenario: 80 pending pushes, 14h since last progress, default 900s threshold -> MUST trip. Pre-fix has no `is_stalled` fn at all.
-- `is_stalled_false_when_zero_pending_no_matter_the_idle_window` -- R1 boundary: idle != dormant.
-- `is_stalled_false_when_recent_progress_with_pending` -- R1 healthy.
-- `is_stalled_true_at_exact_threshold` -- pins the `>=` boundary (not `>`).
-- `is_stalled_false_just_below_threshold` -- counter-boundary.
-- `mark_progress_resets_secs_since_progress` -- stamping path.
-- `read_threshold_defaults_when_env_missing` / `_uses_env_when_valid` / `_falls_back_on_zero` / `_falls_back_on_malformed` -- env reader.
-- `is_recovery_disabled_*` -- kill-switch parsing.
-- `watchdog_fires_on_stall` -- end-to-end with `tokio::time::advance`: spawn the watchdog, pending_fn returns 5, threshold = 0s, on_stall must fire exactly once.
-- `watchdog_does_not_fire_when_no_pending` -- counter-test: pending_fn returns 0, on_stall must NOT fire across 5 virtual ticks.
-
-### `src-tauri/src/push_client.rs` (#[cfg(test)] mod tests)
-
-- `drain_once_stamps_sync_health_progress_when_events_processed` -- exercises the production wiring `PushClient::with_sync_health(...).drain_once()`. Sleeps 2.1s to make elapsed-since-start observably nonzero (SyncHealth uses `std::time::Instant`, not tokio's virtual clock), drains a substrate-refused event, asserts `secs_since_progress() < 1` after the drain (proving the stamp landed).
-- `drain_once_stamps_progress_on_caught_up_empty_journal` -- gate semantics: an empty journal at end-of-drain IS a "caught up" signal and stamps too (so a healthy idle daemon never looks dormant).
-
-### How to verify (cannot self-verify on this host, see B2)
-
+**Acceptance verify-cmd (exact ticket command, read-only against icarus):**
 ```
-cd /var/home/cyril/Burns/TKT-cc4ede6b-vault-sync/src-tauri
-
-# 1. Tests compile and pass on the fix branch:
-cargo test -p vault-sync-daemon sync_health
-cargo test -p vault-sync-daemon push_client::tests::drain_once_stamps
-
-# 2. Confirm RED on old code (the tests do not compile against d9bab1d):
-git stash
-git checkout main
-cargo test -p vault-sync-daemon sync_health
-#   expected: error[E0432]: unresolved import `crate::sync_health`
-#   or similar -- pre-fix has no module.
-git checkout whetstone/opfix-vaultsync-dormancy
-git stash pop
+$ ssh -o BatchMode=yes -o ConnectTimeout=8 cyril@100.70.246.59 \
+    'systemctl is-active nexus-vault-sync 2>/dev/null || systemctl --user is-active nexus-vault-sync; \
+     test -d /var/home/cyril/vaults/Mainframe/02_Projects && echo VAULT_PRESENT || echo VAULT_ABSENT'
+inactive
+inactive
+VAULT_ABSENT
 ```
+Interpretation: RED, and CORRECTLY so -- daemon not active, vault not present,
+because enrollment is owner-gated and was not executed. This line goes GREEN only
+after the owner runs the runbook.
+
+**icarus full read-only state (burn time):**
+```
+HOST=icarus ; daemon-not-active ; VAULT_ABSENT ; no-appimage
+/dev/nvme1n1p3  930G  49G  880G  6%  /var/home
+~/.config/systemd/user writable: yes
+```
+
+**Regression/guard tests (verified GREEN offline on link):**
+The full worktree crate does not build on link: `keyring` (feature
+`sync-secret-service`) pulls `libdbus-sys`, whose build.rs needs `dbus-1` dev
+headers; only the runtime `libdbus-1.so.3` is present (`pkg-config --exists dbus-1`
+= MISSING, no `/usr/include/dbus-1.0`). The two modules under test
+(`config`, `conflict_stash`) have zero keyring/dbus deps, so they were verified via
+a path-include scratch crate (`/tmp/vs-scratch`, lib name `vault_sync_daemon`,
+same source files, no worktree Cargo.toml change):
+```
+running 34 tests   (config + conflict_stash inline tests)
+test result: ok. 34 passed; 0 failed; 0 ignored
+     Running tests/test_r3_vault_name_synthesis.rs
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored
+     Running tests/test_r8_conflict_visibility.rs
+running 2 tests
+test result: ok. 1 passed; 0 failed; 1 ignored
+```
+R4 desired-state spec fails on current code (executable record of the gap):
+```
+$ cargo test --test test_r8_conflict_visibility -- --ignored
+test r4_conflict_material_must_live_under_dot_prefixed_dir ... FAILED
+  R4: conflict material must live under a dot-prefixed dir invisible to Obsidian;
+  got "02_Projects/Foo/Note.conflict-from-icarus-42.md"
+test result: FAILED. 0 passed; 1 failed
+```
+`rustfmt --check` clean on both new test files. In the real worktree these
+compile once `dbus-1` dev headers exist (owner/CI); they reference only
+`vault_sync_daemon::config` and `::conflict_stash`, which exist unchanged.
 
 ---
 
 ## Acceptance checklist
 
-| Item | Status | Where |
+| Acceptance item | State | Evidence |
 |---|---|---|
-| BURN_REPORT.md at worktree root | DONE | This file (also copied to nexus-sync TKT- worktree) |
-| Review row per R1..R5 with file:line evidence at reviewed commit | DONE | Table above (against `d9bab1d`) |
-| Regression test reproducing the silent-dormancy stall | DONE | `sync_health::tests::regression_2026_06_13_pending_with_14h_no_progress_is_stalled` + watchdog end-to-end tests + push_client stamp integration tests |
-| Test red on old code, green after fix | DONE (structural red-on-old) | Tests reference modules/builders absent on pre-fix HEAD, they do not compile against `main` |
-| Local build + test output pasted | **BLOCKED** | B2: cargo not installed on burn host; owner runs `cargo test` per the snippet above |
-| No push | OK | No git push performed |
-| No deploy | OK | OWNER-GATED steps (build, sign, distribute AppImage, restart service) NOT executed |
-| Parked awaiting-owner with branch + report ready | DONE | This report; both branches committed |
-| One-line owner action | DONE | Above, "Verify with cargo test, then build/sign/ship AppImage" |
-| No em-dashes in things I authored | OK | BURN_REPORT prose uses hyphen-minus (the "--" characters in the review table are from quoted source comments and identifier displays, not freshly-authored prose) |
+| verify-cmd green (daemon active + vault present) | **RED (expected, owner-gated)** | Pasted above; goes green after runbook run |
+| v0.4.32 version proof pasted | **DONE (artifact-level)** | Cargo.toml/tauri.conf 0.4.32; link AppImage sha256 `8a305ee8...`; journal-version method documented (runtime proof = post-enrollment) |
+| zero icarus-attributed conflict files during backfill (measured) | **UNVERIFIED** | No backfill run (owner-gated); rails + baseline (`*.conflict-from-icarus-*.md` count) in runbook s4 |
+| sha256 spot-parity 20/20 | **UNVERIFIED** | Procedure in runbook s6; needs populated vault |
+| R8 dot-dir compliance shown | **GAP SHOWN** | conflict_stash.rs:264-278 + failing R4 spec test; config lines that would honor R4 do not exist |
+| survived reboot | **UNVERIFIED** | Procedure in runbook s6 |
+| token never exposed | **DONE** | No token issued/read; only key/subscriber NAMES appear in repo/report |
+
+---
+
+## What this burn built
+
+- `docs/icarus-vault-sync-runbook.md` -- full owner-executable enrollment runbook (R6): stop-gate, install parity, token issuance (names only), vault seed, backfill rails, R4 gap, completion proofs, rollback table, morning follow-up drafts.
+- `docs/icarus-config.toml.example` -- chmod-644 config template mirroring link's shape with icarus identity + mandatory `vault_name`; token stays in a separate 0600 file.
+- `src-tauri/tests/test_r3_vault_name_synthesis.rs` -- 3 guard tests locking the vault_name -> sync-root synthesis (the mass-push footgun).
+- `src-tauri/tests/test_r8_conflict_visibility.rs` -- characterization of the visible-sibling conflict copy + an `#[ignore]`d R4 spec that fails on current code.
+- Read-only ground-truth capture of link (known-good install) and icarus (clean slate).
+
+## What this burn did NOT do (owner-gated, D8)
+
+- No AppImage copy/install on icarus. No systemd unit installed/started on icarus.
+- No `POST /api/sync/subscribers/issue-token` (no subscriber created; no token issued).
+- No vault seed/rsync to icarus. No backfill. No reboot. No push/merge/deploy/deletion.
+- No daemon source change (would diverge the binary from link's known-good; R1 + owner-gated).
 
 ---
 
 ## Open decisions flagged for owner
 
-1. **Dispatcher repo-binding bug.** The TKT-cc4ede6b worktree is bound to `nexus-sync` not `vault-sync`. Future opfix-vaultsync-* burns will hit the same mis-seeding unless the dispatcher routing is corrected. The vault note's spec anchor and the burn description both already point at the right place; the dispatcher seed lookup is what is off.
-
-2. **Stall threshold default.** I chose 900s (15 min). Aggressive enough to catch the 14h incident inside its first quarter-hour, conservative enough that a host doing one very large push will not false-positive. The env var override is `VAULT_SYNC_STALL_THRESHOLD_SECS`. The owner may want to set this lower on the live host while we accumulate experience (e.g. `VAULT_SYNC_STALL_THRESHOLD_SECS=600`).
-
-3. **Recovery primitive choice (`app.restart()`).** Alternative: a finer-grained `respawn_push_pipeline()` that does not kill the SSE consumer / tray. I chose the full restart for two reasons: (a) the staged-update path already uses it, so it is proven; (b) the failure mode the watchdog catches is "spawn task panicked" which can include any of the daemon's spawned futures -- a full restart re-arms ALL of them deterministically. If the owner prefers in-process recovery for non-critical stalls, the watchdog's `on_stall` closure is the only thing to change.
-
-4. **`sync_stalled` Tauri event payload.** I emit `{ pending, secs_since_progress, subscriber_id }`. The wizard may want to render this as a banner. No wizard changes were made; the event is emitted and the wizard's existing event handlers can pick it up (the wizard already handles `inotify_limit_exceeded`, same pattern).
-
-5. **Multi-root semantics.** Each sync_root spawns its own watchdog instance via `spawn_push_pipeline`. They all share the SAME `SyncHealth` Arc, so any root's progress counts as "the pipeline is alive". This is correct under "the daemon process is healthy iff at least one root is making progress". An alternative is per-root SyncHealth so one stalled root trips even if another root is busy. The current implementation is simpler and matches the 2026-06-13 incident shape (whole-process dormancy). If per-root granularity is needed, refactor SyncHealth to a HashMap keyed by subscriber_id.
+1. **Reconcile-direction (blocking).** Resolve trinity's stale-replica mass-push /
+   contested PG before adding icarus, OR enroll icarus PULL-ONLY seeded from link's
+   on-disk vault so it cannot push a divergent view. This is the single biggest gate.
+2. **R4 dot-dir gap (fleet-wide).** Decide whether conflict copies move under a
+   dot-prefixed dir (e.g. `.nexus-conflicts/`) invisible to Obsidian. Affects every
+   host's binary; needs ratification. `test_r8_conflict_visibility.rs` has the spec ready.
+3. **THESEUS blockers.** The 2026-07-19 review says the sync gate is not closeable;
+   enrolling a new subscriber into a mid-incident system compounds it.
+4. **Physical disk for the vault.** R3 says FireCuda 916G; icarus's `/var/home` is
+   nvme1n1p3 (880G free). Confirm the Mainframe copy lands on the intended disk.
+5. **Version-proof field.** The on-disk `config.toml` `daemon_version` is a stale
+   self-report (link shows 0.4.20 while running 0.4.32). Consider having the daemon
+   rewrite it on boot, or drop the field; trust the journal line meanwhile.
 
 ---
 
-## Commits on this branch
+## Commits on this branch (this burn)
 
-See `git log main..HEAD` on `whetstone/opfix-vaultsync-dormancy` in `/var/home/cyril/projects/vault-sync`.
+- `20c87c7` test(icarus): R3 vault_name-synthesis guard + R4/R8 conflict-visibility spec
+- (docs + report committed in the following checkpoint)
+
+Prior commits `60766af..1e2ee68` are the v0.4.32 fix wave (pre-existing on branch).

@@ -1,0 +1,34 @@
+# Nexus Vault Sync -- icarus subscriber config TEMPLATE (TKT-9d927317)
+# Target on-disk path: ~/.config/nexus-vault-sync/config.toml   (mode 0644, NO secret)
+#
+# This mirrors link's known-good v0.4.32 config SHAPE (R1) with icarus identity.
+# The bearer token NEVER lives here; it lands in a SEPARATE 0600 file:
+#     ~/.config/nexus-vault-sync/token-<subscriber_id>.bin   (mode 0600)
+# written by the daemon's pairing flow (token_store.rs:115-133, set_mode(0o600)).
+#
+# CRITICAL (R3 footgun -- see test_r3_vault_name_synthesis.rs):
+#   `vault_name` is MANDATORY. With sync_roots empty AND vault_name absent, the
+#   daemon synthesizes a sync root at the BARE PARENT `vaults_root` and will
+#   push a divergent view of the whole parent tree to PG (the link/trinity
+#   mass-push shape, TKT-86ae42a3 / TKT-8a70148c). Keep vault_name = "Mainframe".
+
+nexus_url = "https://nexus.obsidian-inc.com"
+
+# ISSUED BY THE SERVER at enrollment (R2). This is icarus's OWN subscriber id
+# from POST /api/sync/subscribers/issue-token -- NOT link's
+# (a6f8219e-2fcb-4a9a-a2c6-0d3471919d1c). Placeholder below; replace on issue.
+subscriber_id = "REPLACE-WITH-ICARUS-SUBSCRIBER-ID"
+
+# On Fedora Atomic, /home/cyril -> /var/home/cyril (symlink), so this resolves
+# to /var/home/cyril/vaults, matching R3's target /var/home/cyril/vaults/Mainframe.
+vaults_root = "/home/cyril/vaults"
+
+# MANDATORY -- do not remove (footgun above).
+vault_name = "Mainframe"
+
+daemon_version = "0.4.32"
+daemon_platform = "linux-x86_64"
+
+# Leave empty: back-compat synthesis (config.rs:119-137) builds
+# SyncRoot { path = vaults_root/vault_name = /var/home/cyril/vaults/Mainframe }.
+sync_roots = []
