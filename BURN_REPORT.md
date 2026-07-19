@@ -81,3 +81,108 @@ enriched_body: str           content_hash: str
 - Other `.json().await?` decode sites are left as-is; `decode_json` is available for later adoption. Only `fetch_note` (the reviewed AR-009 path) was rerouted, to keep the sync-daemon blast radius minimal.
 
 ---
+
+## Verification (R4)
+
+### Build environment
+
+The link host is bootc-immutable and has no `-devel` headers (dbus/gtk/webkit) for a native `cargo` build. The full daemon test suite was built and run inside the existing `insync-box` distrobox (Ubuntu 26.04, which ships `libdbus-1-dev`/`libgtk-3-dev`/`libwebkit2gtk-4.1-dev`/`libsoup-3.0-dev`) sharing `$HOME`, so the same `~/.cargo` rustc 1.97.1 toolchain and `target/` are reused. No system package was installed on the host; no daemon was restarted.
+
+### New tests pass on the fix branch (full suite, distrobox)
+
+```
+Running unittests src/lib.rs
+test result: ok. 441 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 5.05s
+Running unittests src/main.rs
+test result: ok. 13 passed; 0 failed; ...
+Running tests/test_alignment_pull.rs   test result: ok. 7 passed; 0 failed
+Running tests/test_api_client.rs       test result: ok. 7 passed; 0 failed
+Running tests/test_b1_alternation.rs   test result: ok. 2 passed; 0 failed
+Running tests/test_config.rs           test result: ok. 3 passed; 0 failed
+Running tests/test_keyring.rs          test result: ok. 3 passed; 0 failed
+Running tests/test_materializer_write.rs test result: ok. 7 passed; 0 failed
+Running tests/test_pairing.rs          test result: ok. 4 passed; 0 failed
+Running tests/test_scope.rs            test result: ok. 13 passed; 0 failed
+Running tests/test_sse.rs              test result: ok. 4 passed; 0 failed; 2 ignored
+```
+
+`cargo clippy --all-targets -- -D warnings` also passes clean (the strict gate CI enforces). Pre-fix baseline was 420 lib tests; the +21 new tests bring lib to 441. New tests added:
+
+- **AR-008** (`conflict_stash.rs`): `regression_ar008_long_x_note_path_stashes_length_safe` (exact live X-note path), `stash_filename_length_safe_linux_bytes`, `stash_filename_length_safe_macos_windows_utf16`, `stash_filename_short_names_unchanged_no_manifest`, `ar008_long_path_stash_is_still_idempotent`.
+- **AR-009** (`tests/test_api_client.rs`): `regression_ar009_daily_note_null_modified_decodes` (exact live Daily path, `modified: null`), `ar009_json_decode_failure_is_diagnosable_and_leak_free`, `ar009_non_json_decode_attaches_bounded_sample`.
+- **AR-003** (`verify_repair.rs`): `regression_ar003_failed_pull_is_red_not_false_green` (e2e: a failed pull -> RED + ledger), `ar003_no_materializer_drift_is_deferred_and_red`, `classify_pull_outcome_table`, `report_cycle_red_semantics`.
+- **Retry ledger** (`retry_ledger.rs`): `record_and_clear_roundtrip`, `repeated_failures_increment_attempts_preserve_first_ts`, `state_is_durable_across_reload`, `corrupt_file_loads_as_empty_not_error`, `error_string_is_capped`.
+
+### Regressions FAIL on v0.4.32 code (red-on-old)
+
+The AR-008 and AR-003 regressions are `#[cfg(test)]`-inline (they travel with the impl), so red-on-old was demonstrated by compiling the NEW test functions against a pristine `git worktree` at `60766af` (v0.4.32). The tests exercise symbols and behavior that do not exist pre-fix, so the old tree fails to compile them (a strictly stronger failure than an assertion miss). Extracted verbatim and compiled against the old sources (`git worktree add --detach /tmp/vsync-old 60766af`, new tests injected, `cargo test --no-run`):
+
+```
+# AR-008 (conflict_stash inline) + AR-003 (verify_repair inline) + retry_ledger, against v0.4.32:
+error[E0433]: cannot find `retry_ledger` in `crate`
+error[E0425]: cannot find value `STASH_BASENAME_MAX` in this scope        (x5)
+error[E0425]: cannot find function `basename_fits` in this scope
+error[E0425]: cannot find function `build_stash_filename` in this scope   (x3)
+error[E0599]: no associated function or constant named `MANIFEST_RELPATH` found for struct `ConflictStash`  (x2)
+error[E0425]: cannot find function `classify_pull_outcome` in this scope   (x5)
+error[E0433]: cannot find type `PullResultClass` in this scope            (x5)
+error[E0599]: no method named `cycle_red` found for struct `VerifyRepairReport`  (x5)
+error[E0599]: no method named `soak_eligible` found for struct `VerifyRepairReport`
+error[E0609]: no field `pulls_attempted`/`pulls_succeeded`/`pulls_failed`/`pulls_deferred`/`still_divergent` on `VerifyRepairReport`
+error[E0599]: no method named `with_retry_ledger` found for struct `VerifyRepair`
+
+# AR-009 (tests/test_api_client.rs) against v0.4.32 (pristine lib):
+error[E0599]: no method named `is_none` found for struct `std::string::String`   <- proves `modified` was `String`, so `modified: null` cannot decode
+error[E0599]: no variant named `Decode` found for enum `ApiError`   (x2)          <- proves decode diagnosability absent
+error: could not compile `vault-sync-daemon` (test "test_api_client") due to 3 previous errors
+```
+
+Mapping (each error proves a specific regression cannot pass on v0.4.32):
+- `ApiError::Decode` absent -> AR-009 diagnosability tests cannot compile/pass.
+- `NotePayload.modified` is `String` -> the `modified: null` note still fails to decode.
+- `build_stash_filename` / `basename_fits` / `STASH_BASENAME_MAX` / `ConflictStash::MANIFEST_RELPATH` absent -> AR-008 tests cannot compile; the long path still hits ENAMETOOLONG.
+- `PullResultClass` / `classify_pull_outcome` / report fields `pulls_failed`/`still_divergent` / `cycle_red()` / `with_retry_ledger` / module `retry_ledger` absent -> AR-003 tests cannot compile; the cycle still reports false green.
+
+---
+
+## Acceptance checklist
+
+| Item | Status | Evidence |
+|---|---|---|
+| Both live defects reproduced from journal evidence PRE-edit | DONE | Journal block above (00:58 cycle + AR-009 live-server field dump) |
+| AR-008 fix: hash-bounded stash name + manifest | DONE | `conflict_stash.rs` `build_stash_filename` + `record_stash_manifest` |
+| AR-009 fix: diagnosable decode + contract + hash-verify gate | DONE | `api_client.rs` `ApiError::Decode`/`decode_json`, `modified: Option`; materializer integrity check unchanged |
+| AR-003 fix: attempted/succeeded/failed/deferred/still-divergent + RED + durable retry | DONE | `verify_repair.rs` report fields + `classify_pull_outcome`; `reconciliation.rs` summary; `retry_ledger.rs` |
+| Regression fixtures use EXACT live failing paths | DONE | Daily path + X-note path embedded verbatim in tests |
+| Regressions fail on old code | DONE | Red-on-old compile output above |
+| Full daemon test suite + regressions pass, output pasted | DONE | 441 lib + all integration green (above) |
+| No deploy / no daemon restart / no version-bump ship | HELD | Live daemon PID 1310111 untouched; no `install.sh`/service action; `CARGO_PKG_VERSION` NOT bumped (still 0.4.32 in-tree) |
+| No push / no merge | HELD | Work committed to `whetstone/vaultsync-pull-defect-pair` only |
+| BURN_REPORT at worktree root | DONE | This file |
+| No em-dashes in authored prose | OK | Hyphen-minus only in my prose |
+
+---
+
+## Open decisions flagged for the owner
+
+1. **Version bump deferred (R5).** The in-tree `Cargo.toml` version is still `0.4.32`. Per R5 this burn does NOT bump to `0.4.33` or ship. When the owner decides to cut the v0.4.33 candidate, bump `[package].version` and build/sign/distribute as a separate, lease-gated step after the icarus/fleet picture settles.
+2. **`decode_json` adoption breadth.** I rerouted only `fetch_note` (the reviewed AR-009 path). `get_changes`, `reconcile_batch`, and the push/health decodes still use `.json().await?` and would surface the same opaque error if THEY ever fail to decode. Low-risk follow-up: route them through `decode_json` too. Left out here to keep the sync-daemon blast radius minimal.
+3. **Retry ledger consumers.** The ledger is written and logged (`retry_ledger_pending=N` in the summary) but no tray/Conductor surface reads it yet. AR-014 (health tiers) is the natural consumer; wiring it to the tray "still-divergent" badge is a Burn D item.
+4. **Stash manifest + the AR-007 cleanup burn.** My AR-008 fix writes `<vault_root>/.sync-conflict-stash-manifest.jsonl` at RUN time (only once deployed). The sibling burn TKT-af36918a (AR-007) is consolidating conflict artifacts into `.sync-quarantine/`. The manifest path is dot-prefixed and Obsidian-invisible, consistent with that burn's R8 convention; if the owner wants a single quarantine root, point `MANIFEST_RELPATH` under `.sync-quarantine/` before deploy. No conflict at delivery time (this burn wrote nothing to the live vault).
+5. **P2-E3 soak semantics.** `cycle_red()`/`soak_eligible()` give the honest per-cycle signal the receipt schema needs, but this burn does NOT wire the three-consecutive-clean-cycle counter (that is Burn D). A soak counter must read `soak_eligible()` and reset on any RED cycle.
+
+---
+
+## Commits on this branch
+
+```
+b930078 docs(burn): pre-edit review table + live journal reproduction
+19d3115 fix(sync): v0.4.33 candidate - AR-008 / AR-009 / AR-003 (+ regressions)
+HEAD    fix(sync): box ApiError::Decode, clippy -D warnings clean, em-dash cleanup, finalize report
+```
+Run `git log --oneline 60766af..HEAD` on this branch for exact hashes.
+
+## Coordination note
+
+The THESEUS review (vaults-d0ba, Pi/GPT-5.6) that seeded this burn is advisory (capacity-unproven) and explicitly says do NOT check P2-E3. This burn closes Burn C only; it does not close P2-E3 and makes no such claim. A concurrent PerimeterScope release-train broadcast on the fleet channel is unrelated to vault-sync.
+

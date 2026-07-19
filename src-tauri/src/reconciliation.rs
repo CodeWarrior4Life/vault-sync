@@ -212,7 +212,7 @@ pub async fn run_reconciliation_pass(
                     deferred = report.pulls_deferred,
                     still_divergent = report.still_divergent,
                     sample = ?report.unresolved_paths_sample,
-                    "reconciliation: cycle is RED — unresolved divergence remains; NOT counting toward soak"
+                    "reconciliation: cycle is RED - unresolved divergence remains; NOT counting toward soak"
                 );
             }
             if let Ok(mut w) = tray_state.write() {

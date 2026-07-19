@@ -29,10 +29,9 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 /// AR-008 (TKT-c41c2225): maximum length of a single path COMPONENT (basename)
-/// that is safe on every platform the daemon runs on:
-///   * Linux ext4/xfs/btrfs: 255 BYTES per component (ENAMETOOLONG / os error 36).
-///   * macOS APFS/HFS+:       255 UTF-16 code units per component.
-///   * Windows NTFS:          255 UTF-16 code units per component.
+/// that is safe on every platform the daemon runs on. Linux ext4/xfs/btrfs cap
+/// a component at 255 BYTES (ENAMETOOLONG / os error 36); macOS APFS/HFS+ and
+/// Windows NTFS cap it at 255 UTF-16 code units.
 /// We enforce BOTH the byte budget and the UTF-16 budget so a stash filename is
 /// portable regardless of which host mints it (fleet-shared vault). Kept a few
 /// bytes under 255 to leave room for the `-2`/`-3` collision suffix.

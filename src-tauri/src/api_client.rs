@@ -82,7 +82,7 @@ pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
                 let end = bytes.len().min(SAMPLE_CAP);
                 Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
             };
-            Err(ApiError::Decode {
+            Err(ApiError::Decode(Box::new(DecodeDetail {
                 context,
                 status,
                 content_type,
@@ -90,9 +90,23 @@ pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
                 request_id,
                 serde_error: e.to_string(),
                 body_sample,
-            })
+            })))
         }
     }
+}
+
+/// AR-009 (TKT-c41c2225): forensics for a decode failure. Boxed inside
+/// `ApiError::Decode` so the common-case `ApiError` stays small (clippy
+/// `result_large_err`). See [`decode_json`] for the no-content-leak rules.
+#[derive(Debug, Clone)]
+pub struct DecodeDetail {
+    pub context: &'static str,
+    pub status: u16,
+    pub content_type: String,
+    pub body_len: usize,
+    pub request_id: Option<String>,
+    pub serde_error: String,
+    pub body_sample: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -122,18 +136,11 @@ pub enum ApiError {
     /// HTML/proxy error page is diagnostic and is not user content); for a
     /// JSON structural mismatch the body IS the note, so no sample is taken.
     #[error(
-        "decode error in {context}: HTTP {status} content-type={content_type} body_len={body_len} request_id={request_id:?} serde=({serde_error}){}",
-        body_sample.as_ref().map(|s| format!(" sample={s:?}")).unwrap_or_default()
+        "decode error in {}: HTTP {} content-type={} body_len={} request_id={:?} serde=({}){}",
+        .0.context, .0.status, .0.content_type, .0.body_len, .0.request_id, .0.serde_error,
+        .0.body_sample.as_ref().map(|s| format!(" sample={s:?}")).unwrap_or_default()
     )]
-    Decode {
-        context: &'static str,
-        status: u16,
-        content_type: String,
-        body_len: usize,
-        request_id: Option<String>,
-        serde_error: String,
-        body_sample: Option<String>,
-    },
+    Decode(Box<DecodeDetail>),
     /// 409 Conflict — base_hash CAS mismatch on push. Server returns the
     /// hash it expected (current server-side content_hash) so the client
     /// can fetch+merge+replay. Per R2 + mandate §5 push contract.

@@ -107,24 +107,17 @@ async fn ar009_json_decode_failure_is_diagnosable_and_leak_free() {
     let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
     let err = client.fetch_note("x.md").await.unwrap_err();
     match err {
-        ApiError::Decode {
-            context,
-            status,
-            content_type,
-            body_len,
-            request_id,
-            serde_error,
-            body_sample,
-        } => {
-            assert_eq!(context, "fetch_note");
-            assert_eq!(status, 200);
-            assert!(content_type.starts_with("application/json"));
-            assert!(body_len > 0);
-            assert_eq!(request_id.as_deref(), Some("x-request-id=req-abc-123"));
-            assert!(!serde_error.is_empty(), "serde detail must be captured");
+        ApiError::Decode(d) => {
+            assert_eq!(d.context, "fetch_note");
+            assert_eq!(d.status, 200);
+            assert!(d.content_type.starts_with("application/json"));
+            assert!(d.body_len > 0);
+            assert_eq!(d.request_id.as_deref(), Some("x-request-id=req-abc-123"));
+            assert!(!d.serde_error.is_empty(), "serde detail must be captured");
             assert!(
-                body_sample.is_none(),
-                "JSON body must NOT be sampled (no content leak); got {body_sample:?}"
+                d.body_sample.is_none(),
+                "JSON body must NOT be sampled (no content leak); got {:?}",
+                d.body_sample
             );
         }
         other => panic!("expected ApiError::Decode, got {other:?}"),
@@ -147,13 +140,9 @@ async fn ar009_non_json_decode_attaches_bounded_sample() {
     let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
     let err = client.fetch_note("x.md").await.unwrap_err();
     match err {
-        ApiError::Decode {
-            content_type,
-            body_sample,
-            ..
-        } => {
-            assert!(content_type.starts_with("text/html"));
-            let s = body_sample.expect("non-JSON body must attach a sample");
+        ApiError::Decode(d) => {
+            assert!(d.content_type.starts_with("text/html"));
+            let s = d.body_sample.expect("non-JSON body must attach a sample");
             assert!(s.len() <= 256, "sample must be bounded (<=256), got {}", s.len());
             assert!(s.starts_with("<html>"));
         }

@@ -633,12 +633,12 @@ impl VerifyRepair {
                 }
                 None => {
                     // No materializer (unit tests / dry-run): these stale-local
-                    // paths are UNRESOLVED (not executed) — count them as
+                    // paths are UNRESOLVED (not executed) - count them as
                     // deferred so the cycle is honestly RED, never a false green.
                     let n = pending_pulls.len();
                     tracing::info!(
                         pending_pulls = n,
-                        "reconciliation: {n} stale-local pull(s) detected but no materializer wired — deferred (cycle RED)"
+                        "reconciliation: {n} stale-local pull(s) detected but no materializer wired - deferred (cycle RED)"
                     );
                     report.pulls_attempted = n;
                     report.pulls_deferred = n;
@@ -1794,10 +1794,12 @@ mod tests {
         assert!(!r.soak_eligible(), "RED cycle is NOT soak-eligible");
 
         // Deferred-only (breaker) is still RED / not soak-eligible.
-        let mut d = VerifyRepairReport::default();
-        d.pulls_attempted = 1;
-        d.pulls_deferred = 1;
-        d.still_divergent = 1;
+        let d = VerifyRepairReport {
+            pulls_attempted: 1,
+            pulls_deferred: 1,
+            still_divergent: 1,
+            ..Default::default()
+        };
         assert!(d.cycle_red());
     }
 
@@ -1808,7 +1810,7 @@ mod tests {
     ///
     /// RED ON OLD CODE: pre-fix `VerifyRepairReport` had no
     /// pulls_failed/still_divergent/cycle_red, `add_count` counted only
-    /// successes, and there was no retry ledger — this test does not compile.
+    /// successes, and there was no retry ledger - this test does not compile.
     #[tokio::test]
     async fn regression_ar003_failed_pull_is_red_not_false_green() {
         let vault = TempDir::new().unwrap();
