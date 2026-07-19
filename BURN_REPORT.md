@@ -187,6 +187,6 @@ FAILS on current code — the executable record of the R4 gap deferred to v0.4.3
 
 - `20c87c7` test(icarus): R3 vault_name-synthesis guard + R4/R8 conflict-visibility spec
 - `9f2461a` docs(icarus): enrollment runbook + config template + BURN_REPORT
-- (leg-1 execution: runbook + report refresh committed in the following checkpoint)
+- `000d7b9` feat(icarus): EXECUTE owner-authorized pull-only enrollment (leg 1)
 
 Prior commits `60766af..1e2ee68` are the v0.4.32 fix wave (pre-existing on branch).
