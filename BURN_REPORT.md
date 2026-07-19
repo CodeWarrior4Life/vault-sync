@@ -10,6 +10,14 @@
 
 ---
 
+## STATUS: PARKED AWAITING-OWNER
+
+All three defects fixed on the burn branch, regressions fail-on-old / pass-on-new, full suite + strict clippy green. Nothing irreversible was done: no deploy, no daemon restart (live PID 1310111 untouched), no version bump, no push, no merge, no vault write.
+
+**One-line owner action:** review the branch `whetstone/vaultsync-pull-defect-pair`, then when ready cut the v0.4.33 candidate (bump `Cargo.toml` version, build/sign/distribute via the lease-gated deploy) as a SEPARATE step after the icarus/fleet picture settles.
+
+---
+
 ## Live journal reproduction (R4, PRE-EDIT)
 
 Daemon on link: `nexus-vault-sync.service`, PID 1310111, v0.4.32-era code. `journalctl --user -u nexus-vault-sync.service`. The identical failure pair recurs EVERY reconcile cycle (00:08, 00:18, 00:38, 00:48, 00:58, 01:08, 01:18, 01:28, 01:38, ...). The canonical 00:58 cycle the spec cites:
