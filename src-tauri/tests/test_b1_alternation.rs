@@ -95,7 +95,7 @@ fn test_b1_alternation_regression() {
         frontmatter: serde_json::Value::Null,
         body: server_lf.to_string(),
         sha256: server_sha.clone(),
-        modified: "2026-07-01T00:00:00Z".to_string(),
+        modified: Some("2026-07-01T00:00:00Z".to_string()),
         file_mtime: None,
         enriched_body: Some(server_lf.to_string()),
         created: None,
