@@ -3101,9 +3101,21 @@ mod tests {
             .create_async()
             .await;
         // Refetch of the current server version (the merge source).
-        let note = format!(
-            r#"{{"path":"01_Notes/x.md","frontmatter":{{}},"body":"{server_body}","sha256":"{server_sha}","modified":null,"file_mtime":null,"created":null,"change_seq":9,"enriched_body":"{server_body}"}}"#
-        );
+        // Built via serde_json so the body's newline is properly escaped --
+        // interpolating it raw into a JSON literal produced an invalid document
+        // (control character in string) that the AR-009 decoder rightly rejected.
+        let note = serde_json::json!({
+            "path": "01_Notes/x.md",
+            "frontmatter": {},
+            "body": server_body,
+            "sha256": server_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 9,
+            "enriched_body": server_body,
+        })
+        .to_string();
         let mn = srv
             .mock("GET", "/api/sync/note")
             .match_query(mockito::Matcher::Any)

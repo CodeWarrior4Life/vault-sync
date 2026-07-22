@@ -2984,7 +2984,10 @@ mod tests {
     async fn records_observed_base_seq_only_from_server_change_seq() {
         let sdir = TempDir::new().unwrap();
         let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
-        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
+            sdir.path().join("base_seq.json"),
+            vec!["Mainframe".to_string()],
+        );
 
         let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let m = m
