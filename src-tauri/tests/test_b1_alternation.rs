@@ -99,6 +99,7 @@ fn test_b1_alternation_regression() {
         file_mtime: None,
         enriched_body: Some(server_lf.to_string()),
         created: None,
+        change_seq: None,
     };
     let outcome1 = mat.write(&payload).unwrap();
     assert_eq!(

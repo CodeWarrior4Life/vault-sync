@@ -213,6 +213,16 @@ pub struct NotePayload {
     // (2026-06-05). serde(default) keeps back-compat with servers that omit it.
     #[serde(default)]
     pub created: Option<f64>,
+    // R7b (THESEUS AR-002, TKT-166e1c07): the server's monotonic version token
+    // for this note (`vault_notes.change_seq`), returned by GET /api/sync/note
+    // (sync_routes_p1.py, S549). This is the AUTHORITATIVE observed-seq source
+    // for the pull leg: after the materializer byte-verifies the written bytes,
+    // it records THIS value as the note's observed base_seq (R3 - observed seq
+    // comes from the server response, never a local assumption). `serde(default)`
+    // keeps back-compat with pre-R7b servers that omit it -> None -> the note
+    // stays unobserved (fail-closed: the next push sends base_seq=null, R4/R5).
+    #[serde(default)]
+    pub change_seq: Option<i64>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).
@@ -266,6 +276,18 @@ pub struct PushRequest<'a> {
     /// the server treats "" as "no known base" and either accepts (server has
     /// no row) or returns 409 conflict with its current hash. Verified S473.
     pub base_hash: &'a str,
+    /// R7b proof-of-observation (THESEUS AR-002, TKT-166e1c07): the server
+    /// `change_seq` of the version this daemon last OBSERVED for `path`, or
+    /// `None` for unknown/empty lineage. Matches server `SyncPushRequest.base_seq:
+    /// Optional[int]` (nexus core/sync/models.py). Serialized on EVERY push and
+    /// delete (R1) - `null` when unknown so the wire always DECLARES a lineage
+    /// (or its absence). Under NEXUS_FF_SYNC_CONVERGENCE the server fails the
+    /// causal gate CLOSED on `None`-against-a-tracked-version (R4) and on a
+    /// stale/forged seq (409), which the client routes to refetch/merge (R2).
+    /// With the flag off, or against a pre-R7b server, the field is ignored
+    /// (extra JSON field; Pydantic default-ignores it) so behavior is
+    /// byte-identical to the legacy daemon (R5).
+    pub base_seq: Option<i64>,
     pub action: PushApiAction,
 }
 
@@ -650,9 +672,9 @@ mod tests {
     /// the TKT-86ae42a3 conflict-storm fix (B2' shadow-key migration +
     /// conflict-storm circuit breaker).
     #[test]
-    fn daemon_version_is_0_4_32() {
-        assert_eq!(daemon_version(), "0.4.32");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.32/"));
+    fn daemon_version_is_0_4_33() {
+        assert_eq!(daemon_version(), "0.4.33");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.33/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
@@ -734,6 +756,7 @@ mod tests {
             path: "a.md",
             content_b64: "eA==",
             base_hash: "",
+            base_seq: None,
             action: PushApiAction::Modify,
         };
         match api.push(&req).await {
@@ -769,5 +792,72 @@ mod tests {
             }
             other => panic!("expected UpgradeRequired, got {other:?}"),
         }
+    }
+
+    // --- R7b base_seq daemon leg (THESEUS AR-002, TKT-166e1c07) ---
+
+    /// R1: the daemon DECLARES base_seq on the wire of EVERY push/delete. A
+    /// known lineage serializes the integer; an unknown lineage serializes
+    /// explicit `null` (so the absence of a lineage is still declared). Fails on
+    /// pre-R7b code where `PushRequest` has no `base_seq` field at all.
+    #[test]
+    fn push_request_serializes_base_seq() {
+        let with_seq = PushRequest {
+            device_id: "dev",
+            path: "01_Notes/x.md",
+            content_b64: "eA==",
+            base_hash: "abc",
+            base_seq: Some(4242),
+            action: PushApiAction::Modify,
+        };
+        let json = serde_json::to_string(&with_seq).unwrap();
+        assert!(
+            json.contains(r#""base_seq":4242"#),
+            "base_seq must be declared on the wire, got: {json}"
+        );
+
+        let unknown = PushRequest {
+            device_id: "dev",
+            path: "01_Notes/x.md",
+            content_b64: "",
+            base_hash: "",
+            base_seq: None,
+            action: PushApiAction::Delete,
+        };
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert!(
+            json.contains(r#""base_seq":null"#),
+            "unknown lineage must serialize explicit null (declared on delete too), got: {json}"
+        );
+    }
+
+    /// R3 source + R5 back-compat: NotePayload captures the server's change_seq
+    /// (the observed-seq authority for the pull leg) when present, and degrades
+    /// to None (never a decode error) when a pre-R7b server omits it. Fails on
+    /// pre-R7b code where NotePayload has no `change_seq` field.
+    #[test]
+    fn note_payload_captures_change_seq_and_tolerates_absence() {
+        let with_seq = r#"{
+            "path":"01_Notes/x.md","frontmatter":{},"body":"b","sha256":"aa",
+            "modified":null,"file_mtime":null,"created":null,"change_seq":9012
+        }"#;
+        let p: NotePayload = serde_json::from_str(with_seq).unwrap();
+        assert_eq!(p.change_seq, Some(9012));
+
+        // Pre-R7b server: field absent entirely -> None, no decode error (R5).
+        let legacy = r#"{"path":"01_Notes/x.md","frontmatter":{},"body":"b","sha256":"aa"}"#;
+        let p: NotePayload = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.change_seq, None);
+    }
+
+    /// R5: a push RESPONSE from a server that omits server_seq (flag off /
+    /// pre-R7b) still deserializes cleanly with server_seq == None, so the
+    /// daemon degrades without error spam and simply records no observation.
+    #[test]
+    fn push_response_without_server_seq_degrades() {
+        let body = r#"{"status":"accepted","seq":1,"content_hash":"aa","server_hash":"aa","merged_content":null,"message":null}"#;
+        let r: PushResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.server_seq, None);
+        assert_eq!(r.status, PushStatus::Accepted);
     }
 }

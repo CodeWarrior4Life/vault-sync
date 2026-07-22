@@ -1,4 +1,5 @@
 pub mod api_client;
+pub mod base_seq_store;
 pub mod canonical_form;
 pub mod commands;
 pub mod commands_vaults;
@@ -612,6 +613,25 @@ fn spawn_sse_consumer(
             vault_folders,
         );
         sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
+        // R7b daemon leg (THESEUS AR-002, TKT-166e1c07): the per-note
+        // observed-base_seq store, keyed IDENTICALLY to the shadow store (same
+        // vault_folders + canonicalization) and persisted to a sibling file. The
+        // push path reads it to declare base_seq on every push/delete (R1); the
+        // materializer + push-accept paths record the server's returned seq only
+        // after byte-verify (R3). Empty/missing => unknown lineage => fail-closed
+        // (R4). Wired into BOTH the materializer (pull leg) and the push_client.
+        let base_seq = base_seq_store::BaseSeqStore::load_with_vault_folders(
+            commands::resolve_workspace_root()
+                .join(".lattice-runtime")
+                .join(&cfg.subscriber_id)
+                .join("sync-state")
+                .join("base_seq.json"),
+            watch_roots
+                .iter()
+                .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect(),
+        );
+        base_seq_store::BaseSeqStore::spawn_periodic_flush(base_seq.clone());
         // D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path. If the shadow store
         // loaded EMPTY (fresh install / corrupt reset / manual delete), seed
         // shadow=server for every already-mirrored note BEFORE the push pipeline
@@ -650,7 +670,9 @@ fn spawn_sse_consumer(
         )
         .with_tray_state(tray_state.clone())
         .with_echo_guard(echo_guard.clone())
-        .with_shadow_store(shadow.clone());
+        .with_shadow_store(shadow.clone())
+        // R3 (TKT-166e1c07): the pull leg records the observed base_seq here.
+        .with_base_seq_store(base_seq.clone());
 
         // Wave 4: spawn a 60s periodic task that refreshes the tray's
         // `conflict_unresolved` counter from the on-disk stash siblings.
@@ -721,6 +743,7 @@ fn spawn_sse_consumer(
                     echo_guard.clone(),
                     materializer.clone(),
                     shadow.clone(),
+                    base_seq.clone(),
                     sync_health.clone(),
                 )
             })
@@ -836,9 +859,31 @@ fn spawn_push_pipeline(
     echo_guard: std::sync::Arc<echo_guard::EchoGuard>,
     materializer: materializer::Materializer,
     shadow: std::sync::Arc<sync_shadow::ShadowStore>,
+    base_seq: std::sync::Arc<base_seq_store::BaseSeqStore>,
     sync_health: std::sync::Arc<sync_health::SyncHealth>,
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
+
+    // R7 (TKT-166e1c07, 2026-07-18 trinity incident): PARK the push side when the
+    // shadow store loaded in the suspect state (vault_folders resolved EMPTY but
+    // vault-prefixed keys are present, i.e. config vault_name is likely missing).
+    // Proceeding would mass-mis-key and re-push the vault. Refuse to start the
+    // push pipeline at all (no drain, no push) and surface it loudly - this is a
+    // park, NOT a silent no-op. The operator must fix the config and restart.
+    if shadow.vault_scope_suspect() {
+        tracing::error!(
+            "push pipeline: PARKED (R7) - vault_folders resolved EMPTY but the shadow store holds \
+             vault-prefixed keys (config vault_name is likely missing). Refusing to start the push \
+             side to avoid a mass re-push (2026-07-18 trinity incident). Fix config vault_name and restart."
+        );
+        notify_user(
+            app,
+            "Vault Sync parked (config error)",
+            "vault_folders resolved empty but prior sync history is present. Push is refused to \
+             avoid a mass re-push. Set vault_name in the config and restart.",
+        );
+        return None;
+    }
 
     let token = match token_store::load(&subscriber_id) {
         Ok(Some(t)) => t,
@@ -960,6 +1005,8 @@ fn spawn_push_pipeline(
     )
     .with_tray_state(tray_state.clone())
     .with_shadow_store(shadow.clone())
+    // R1/R2/R3 (TKT-166e1c07): push leg declares + records base_seq.
+    .with_base_seq_store(base_seq.clone())
     .with_sync_health(sync_health.clone())
     // D2 (v0.4.28): ack-materialize-back rides the same materializer clone
     // the reconcile backstop uses (echo-guarded + shadow-backed).
