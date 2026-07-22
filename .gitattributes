@@ -1,0 +1,2 @@
+# Cross-language pinned test vectors are SHA-256 verified byte-exact: never eol-convert
+src-tauri/tests/vectors/*.json -text
