@@ -43,6 +43,7 @@ fn payload(path: &str, body: &str) -> NotePayload {
         modified: Some("2026-05-27T00:00:00Z".into()),
         file_mtime: None,
         created: None,
+        change_seq: None,
         enriched_body: Some(serialized),
     }
 }

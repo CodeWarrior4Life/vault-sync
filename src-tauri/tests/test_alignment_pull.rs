@@ -77,6 +77,7 @@ fn payload(rel: &str, canonical: &str) -> NotePayload {
         file_mtime: None,
         enriched_body: Some(canonical.to_string()),
         created: None,
+        change_seq: None,
     }
 }
 
