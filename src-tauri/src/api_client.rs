@@ -213,6 +213,16 @@ pub struct NotePayload {
     // (2026-06-05). serde(default) keeps back-compat with servers that omit it.
     #[serde(default)]
     pub created: Option<f64>,
+    // R7b (THESEUS AR-002, TKT-166e1c07): the server's monotonic version token
+    // for this note (`vault_notes.change_seq`), returned by GET /api/sync/note
+    // (sync_routes_p1.py, S549). This is the AUTHORITATIVE observed-seq source
+    // for the pull leg: after the materializer byte-verifies the written bytes,
+    // it records THIS value as the note's observed base_seq (R3 - observed seq
+    // comes from the server response, never a local assumption). `serde(default)`
+    // keeps back-compat with pre-R7b servers that omit it -> None -> the note
+    // stays unobserved (fail-closed: the next push sends base_seq=null, R4/R5).
+    #[serde(default)]
+    pub change_seq: Option<i64>,
 }
 
 /// 4-state push outcome envelope (mandate §5, post-S473 amendments).
@@ -266,6 +276,18 @@ pub struct PushRequest<'a> {
     /// the server treats "" as "no known base" and either accepts (server has
     /// no row) or returns 409 conflict with its current hash. Verified S473.
     pub base_hash: &'a str,
+    /// R7b proof-of-observation (THESEUS AR-002, TKT-166e1c07): the server
+    /// `change_seq` of the version this daemon last OBSERVED for `path`, or
+    /// `None` for unknown/empty lineage. Matches server `SyncPushRequest.base_seq:
+    /// Optional[int]` (nexus core/sync/models.py). Serialized on EVERY push and
+    /// delete (R1) - `null` when unknown so the wire always DECLARES a lineage
+    /// (or its absence). Under NEXUS_FF_SYNC_CONVERGENCE the server fails the
+    /// causal gate CLOSED on `None`-against-a-tracked-version (R4) and on a
+    /// stale/forged seq (409), which the client routes to refetch/merge (R2).
+    /// With the flag off, or against a pre-R7b server, the field is ignored
+    /// (extra JSON field; Pydantic default-ignores it) so behavior is
+    /// byte-identical to the legacy daemon (R5).
+    pub base_seq: Option<i64>,
     pub action: PushApiAction,
 }
 
@@ -650,9 +672,9 @@ mod tests {
     /// the TKT-86ae42a3 conflict-storm fix (B2' shadow-key migration +
     /// conflict-storm circuit breaker).
     #[test]
-    fn daemon_version_is_0_4_32() {
-        assert_eq!(daemon_version(), "0.4.32");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.32/"));
+    fn daemon_version_is_0_4_33() {
+        assert_eq!(daemon_version(), "0.4.33");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.33/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
@@ -734,6 +756,7 @@ mod tests {
             path: "a.md",
             content_b64: "eA==",
             base_hash: "",
+            base_seq: None,
             action: PushApiAction::Modify,
         };
         match api.push(&req).await {

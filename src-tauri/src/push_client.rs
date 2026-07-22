@@ -164,6 +164,13 @@ pub struct PushClient {
     /// hash is. Recording it keeps the reconcile backstop from later mistaking
     /// a freshly-pushed file for a stale-pull candidate. `None` = no recording.
     shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// R7b (THESEUS AR-002, TKT-166e1c07): per-note observed-base_seq store.
+    /// Read to populate `PushRequest.base_seq` on EVERY push/delete (R1); the
+    /// server-returned `server_seq` is recorded here ONLY after the pushed bytes
+    /// are confirmed on the local FS (R3). `None` = no lineage tracking (unit
+    /// tests / degraded wiring); the push then declares `base_seq: null` which
+    /// the server (flag on) fails closed, exactly the unknown-lineage path (R4).
+    base_seq_store: Option<Arc<crate::base_seq_store::BaseSeqStore>>,
     /// opfix-vaultsync-dormancy: shared progress-tracking handle. When set,
     /// every `drain_once` that processed at least one event stamps a fresh
     /// progress marker so the watchdog can distinguish "pipeline healthy"
@@ -205,6 +212,7 @@ impl PushClient {
             vault_root,
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -239,6 +247,16 @@ impl PushClient {
     /// pushed path. Backwards-compatible — without it, no recording.
     pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
         self.shadow_store = Some(store);
+        self
+    }
+
+    /// R7b (TKT-166e1c07): attach the per-note observed-base_seq store. After
+    /// this, every push/delete declares the note's last-observed `change_seq`
+    /// as proof-of-observation (R1), and an accepted push records the server's
+    /// new `server_seq` once the bytes are confirmed local (R3).
+    /// Backwards-compatible - without it, pushes declare `base_seq: null`.
+    pub fn with_base_seq_store(mut self, store: Arc<crate::base_seq_store::BaseSeqStore>) -> Self {
+        self.base_seq_store = Some(store);
         self
     }
 
@@ -342,6 +360,19 @@ impl PushClient {
     /// ack/nack each in the journal. Returns the (event, outcome) pairs in
     /// drain order for the caller's tray/log layer.
     pub async fn drain_once(&self) -> Vec<(PushEvent, PushOutcome)> {
+        // R7 (TKT-166e1c07): empty-vault_folders guard, defense-in-depth. The
+        // pipeline spawn already parks on this state (lib.rs), so in production
+        // drain_once is never reached while suspect; this is the belt-and-braces
+        // chokepoint (and the unit-test seam). PARK: refuse to drain rather than
+        // mass-mis-key and re-push the vault (2026-07-18 trinity incident).
+        if let Some(sh) = &self.shadow_store {
+            if sh.vault_scope_suspect() {
+                tracing::debug!(
+                    "push_client: PARKED (R7) - vault scope suspect (empty vault_folders + prefixed keys); refusing drain"
+                );
+                return Vec::new();
+            }
+        }
         // S5 (v0.4.28): min-daemon-version gate cooldown. After a 426 we stand
         // down entirely - no journal drain, no HTTP - until the window passes.
         {
@@ -610,6 +641,15 @@ impl PushClient {
             None => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
         };
 
+        // R1 (THESEUS AR-002, TKT-166e1c07): declare our last-observed base_seq
+        // (proof-of-observation) on EVERY push and delete. `None` when we have
+        // no recorded lineage for this path (a create, or a note we never
+        // byte-verified) - the fail-closed unknown-lineage signal (R4). We NEVER
+        // fabricate or default a seq; the server (flag on) fails the causal gate
+        // closed on `None`-against-a-tracked-version and we refetch/merge (R2).
+        // Push and delete share this one request path, so both carry it.
+        let base_seq: Option<i64> = self.base_seq_store.as_ref().and_then(|s| s.get(&evt.path));
+
         let req = PushRequest {
             device_id: &self.device_id,
             path: &evt.path,
@@ -619,6 +659,7 @@ impl PushClient {
             // (reconcile pushes), else the shadow-backfilled base (file_watcher
             // pushes); "" only when we truly have no known base → server CREATEs.
             base_hash: backfilled_base.as_deref().unwrap_or(""),
+            base_seq,
             action,
         };
 
@@ -646,6 +687,12 @@ impl PushClient {
                     // above). That converges the file to the exact state the
                     // pre-D2 daemon only reached indirectly, on its NEXT pull
                     // pass. Deletes have no local file to align.
+                    // R3 (TKT-166e1c07): the server's new authoritative version
+                    // token for this accepted push. Recorded as our observed
+                    // base_seq ONLY on the branches where the local FS is
+                    // confirmed to hold the exact accepted bytes (below); never
+                    // a local assumption (it comes straight from the response).
+                    let server_seq = resp.server_seq;
                     let needs_align = matches!(resp.status, PushStatus::Accepted)
                         && !matches!(evt.action, PushAction::Delete)
                         && resp
@@ -662,6 +709,7 @@ impl PushClient {
                             &content_bytes,
                             &drained_sha,
                             &server_hash,
+                            server_seq,
                         )
                         .await;
                     } else if let Some(sh) = &self.shadow_store {
@@ -687,6 +735,35 @@ impl PushClient {
                             sh.record(&evt.path, &h);
                         }
                     }
+                    // R3 (TKT-166e1c07): record the observed base_seq for the
+                    // non-align accept path. The `needs_align` branch records
+                    // inside ack_materialize_back AFTER its own byte-verify, so
+                    // it is excluded here to avoid recording before the aligned
+                    // bytes land.
+                    if !needs_align {
+                        if let Some(bs) = &self.base_seq_store {
+                            match (&resp.status, evt.action) {
+                                // Accepted delete: the note is tombstoned; drop
+                                // its lineage so a later re-create starts from
+                                // unknown lineage (fail-closed), not a stale seq.
+                                (PushStatus::Accepted, PushAction::Delete) => bs.remove(&evt.path),
+                                // Accepted create/modify on the non-align branch:
+                                // the local FS holds EXACTLY the accepted bytes
+                                // (== server canonical), so the version is
+                                // confirmed materialized (R3). Record the server's
+                                // returned token as observed - never a local
+                                // assumption. Merged is deliberately excluded: the
+                                // server-merged bytes are not on our FS yet, so
+                                // recording would violate R3 (converges via pull).
+                                (PushStatus::Accepted, _) => {
+                                    if let Some(seq) = server_seq {
+                                        bs.record(&evt.path, seq);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     return map_response(resp);
                 }
                 Err(ApiError::Unauthorized) => {
@@ -708,6 +785,19 @@ impl PushClient {
                     if !content_bytes.is_empty() {
                         self.stash_local_on_conflict(&evt.path, &content_bytes);
                     }
+                    // R2/R4 (causal gate, TKT-166e1c07): under
+                    // NEXUS_FF_SYNC_CONVERGENCE a 409 means our declared base_seq
+                    // was unknown (None -> fail-closed, R4) or stale/forged vs the
+                    // current head; flag-off it is the base_hash CAS losing. The
+                    // contract is the same either way: refetch the current server
+                    // version and MERGE, never blind-retry or overwrite. The
+                    // losing local bytes are already stashed above (never dropped);
+                    // now converge the canonical file to the server head
+                    // (byte-verified) and learn the fresh observed base_seq (R3).
+                    self.refetch_and_merge_on_conflict(&evt.path).await;
+                    // Still surface the conflict so Burn C accounting counts it
+                    // (R6) and the journal entry is acked (the edit survives as the
+                    // stash, not an infinite blind retry).
                     return PushOutcome::Failed(FailureReason::ConflictUnrecoverable {
                         expected_hash,
                     });
@@ -827,6 +917,7 @@ impl PushClient {
         drained_bytes: &[u8],
         drained_sha: &str,
         server_hash: &str,
+        server_seq: Option<i64>,
     ) {
         let Some(mat) = &self.materializer else {
             // No write machinery wired: record NOTHING. Recording server_hash
@@ -914,6 +1005,17 @@ impl PushClient {
                         );
                     }
                 }
+                // R3 (TKT-166e1c07): the server-canonical bytes (pre-verified to
+                // hash to server_hash) were atomically materialized on the local
+                // FS by write_aligned_bytes, so the exact version is now confirmed
+                // present. Record the server's returned token as observed. This is
+                // the ONLY align-path arm that records base_seq: SkippedConcurrentEdit
+                // leaves a NEWER local edit on the FS (server bytes NOT materialized),
+                // and the error/other arms did not write, so both stay unobserved
+                // (fail-closed - the next push declares base_seq=null and refetches).
+                if let (Some(bs), Some(seq)) = (&self.base_seq_store, server_seq) {
+                    bs.record(path, seq);
+                }
                 tracing::info!(
                     path,
                     sha = %canonical_sha,
@@ -947,6 +1049,57 @@ impl PushClient {
                     "D2: ack-materialize rewrite FAILED - shadow left stale (pull converges next pass, B2'c fail-closed)"
                 );
             }
+        }
+    }
+
+    /// R2/R4 (TKT-166e1c07): on a causal-gate / CAS 409, refetch the current
+    /// server version and materialize it locally (byte-verified) so the daemon
+    /// converges to the server head AND learns the fresh observed base_seq. The
+    /// observed seq is recorded by the materializer ONLY after the exact bytes
+    /// land + verify (R3), and only from the server response's `change_seq`
+    /// (never a local assumption). Never blind-retries and never overwrites an
+    /// unobserved local edit: the losing local bytes are stashed by the caller
+    /// BEFORE this runs. Best-effort and fail-honest: with no materializer wired,
+    /// or on a fetch/materialize error, convergence falls to the next reconcile
+    /// pull and the conflict is still surfaced to the accounting layer (R6).
+    async fn refetch_and_merge_on_conflict(&self, path: &str) {
+        let Some(mat) = &self.materializer else {
+            tracing::info!(
+                path,
+                "409 refetch/merge: no materializer wired - conflict surfaced, pull converges next pass"
+            );
+            return;
+        };
+        match self.api.fetch_note(path).await {
+            Ok(payload) => match mat.write(&payload) {
+                Ok(outcome) => tracing::info!(
+                    path,
+                    ?outcome,
+                    "409 refetch/merge: server head materialized (observed base_seq recorded post-verify, R3)"
+                ),
+                Err(e) => tracing::warn!(
+                    path,
+                    error = %e,
+                    "409 refetch/merge: materialize failed - pull converges next reconcile pass"
+                ),
+            },
+            Err(ApiError::NotFound(_)) => {
+                // The server has no such note (deleted since our push). Drop the
+                // stale lineage so a later re-create starts from unknown lineage
+                // (fail-closed, R4) rather than a stale observed seq.
+                if let Some(bs) = &self.base_seq_store {
+                    bs.remove(path);
+                }
+                tracing::info!(
+                    path,
+                    "409 refetch/merge: server has no such note (deleted) - lineage dropped (fail-closed)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                path,
+                error = %e,
+                "409 refetch/merge: refetch failed - pull converges next reconcile pass"
+            ),
         }
     }
 }
@@ -1920,6 +2073,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -1948,6 +2102,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -1972,6 +2127,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -1995,6 +2151,7 @@ mod tests {
             vault_root: PathBuf::from("/v"),
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -2659,6 +2816,7 @@ mod tests {
             vault_root: PathBuf::from("/sync/root/a"), // per-root path
             tray_state: None,
             shadow_store: None,
+            base_seq_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,

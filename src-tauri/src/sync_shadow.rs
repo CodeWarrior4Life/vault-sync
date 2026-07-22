@@ -78,6 +78,40 @@ pub struct ShadowStore {
     /// history and R5-stashed a conflict copy per divergent path (2,395 mints
     /// on link on 07-18 alone). Canonical key form is sync-root-relative.
     vault_folders: Vec<String>,
+    /// R7 (TKT-166e1c07, 2026-07-18 trinity incident): set at load when
+    /// `vault_folders` resolved EMPTY but the store holds vault-prefixed-looking
+    /// keys. In that state the prefix strip is a silent no-op and a push/migration
+    /// would mass-mis-key and re-push the vault. Consumers (the push pipeline)
+    /// read this and PARK rather than proceed. See [`detect_vault_scope_suspect`].
+    vault_scope_suspect: AtomicBool,
+}
+
+/// R7 (TKT-166e1c07, 2026-07-18 trinity incident): detect the misconfiguration
+/// where `vault_folders` resolves EMPTY (e.g. `config.toml` missing `vault_name`,
+/// collapsing the sync root to `vaults_root` with no vault segment) while the
+/// shadow store still holds vault-prefixed-looking keys. In that state the
+/// prefix-strip is a silent no-op, so a migration/push mis-keys EN MASSE and the
+/// B2 migration no-ops -> the 2,249-note mass push. Returns the count of
+/// prefixed-looking keys when the scope is suspect, else `None`.
+///
+/// Definition: suspect iff `vault_folders` is empty AND at least one key looks
+/// vault-prefixed (carries a leading path segment, i.e. contains `/`). In normal
+/// operation `vault_folders` is NEVER empty (there is always a sync-root
+/// basename), so this fires ONLY in the misconfiguration state; a genuinely flat
+/// vault (keys with no `/`) never trips it.
+pub fn detect_vault_scope_suspect<'a>(
+    vault_folders: &[String],
+    keys: impl Iterator<Item = &'a str>,
+) -> Option<usize> {
+    if !vault_folders.is_empty() {
+        return None;
+    }
+    let n = keys.filter(|k| k.contains('/')).count();
+    if n > 0 {
+        Some(n)
+    } else {
+        None
+    }
 }
 
 impl ShadowStore {
@@ -193,11 +227,25 @@ impl ShadowStore {
                 "shadow store: migrated keys to canonical form (NFC, S511 D8 + vault-prefix strip, B2' TKT-86ae42a3)"
             );
         }
+        // R7 (TKT-166e1c07): flag the empty-vault_folders + prefixed-keys state so
+        // the push pipeline parks instead of mass-re-pushing (2026-07-18 trinity
+        // incident). WARN loudly at load; the actual refusal is at the push side.
+        let suspect = detect_vault_scope_suspect(&vault_folders, map.keys().map(|s| s.as_str()));
+        if let Some(prefixed_keys) = suspect {
+            warn!(
+                path = %path.display(),
+                prefixed_keys,
+                "shadow store: vault_folders resolved EMPTY but the store holds vault-prefixed keys \
+                 (config vault_name is likely missing). REFUSING migrations/pushes downstream (park) \
+                 to avoid a mass re-push. Fix the config vault_name and restart (R7, 2026-07-18 trinity incident)."
+            );
+        }
         Arc::new(ShadowStore {
             inner: Mutex::new(map),
             path,
             dirty: AtomicBool::new(migrated),
             vault_folders,
+            vault_scope_suspect: AtomicBool::new(suspect.is_some()),
         })
     }
 
@@ -232,6 +280,15 @@ impl ShadowStore {
     /// True iff the store has no recorded entries (see [`Self::len`]).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// R7 (TKT-166e1c07): true when this store loaded in the suspect state
+    /// (`vault_folders` empty but vault-prefixed keys present). The push
+    /// pipeline reads this and PARKS (refuses to drain/push) so a config with a
+    /// missing `vault_name` cannot mass-re-push the vault (2026-07-18 trinity
+    /// incident). See [`detect_vault_scope_suspect`].
+    pub fn vault_scope_suspect(&self) -> bool {
+        self.vault_scope_suspect.load(Ordering::Relaxed)
     }
 
     /// Persist the full map to `self.path` via atomic tmp+rename. No-op (and

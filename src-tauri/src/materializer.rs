@@ -311,6 +311,13 @@ pub struct Materializer {
     /// (pull). Optional + `Arc`-shared so a clone (reconcile, SSE consumer)
     /// shares one on-disk marker; `None` keeps pre-fix behavior (no recording).
     shadow_store: Option<Arc<crate::sync_shadow::ShadowStore>>,
+    /// R7b (THESEUS AR-002, TKT-166e1c07): per-note observed-base_seq store.
+    /// On every Live-mode write that byte-verifies (the same point the shadow
+    /// hash is recorded), the server-provided `payload.change_seq` is recorded
+    /// here as the note's observed base_seq (R3 - observed seq comes from the
+    /// server response, recorded only AFTER the exact bytes materialize + pass
+    /// the integrity check). `None` keeps pre-R7b behavior (no seq recording).
+    base_seq_store: Option<Arc<crate::base_seq_store::BaseSeqStore>>,
     /// D2c (S511, TKT-2dc9a17e): per-path advisory lock registry. Serializes the
     /// `exists -> compare -> read-shadow -> stash -> persist` critical section
     /// for a SINGLE path so ~15 concurrent writers cannot lose a stash basis
@@ -340,6 +347,7 @@ impl Clone for Materializer {
             echo_guard: self.echo_guard.clone(),
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
             shadow_store: self.shadow_store.clone(),
+            base_seq_store: self.base_seq_store.clone(),
             path_locks: self.path_locks.clone(),
             conflict_mints: self.conflict_mints.clone(),
         }
@@ -373,6 +381,7 @@ impl Materializer {
             echo_guard: None,
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
             shadow_store: None,
+            base_seq_store: None,
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             conflict_mints: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
@@ -413,6 +422,16 @@ impl Materializer {
     /// direction (push vs pull). Backwards-compatible — without it, no recording.
     pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
         self.shadow_store = Some(store);
+        self
+    }
+
+    /// R7b (TKT-166e1c07): attach the per-note observed-base_seq store. After
+    /// this, every Live-mode write that byte-verifies records the server's
+    /// `payload.change_seq` as the note's observed base_seq (R3), at the same
+    /// point the shadow hash is recorded. Backwards-compatible - without it, no
+    /// seq recording (the note stays unobserved -> fail-closed on the next push).
+    pub fn with_base_seq_store(mut self, store: Arc<crate::base_seq_store::BaseSeqStore>) -> Self {
+        self.base_seq_store = Some(store);
         self
     }
 
@@ -916,6 +935,17 @@ impl Materializer {
         if matches!(self.mode, MaterializerMode::Live) {
             if let Some(sh) = &self.shadow_store {
                 sh.record(&payload.path, &payload.sha256);
+            }
+            // R3 (THESEUS AR-002, TKT-166e1c07): record the observed base_seq at
+            // the SAME post-byte-verify, Live-only point as the shadow hash. The
+            // seq comes straight from the server response (`payload.change_seq`),
+            // never a local assumption; a pre-R7b server omits it (None) so the
+            // note stays unobserved and the next push fails closed (R4/R5). This
+            // block is reached only after the integrity check passed (an
+            // IntegrityFailed write returned earlier), so the exact bytes are
+            // confirmed materialized before we claim the observation.
+            if let (Some(bs), Some(seq)) = (&self.base_seq_store, payload.change_seq) {
+                bs.record(&payload.path, seq);
             }
         }
 
@@ -1588,6 +1618,7 @@ mod tests {
             modified: Some("2026-05-27T00:00:00Z".into()),
             file_mtime: None,
             created: None,
+            change_seq: None,
             // Mirror the real server: enriched_body is the exact content the
             // sha256 is computed over (S486).
             enriched_body: Some(serialized),
@@ -1629,6 +1660,7 @@ mod tests {
             modified: Some("2026-05-31T00:00:00Z".into()),
             file_mtime: None,
             created: None,
+            change_seq: None,
             enriched_body: Some(original.to_string()),
         };
 
@@ -1670,6 +1702,7 @@ mod tests {
             modified: Some("2026-05-31T00:00:00Z".into()),
             file_mtime: None,
             created: None,
+            change_seq: None,
             enriched_body: None,
         };
         let out = m.write(&p).unwrap();
@@ -1884,6 +1917,7 @@ mod tests {
             modified: Some("2026-05-27T00:00:00Z".into()),
             file_mtime: None,
             created: None,
+            change_seq: None,
             enriched_body: Some(serialized.clone()),
         };
         let out = m.write(&p).unwrap();
@@ -2007,6 +2041,7 @@ mod tests {
             modified: Some("2026-07-18T00:00:00Z".into()),
             file_mtime: None,
             created: None,
+            change_seq: None,
             enriched_body: Some(server_body.to_string()),
         };
         // Local diverges from the server canonical: a genuine local edit.
@@ -2466,6 +2501,7 @@ mod tests {
                 modified: Some("2026-05-29T00:00:00Z".into()),
                 file_mtime: None,
                 created: None,
+                change_seq: None,
                 enriched_body: Some(serialized),
             }
         };
