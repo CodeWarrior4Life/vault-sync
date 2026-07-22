@@ -692,7 +692,10 @@ impl PushClient {
                     // base_seq ONLY on the branches where the local FS is
                     // confirmed to hold the exact accepted bytes (below); never
                     // a local assumption (it comes straight from the response).
-                    let server_seq = resp.server_seq;
+                    // The wire field is u64; base_seq is i64 fleet-wide (matches
+                    // the server change_seq / NotePayload.change_seq), so cast at
+                    // this single boundary (server seqs are well within i64).
+                    let server_seq = resp.server_seq.map(|s| s as i64);
                     let needs_align = matches!(resp.status, PushStatus::Accepted)
                         && !matches!(evt.action, PushAction::Delete)
                         && resp
