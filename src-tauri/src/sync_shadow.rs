@@ -563,4 +563,52 @@ mod tests {
         // The NFC lookup hits the migrated key.
         assert_eq!(store.get(&nfc), Some("h".to_string()));
     }
+
+    // --- R7 empty-vault_folders guard (TKT-166e1c07, 2026-07-18 trinity) ---
+
+    /// R7: the pure detector fires ONLY when vault_folders is empty AND the
+    /// store holds vault-prefixed-looking keys; a flat vault or a configured
+    /// vault_folders never trips it.
+    #[test]
+    fn detect_vault_scope_suspect_matrix() {
+        let prefixed = ["Mainframe/01_Notes/x.md", "Mainframe/y.md"];
+        let flat = ["x.md", "y.md"];
+        // Empty folders + prefixed keys -> suspect (count of prefixed keys).
+        assert_eq!(
+            detect_vault_scope_suspect(&[], prefixed.iter().copied()),
+            Some(2)
+        );
+        // Empty folders + flat keys -> not suspect (a genuinely flat vault).
+        assert_eq!(detect_vault_scope_suspect(&[], flat.iter().copied()), None);
+        // Configured folders -> never suspect (normal operation).
+        assert_eq!(
+            detect_vault_scope_suspect(&["Mainframe".to_string()], prefixed.iter().copied()),
+            None
+        );
+        // Empty folders + empty store -> not suspect (nothing to protect).
+        assert_eq!(
+            detect_vault_scope_suspect(&[], std::iter::empty::<&str>()),
+            None
+        );
+    }
+
+    /// R7: a shadow store that loads with EMPTY vault_folders but holds
+    /// vault-prefixed keys reports vault_scope_suspect() == true (so the push
+    /// pipeline parks); the same store with vault_folders configured does not.
+    #[test]
+    fn shadow_store_flags_and_clears_suspect_scope() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let mut m = HashMap::new();
+        m.insert("Mainframe/01_Notes/x.md".to_string(), "h".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        // Empty vault_folders + prefixed key -> suspect.
+        let suspect = ShadowStore::load_with_vault_folders(path.clone(), vec![]);
+        assert!(suspect.vault_scope_suspect());
+
+        // Same file, vault_folders configured -> prefix strips, not suspect.
+        let ok = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        assert!(!ok.vault_scope_suspect());
+    }
 }

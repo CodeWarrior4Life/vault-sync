@@ -2975,4 +2975,229 @@ mod tests {
         );
         m.assert_async().await; // exactly ONE HTTP attempt (the post-expiry tick)
     }
+
+    // --- R7b base_seq daemon leg integration (TKT-166e1c07) ---
+
+    /// Fully-wired push client (materializer Live + shadow + base_seq) like
+    /// production, plus a base_seq store handle for assertions. Vault root is a
+    /// TempDir so refetch/merge materialization lands somewhere real.
+    async fn make_baseseq_client(
+        base_url: &str,
+        journal: Arc<Mutex<PushJournal>>,
+    ) -> (
+        PushClient,
+        TempDir,
+        Arc<crate::base_seq_store::BaseSeqStore>,
+        Arc<ShadowStore>,
+    ) {
+        let vault = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+        let mat = Materializer::new(
+            vault.path().to_path_buf(),
+            None,
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            MaterializerConfig {
+                device_id: "dev-test".into(),
+                ..Default::default()
+            },
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_echo_guard(Arc::new(EchoGuard::new()));
+        let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
+        let client = PushClient::new(
+            api,
+            journal,
+            "dev-test".into(),
+            config_for_test(),
+            vault.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_materializer(mat);
+        // Keep the vault TempDir alive by returning it.
+        (client, vault, bs, shadow)
+    }
+
+    /// R1 (wire): a push of a note with a recorded lineage DECLARES base_seq on
+    /// the request body sent to /api/sync/push. The mock only matches when the
+    /// body carries the seq, so a miss makes the push fail -> the test fails.
+    #[tokio::test]
+    async fn push_declares_recorded_base_seq_on_the_wire() {
+        let mut srv = Server::new_async().await;
+        let body = "hello base_seq";
+        let drained = sha256_hex(body.as_bytes());
+        let accepted = format!(
+            r#"{{"status":"accepted","seq":1,"content_hash":"{drained}","server_hash":"{drained}","server_seq":5,"merged_content":null,"message":null}}"#
+        );
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::Regex(r#""base_seq":91"#.to_string()))
+            .with_status(200)
+            .with_body(accepted)
+            .create_async()
+            .await;
+
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", body.as_bytes())]);
+        let (client, _vault, bs, _shadow) = make_baseseq_client(&srv.url(), journal).await;
+        // Record a prior observation so the push declares it.
+        bs.record("01_Notes/x.md", 91);
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        m.assert_async().await; // matched => base_seq:91 was on the wire (R1)
+    }
+
+    /// R3: an accepted push whose bytes are canonical (server_hash == our bytes,
+    /// non-align) records the server's returned server_seq as the observed
+    /// base_seq - and ONLY from the response, never a local guess.
+    #[tokio::test]
+    async fn accepted_push_records_server_seq_as_observed() {
+        let mut srv = Server::new_async().await;
+        let body = "canonical body";
+        let drained = sha256_hex(body.as_bytes());
+        let accepted = format!(
+            r#"{{"status":"accepted","seq":1,"content_hash":"{drained}","server_hash":"{drained}","server_seq":4242,"merged_content":null,"message":null}}"#
+        );
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(accepted)
+            .create_async()
+            .await;
+
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/c.md", body.as_bytes())]);
+        let (client, _vault, bs, _shadow) = make_baseseq_client(&srv.url(), journal).await;
+        assert_eq!(bs.get("01_Notes/c.md"), None); // unobserved before
+        let outcomes = client.drain_once().await;
+        assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
+        assert_eq!(bs.get("01_Notes/c.md"), Some(4242)); // observed after (R3)
+    }
+
+    /// R2 + R4: on a 409 (causal gate / CAS) the daemon REFETCHES the current
+    /// server version and MERGES it - materializes the server head locally
+    /// (byte-verified), records the fresh observed base_seq from the /note
+    /// response, and PRESERVES the losing local bytes as a conflict stash. It
+    /// never blind-retries (one push attempt) and never overwrites-loses local.
+    #[tokio::test]
+    async fn conflict_refetches_merges_and_records_observed() {
+        let mut srv = Server::new_async().await;
+        let server_body = "server wins\n";
+        let server_sha = sha256_hex(server_body.as_bytes());
+        // Push is rejected by the causal gate / CAS.
+        let mp = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv"}"#)
+            .expect(1) // NO blind retry: exactly one push attempt
+            .create_async()
+            .await;
+        // Refetch of the current server version (the merge source).
+        let note = format!(
+            r#"{{"path":"01_Notes/x.md","frontmatter":{{}},"body":"{server_body}","sha256":"{server_sha}","modified":null,"file_mtime":null,"created":null,"change_seq":9,"enriched_body":"{server_body}"}}"#
+        );
+        let mn = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", b"local edit\n")]);
+        let (client, vault, bs, _shadow) = make_baseseq_client(&srv.url(), journal).await;
+
+        let outcomes = client.drain_once().await;
+        // Conflict is surfaced (never silently swallowed, R6-friendly).
+        assert!(
+            matches!(
+                outcomes[0].1,
+                PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+            ),
+            "got {:?}",
+            outcomes[0].1
+        );
+        mp.assert_async().await; // exactly one push (no blind retry, R2)
+        mn.assert_async().await; // the daemon refetched the server version (R2)
+
+        // Merge converged the canonical file to the server head (byte-verified).
+        let materialized = std::fs::read_to_string(vault.path().join("01_Notes/x.md")).unwrap();
+        assert_eq!(materialized, server_body);
+        // Observed base_seq recorded from the /note response, only after the
+        // bytes materialized + verified (R3).
+        assert_eq!(bs.get("01_Notes/x.md"), Some(9));
+        // Losing local bytes preserved (never overwritten-lost): a conflict
+        // sibling exists somewhere under the vault root.
+        let mut found_stash = false;
+        for e in walk_files(vault.path()) {
+            if e.file_name().to_string_lossy().contains("conflict-from") {
+                found_stash = true;
+                break;
+            }
+        }
+        assert!(
+            found_stash,
+            "losing local bytes must be stashed, not dropped"
+        );
+    }
+
+    /// R7: a push client backed by a shadow store in the suspect state
+    /// (vault_folders empty but vault-prefixed keys present) PARKS - drain_once
+    /// refuses to drain and no push is sent (guards the 2026-07-18 trinity
+    /// mass-re-push). The mock is set to reject if a push is attempted.
+    #[tokio::test]
+    async fn drain_parks_on_suspect_vault_scope() {
+        let mut srv = Server::new_async().await;
+        // Any push at all is a failure of the guard.
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .create_async()
+            .await;
+
+        // Craft a suspect shadow: empty vault_folders + a vault-prefixed key.
+        let sdir = TempDir::new().unwrap();
+        let spath = sdir.path().join("shadow.json");
+        let mut map = std::collections::HashMap::new();
+        map.insert("Mainframe/01_Notes/x.md".to_string(), "h".to_string());
+        std::fs::write(&spath, serde_json::to_vec(&map).unwrap()).unwrap();
+        let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
+        assert!(shadow.vault_scope_suspect());
+
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", b"edit\n")]);
+        let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
+        let client = PushClient::new(
+            api,
+            journal,
+            "dev-test".into(),
+            config_for_test(),
+            PathBuf::from("/nonexistent"),
+        )
+        .with_shadow_store(shadow);
+
+        let outcomes = client.drain_once().await;
+        assert!(outcomes.is_empty(), "parked drain must process nothing");
+        m.assert_async().await; // expect(0): no push was attempted (R7)
+    }
+
+    /// Minimal recursive file walk for the conflict-stash assertion.
+    fn walk_files(root: &std::path::Path) -> Vec<std::fs::DirEntry> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk_files(&p));
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
 }

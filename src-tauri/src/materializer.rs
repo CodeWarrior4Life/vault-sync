@@ -2971,4 +2971,46 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), canonical_bytes);
         assert_eq!(shadow.get(&rel).as_deref(), Some(canonical_sha.as_str()));
     }
+
+    // --- R3 observed base_seq recorded only after byte-verify (TKT-166e1c07) ---
+
+    /// R3: a Live-mode write whose bytes pass the integrity check records the
+    /// server-provided change_seq as the note's observed base_seq (at the SAME
+    /// post-verify point as the shadow hash); a payload with NO change_seq (a
+    /// pre-R7b server, R5) records nothing, leaving the note unobserved
+    /// (fail-closed). Fails on pre-R7b code: there is no base_seq store to
+    /// record into, and NotePayload has no change_seq.
+    #[tokio::test]
+    async fn records_observed_base_seq_only_from_server_change_seq() {
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+
+        let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_base_seq_store(bs.clone());
+
+        // Server returned a change_seq -> observed after the write byte-verifies.
+        let mut p = payload("01_Inbox/seq.md", "hello base_seq");
+        p.change_seq = Some(7788);
+        let out = m.write(&p).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
+        // Keyed sync-root-relative (vault prefix stripped by canon), matching
+        // the shadow store. The observed seq is exactly the server's token.
+        assert_eq!(bs.get("01_Inbox/seq.md"), Some(7788));
+
+        // Pre-R7b server omits change_seq -> nothing recorded (fail-closed, R5).
+        let p2 = payload("01_Inbox/noseq.md", "no server seq");
+        assert_eq!(p2.change_seq, None);
+        let out2 = m.write(&p2).unwrap();
+        assert!(
+            matches!(out2, MaterializeOutcome::Wrote { .. }),
+            "got {out2:?}"
+        );
+        assert_eq!(bs.get("01_Inbox/noseq.md"), None);
+    }
 }
