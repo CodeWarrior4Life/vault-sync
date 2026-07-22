@@ -81,7 +81,12 @@ struct StashFilename {
 /// The hash is derived from the FULL original path, so the same note always maps
 /// to the same stash base (idempotency + collision reuse keep working), and the
 /// manifest maps the hashed name back to the original path for the resolver UI.
-fn build_stash_filename(original_path: &str, stem: &str, device_id: &str, lsn: u64) -> StashFilename {
+fn build_stash_filename(
+    original_path: &str,
+    stem: &str,
+    device_id: &str,
+    lsn: u64,
+) -> StashFilename {
     let natural = format!("{stem}.conflict-from-{device_id}-{lsn}.md");
     if basename_fits(&natural) {
         return StashFilename {
@@ -1054,7 +1059,9 @@ mod tests {
         let stash = ConflictStash::new(tmp.path().to_path_buf(), ConflictPolicy::ServerWins);
         let p1 = stash.write_stash(live_path, b"loser", "link", 1).unwrap();
         // Same content, different device+lsn -> reuse the existing stash.
-        let p2 = stash.write_stash(live_path, b"loser", "trinity", 99).unwrap();
+        let p2 = stash
+            .write_stash(live_path, b"loser", "trinity", 99)
+            .unwrap();
         assert_eq!(p1, p2, "identical content must reuse the single stash");
         let parent = p1.parent().unwrap();
         let n = fs::read_dir(parent)

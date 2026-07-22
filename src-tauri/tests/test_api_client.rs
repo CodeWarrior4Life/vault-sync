@@ -143,7 +143,11 @@ async fn ar009_non_json_decode_attaches_bounded_sample() {
         ApiError::Decode(d) => {
             assert!(d.content_type.starts_with("text/html"));
             let s = d.body_sample.expect("non-JSON body must attach a sample");
-            assert!(s.len() <= 256, "sample must be bounded (<=256), got {}", s.len());
+            assert!(
+                s.len() <= 256,
+                "sample must be bounded (<=256), got {}",
+                s.len()
+            );
             assert!(s.starts_with("<html>"));
         }
         other => panic!("expected ApiError::Decode, got {other:?}"),

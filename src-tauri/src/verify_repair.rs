@@ -1863,7 +1863,10 @@ mod tests {
         assert_eq!(report.pulls_succeeded, 0);
         assert_eq!(report.pulls_failed, 1, "the bad-decode pull must be FAILED");
         assert_eq!(report.still_divergent, 1);
-        assert_eq!(report.add_count, 0, "a failed pull must NOT inflate add_count");
+        assert_eq!(
+            report.add_count, 0,
+            "a failed pull must NOT inflate add_count"
+        );
         assert!(report.cycle_red(), "a failed pull makes the cycle RED");
         assert!(!report.soak_eligible());
         assert!(!report.errors.is_empty());
