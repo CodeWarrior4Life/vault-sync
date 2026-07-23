@@ -83,7 +83,7 @@ use walkdir::WalkDir;
 
 use crate::api_client::{ApiClient, ApiError, ReconcileBatchItem, ReconcileBatchRequest};
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 
@@ -188,6 +188,11 @@ pub struct VerifyRepairReport {
     pub delete_paths_sample: Vec<String>,
     pub substrate_refused_count: usize,
     pub extension_filtered_count: usize,
+    /// R6 / F-A4.1 (TKT-989ad5f2): count of symlinks encountered inside the
+    /// vault scan path and SKIPPED by the walker. Each is also WARN-logged
+    /// (pre-fix they were dropped with zero log — trinity's 6 dangling conductor
+    /// symlinks appeared 0 times in a 1.4GB daily log, RC-A4).
+    pub symlinks_skipped: usize,
     pub errors: Vec<(String, String)>,
     pub elapsed_ms: u64,
 
@@ -307,10 +312,25 @@ pub enum PullResultClass {
 }
 
 /// Classify a single pull result. `Err` (fetch/materialize) and a post-write
-/// integrity failure are FAILED; a conflict-storm-breaker skip is DEFERRED;
-/// every other outcome (Wrote / Stashed / AlignedToCanonical, or a benign
-/// Skipped such as IdenticalToLocal / LocalEditPreserved / DisabledMode) is a
-/// resolved SUCCEEDED state.
+/// integrity failure are FAILED.
+///
+/// R2 / F-B1.2 (TKT-989ad5f2): every REFUSAL skip — a pull the daemon declined
+/// to converge because it would strip/overwrite local — is DEFERRED (still
+/// divergent), NOT a resolved success. The pre-fix code mapped
+/// `LocalEditPreserved` to `Succeeded`, so a preserved-local refusal counted as
+/// a converged pull, `still_divergent` stayed 0, `cycle_red()` was false, and
+/// the strand became soak-eligible while divergence persisted (AR-5). The
+/// refusal skips are:
+///
+/// * `ConflictStormBreakerOpen` — breaker deferred the write.
+/// * `LocalEditPreserved` — a genuine local edit preserved; still divergent
+///   until the watcher-enqueued push lands.
+/// * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
+///   a compensating push; still divergent until it lands.
+///
+/// A `Wrote`/`Stashed`/`AlignedToCanonical` (incl. anti-strip ARM 2, which
+/// stashes then aligns local to server) and a benign in-sync/no-op Skipped
+/// (`IdenticalToLocal` / `DisabledMode` / `SubstrateRefused`) are SUCCEEDED.
 pub fn classify_pull_outcome(
     res: &Result<crate::materializer::MaterializeOutcome, String>,
 ) -> PullResultClass {
@@ -319,6 +339,8 @@ pub fn classify_pull_outcome(
         Err(_) => PullResultClass::Failed,
         Ok(O::IntegrityFailed { .. }) => PullResultClass::Failed,
         Ok(O::Skipped(S::ConflictStormBreakerOpen)) => PullResultClass::Deferred,
+        Ok(O::Skipped(S::LocalEditPreserved)) => PullResultClass::Deferred,
+        Ok(O::Skipped(S::GuardPreserveLocalPushUp { .. })) => PullResultClass::Deferred,
         Ok(_) => PullResultClass::Succeeded,
     }
 }
@@ -469,12 +491,18 @@ impl VerifyRepair {
                     };
 
                     // LIGHTWEIGHT (lazy) push ref — no file read here. The
-                    // push_client reads the body from disk at drain time. The
-                    // CAS base is the server's CURRENT hash from the delta:
-                    // Some(server_hash) for drift (overwrite the diverged row),
-                    // None for missing-on-server (create). delta.server_hash is
-                    // already exactly that (None when the server has no row).
-                    pending_pushes.push(self.build_modify_push(local, delta.server_hash.clone()));
+                    // push_client reads the body from disk at drain time. R4 /
+                    // F-B3.2 (TKT-989ad5f2): the CAS base is a THREE-STATE derived
+                    // from the reconcile delta: `KnownBase(server_hash)` for drift
+                    // (overwrite the diverged row), `NoRow` for missing-on-server
+                    // (force a CREATE). `NoRow` is explicitly NOT `Unknown`, so
+                    // push_client never shadow-backfills a stale hash onto a path
+                    // the server has no row for.
+                    let base = match delta.server_hash.clone() {
+                        Some(h) => PushBase::KnownBase(h),
+                        None => PushBase::NoRow,
+                    };
+                    pending_pushes.push(self.build_modify_push(local, base));
                 }
                 Direction::Pull => {
                     // Our local is stale (the server moved since we last synced,
@@ -795,6 +823,22 @@ impl VerifyRepair {
                     continue;
                 }
             };
+            // R6 / F-A4.1 (TKT-989ad5f2): a symlink inside the vault scan path
+            // is SKIPPED, but VISIBLY — WARN + a report counter. `follow_links`
+            // is false, so a symlink surfaces as a symlink entry (never a file),
+            // and the pre-fix `!is_file() -> continue` dropped it with zero log.
+            // Symlinks are not synced (their target's identity/containment is
+            // ambiguous and a dangling one has no content), but the operator MUST
+            // be able to see they exist (trinity's 6 dangling conductor symlinks
+            // were invisible in a 1.4GB daily log, RC-A4).
+            if entry.file_type().is_symlink() {
+                report.symlinks_skipped += 1;
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "verify_repair: SYMLINK inside vault scan path — SKIPPED (not synced; symlinks_skipped counter bumped)"
+                );
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -890,14 +934,18 @@ impl VerifyRepair {
     /// against `vault_reconcile_state.fs_hash` — it MUST be the server's CURRENT
     /// hash, NOT our local one.
     ///
-    /// - `drift` → `Some(server_hash)` (from the reconcile delta) so the CAS
-    ///   passes and the local version overwrites the diverged server one.
-    /// - `missing-on-server` → `None` (sent as `""`) so the server CREATEs the
-    ///   row (an `""` base on an existing row would conflict).
+    /// - `drift` → `PushBase::KnownBase(server_hash)` (from the reconcile delta)
+    ///   so the CAS passes and the local version overwrites the diverged server
+    ///   one. Honored verbatim by push_client; NEVER shadow-backfilled.
+    /// - `missing-on-server` → `PushBase::NoRow` (R4 / F-B3.2, TKT-989ad5f2):
+    ///   the server has no row, so force a CREATE (wire base `""`). This is
+    ///   distinct from a watcher `Unknown`; the pre-fix `None` conflated the two,
+    ///   so push_client shadow-backfilled a stale hash and 409'd forever against
+    ///   a row that does not exist (the perpetual CAS-409 push loop).
     ///
     /// v0.4.10 wrongly sent our LOCAL hash here, which by definition mismatches
     /// a drifted server row → every drift push 409'd `ConflictUnrecoverable`.
-    fn build_modify_push(&self, entry: &ManifestEntry, base_hash: Option<String>) -> PushEvent {
+    fn build_modify_push(&self, entry: &ManifestEntry, base_hash: PushBase) -> PushEvent {
         PushEvent {
             schema_version: CURRENT_SCHEMA,
             id: new_event_id(),
@@ -1449,7 +1497,10 @@ mod tests {
         // v0.4.11: a DRIFT push must carry the SERVER's current hash as the CAS
         // base (from the delta), NOT the local hash — else the server's
         // base_hash==current check fails and the push 409s ConflictUnrecoverable.
-        assert_eq!(batch[0].0.base_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase("deadbeef".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1483,9 +1534,11 @@ mod tests {
             j.drain(10).unwrap()
         };
         assert_eq!(batch.len(), 1);
-        // v0.4.11: missing-on-server → base_hash None (sent as "") so the server
-        // CREATEs the row (a non-empty base on a missing row would conflict).
-        assert_eq!(batch[0].0.base_hash, None);
+        // R4 / F-B3.2 (TKT-989ad5f2): missing-on-server → base_hash NoRow (sent
+        // as "") so the server CREATEs the row. NoRow is distinct from Unknown,
+        // so push_client never shadow-backfills a stale hash here (the pre-fix
+        // None conflated the two → perpetual CAS-409 push loop).
+        assert_eq!(batch[0].0.base_hash, PushBase::NoRow);
     }
 
     #[tokio::test]
@@ -1771,10 +1824,105 @@ mod tests {
             })),
             PullResultClass::Succeeded
         );
-        // Benign skip (local edit preserved) → Succeeded (resolved, no pull).
+        // R2 / F-B1.2 (TKT-989ad5f2): a preserved-local REFUSAL is Deferred
+        // (still divergent), NOT Succeeded. Benign in-sync skips remain
+        // Succeeded.
         assert_eq!(
             classify_pull_outcome(&Ok(O::Skipped(S::LocalEditPreserved))),
+            PullResultClass::Deferred
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }))),
+            PullResultClass::Deferred
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::IdenticalToLocal))),
             PullResultClass::Succeeded
+        );
+    }
+
+    /// T6a (R2 / F-B1.2): a preserved-local refusal classifies as Deferred, not
+    /// Succeeded. FAILS on pre-fix code (which returned Succeeded — the
+    /// false-green strand, AR-5).
+    #[test]
+    fn t6a_local_edit_preserved_is_deferred_not_succeeded() {
+        use crate::materializer::{MaterializeOutcome as O, SkipReason as S};
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::LocalEditPreserved))),
+            PullResultClass::Deferred,
+            "a preserved-local refusal is still divergent (Deferred), never Succeeded"
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }))),
+            PullResultClass::Deferred,
+            "the anti-strip ARM-1 preserve+push skip is still divergent (Deferred)"
+        );
+    }
+
+    /// T6b (R2 / F-B1.2): a pass whose only pull was a preserved-local refusal
+    /// is cycle RED (still_divergent > 0) and NOT soak-eligible. This is the
+    /// end-to-end consequence of T6a: on pre-fix code the same pass counted the
+    /// refusal as Succeeded, `still_divergent` stayed 0, and the strand was
+    /// falsely soak-eligible while divergence persisted.
+    #[test]
+    fn t6b_preserved_local_pull_makes_cycle_red_not_soak_eligible() {
+        // Mimic the run() accounting: classify the outcome, then credit the
+        // report the way the pull loop does.
+        let outcome: Result<crate::materializer::MaterializeOutcome, String> =
+            Ok(crate::materializer::MaterializeOutcome::Skipped(
+                crate::materializer::SkipReason::LocalEditPreserved,
+            ));
+        let mut report = VerifyRepairReport {
+            pulls_attempted: 1,
+            ..Default::default()
+        };
+        match classify_pull_outcome(&outcome) {
+            PullResultClass::Succeeded => report.pulls_succeeded += 1,
+            PullResultClass::Deferred => report.pulls_deferred += 1,
+            PullResultClass::Failed => report.pulls_failed += 1,
+        }
+        report.still_divergent = report.pulls_failed + report.pulls_deferred;
+        assert_eq!(report.pulls_deferred, 1, "the refusal is a deferred pull");
+        assert!(
+            report.cycle_red(),
+            "a preserved-local refusal must make the cycle RED"
+        );
+        assert!(
+            !report.soak_eligible(),
+            "a RED cycle must NOT be soak-eligible (AR-5)"
+        );
+    }
+
+    /// T10 (R6 / F-A4.1): a symlink inside the vault scan path is SKIPPED but
+    /// VISIBLE — counted in `report.symlinks_skipped` (and WARN-logged). FAILS
+    /// on pre-fix code: the walker dropped symlinks at `!is_file() -> continue`
+    /// with zero log and no counter (RC-A4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t10_symlink_in_scan_path_is_counted_not_silently_dropped() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "notes/real.md", b"real body");
+        // A symlink inside the vault (points at the real note).
+        std::os::unix::fs::symlink(v.join("notes/real.md"), v.join("notes/link.md")).unwrap();
+
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let mut report = VerifyRepairReport::default();
+        let m = vr.build_local_manifest_with_report(&mut report).unwrap();
+
+        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"notes/real.md"), "the real file is synced");
+        assert!(
+            !paths.contains(&"notes/link.md"),
+            "the symlink itself is not synced"
+        );
+        assert_eq!(
+            report.symlinks_skipped, 1,
+            "the symlink must be COUNTED (was silently dropped pre-fix)"
         );
     }
 

@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 use crate::redflag::DeleteBurstDetector;
@@ -241,6 +241,12 @@ pub struct FileWatcher {
     /// auto-recover a dead/fenced watcher REGARDLESS of pending count. `None`
     /// keeps pre-S511 behavior (no heartbeat); the production wire-up sets it.
     sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
+    /// R6 / F-A4.1 (TKT-989ad5f2): count of symlinks encountered inside the
+    /// vault scan path and skipped by `normalize_event`. Each is also
+    /// WARN-logged. Pre-fix the watcher silently followed internal symlinks and
+    /// silently dropped symlink escapes (zero log, RC-A4). `Arc` so clones share
+    /// the count; readable via [`Self::symlinks_skipped`].
+    symlinks_skipped: Arc<AtomicU64>,
 }
 
 impl FileWatcher {
@@ -264,7 +270,14 @@ impl FileWatcher {
             enqueued_hashes: Arc::new(Mutex::new(HashMap::new())),
             shadow_store: None,
             sync_health: None,
+            symlinks_skipped: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// R6 / F-A4.1 (TKT-989ad5f2): number of symlinks the watcher has skipped
+    /// inside the vault scan path this session (see [`Self::normalize_event`]).
+    pub fn symlinks_skipped(&self) -> u64 {
+        self.symlinks_skipped.load(Ordering::Relaxed)
     }
 
     /// D6 (S511): attach the shared shadow store so the enqueue dedup is gated
@@ -572,7 +585,7 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: path.clone(),
                     action: PushAction::Create,
-                    base_hash: None,
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -593,13 +606,12 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: path.clone(),
                     action: PushAction::Modify,
-                    // Caller is responsible for sourcing the base_hash from
-                    // the materializer's last-known state; in this layer we
-                    // do not have it. v0.3.1 spec note: the push_client
-                    // backfills base_hash by reading the materializer index
-                    // before sending. For now we emit None and let the
-                    // push_client OR the server retry path handle it.
-                    base_hash: None,
+                    // R4 / F-B3.2 (TKT-989ad5f2): a real-time watcher event has
+                    // no known CAS base, so it is `Unknown` — push_client sources
+                    // the base from the shadow store (I29). This is deliberately
+                    // distinct from a reconcile `NoRow`, which must NOT be
+                    // shadow-backfilled; the pre-fix `None` conflated the two.
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -618,7 +630,7 @@ impl FileWatcher {
                 id: new_event_id(),
                 path: path.clone(),
                 action: PushAction::Delete,
-                base_hash: None,
+                base_hash: PushBase::Unknown,
                 content_sha: String::new(),
                 content_bytes: None,
                 queued_at: now,
@@ -642,7 +654,7 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: new_path.clone(),
                     action: PushAction::Create,
-                    base_hash: None,
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -692,6 +704,26 @@ impl FileWatcher {
     /// variant kind. Used by the FS-watcher loop (per-path, post kind-filter).
     /// Public for integration tests that bypass the spawned task.
     pub fn normalize_event(&self, abs: &Path, kind: WatchEventKindHint) -> Option<WatchEvent> {
+        // R6 / F-A4.1 (TKT-989ad5f2): a symlink inside the vault scan path is
+        // SKIPPED, but VISIBLY — WARN + a counter. Pre-fix the watcher silently
+        // FOLLOWED internal symlinks (normalize_path canonicalizes the target)
+        // and silently DROPPED escapes (returns None), so a symlink appeared 0
+        // times in the log (RC-A4). We check the raw path's OWN metadata (a
+        // no-follow lstat) BEFORE normalization. A Deleted symlink can no longer
+        // be stat'd, so the check naturally no-ops there and the delete
+        // propagates as before.
+        if !matches!(kind, WatchEventKindHint::Deleted) {
+            if let Ok(md) = std::fs::symlink_metadata(abs) {
+                if md.file_type().is_symlink() {
+                    self.symlinks_skipped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        path = %abs.display(),
+                        "file_watcher: SYMLINK inside vault scan path — SKIPPED (not synced; symlinks_skipped counter bumped)"
+                    );
+                    return None;
+                }
+            }
+        }
         let p = self.normalize_path(abs)?;
         Some(match kind {
             WatchEventKindHint::Created => WatchEvent::Created { path: p },
@@ -1840,7 +1872,7 @@ mod tests {
         // disk at drain); content_sha is still computed from the body.
         assert!(push.content_bytes.is_none());
         assert_eq!(push.content_sha, sha256_hex(&body));
-        assert!(push.base_hash.is_none());
+        assert_eq!(push.base_hash, PushBase::Unknown);
         assert_eq!(push.content_sha.len(), 64);
         assert_eq!(push.device_id, "dev-test");
     }

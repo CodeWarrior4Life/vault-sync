@@ -24,6 +24,9 @@ use crate::conflict_stash::{ConflictClassifier, ConflictPolicy, ConflictStash, S
 use crate::integrity_check::{
     ByteLevelResult, ExpectedIntegrity, IntegrityChecker, IntegrityError, IntegrityResult,
 };
+use crate::push_journal::{
+    new_event_id, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::scope::is_safe_path;
 use crate::sync_shadow::canonical_sync_path;
@@ -114,6 +117,17 @@ pub enum SkipReason {
     /// file is left UNTOUCHED (no stash, no overwrite); reconcile retries
     /// after the window (or after the operator resolves the divergence source).
     ConflictStormBreakerOpen,
+    /// R1 / F-B1.1 ARM 1 (TKT-989ad5f2): the anti-strip guard fired and the
+    /// server version merely DROPPED the frontmatter block (the
+    /// frontmatter-normalized bodies are byte-equal — a pure server-strip). The
+    /// local frontmatter-bearing copy is preserved AND a compensating UP push
+    /// was enqueued (CAS base = the server hash from the pull payload) so the
+    /// local frontmatter propagates UP. The path is STILL DIVERGENT until that
+    /// push lands, so this classifies as `Deferred`/RED (R2), never converged.
+    /// `enqueued_push` is false only when no push-journal handle was wired (a
+    /// fail-honest degrade: local is still preserved, but convergence then
+    /// waits on the next reconcile pass).
+    GuardPreserveLocalPushUp { enqueued_push: bool },
 }
 
 /// Outcome of a single `write()` call.
@@ -332,6 +346,16 @@ pub struct Materializer {
     /// so every clone (SSE consumer, reconcile backstop, pull backfill) counts
     /// against ONE budget — the storm arrived through the reconcile clone.
     conflict_mints: Arc<Mutex<std::collections::VecDeque<std::time::Instant>>>,
+    /// R1 / F-B1.1 (TKT-989ad5f2): optional push-journal handle used to enqueue
+    /// the ARM-1 compensating UP push (pure server-strip: the server merely
+    /// dropped the frontmatter block; the body is byte-identical after
+    /// normalization). The local file is byte-unchanged in that case, so the
+    /// file_watcher never fires — without this proactive enqueue the pull
+    /// re-hits the anti-strip guard every pass (the 8,081 phantom-pull
+    /// deadlock). Its own `PushJournal` handle on the shared jsonl file (the
+    /// journal is file-authoritative; N handles converge). `None` keeps the
+    /// pre-fix behavior (preserve local, rely on the watcher).
+    push_journal: Option<Arc<Mutex<PushJournal>>>,
 }
 
 impl Clone for Materializer {
@@ -350,6 +374,7 @@ impl Clone for Materializer {
             base_seq_store: self.base_seq_store.clone(),
             path_locks: self.path_locks.clone(),
             conflict_mints: self.conflict_mints.clone(),
+            push_journal: self.push_journal.clone(),
         }
     }
 }
@@ -384,6 +409,59 @@ impl Materializer {
             base_seq_store: None,
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             conflict_mints: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            push_journal: None,
+        }
+    }
+
+    /// R1 / F-B1.1 (TKT-989ad5f2): attach the push-journal handle used to
+    /// enqueue the ARM-1 compensating UP push. Builder; `None` (unset) keeps
+    /// the pre-fix preserve-and-wait-for-watcher behavior.
+    pub fn with_push_journal(mut self, journal: Arc<Mutex<PushJournal>>) -> Self {
+        self.push_journal = Some(journal);
+        self
+    }
+
+    /// R1 / F-B1.1 ARM 1 (TKT-989ad5f2): enqueue the compensating UP push that
+    /// carries the preserved local (frontmatter-bearing) bytes back to the
+    /// server. `server_hash` is the CAS base (the server hash from the pull
+    /// payload) so the server accepts our bytes over its stripped copy;
+    /// `local_sha` is the sha of the bytes on disk we are pushing. A LAZY ref
+    /// (`content_bytes: None`) — push_client reads the file at drain time.
+    /// Returns true iff a journal handle was wired AND the append succeeded.
+    fn enqueue_compensating_push(&self, path: &str, local_sha: &str, server_hash: &str) -> bool {
+        let Some(journal) = &self.push_journal else {
+            warn!(
+                path,
+                "ARM 1: no push-journal handle wired - local preserved but compensating push NOT enqueued (convergence waits on next reconcile pass)"
+            );
+            return false;
+        };
+        let evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: new_event_id(),
+            path: path.to_string(),
+            action: PushAction::Modify,
+            // The CAS base is the server hash from the pull payload: base ==
+            // current server row -> the server accepts our frontmatter-bearing
+            // bytes (operator-ratified local-wins-push-up for a pure strip).
+            base_hash: PushBase::KnownBase(server_hash.to_string()),
+            content_sha: local_sha.to_string(),
+            content_bytes: None,
+            queued_at: chrono::Utc::now(),
+            device_id: self.config.device_id.clone(),
+        };
+        match journal.lock() {
+            Ok(mut j) => match j.append(evt) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(path, error = %e, "ARM 1: compensating push append failed");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!(path, error = %e, "ARM 1: push-journal mutex poisoned; compensating push not enqueued");
+                false
+            }
         }
     }
 
@@ -680,16 +758,60 @@ impl Materializer {
             );
             let pull_would_strip =
                 starts_with_frontmatter(&local_bytes) && !starts_with_frontmatter(content_bytes);
-            if pull_would_strip && matches!(raw_decision, Decision::PullClean | Decision::Conflict)
-            {
-                warn!(
-                    path = %payload.path,
-                    ?raw_decision,
-                    change_seq,
-                    "materializer ANTI-STRIP GUARD (S513): server version drops YAML frontmatter local holds — REFUSING pull, PRESERVING local (will push up)"
-                );
-            }
-            match guard_no_frontmatter_strip(raw_decision, pull_would_strip) {
+            // R1 / F-B1.1 (TKT-989ad5f2): the anti-strip guard NEVER silently
+            // strips and NEVER just parks on a bare "will push up" promise. When
+            // a pull WOULD drop frontmatter local holds, resolve into one of two
+            // arms based on whether the frontmatter-normalized BODIES are equal.
+            let guard_hit = pull_would_strip
+                && matches!(raw_decision, Decision::PullClean | Decision::Conflict);
+            let effective_decision = if guard_hit {
+                match classify_guard_arm(&local_bytes, content_bytes) {
+                    GuardArm::PreserveAndPushUp => {
+                        // ARM 1 — pure server-strip: the server dropped only the
+                        // frontmatter block; the body is byte-identical. Preserve
+                        // the local frontmatter-bearing copy and enqueue a
+                        // compensating UP push whose CAS base is the server hash
+                        // from THIS pull payload, so the local frontmatter
+                        // propagates UP. The local file is byte-unchanged, so the
+                        // file_watcher never fires — this proactive enqueue is
+                        // what breaks the phantom-pull deadlock (RC-B1). The path
+                        // stays divergent until the push lands (R2: Deferred/RED).
+                        let enqueued_push = self.enqueue_compensating_push(
+                            &payload.path,
+                            &local_raw_sha,
+                            &payload.sha256,
+                        );
+                        warn!(
+                            path = %payload.path,
+                            ?raw_decision,
+                            change_seq,
+                            base_hash = %payload.sha256,
+                            enqueued_push,
+                            "materializer ANTI-STRIP GUARD (S513) ARM 1 (pure server-strip: frontmatter-normalized bodies equal): PRESERVING local + ENQUEUED compensating UP push (CAS base = server hash from pull); still divergent until it lands"
+                        );
+                        return Ok(MaterializeOutcome::Skipped(
+                            SkipReason::GuardPreserveLocalPushUp { enqueued_push },
+                        ));
+                    }
+                    GuardArm::StashThenAlign => {
+                        // ARM 2 — genuine divergence: the bodies differ. Fall
+                        // through to the R4/R5 stash-then-align path (stash the
+                        // local bytes OUTSIDE sync scope as a conflict copy, then
+                        // materialize the server winner + update the shadow). No
+                        // data loss: the local bytes survive as the stash.
+                        warn!(
+                            path = %payload.path,
+                            ?raw_decision,
+                            change_seq,
+                            "materializer ANTI-STRIP GUARD (S513) ARM 2 (genuine divergence: frontmatter-normalized bodies differ): STASHING local then ALIGNING to server (local preserved as conflict copy)"
+                        );
+                        Decision::Conflict
+                    }
+                }
+            } else {
+                raw_decision
+            };
+            match effective_decision {
                 Decision::Noop => {
                     if local_bytes == content_bytes {
                         // R1 byte-strict half: truly identical bytes. Nothing
@@ -740,13 +862,20 @@ impl Materializer {
                 Decision::PreserveLocalEdit => {
                     // R2: shadow == server (server has NOT moved since we synced)
                     // AND local diverges => a genuine LOCAL edit. NEVER overwrite
-                    // it with the older server copy. Leave the file untouched so
-                    // the file_watcher/push pipeline carries the edit UP. This is
-                    // the exact silent-revert the operator hit (TKT-2dc9a17e).
+                    // it with the older server copy. Leave the file untouched.
+                    // R3 (TKT-989ad5f2) log truth: the materializer enqueues NO
+                    // push here — the user's edit that caused this divergence was
+                    // already observed by the file_watcher and enqueued at edit
+                    // time; that push carries it UP. We state that honestly rather
+                    // than promising a push the materializer did not make. The
+                    // path stays divergent until the watcher-enqueued push lands
+                    // (R2: this outcome classifies as Deferred/RED, never
+                    // converged). This is the exact silent-revert the operator
+                    // hit (TKT-2dc9a17e), now preserved + accounted honestly.
                     warn!(
                         path = %payload.path,
                         change_seq,
-                        "materializer R2: local edit diverges, server unchanged since last sync, PRESERVING local (will push up), NOT overwriting"
+                        "materializer R2: local edit diverges, server unchanged since last sync — PRESERVING local, NOT overwriting (watcher-enqueued push carries it up; still divergent until it lands)"
                     );
                     return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
                 }
@@ -1298,6 +1427,62 @@ pub fn guard_no_frontmatter_strip(
         return Decision::PreserveLocalEdit;
     }
     decision
+}
+
+/// R1 / F-B1.1 (TKT-989ad5f2): the two arms of a guard-hit (anti-strip)
+/// resolution. Which arm applies is decided purely by whether the
+/// frontmatter-normalized BODIES are byte-equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardArm {
+    /// Pure server-strip: the server dropped ONLY the frontmatter block; the
+    /// body is byte-identical after BOM/EOL normalization. Preserve local +
+    /// enqueue a compensating UP push (CAS base = the pull's server hash).
+    PreserveAndPushUp,
+    /// Genuine divergence: the bodies differ. Stash local OUTSIDE sync scope,
+    /// align local to the server, update the shadow (the R4/R5 stash-then-align).
+    StashThenAlign,
+}
+
+/// Strip a leading YAML frontmatter block (if present) and return the
+/// BOM/EOL-normalized body. Unlike `normalize_for_diff` (which keeps the
+/// frontmatter and strips only volatile fields), this removes the whole block
+/// so a note that differs ONLY by the presence of frontmatter compares equal in
+/// the body. Non-UTF-8 input passes through unchanged (never a false-equal).
+pub fn body_after_frontmatter_normalized(content: &[u8]) -> Vec<u8> {
+    let raw = match std::str::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return content.to_vec(),
+    };
+    let no_bom = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let normalized: String = if no_bom.contains('\r') {
+        no_bom.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        no_bom.to_string()
+    };
+    let s = normalized.as_str();
+    if !s.starts_with("---\n") {
+        // No leading frontmatter: the whole (normalized) content is the body.
+        return s.as_bytes().to_vec();
+    }
+    match find_frontmatter_end(s) {
+        Some(fe) => s.as_bytes()[fe.body_start..].to_vec(),
+        None => s.as_bytes().to_vec(),
+    }
+}
+
+/// R1 / F-B1.1: classify a guard-hit resolution into its arm. `PreserveAndPushUp`
+/// (ARM 1) iff the frontmatter-normalized bodies are byte-equal (pure
+/// server-strip); otherwise `StashThenAlign` (ARM 2, genuine divergence). PURE +
+/// table-tested; the caller has already established that a pull WOULD strip
+/// local frontmatter.
+pub fn classify_guard_arm(local_bytes: &[u8], server_bytes: &[u8]) -> GuardArm {
+    if body_after_frontmatter_normalized(local_bytes)
+        == body_after_frontmatter_normalized(server_bytes)
+    {
+        GuardArm::PreserveAndPushUp
+    } else {
+        GuardArm::StashThenAlign
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2625,6 +2810,168 @@ mod tests {
         let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
         let m = m.with_shadow_store(shadow.clone());
         (v, w, m, shadow)
+    }
+
+    /// R8 / T3 harness (TKT-989ad5f2): materializer wired with a shadow store
+    /// AND a push-journal handle, so the anti-strip ARM-1 compensating push can
+    /// be observed. Returns the journal so tests can drain it.
+    fn mk_with_shadow_and_journal(
+        mode: MaterializerMode,
+    ) -> (
+        TempDir,
+        TempDir,
+        Materializer,
+        Arc<ShadowStore>,
+        Arc<Mutex<PushJournal>>,
+    ) {
+        let (v, w, m) = mk(mode, default_cfg());
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let journal = Arc::new(Mutex::new(
+            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+        ));
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_push_journal(journal.clone());
+        (v, w, m, shadow, journal)
+    }
+
+    /// T3 (R1 / F-B1.1 ARM 1): a PURE server-strip (server dropped the
+    /// frontmatter block; body byte-identical) PRESERVES local AND enqueues a
+    /// compensating UP push whose CAS base is the server hash from the pull. The
+    /// local file is byte-unchanged (so the watcher never fires — the enqueue is
+    /// what breaks the phantom-pull deadlock). FAILS on pre-fix code: the guard
+    /// only downgraded to LocalEditPreserved and enqueued NOTHING.
+    #[test]
+    fn t3_guard_arm1_pure_strip_preserves_local_and_enqueues_compensating_push() {
+        let (vaults, _ws, m, shadow, journal) = mk_with_shadow_and_journal(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/strip.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/strip.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Local holds frontmatter + body; it equals the last-synced shadow
+        // (local untouched since sync => the PullClean basis).
+        let local = "---\ntitle: Keep Me\n---\nSHARED BODY\n";
+        std::fs::write(&target, local).unwrap();
+        shadow.record(&rel, &sha256_hex(local));
+
+        // Server dropped the frontmatter, but the BODY is byte-identical.
+        let server_body = "SHARED BODY\n";
+        let server = NotePayload {
+            path: rel.clone(),
+            frontmatter: serde_json::json!({}),
+            body: server_body.into(),
+            sha256: sha256_hex(server_body),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: None,
+            enriched_body: Some(server_body.to_string()),
+        };
+
+        let out = m.write(&server).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }),
+            "ARM 1 must preserve local AND enqueue a compensating push, got {out:?}"
+        );
+        // Local frontmatter preserved verbatim — the server strip is NOT applied.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            local,
+            "local frontmatter must be preserved (guard never strips)"
+        );
+        // A compensating UP push was enqueued, CAS base = the server hash.
+        let batch = journal.lock().unwrap().drain(10).unwrap();
+        assert_eq!(batch.len(), 1, "exactly one compensating push enqueued");
+        assert_eq!(batch[0].0.path, rel);
+        assert_eq!(batch[0].0.action, PushAction::Modify);
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase(sha256_hex(server_body)),
+            "CAS base must be the server hash from the pull payload"
+        );
+    }
+
+    /// T3 (R1 / F-B1.1 ARM 2): GENUINE divergence (server dropped frontmatter
+    /// AND changed the body) STASHES local then ALIGNS to the server — local
+    /// survives as a conflict copy, nothing enqueued. FAILS on pre-fix code:
+    /// the guard downgraded to LocalEditPreserved (no stash, no align, no
+    /// convergence — the phantom-pull deadlock).
+    #[test]
+    fn t3_guard_arm2_divergence_stashes_then_aligns() {
+        let (vaults, _ws, m, shadow, journal) = mk_with_shadow_and_journal(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/diverge.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/diverge.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let local = "---\ntitle: Keep Me\n---\nLOCAL BODY\n";
+        std::fs::write(&target, local).unwrap();
+        shadow.record(&rel, &sha256_hex(local));
+
+        // Server dropped frontmatter AND changed the body -> genuine divergence.
+        let server_body = "SERVER BODY (different)\n";
+        let server = NotePayload {
+            path: rel.clone(),
+            frontmatter: serde_json::json!({}),
+            body: server_body.into(),
+            sha256: sha256_hex(server_body),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: None,
+            enriched_body: Some(server_body.to_string()),
+        };
+
+        let out = m.write(&server).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "ARM 2 must stash-then-align (Stashed), got {out:?}"
+        );
+        // Local aligned to server; the losing local bytes survive as a stash.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            server_body,
+            "ARM 2 aligns local to server"
+        );
+        let dir = target.parent().unwrap();
+        assert!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".conflict-from-")),
+            "ARM 2 must stash the losing local bytes as a conflict copy"
+        );
+        // ARM 2 does NOT enqueue a compensating push (it converges via align).
+        assert_eq!(
+            journal.lock().unwrap().drain(10).unwrap().len(),
+            0,
+            "ARM 2 enqueues no compensating push"
+        );
+    }
+
+    /// PURE classify_guard_arm table (R1 / F-B1.1): body-equal (pure strip) ->
+    /// ARM 1; body-differ -> ARM 2. Independent of frontmatter presence.
+    #[test]
+    fn t3_classify_guard_arm_table() {
+        // Local has frontmatter, server stripped it, body identical -> ARM 1.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nBODY\n", b"BODY\n"),
+            GuardArm::PreserveAndPushUp
+        );
+        // Body differs -> ARM 2.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nBODY A\n", b"BODY B\n"),
+            GuardArm::StashThenAlign
+        );
+        // CRLF-only body delta is still "equal" (normalized) -> ARM 1.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nL1\r\nL2\n", b"L1\nL2\n"),
+            GuardArm::PreserveAndPushUp
+        );
     }
 
     /// PURE decide() truth table (R1-R5). This is the load-bearing decision and
