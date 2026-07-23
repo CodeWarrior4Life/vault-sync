@@ -261,6 +261,20 @@ impl ShadowStore {
         }
     }
 
+    /// R5 / F-B3.3 (TKT-989ad5f2): drop the recorded hash for `path`. Used on a
+    /// terminal 409+404 (the server has no row) so the stale shadow does not
+    /// keep re-arming a CAS-conflict push against a row that no longer exists.
+    /// Sets the dirty flag so the next `flush()` persists the removal. No-op if
+    /// the key was absent. Key normalized to NFC like `record`/`get`.
+    pub fn remove(&self, path: &str) {
+        let key = self.canon_key(path);
+        if let Ok(mut m) = self.inner.lock() {
+            if m.remove(&key).is_some() {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The last-synced server hash recorded for `path`, if any. D8 (S511): the
     /// lookup key is normalized to NFC so a get always hits the record() that
     /// stored it, even across an NFD/NFC OS boundary.

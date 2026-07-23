@@ -29,7 +29,9 @@ use tokio::sync::Mutex;
 use crate::api_client::{
     ApiClient, ApiError, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
-use crate::push_journal::{JournalCursor, PushAction, PushBase, PushEvent, PushJournal};
+use crate::push_journal::{
+    new_event_id, JournalCursor, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
 
@@ -806,7 +808,8 @@ impl PushClient {
                     // losing local bytes are already stashed above (never dropped);
                     // now converge the canonical file to the server head
                     // (byte-verified) and learn the fresh observed base_seq (R3).
-                    self.refetch_and_merge_on_conflict(&evt.path).await;
+                    self.refetch_and_merge_on_conflict(&evt.path, evt.action)
+                        .await;
                     // Still surface the conflict so Burn C accounting counts it
                     // (R6) and the journal entry is acked (the edit survives as the
                     // stash, not an infinite blind retry).
@@ -1074,7 +1077,7 @@ impl PushClient {
     /// BEFORE this runs. Best-effort and fail-honest: with no materializer wired,
     /// or on a fetch/materialize error, convergence falls to the next reconcile
     /// pull and the conflict is still surfaced to the accounting layer (R6).
-    async fn refetch_and_merge_on_conflict(&self, path: &str) {
+    async fn refetch_and_merge_on_conflict(&self, path: &str, action: PushAction) {
         let Some(mat) = &self.materializer else {
             tracing::info!(
                 path,
@@ -1096,22 +1099,88 @@ impl PushClient {
                 ),
             },
             Err(ApiError::NotFound(_)) => {
-                // The server has no such note (deleted since our push). Drop the
-                // stale lineage so a later re-create starts from unknown lineage
-                // (fail-closed, R4) rather than a stale observed seq.
+                // R5 / F-B3.3 terminal 409+404 (TKT-989ad5f2): our push lost the
+                // CAS (409) AND the refetch shows the server has NO row (404).
+                // The losing local bytes are already stashed by the caller
+                // (never dropped). Resolve EXPLICITLY — never a silent
+                // drop-and-requeue that re-drifts and re-409s every pass:
+                //   1. Clear the stale shadow + lineage (fail-closed, R4).
+                //   2. Per tombstone: a DELETE that 404s is already gone
+                //      server-side -> accept-delete. A CREATE/MODIFY has NO
+                //      local delete intent (no tombstone) + no server row -> a
+                //      CREATE (content preserved, re-created on the server),
+                //      NEVER a local delete.
+                if let Some(sh) = &self.shadow_store {
+                    sh.remove(path);
+                }
                 if let Some(bs) = &self.base_seq_store {
                     bs.remove(path);
                 }
-                tracing::info!(
-                    path,
-                    "409 refetch/merge: server has no such note (deleted) - lineage dropped (fail-closed)"
-                );
+                match action {
+                    PushAction::Delete => {
+                        tracing::info!(
+                            path,
+                            "terminal 409+404 (R5 F-B3.3): DELETE accepted - server already has no row; shadow+lineage cleared"
+                        );
+                    }
+                    PushAction::Create | PushAction::Modify => {
+                        let enqueued = self.enqueue_recreate_after_terminal_404(path).await;
+                        tracing::info!(
+                            path,
+                            enqueued,
+                            "terminal 409+404 (R5 F-B3.3): no server row + no tombstone -> enqueued CREATE (content preserved, never a local delete)"
+                        );
+                    }
+                }
             }
             Err(e) => tracing::warn!(
                 path,
                 error = %e,
                 "409 refetch/merge: refetch failed - pull converges next reconcile pass"
             ),
+        }
+    }
+
+    /// R5 / F-B3.3 (TKT-989ad5f2): after a terminal 409+404 on a create/modify
+    /// with no server row and no local delete intent, enqueue an explicit CREATE
+    /// so the locally-preserved content is re-created on the server rather than
+    /// silently dropped-and-requeued. Base `NoRow` -> the server CREATEs (never
+    /// backfilled). A LAZY ref (`content_bytes: None`) — push_client reads the
+    /// local file at drain time, so the content is exactly what is on disk.
+    /// Returns true iff the append succeeded. Best-effort: a failure is logged,
+    /// the conflict is still surfaced, and the next reconcile pass retries.
+    async fn enqueue_recreate_after_terminal_404(&self, path: &str) -> bool {
+        // Only re-create if the file is still on disk (it usually is: a push
+        // never deletes local). If it is gone, there is nothing to re-create.
+        let abs = self.vault_root.join(forward_slash_to_path(path));
+        let local_sha = match std::fs::read(&abs) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(_) => {
+                tracing::info!(
+                    path,
+                    "terminal 409+404 (R5): local file absent - nothing to re-create"
+                );
+                return false;
+            }
+        };
+        let evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: new_event_id(),
+            path: path.to_string(),
+            action: PushAction::Create,
+            base_hash: PushBase::NoRow,
+            content_sha: local_sha,
+            content_bytes: None,
+            queued_at: chrono::Utc::now(),
+            device_id: self.device_id.clone(),
+        };
+        let mut j = self.journal.lock().await;
+        match j.append(evt) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(path, error = %e, "terminal 409+404 (R5): re-create append failed");
+                false
+            }
         }
     }
 }
