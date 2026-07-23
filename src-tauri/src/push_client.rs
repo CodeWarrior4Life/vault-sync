@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use crate::api_client::{
     ApiClient, ApiError, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
-use crate::push_journal::{JournalCursor, PushAction, PushEvent, PushJournal};
+use crate::push_journal::{JournalCursor, PushAction, PushBase, PushEvent, PushJournal};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
 
@@ -636,9 +636,18 @@ impl PushClient {
         // → 409 → edit-beats-delete, no silent wipe; a never-synced file has no
         // shadow → "" → server no-op. A genuine new file's CREATE still has no
         // shadow → "" → CREATE, unchanged.
+        // R4 / F-B3.2 (TKT-989ad5f2): three-state scoping of the I29 backfill.
+        // `KnownBase(h)` (reconcile drift) is honored verbatim. `NoRow`
+        // (reconcile determined the server has no row) forces a CREATE (base
+        // "") and is NEVER shadow-backfilled — the pre-fix code conflated it
+        // with `Unknown` under `None` and backfilled a stale shadow hash, which
+        // 409'd forever against a row the server does not hold (the perpetual
+        // CAS-409 push loop). Only `Unknown` (a real-time watcher event) sources
+        // the base from the shadow store.
         let backfilled_base: Option<String> = match &evt.base_hash {
-            Some(b) => Some(b.clone()),
-            None => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
+            PushBase::KnownBase(b) => Some(b.clone()),
+            PushBase::NoRow => Some(String::new()),
+            PushBase::Unknown => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
         };
 
         // R1 (THESEUS AR-002, TKT-166e1c07): declare our last-observed base_seq
@@ -1303,7 +1312,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: path.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(body),
             content_bytes: Some(body.to_vec()),
             queued_at: Utc::now(),
@@ -1428,7 +1437,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: path.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(enqueue_sha_of),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2270,7 +2279,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: rel.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(body),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2301,7 +2310,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/gone.md".to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: "a".repeat(64),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2432,7 +2441,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/edited.md".to_string(),
             action: PushAction::Modify,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: sha256_hex(b"new local body"),
             content_bytes: Some(b"new local body".to_vec()),
             queued_at: Utc::now(),
@@ -2480,7 +2489,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/brand-new.md".to_string(),
             action: PushAction::Modify,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: sha256_hex(b"brand new"),
             content_bytes: Some(b"brand new".to_vec()),
             queued_at: Utc::now(),
@@ -2532,7 +2541,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/deleted.md".to_string(),
             action: PushAction::Delete,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: String::new(),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2761,7 +2770,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: rel.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: "a".repeat(64),
             content_bytes: None, // lazy — will be read from vault_root at drain time
             queued_at: chrono::Utc::now(),

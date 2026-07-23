@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 use crate::redflag::DeleteBurstDetector;
@@ -572,7 +572,7 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: path.clone(),
                     action: PushAction::Create,
-                    base_hash: None,
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -593,13 +593,12 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: path.clone(),
                     action: PushAction::Modify,
-                    // Caller is responsible for sourcing the base_hash from
-                    // the materializer's last-known state; in this layer we
-                    // do not have it. v0.3.1 spec note: the push_client
-                    // backfills base_hash by reading the materializer index
-                    // before sending. For now we emit None and let the
-                    // push_client OR the server retry path handle it.
-                    base_hash: None,
+                    // R4 / F-B3.2 (TKT-989ad5f2): a real-time watcher event has
+                    // no known CAS base, so it is `Unknown` — push_client sources
+                    // the base from the shadow store (I29). This is deliberately
+                    // distinct from a reconcile `NoRow`, which must NOT be
+                    // shadow-backfilled; the pre-fix `None` conflated the two.
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -618,7 +617,7 @@ impl FileWatcher {
                 id: new_event_id(),
                 path: path.clone(),
                 action: PushAction::Delete,
-                base_hash: None,
+                base_hash: PushBase::Unknown,
                 content_sha: String::new(),
                 content_bytes: None,
                 queued_at: now,
@@ -642,7 +641,7 @@ impl FileWatcher {
                     id: new_event_id(),
                     path: new_path.clone(),
                     action: PushAction::Create,
-                    base_hash: None,
+                    base_hash: PushBase::Unknown,
                     content_sha: sha256_hex(&bytes),
                     // Lazy ref (v0.4.7): hash the body for content_sha but do
                     // NOT embed it. push_client reads the file from disk at
@@ -1840,7 +1839,7 @@ mod tests {
         // disk at drain); content_sha is still computed from the body.
         assert!(push.content_bytes.is_none());
         assert_eq!(push.content_sha, sha256_hex(&body));
-        assert!(push.base_hash.is_none());
+        assert_eq!(push.base_hash, PushBase::Unknown);
         assert_eq!(push.content_sha.len(), 64);
         assert_eq!(push.device_id, "dev-test");
     }

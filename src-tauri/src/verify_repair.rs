@@ -83,7 +83,7 @@ use walkdir::WalkDir;
 
 use crate::api_client::{ApiClient, ApiError, ReconcileBatchItem, ReconcileBatchRequest};
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 
@@ -469,12 +469,18 @@ impl VerifyRepair {
                     };
 
                     // LIGHTWEIGHT (lazy) push ref — no file read here. The
-                    // push_client reads the body from disk at drain time. The
-                    // CAS base is the server's CURRENT hash from the delta:
-                    // Some(server_hash) for drift (overwrite the diverged row),
-                    // None for missing-on-server (create). delta.server_hash is
-                    // already exactly that (None when the server has no row).
-                    pending_pushes.push(self.build_modify_push(local, delta.server_hash.clone()));
+                    // push_client reads the body from disk at drain time. R4 /
+                    // F-B3.2 (TKT-989ad5f2): the CAS base is a THREE-STATE derived
+                    // from the reconcile delta: `KnownBase(server_hash)` for drift
+                    // (overwrite the diverged row), `NoRow` for missing-on-server
+                    // (force a CREATE). `NoRow` is explicitly NOT `Unknown`, so
+                    // push_client never shadow-backfills a stale hash onto a path
+                    // the server has no row for.
+                    let base = match delta.server_hash.clone() {
+                        Some(h) => PushBase::KnownBase(h),
+                        None => PushBase::NoRow,
+                    };
+                    pending_pushes.push(self.build_modify_push(local, base));
                 }
                 Direction::Pull => {
                     // Our local is stale (the server moved since we last synced,
@@ -890,14 +896,18 @@ impl VerifyRepair {
     /// against `vault_reconcile_state.fs_hash` — it MUST be the server's CURRENT
     /// hash, NOT our local one.
     ///
-    /// - `drift` → `Some(server_hash)` (from the reconcile delta) so the CAS
-    ///   passes and the local version overwrites the diverged server one.
-    /// - `missing-on-server` → `None` (sent as `""`) so the server CREATEs the
-    ///   row (an `""` base on an existing row would conflict).
+    /// - `drift` → `PushBase::KnownBase(server_hash)` (from the reconcile delta)
+    ///   so the CAS passes and the local version overwrites the diverged server
+    ///   one. Honored verbatim by push_client; NEVER shadow-backfilled.
+    /// - `missing-on-server` → `PushBase::NoRow` (R4 / F-B3.2, TKT-989ad5f2):
+    ///   the server has no row, so force a CREATE (wire base `""`). This is
+    ///   distinct from a watcher `Unknown`; the pre-fix `None` conflated the two,
+    ///   so push_client shadow-backfilled a stale hash and 409'd forever against
+    ///   a row that does not exist (the perpetual CAS-409 push loop).
     ///
     /// v0.4.10 wrongly sent our LOCAL hash here, which by definition mismatches
     /// a drifted server row → every drift push 409'd `ConflictUnrecoverable`.
-    fn build_modify_push(&self, entry: &ManifestEntry, base_hash: Option<String>) -> PushEvent {
+    fn build_modify_push(&self, entry: &ManifestEntry, base_hash: PushBase) -> PushEvent {
         PushEvent {
             schema_version: CURRENT_SCHEMA,
             id: new_event_id(),
@@ -1449,7 +1459,10 @@ mod tests {
         // v0.4.11: a DRIFT push must carry the SERVER's current hash as the CAS
         // base (from the delta), NOT the local hash — else the server's
         // base_hash==current check fails and the push 409s ConflictUnrecoverable.
-        assert_eq!(batch[0].0.base_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase("deadbeef".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1483,9 +1496,11 @@ mod tests {
             j.drain(10).unwrap()
         };
         assert_eq!(batch.len(), 1);
-        // v0.4.11: missing-on-server → base_hash None (sent as "") so the server
-        // CREATEs the row (a non-empty base on a missing row would conflict).
-        assert_eq!(batch[0].0.base_hash, None);
+        // R4 / F-B3.2 (TKT-989ad5f2): missing-on-server → base_hash NoRow (sent
+        // as "") so the server CREATEs the row. NoRow is distinct from Unknown,
+        // so push_client never shadow-backfills a stale hash here (the pre-fix
+        // None conflated the two → perpetual CAS-409 push loop).
+        assert_eq!(batch[0].0.base_hash, PushBase::NoRow);
     }
 
     #[tokio::test]
