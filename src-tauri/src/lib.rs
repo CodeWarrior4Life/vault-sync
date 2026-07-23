@@ -656,11 +656,35 @@ fn spawn_sse_consumer(
                 }
             }
         }
+        // R1 / F-B1.1 (TKT-989ad5f2): open a push-journal handle on the SAME
+        // file push_client drains (resolve_workspace_root + push_journal_path,
+        // the single source of truth) so the anti-strip ARM-1 path can enqueue
+        // its compensating UP push. The journal is file-authoritative (N handles
+        // converge), so a dedicated std-Mutex handle here is safe alongside the
+        // file_watcher/push_client/verify_repair handles. In the single-root
+        // incident configuration (trinity/link) `cfg.subscriber_id` is the
+        // effective subscriber for the primary root; multi-root secondary roots
+        // enqueue to this primary journal (consistent with the SSE consumer
+        // materializing only the primary root — multi-root is deferred).
+        let compensating_journal: Option<std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>> = {
+            let jp = commands::push_journal_path(
+                &commands::resolve_workspace_root(),
+                &cfg.subscriber_id,
+            );
+            match push_journal::PushJournal::open(&jp) {
+                Ok(j) => Some(std::sync::Arc::new(std::sync::Mutex::new(j))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "R1: compensating-push journal open failed; anti-strip ARM 1 will preserve local but not enqueue (converges next reconcile pass)");
+                    None
+                }
+            }
+        };
+
         // B2: materializer uses the primary sync_root.path as vault root.
         // Multi-root materialization is a deferred task (one materializer
         // per sync_root); for now the SSE consumer materializes into the
         // first root only (back-compat with single-vault setups).
-        let materializer = materializer::Materializer::new(
+        let mut materializer = materializer::Materializer::new(
             primary_root.clone(),
             snap.shadow_path.clone(),
             materializer::MaterializerMode::from_str(&snap.materializer_mode),
@@ -673,6 +697,9 @@ fn spawn_sse_consumer(
         .with_shadow_store(shadow.clone())
         // R3 (TKT-166e1c07): the pull leg records the observed base_seq here.
         .with_base_seq_store(base_seq.clone());
+        if let Some(j) = compensating_journal {
+            materializer = materializer.with_push_journal(j);
+        }
 
         // Wave 4: spawn a 60s periodic task that refreshes the tray's
         // `conflict_unresolved` counter from the on-disk stash siblings.

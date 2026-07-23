@@ -307,10 +307,23 @@ pub enum PullResultClass {
 }
 
 /// Classify a single pull result. `Err` (fetch/materialize) and a post-write
-/// integrity failure are FAILED; a conflict-storm-breaker skip is DEFERRED;
-/// every other outcome (Wrote / Stashed / AlignedToCanonical, or a benign
-/// Skipped such as IdenticalToLocal / LocalEditPreserved / DisabledMode) is a
-/// resolved SUCCEEDED state.
+/// integrity failure are FAILED.
+///
+/// R2 / F-B1.2 (TKT-989ad5f2): every REFUSAL skip — a pull the daemon declined
+/// to converge because it would strip/overwrite local — is DEFERRED (still
+/// divergent), NOT a resolved success. The pre-fix code mapped
+/// `LocalEditPreserved` to `Succeeded`, so a preserved-local refusal counted as
+/// a converged pull, `still_divergent` stayed 0, `cycle_red()` was false, and
+/// the strand became soak-eligible while divergence persisted (AR-5). The
+/// refusal skips are:
+///   * `ConflictStormBreakerOpen` — breaker deferred the write.
+///   * `LocalEditPreserved` — a genuine local edit preserved; still divergent
+///     until the watcher-enqueued push lands.
+///   * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
+///     a compensating push; still divergent until it lands.
+/// A `Wrote`/`Stashed`/`AlignedToCanonical` (incl. anti-strip ARM 2, which
+/// stashes then aligns local to server) and a benign in-sync/no-op Skipped
+/// (`IdenticalToLocal` / `DisabledMode` / `SubstrateRefused`) are SUCCEEDED.
 pub fn classify_pull_outcome(
     res: &Result<crate::materializer::MaterializeOutcome, String>,
 ) -> PullResultClass {
@@ -319,6 +332,8 @@ pub fn classify_pull_outcome(
         Err(_) => PullResultClass::Failed,
         Ok(O::IntegrityFailed { .. }) => PullResultClass::Failed,
         Ok(O::Skipped(S::ConflictStormBreakerOpen)) => PullResultClass::Deferred,
+        Ok(O::Skipped(S::LocalEditPreserved)) => PullResultClass::Deferred,
+        Ok(O::Skipped(S::GuardPreserveLocalPushUp { .. })) => PullResultClass::Deferred,
         Ok(_) => PullResultClass::Succeeded,
     }
 }
@@ -1786,9 +1801,21 @@ mod tests {
             })),
             PullResultClass::Succeeded
         );
-        // Benign skip (local edit preserved) → Succeeded (resolved, no pull).
+        // R2 / F-B1.2 (TKT-989ad5f2): a preserved-local REFUSAL is Deferred
+        // (still divergent), NOT Succeeded. Benign in-sync skips remain
+        // Succeeded.
         assert_eq!(
             classify_pull_outcome(&Ok(O::Skipped(S::LocalEditPreserved))),
+            PullResultClass::Deferred
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }))),
+            PullResultClass::Deferred
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::IdenticalToLocal))),
             PullResultClass::Succeeded
         );
     }
