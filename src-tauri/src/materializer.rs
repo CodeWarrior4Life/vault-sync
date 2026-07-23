@@ -2810,6 +2810,170 @@ mod tests {
         (v, w, m, shadow)
     }
 
+    /// R8 / T3 harness (TKT-989ad5f2): materializer wired with a shadow store
+    /// AND a push-journal handle, so the anti-strip ARM-1 compensating push can
+    /// be observed. Returns the journal so tests can drain it.
+    fn mk_with_shadow_and_journal(
+        mode: MaterializerMode,
+    ) -> (
+        TempDir,
+        TempDir,
+        Materializer,
+        Arc<ShadowStore>,
+        Arc<Mutex<PushJournal>>,
+    ) {
+        let (v, w, m) = mk(mode, default_cfg());
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let journal = Arc::new(Mutex::new(
+            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+        ));
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_push_journal(journal.clone());
+        (v, w, m, shadow, journal)
+    }
+
+    /// T3 (R1 / F-B1.1 ARM 1): a PURE server-strip (server dropped the
+    /// frontmatter block; body byte-identical) PRESERVES local AND enqueues a
+    /// compensating UP push whose CAS base is the server hash from the pull. The
+    /// local file is byte-unchanged (so the watcher never fires — the enqueue is
+    /// what breaks the phantom-pull deadlock). FAILS on pre-fix code: the guard
+    /// only downgraded to LocalEditPreserved and enqueued NOTHING.
+    #[test]
+    fn t3_guard_arm1_pure_strip_preserves_local_and_enqueues_compensating_push() {
+        let (vaults, _ws, m, shadow, journal) =
+            mk_with_shadow_and_journal(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/strip.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/strip.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Local holds frontmatter + body; it equals the last-synced shadow
+        // (local untouched since sync => the PullClean basis).
+        let local = "---\ntitle: Keep Me\n---\nSHARED BODY\n";
+        std::fs::write(&target, local).unwrap();
+        shadow.record(&rel, &sha256_hex(local));
+
+        // Server dropped the frontmatter, but the BODY is byte-identical.
+        let server_body = "SHARED BODY\n";
+        let server = NotePayload {
+            path: rel.clone(),
+            frontmatter: serde_json::json!({}),
+            body: server_body.into(),
+            sha256: sha256_hex(server_body),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: None,
+            enriched_body: Some(server_body.to_string()),
+        };
+
+        let out = m.write(&server).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }),
+            "ARM 1 must preserve local AND enqueue a compensating push, got {out:?}"
+        );
+        // Local frontmatter preserved verbatim — the server strip is NOT applied.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            local,
+            "local frontmatter must be preserved (guard never strips)"
+        );
+        // A compensating UP push was enqueued, CAS base = the server hash.
+        let batch = journal.lock().unwrap().drain(10).unwrap();
+        assert_eq!(batch.len(), 1, "exactly one compensating push enqueued");
+        assert_eq!(batch[0].0.path, rel);
+        assert_eq!(batch[0].0.action, PushAction::Modify);
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase(sha256_hex(server_body)),
+            "CAS base must be the server hash from the pull payload"
+        );
+    }
+
+    /// T3 (R1 / F-B1.1 ARM 2): GENUINE divergence (server dropped frontmatter
+    /// AND changed the body) STASHES local then ALIGNS to the server — local
+    /// survives as a conflict copy, nothing enqueued. FAILS on pre-fix code:
+    /// the guard downgraded to LocalEditPreserved (no stash, no align, no
+    /// convergence — the phantom-pull deadlock).
+    #[test]
+    fn t3_guard_arm2_divergence_stashes_then_aligns() {
+        let (vaults, _ws, m, shadow, journal) =
+            mk_with_shadow_and_journal(MaterializerMode::Live);
+        let rel = format!("{VAULT}/01_Inbox/diverge.md");
+        let target = vaults.path().join(VAULT).join("01_Inbox/diverge.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let local = "---\ntitle: Keep Me\n---\nLOCAL BODY\n";
+        std::fs::write(&target, local).unwrap();
+        shadow.record(&rel, &sha256_hex(local));
+
+        // Server dropped frontmatter AND changed the body -> genuine divergence.
+        let server_body = "SERVER BODY (different)\n";
+        let server = NotePayload {
+            path: rel.clone(),
+            frontmatter: serde_json::json!({}),
+            body: server_body.into(),
+            sha256: sha256_hex(server_body),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: None,
+            enriched_body: Some(server_body.to_string()),
+        };
+
+        let out = m.write(&server).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "ARM 2 must stash-then-align (Stashed), got {out:?}"
+        );
+        // Local aligned to server; the losing local bytes survive as a stash.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            server_body,
+            "ARM 2 aligns local to server"
+        );
+        let dir = target.parent().unwrap();
+        assert!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".conflict-from-")),
+            "ARM 2 must stash the losing local bytes as a conflict copy"
+        );
+        // ARM 2 does NOT enqueue a compensating push (it converges via align).
+        assert_eq!(
+            journal.lock().unwrap().drain(10).unwrap().len(),
+            0,
+            "ARM 2 enqueues no compensating push"
+        );
+    }
+
+    /// PURE classify_guard_arm table (R1 / F-B1.1): body-equal (pure strip) ->
+    /// ARM 1; body-differ -> ARM 2. Independent of frontmatter presence.
+    #[test]
+    fn t3_classify_guard_arm_table() {
+        // Local has frontmatter, server stripped it, body identical -> ARM 1.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nBODY\n", b"BODY\n"),
+            GuardArm::PreserveAndPushUp
+        );
+        // Body differs -> ARM 2.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nBODY A\n", b"BODY B\n"),
+            GuardArm::StashThenAlign
+        );
+        // CRLF-only body delta is still "equal" (normalized) -> ARM 1.
+        assert_eq!(
+            classify_guard_arm(b"---\nx: 1\n---\nL1\r\nL2\n", b"L1\nL2\n"),
+            GuardArm::PreserveAndPushUp
+        );
+    }
+
     /// PURE decide() truth table (R1-R5). This is the load-bearing decision and
     /// must be exhaustively correct.
     #[test]

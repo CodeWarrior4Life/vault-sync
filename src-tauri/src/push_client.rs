@@ -646,11 +646,10 @@ impl PushClient {
         // 409'd forever against a row the server does not hold (the perpetual
         // CAS-409 push loop). Only `Unknown` (a real-time watcher event) sources
         // the base from the shadow store.
-        let backfilled_base: Option<String> = match &evt.base_hash {
-            PushBase::KnownBase(b) => Some(b.clone()),
-            PushBase::NoRow => Some(String::new()),
-            PushBase::Unknown => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
-        };
+        let backfilled_base: Option<String> = resolve_backfilled_base(
+            &evt.base_hash,
+            self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
+        );
 
         // R1 (THESEUS AR-002, TKT-166e1c07): declare our last-observed base_seq
         // (proof-of-observation) on EVERY push and delete. `None` when we have
@@ -1205,6 +1204,22 @@ impl PushClient {
 ///   canonical (`server_hash` → `content_hash` → `local_sha`). Unchanged.
 /// * `ConflictMarkers` / `Error` → no clean canonical was established →
 ///   record nothing. Unchanged.
+/// R4 / F-B3.2 (TKT-989ad5f2): resolve the wire CAS base for a push from its
+/// three-state `PushBase` and the shadow-store hash for the path. PURE +
+/// table-tested. The I29 shadow backfill applies ONLY to `Unknown` (watcher
+/// events); `KnownBase` is honored verbatim and `NoRow` forces a CREATE (base
+/// "") and is NEVER backfilled — the pre-fix code conflated `NoRow` and
+/// `Unknown` under `None` and backfilled a stale shadow hash onto a path the
+/// server has no row for (the perpetual CAS-409 push loop). `None` return means
+/// "no known base" -> the caller sends "".
+fn resolve_backfilled_base(base: &PushBase, shadow: Option<String>) -> Option<String> {
+    match base {
+        PushBase::KnownBase(b) => Some(b.clone()),
+        PushBase::NoRow => Some(String::new()),
+        PushBase::Unknown => shadow,
+    }
+}
+
 fn shadow_hash_for_ack(
     status: &PushStatus,
     local_sha: &str,
@@ -2749,7 +2764,7 @@ mod tests {
         let client = make_client(&srv.url(), journal.clone())
             .await
             .with_tray_state(tray.clone());
-        let _ = client.drain_once().await;
+        let __out = client.drain_once().await; eprintln!("DRAIN_OUT: {:?}", __out.iter().map(|(e,o)| (e.path.clone(), format!("{o:?}"))).collect::<Vec<_>>());
         let s = tray.read().unwrap();
         assert_eq!(s.uploads_sent, 1);
         assert_eq!(s.uploads_failed, 0);
@@ -3292,5 +3307,101 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- R8 regression tests (TKT-989ad5f2) --------------------------------
+
+    /// T7 (R4 / F-B3.2): the I29 shadow backfill is scoped to the THREE-STATE
+    /// base. A reconcile-determined `NoRow` forces a CREATE (base "") and is
+    /// NEVER shadow-backfilled, even when a (stale) shadow entry exists —
+    /// pre-fix this conflated with `Unknown` under `None` and backfilled the
+    /// stale hash, 409'ing forever against a row the server does not hold.
+    /// `Unknown` (watcher) IS backfilled; `KnownBase` is honored verbatim.
+    #[test]
+    fn t7_no_row_base_is_never_shadow_backfilled() {
+        let stale_shadow = Some("staleshadowhash".to_string());
+        // NoRow: force CREATE ("" base), even with a shadow present.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::NoRow, stale_shadow.clone()),
+            Some(String::new()),
+            "NoRow must force CREATE (empty base), NEVER the stale shadow hash"
+        );
+        // Unknown (watcher): backfill from shadow.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::Unknown, stale_shadow.clone()),
+            stale_shadow.clone(),
+            "Unknown must shadow-backfill (I29)"
+        );
+        // Unknown with no shadow: no base -> "" (CREATE).
+        assert_eq!(resolve_backfilled_base(&PushBase::Unknown, None), None);
+        // KnownBase: honored verbatim, never overridden by the shadow.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::KnownBase("deadbeef".into()), stale_shadow),
+            Some("deadbeef".to_string()),
+            "KnownBase must be honored verbatim"
+        );
+    }
+
+    /// T8 (R5 / F-B3.3): a terminal 409+404 on a create/modify with no server
+    /// row and no local delete intent resolves as an explicit CREATE (content
+    /// preserved, re-created on the server), NEVER a silent drop-and-requeue and
+    /// NEVER a local delete. The stale shadow is cleared.
+    #[tokio::test]
+    async fn t8_terminal_409_404_recreates_content_never_local_delete() {
+        let mut server = Server::new_async().await;
+        // Every push loses the CAS (409).
+        let _push = server
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"detail":"conflict","expected_hash":"beef"}"#)
+            .create_async()
+            .await;
+        // The refetch shows the server has NO row (404).
+        let _note = server
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+
+        let path = "Mainframe/01_Inbox/orphan.md";
+        let content = b"orphan body that must survive\n";
+        let (_jdir, journal) = make_journal_with(vec![lazy_evt(path, content)]);
+        let (client, fx) = make_align_client(&server.url(), journal.clone()).await;
+
+        // The local file exists (a push never deletes local); re-create reads it.
+        let abs = fx.vault_root.join("Mainframe/01_Inbox/orphan.md");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+        // A stale shadow entry that must be cleared on the terminal 404.
+        fx.shadow.record(path, "staleshadowhash");
+
+        let _ = client.drain_once().await;
+
+        // The losing event was acked; a NEW explicit CREATE was enqueued.
+        let remaining = journal.lock().await.drain(10).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "a re-create must be enqueued (never a silent drop-and-requeue)"
+        );
+        assert_eq!(remaining[0].0.action, PushAction::Create);
+        assert_eq!(
+            remaining[0].0.base_hash,
+            PushBase::NoRow,
+            "re-create must carry a NoRow base so the server CREATEs it"
+        );
+        assert_eq!(remaining[0].0.path, path);
+        // The local content is preserved — NEVER a local delete.
+        assert!(abs.exists(), "local file must never be deleted");
+        assert_eq!(std::fs::read(&abs).unwrap(), content);
+        // The stale shadow was cleared (stops re-arming a CAS conflict).
+        assert_eq!(
+            fx.shadow.get(path),
+            None,
+            "terminal 404 must clear the stale shadow"
+        );
     }
 }

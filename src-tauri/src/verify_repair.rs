@@ -1841,6 +1841,88 @@ mod tests {
         );
     }
 
+    /// T6a (R2 / F-B1.2): a preserved-local refusal classifies as Deferred, not
+    /// Succeeded. FAILS on pre-fix code (which returned Succeeded — the
+    /// false-green strand, AR-5).
+    #[test]
+    fn t6a_local_edit_preserved_is_deferred_not_succeeded() {
+        use crate::materializer::{MaterializeOutcome as O, SkipReason as S};
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::LocalEditPreserved))),
+            PullResultClass::Deferred,
+            "a preserved-local refusal is still divergent (Deferred), never Succeeded"
+        );
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::GuardPreserveLocalPushUp {
+                enqueued_push: true
+            }))),
+            PullResultClass::Deferred,
+            "the anti-strip ARM-1 preserve+push skip is still divergent (Deferred)"
+        );
+    }
+
+    /// T6b (R2 / F-B1.2): a pass whose only pull was a preserved-local refusal
+    /// is cycle RED (still_divergent > 0) and NOT soak-eligible. This is the
+    /// end-to-end consequence of T6a: on pre-fix code the same pass counted the
+    /// refusal as Succeeded, `still_divergent` stayed 0, and the strand was
+    /// falsely soak-eligible while divergence persisted.
+    #[test]
+    fn t6b_preserved_local_pull_makes_cycle_red_not_soak_eligible() {
+        // Mimic the run() accounting: classify the outcome, then credit the
+        // report the way the pull loop does.
+        let outcome: Result<crate::materializer::MaterializeOutcome, String> = Ok(
+            crate::materializer::MaterializeOutcome::Skipped(
+                crate::materializer::SkipReason::LocalEditPreserved,
+            ),
+        );
+        let mut report = VerifyRepairReport::default();
+        report.pulls_attempted = 1;
+        match classify_pull_outcome(&outcome) {
+            PullResultClass::Succeeded => report.pulls_succeeded += 1,
+            PullResultClass::Deferred => report.pulls_deferred += 1,
+            PullResultClass::Failed => report.pulls_failed += 1,
+        }
+        report.still_divergent = report.pulls_failed + report.pulls_deferred;
+        assert_eq!(report.pulls_deferred, 1, "the refusal is a deferred pull");
+        assert!(
+            report.cycle_red(),
+            "a preserved-local refusal must make the cycle RED"
+        );
+        assert!(
+            !report.soak_eligible(),
+            "a RED cycle must NOT be soak-eligible (AR-5)"
+        );
+    }
+
+    /// T10 (R6 / F-A4.1): a symlink inside the vault scan path is SKIPPED but
+    /// VISIBLE — counted in `report.symlinks_skipped` (and WARN-logged). FAILS
+    /// on pre-fix code: the walker dropped symlinks at `!is_file() -> continue`
+    /// with zero log and no counter (RC-A4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t10_symlink_in_scan_path_is_counted_not_silently_dropped() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "notes/real.md", b"real body");
+        // A symlink inside the vault (points at the real note).
+        std::os::unix::fs::symlink(v.join("notes/real.md"), v.join("notes/link.md")).unwrap();
+
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", test_config()).await;
+        let mut report = VerifyRepairReport::default();
+        let m = vr.build_local_manifest_with_report(&mut report).unwrap();
+
+        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"notes/real.md"), "the real file is synced");
+        assert!(
+            !paths.contains(&"notes/link.md"),
+            "the symlink itself is not synced"
+        );
+        assert_eq!(
+            report.symlinks_skipped, 1,
+            "the symlink must be COUNTED (was silently dropped pre-fix)"
+        );
+    }
+
     #[test]
     fn report_cycle_red_semantics() {
         let mut r = VerifyRepairReport::default();

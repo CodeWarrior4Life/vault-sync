@@ -672,9 +672,9 @@ mod tests {
     /// the TKT-86ae42a3 conflict-storm fix (B2' shadow-key migration +
     /// conflict-storm circuit breaker).
     #[test]
-    fn daemon_version_is_0_4_33() {
-        assert_eq!(daemon_version(), "0.4.33");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.33/"));
+    fn daemon_version_is_0_4_34() {
+        assert_eq!(daemon_version(), "0.4.34");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.34/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`

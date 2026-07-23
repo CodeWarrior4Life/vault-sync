@@ -155,6 +155,49 @@ mod tests {
         }
     }
 
+    /// T11 (R8, TKT-989ad5f2): CRLF / BOM / NFC byte-parity CHARACTERIZATION
+    /// matrix. Pins the daemon's Form C behavior against the server's
+    /// `canonicalize()` contract (spec §2.2), one row per transform dimension:
+    ///   * CRLF and lone-CR both fold to LF; no 0x0D survives.
+    ///   * ALL leading U+FEFF (BOM) are stripped; interior U+FEFF is preserved.
+    ///   * NFC is NOT applied (dropped per the round-2 verdict): a
+    ///     canonically-decomposed sequence stays decomposed, byte-for-byte.
+    /// A drift on any row is a new unstable-hash family member (the exact class
+    /// this whole effort exists to kill), so this test documents the parity a
+    /// server-side fixture must also satisfy.
+    #[test]
+    fn t11_crlf_bom_nfc_byte_parity_characterization() {
+        // CRLF -> LF.
+        assert_eq!(canonicalize("a\r\nb").unwrap(), "a\nb");
+        // Lone CR -> LF.
+        assert_eq!(canonicalize("a\rb").unwrap(), "a\nb");
+        // CRLF followed by CR ("\r\r\n") folds in one pass, no 0x0D survives.
+        let mixed = canonicalize("x\r\r\ny").unwrap();
+        assert!(!mixed.contains('\r'), "no carriage return may survive");
+        assert_eq!(mixed, "x\n\ny");
+        // Leading BOM stripped; double BOM stripped; interior BOM preserved.
+        assert_eq!(canonicalize("\u{feff}hello").unwrap(), "hello");
+        assert_eq!(canonicalize("\u{feff}\u{feff}hi").unwrap(), "hi");
+        assert_eq!(
+            canonicalize("mid\u{feff}dle").unwrap(),
+            "mid\u{feff}dle",
+            "interior BOM is content and must be preserved"
+        );
+        // NFC is NOT applied: "e" + COMBINING ACUTE (U+0301) stays decomposed;
+        // it is NOT folded to the precomposed "é" (U+00E9).
+        let decomposed = "e\u{301}";
+        let out = canonicalize(decomposed).unwrap();
+        assert_eq!(
+            out, decomposed,
+            "Form C must NOT NFC-normalize (decomposed sequence stays decomposed)"
+        );
+        assert_ne!(
+            out, "\u{e9}",
+            "Form C must NOT fold to the precomposed codepoint"
+        );
+        assert_eq!(out.as_bytes(), &[0x65, 0xCC, 0x81], "exact decomposed bytes");
+    }
+
     /// Strict-decode precondition: canonicalize_bytes rejects non-UTF-8
     /// instead of ever decoding lossily (errors="replace" is banned on every
     /// sync path, spec §2.2).
