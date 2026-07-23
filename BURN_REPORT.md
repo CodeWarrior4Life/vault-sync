@@ -64,4 +64,115 @@ confirmation.
 8. **R8:** tests T3/T6a/T6b/T7/T8/T10 (fail pre-fix) + T11; build fmt/clippy/test in podman vsync-ci; paste output.
 9. **Version:** bump 0.4.33 -> 0.4.34 (Cargo.toml, tauri.conf.json, package.json) + `daemon_version` pin test. Reversible, branch-only; release stays owner-gated (R9). Flagged as a decision.
 
-<!-- BUILD/TEST OUTPUT + ACCEPTANCE CHECKLIST appended as the burn proceeds -->
+## What was built (fix delivered, file:line at HEAD ab72b78)
+
+All changes are on branch `whetstone/opfix-vsync-durability-daemon`, committed as durable checkpoints (see the commit log at the end). Nothing tagged, released, merged, or pushed.
+
+| Req | Fix summary | Key file:line (HEAD) |
+|-----|-------------|----------------------|
+| R4 | New three-state `PushBase { KnownBase(String) \| NoRow \| Unknown }` replaces `PushEvent.base_hash: Option<String>`. Wire-compatible with the old `Option<String>` (`null`/`""`/`hex`) via manual Serialize/Deserialize, so old journal lines load AND old daemons read new lines. `push_client` backfill scoped via `resolve_backfilled_base`: `Unknown` (watcher) shadow-backfills, `NoRow` (reconcile no-row) forces CREATE and is NEVER backfilled, `KnownBase` honored verbatim. Watcher emits `Unknown`; reconcile drift emits `KnownBase(h)`, missing-on-server emits `NoRow`. | `push_journal.rs:183` (enum), `push_client.rs:1199` (`resolve_backfilled_base`), `push_client.rs:639` (call), `verify_repair.rs:477`/`:900` (reconcile), `file_watcher.rs:575+` (watcher) |
+| R1 | Guard-hit resolves into two arms via `classify_guard_arm` (frontmatter-normalized body equality, `body_after_frontmatter_normalized`). ARM 1 (pure strip): preserve local + `enqueue_compensating_push` (CAS base = pull's server hash) via a new optional `Materializer` push-journal handle wired in `lib.rs`; returns `Skipped(GuardPreserveLocalPushUp { enqueued_push })`. ARM 2 (divergence): fall through to the Conflict stash-then-align. | `materializer.rs:1478` (`classify_guard_arm`), `materializer.rs:1447` (`body_after_frontmatter_normalized`), `materializer.rs:765-808` (two-arm dispatch in `write`), `materializer.rs:431` (`enqueue_compensating_push`), `lib.rs:663-694` (journal wire-up) |
+| R2 | `classify_pull_outcome` maps `LocalEditPreserved` AND `GuardPreserveLocalPushUp` to `Deferred` (still divergent -> `cycle_red()` -> retry ledger, never soak-eligible). | `verify_repair.rs:339-343` |
+| R3 | Guard log lines state the arm (`ARM 1 (pure server-strip ...)` / `ARM 2 (genuine divergence ...)`); the R2 `PreserveLocalEdit` line no longer promises a push the materializer did not enqueue. | `materializer.rs:782-807`, `materializer.rs:866-880` |
+| R5 | Terminal 409+404 `NotFound` arm: clears the shadow (`ShadowStore::remove`, new) + base_seq lineage, then per tombstone — DELETE -> accept-delete; CREATE/MODIFY -> `enqueue_recreate_after_terminal_404` (explicit `NoRow` CREATE, lazy content ref, content preserved, never a local delete). | `push_client.rs:1089-1140` (arm), `push_client.rs:1151` (re-create), `sync_shadow.rs:269` (`remove`) |
+| R6 | `verify_repair` walker WARNs + increments new `report.symlinks_skipped` for a symlink entry (was `!is_file() -> continue`, zero log). `file_watcher::normalize_event` lstat-checks the raw path, WARNs + bumps a `symlinks_skipped` counter (getter `FileWatcher::symlinks_skipped`), and skips (was: silently followed internal symlinks / dropped escapes). | `verify_repair.rs:195` (field), `verify_repair.rs:824-838` (walker), `file_watcher.rs:694-717` (`normalize_event`) |
+| R7 | `init_logging` defaults the crate directive to INFO with DEBUG opt-in via `VAULT_SYNC_LOG_DEBUG` (RUST_LOG still overrides). Pure `resolve_log_directive`. (Opt-in is env-based because logging initializes before the daemon config loads and a tracing subscriber cannot be re-inited — see Open Decisions.) | `main.rs:37` (`resolve_log_directive`), `main.rs:49` (`debug_logging_opt_in`), `main.rs:93` (wire) |
+
+## R8 — regression tests, PROVEN failing on pre-fix code
+
+Each test below FAILS on the pre-fix behavior and PASSES on the fix. The tests reference new APIs (so they cannot compile against the raw base commit), so the failure was proven rigorously by reverting ONLY the behavioral hunk for each requirement (keeping the new types/signatures so the test compiles), running the test, and capturing the assertion failure — then restoring the fix. Exact captured output:
+
+| Test | Requirement | Location | Pre-fix failure (captured) |
+|------|-------------|----------|-----------------------------|
+| `t3_guard_arm1_pure_strip_preserves_local_and_enqueues_compensating_push` | R1 ARM 1 | materializer.rs | `left: Skipped(LocalEditPreserved)` vs `right: Skipped(GuardPreserveLocalPushUp { enqueued_push: true })` — "ARM 1 must preserve local AND enqueue a compensating push" |
+| `t3_guard_arm2_divergence_stashes_then_aligns` | R1 ARM 2 | materializer.rs | pre-fix returns `LocalEditPreserved` (no stash, no align) instead of `Stashed` |
+| `t3_classify_guard_arm_table` | R1 | materializer.rs | new pure fn; encodes body-equal->ARM1 / body-differ->ARM2 |
+| `t6a_local_edit_preserved_is_deferred_not_succeeded` | R2 | verify_repair.rs | `left: Succeeded` vs `right: Deferred` — "a preserved-local refusal is still divergent" |
+| `t6b_preserved_local_pull_makes_cycle_red_not_soak_eligible` | R2 | verify_repair.rs | pre-fix credits `pulls_succeeded` -> `still_divergent=0` -> `cycle_red()` false (soak-eligible while divergent) |
+| `t7_no_row_base_is_never_shadow_backfilled` | R4 | push_client.rs | `left: Some("staleshadowhash")` vs `right: Some("")` — "NoRow must force CREATE, NEVER the stale shadow hash" |
+| `t8_terminal_409_404_recreates_content_never_local_delete` | R5 | push_client.rs | `left: 0` vs `right: 1` re-create enqueued — "a re-create must be enqueued (never a silent drop-and-requeue)"; shadow also not cleared pre-fix |
+| `t10_symlink_in_scan_path_is_counted_not_silently_dropped` | R6 | verify_repair.rs | `left: 0` vs `right: 1` — "the symlink must be COUNTED (was silently dropped pre-fix)" |
+| `t11_crlf_bom_nfc_byte_parity_characterization` | R8 char. | canonical_form.rs | characterization (not required to fail pre-fix); pins CRLF/BOM fold + NO-NFC byte parity |
+| `push_base_wire_is_option_string_compatible` | R4 back-compat | push_journal.rs | pins the `null`/`""`/`hex` wire mapping (R5 back-compat) |
+
+Pre-fix proof run (all 7 behavioral tests, with the fixes reverted):
+```
+test verify_repair::tests::t6a_local_edit_preserved_is_deferred_not_succeeded ... FAILED
+test push_client::tests::t7_no_row_base_is_never_shadow_backfilled ... FAILED
+test verify_repair::tests::t6b_preserved_local_pull_makes_cycle_red_not_soak_eligible ... FAILED
+test materializer::tests::t3_guard_arm2_divergence_stashes_then_aligns ... FAILED
+test materializer::tests::t3_guard_arm1_pure_strip_preserves_local_and_enqueues_compensating_push ... FAILED
+test verify_repair::tests::t10_symlink_in_scan_path_is_counted_not_silently_dropped ... FAILED
+test push_client::tests::t8_terminal_409_404_recreates_content_never_local_delete ... FAILED
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 462 filtered out
+```
+
+## Self-verification output (podman vsync-ci: `rust:1-bookworm` + libwebkit2gtk-4.1/gtk-3/ayatana-appindicator3/rsvg2/secret-1/dbus + gnome-keyring, mount `:z`)
+
+`cargo fmt --check` — clean:
+```
+FMT_RC=0
+```
+
+`cargo clippy --all-targets -- -D warnings` — clean:
+```
+CLIPPY_RC=0
+```
+
+`cargo test --all-targets` — full suite GREEN (lib + all integration binaries):
+```
+test result: ok. 466 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out   # lib (incl. all T3/T6a/T6b/T7/T8/T10/T11)
+test result: ok. 14 passed; 0 failed; 0 ignored   # main (CLI parse)
+test result: ok. 7 passed;  0 failed; 0 ignored   # test_alignment_pull (incl. updated anti-strip)
+test result: ok. 7 passed;  0 failed; 0 ignored
+test result: ok. 2 passed;  0 failed; 0 ignored
+test result: ok. 3 passed;  0 failed; 0 ignored
+test result: ok. 3 passed;  0 failed; 0 ignored
+test result: ok. 7 passed;  0 failed; 0 ignored
+test result: ok. 4 passed;  0 failed; 0 ignored
+test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok. 4 passed;  0 failed; 2 ignored
+# 0 failed across every binary. RC=0.
+```
+
+Note on the CI env: the burn host cannot build the crate natively (no cargo/rustc; S561), so all builds ran in the podman `vsync-ci` image. Containers run as root; one existing test (`test_ack_materialize_failed_rewrite_leaves_shadow_stale`) forces a rewrite failure by `chmod 0o555` on a dir, which root bypasses via `CAP_DAC_OVERRIDE` — so it (and only it) reds under root and is unrelated to this burn (it also reds on the pristine base commit 622c2ac). The green run above drops `DAC_OVERRIDE`/`FOWNER` (`podman run --cap-drop=DAC_OVERRIDE --cap-drop=FOWNER`) to mirror the non-root GitHub `ubuntu-latest` CI user; the test then passes, confirming it is purely a root-in-container artifact, not a code defect.
+
+## ACCEPTANCE CHECKLIST
+
+- [x] **Review table with file:line evidence for R1-R9** — completed BEFORE any edit, committed at 622c2ac (table above; R1-R8 GAPs cited, R9 CONFORMS).
+- [x] **R1 F-B1.1 two-arm resolution** — ARM 1 preserve+compensating-push, ARM 2 stash-then-align; guard never silently strips; nothing converges to server without a stash (ARM 2 stashes). `materializer.rs:765-808`.
+- [x] **R2 F-B1.2 honest RED accounting** — refusal skips -> Deferred/still_divergent/RED/retry-ledger; lands in the SAME release as R1. `verify_repair.rs:339-343`.
+- [x] **R3 F-B1.3 log truth** — arm named in the log; bare "will push up" without an enqueued push removed.
+- [x] **R4 F-B3.2 I29 scoping** — three-state base_hash; backfill only on `Unknown`, never reconcile `NoRow`.
+- [x] **R5 F-B3.3 terminal 409+404** — stash (caller) + clear shadow + explicit re-create/accept-delete; no-tombstone+no-row -> CREATE, never a local delete.
+- [x] **R6 F-A4.1 symlink visibility** — WARN + `symlinks_skipped` counter in verify_repair walker AND file_watcher.
+- [x] **R7 F-A6 log hygiene** — default INFO, DEBUG opt-in.
+- [x] **R8 regression tests** — T3/T6a/T6b/T7/T8/T10 present + PROVEN failing on pre-fix (output above); T11 characterization present; full suite GREEN in vsync-ci (output above).
+- [x] **cargo fmt --check clean** — output above.
+- [x] **No tag / no release / no merge to main / no push beyond the branch (R9, D8)** — verified: no `v0.4.34` tag created; delivery is branch-only.
+- [ ] **Release train ride (tag v0.4.34 + release; merge to vault-sync main)** — OWNER-GATED, intentionally NOT executed by this burn (see below).
+
+## Open decisions flagged for the owner
+
+1. **Version bump to 0.4.34 (decision taken, reversible):** R1-R9 did not explicitly list a version bump, but this IS the v0.4.34 durability leg, so the branch carries version 0.4.34 (`Cargo.toml`, `tauri.conf.json`, `package.json`) and the `daemon_version` pin test was moved to 0.4.34. Branch-only and reversible; the release itself remains owner-gated. Revert the bump if the owner prefers the version move to ride with the release commit.
+2. **R7 opt-in is env-based (`VAULT_SYNC_LOG_DEBUG`), not a config-file field.** Logging initializes before the daemon config loads and a `tracing` subscriber cannot be re-inited, so a config-file flag could not take effect at init without a larger refactor. The env var is the config knob available at that point; `RUST_LOG` still overrides. Confirm this satisfies "DEBUG opt-in via config" or request the deferred re-init refactor.
+3. **Multi-root compensating-push journal:** the ARM-1 compensating push and the SSE materializer both target the PRIMARY sync_root's journal (`cfg.subscriber_id`). This matches the existing single-root-effective SSE behavior (multi-root materialization is already a documented deferred task), but a multi-root host's secondary-root ARM-1 pushes would route via the primary journal. Single-root is the trinity/link incident reality. Flag if a multi-root host is in scope before release.
+4. **Spec note not resolvable locally:** the 2026-07-22 emergency fix spec + adversarial review note had not synced to the burn host's vault; the ticket's embedded EMPIRICALLY-CONFIRMED R1-R9 (with file:line anchors) were treated as authority. The T-number -> requirement mapping was inferred (documented above). Confirm the mapping matches the spec's intent.
+
+## PARK — awaiting owner
+
+**Status:** branch `whetstone/opfix-vsync-durability-daemon` is ready at HEAD `ab72b78`; report complete; full suite green in vsync-ci; fmt/clippy clean; no tag/release/merge/push performed.
+
+**One-line owner action:** coordinate the trinity soak-RED window with the P2-E3 lane (nexus-356f), then tag `v0.4.34` + run the release train and merge the branch to vault-sync `main` (the auto-promote reaches link+trinity and flips trinity's soak RED until the 8,081 phantom-pull set drains — AR-5 / R9, D8 hard gate).
+
+## Commit log (this burn, on-branch)
+```
+ab72b78 test(sync): update test_alignment_pull_respects_anti_strip for R1 two-arm
+79ca13f style(sync): cargo fmt + clippy -D warnings clean (R8 CI hygiene)
+053ae46 test(sync): R8 regression suite T3/T6a/T6b/T7/T8/T10 + T11 + version 0.4.34
+4c2b9c3 fix(sync): R6 symlink visibility + R7 log hygiene (default INFO)
+b708a94 fix(sync): R5 F-B3.3 terminal 409+404 explicit resolution (no silent drop-requeue)
+2aa8f5d fix(sync): R1/R2/R3 two-arm anti-strip guard + honest RED accounting + log truth
+f90753c fix(sync): R4 F-B3.2 three-state PushEvent.base_hash (I29 scoping)
+622c2ac docs(burn): R1-R9 review table for vsync durability daemon leg (TKT-989ad5f2)
+```
