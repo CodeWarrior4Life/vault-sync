@@ -666,7 +666,9 @@ fn spawn_sse_consumer(
         // effective subscriber for the primary root; multi-root secondary roots
         // enqueue to this primary journal (consistent with the SSE consumer
         // materializing only the primary root — multi-root is deferred).
-        let compensating_journal: Option<std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>> = {
+        let compensating_journal: Option<
+            std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>,
+        > = {
             let jp = commands::push_journal_path(
                 &commands::resolve_workspace_root(),
                 &cfg.subscriber_id,

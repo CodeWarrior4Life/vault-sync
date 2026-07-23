@@ -21,9 +21,11 @@
 
 use crate::api_client::NotePayload;
 use crate::conflict_stash::{ConflictClassifier, ConflictPolicy, ConflictStash, StashError};
-use crate::push_journal::{new_event_id, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA};
 use crate::integrity_check::{
     ByteLevelResult, ExpectedIntegrity, IntegrityChecker, IntegrityError, IntegrityResult,
+};
+use crate::push_journal::{
+    new_event_id, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::scope::is_safe_path;
@@ -760,8 +762,8 @@ impl Materializer {
             // strips and NEVER just parks on a bare "will push up" promise. When
             // a pull WOULD drop frontmatter local holds, resolve into one of two
             // arms based on whether the frontmatter-normalized BODIES are equal.
-            let guard_hit =
-                pull_would_strip && matches!(raw_decision, Decision::PullClean | Decision::Conflict);
+            let guard_hit = pull_would_strip
+                && matches!(raw_decision, Decision::PullClean | Decision::Conflict);
             let effective_decision = if guard_hit {
                 match classify_guard_arm(&local_bytes, content_bytes) {
                     GuardArm::PreserveAndPushUp => {
@@ -1463,7 +1465,7 @@ pub fn body_after_frontmatter_normalized(content: &[u8]) -> Vec<u8> {
         return s.as_bytes().to_vec();
     }
     match find_frontmatter_end(s) {
-        Some(fe) => s[fe.body_start..].as_bytes().to_vec(),
+        Some(fe) => s.as_bytes()[fe.body_start..].to_vec(),
         None => s.as_bytes().to_vec(),
     }
 }
@@ -2843,8 +2845,7 @@ mod tests {
     /// only downgraded to LocalEditPreserved and enqueued NOTHING.
     #[test]
     fn t3_guard_arm1_pure_strip_preserves_local_and_enqueues_compensating_push() {
-        let (vaults, _ws, m, shadow, journal) =
-            mk_with_shadow_and_journal(MaterializerMode::Live);
+        let (vaults, _ws, m, shadow, journal) = mk_with_shadow_and_journal(MaterializerMode::Live);
         let rel = format!("{VAULT}/01_Inbox/strip.md");
         let target = vaults.path().join(VAULT).join("01_Inbox/strip.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -2902,8 +2903,7 @@ mod tests {
     /// convergence — the phantom-pull deadlock).
     #[test]
     fn t3_guard_arm2_divergence_stashes_then_aligns() {
-        let (vaults, _ws, m, shadow, journal) =
-            mk_with_shadow_and_journal(MaterializerMode::Live);
+        let (vaults, _ws, m, shadow, journal) = mk_with_shadow_and_journal(MaterializerMode::Live);
         let rel = format!("{VAULT}/01_Inbox/diverge.md");
         let target = vaults.path().join(VAULT).join("01_Inbox/diverge.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();

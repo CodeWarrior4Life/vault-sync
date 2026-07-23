@@ -1188,22 +1188,6 @@ impl PushClient {
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Decide which hash (if any) to record into the ShadowStore for a push the
-/// server acked. Pure + table-tested.
-///
-/// * `Accepted` (D3, v0.4.28) → record the SERVER's canonical hash
-///   (`server_hash`, falling back to `content_hash`, then `local_sha` for
-///   pre-Piece-1 servers that omit both). The Piece 1 server may have
-///   CANONICALIZED (or region-defended) what we sent, so the local sha is no
-///   longer guaranteed to be the canonical; recording it unconditionally was
-///   step 3 of the B1' eternal push/pull alternation (push_client.rs:656 in
-///   v0.4.27). With this change an idempotent accept of raw CRLF bytes
-///   records the canonical hash, so the next reconcile pass classifies the
-///   file as PULL (→ the D1 alignment rewrite) instead of ping-ponging.
-/// * `Merged` → the server merged a concurrent edit; record its returned
-///   canonical (`server_hash` → `content_hash` → `local_sha`). Unchanged.
-/// * `ConflictMarkers` / `Error` → no clean canonical was established →
-///   record nothing. Unchanged.
 /// R4 / F-B3.2 (TKT-989ad5f2): resolve the wire CAS base for a push from its
 /// three-state `PushBase` and the shadow-store hash for the path. PURE +
 /// table-tested. The I29 shadow backfill applies ONLY to `Unknown` (watcher
@@ -1220,6 +1204,22 @@ fn resolve_backfilled_base(base: &PushBase, shadow: Option<String>) -> Option<St
     }
 }
 
+/// Decide which hash (if any) to record into the ShadowStore for a push the
+/// server acked. Pure + table-tested.
+///
+/// * `Accepted` (D3, v0.4.28) → record the SERVER's canonical hash
+///   (`server_hash`, falling back to `content_hash`, then `local_sha` for
+///   pre-Piece-1 servers that omit both). The Piece 1 server may have
+///   CANONICALIZED (or region-defended) what we sent, so the local sha is no
+///   longer guaranteed to be the canonical; recording it unconditionally was
+///   step 3 of the B1' eternal push/pull alternation (push_client.rs:656 in
+///   v0.4.27). With this change an idempotent accept of raw CRLF bytes
+///   records the canonical hash, so the next reconcile pass classifies the
+///   file as PULL (→ the D1 alignment rewrite) instead of ping-ponging.
+/// * `Merged` → the server merged a concurrent edit; record its returned
+///   canonical (`server_hash` → `content_hash` → `local_sha`). Unchanged.
+/// * `ConflictMarkers` / `Error` → no clean canonical was established →
+///   record nothing. Unchanged.
 fn shadow_hash_for_ack(
     status: &PushStatus,
     local_sha: &str,
@@ -2764,7 +2764,14 @@ mod tests {
         let client = make_client(&srv.url(), journal.clone())
             .await
             .with_tray_state(tray.clone());
-        let __out = client.drain_once().await; eprintln!("DRAIN_OUT: {:?}", __out.iter().map(|(e,o)| (e.path.clone(), format!("{o:?}"))).collect::<Vec<_>>());
+        let __out = client.drain_once().await;
+        eprintln!(
+            "DRAIN_OUT: {:?}",
+            __out
+                .iter()
+                .map(|(e, o)| (e.path.clone(), format!("{o:?}")))
+                .collect::<Vec<_>>()
+        );
         let s = tray.read().unwrap();
         assert_eq!(s.uploads_sent, 1);
         assert_eq!(s.uploads_failed, 0);

@@ -321,11 +321,13 @@ pub enum PullResultClass {
 /// a converged pull, `still_divergent` stayed 0, `cycle_red()` was false, and
 /// the strand became soak-eligible while divergence persisted (AR-5). The
 /// refusal skips are:
-///   * `ConflictStormBreakerOpen` — breaker deferred the write.
-///   * `LocalEditPreserved` — a genuine local edit preserved; still divergent
-///     until the watcher-enqueued push lands.
-///   * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
-///     a compensating push; still divergent until it lands.
+///
+/// * `ConflictStormBreakerOpen` — breaker deferred the write.
+/// * `LocalEditPreserved` — a genuine local edit preserved; still divergent
+///   until the watcher-enqueued push lands.
+/// * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
+///   a compensating push; still divergent until it lands.
+///
 /// A `Wrote`/`Stashed`/`AlignedToCanonical` (incl. anti-strip ARM 2, which
 /// stashes then aligns local to server) and a benign in-sync/no-op Skipped
 /// (`IdenticalToLocal` / `DisabledMode` / `SubstrateRefused`) are SUCCEEDED.
@@ -1870,13 +1872,14 @@ mod tests {
     fn t6b_preserved_local_pull_makes_cycle_red_not_soak_eligible() {
         // Mimic the run() accounting: classify the outcome, then credit the
         // report the way the pull loop does.
-        let outcome: Result<crate::materializer::MaterializeOutcome, String> = Ok(
-            crate::materializer::MaterializeOutcome::Skipped(
+        let outcome: Result<crate::materializer::MaterializeOutcome, String> =
+            Ok(crate::materializer::MaterializeOutcome::Skipped(
                 crate::materializer::SkipReason::LocalEditPreserved,
-            ),
-        );
-        let mut report = VerifyRepairReport::default();
-        report.pulls_attempted = 1;
+            ));
+        let mut report = VerifyRepairReport {
+            pulls_attempted: 1,
+            ..Default::default()
+        };
         match classify_pull_outcome(&outcome) {
             PullResultClass::Succeeded => report.pulls_succeeded += 1,
             PullResultClass::Deferred => report.pulls_deferred += 1,

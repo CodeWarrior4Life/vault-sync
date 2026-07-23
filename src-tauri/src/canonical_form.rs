@@ -158,10 +158,12 @@ mod tests {
     /// T11 (R8, TKT-989ad5f2): CRLF / BOM / NFC byte-parity CHARACTERIZATION
     /// matrix. Pins the daemon's Form C behavior against the server's
     /// `canonicalize()` contract (spec §2.2), one row per transform dimension:
-    ///   * CRLF and lone-CR both fold to LF; no 0x0D survives.
-    ///   * ALL leading U+FEFF (BOM) are stripped; interior U+FEFF is preserved.
-    ///   * NFC is NOT applied (dropped per the round-2 verdict): a
-    ///     canonically-decomposed sequence stays decomposed, byte-for-byte.
+    ///
+    /// * CRLF and lone-CR both fold to LF; no 0x0D survives.
+    /// * ALL leading U+FEFF (BOM) are stripped; interior U+FEFF is preserved.
+    /// * NFC is NOT applied (dropped per the round-2 verdict): a
+    ///   canonically-decomposed sequence stays decomposed, byte-for-byte.
+    ///
     /// A drift on any row is a new unstable-hash family member (the exact class
     /// this whole effort exists to kill), so this test documents the parity a
     /// server-side fixture must also satisfy.
@@ -195,7 +197,11 @@ mod tests {
             out, "\u{e9}",
             "Form C must NOT fold to the precomposed codepoint"
         );
-        assert_eq!(out.as_bytes(), &[0x65, 0xCC, 0x81], "exact decomposed bytes");
+        assert_eq!(
+            out.as_bytes(),
+            &[0x65, 0xCC, 0x81],
+            "exact decomposed bytes"
+        );
     }
 
     /// Strict-decode precondition: canonicalize_bytes rejects non-UTF-8

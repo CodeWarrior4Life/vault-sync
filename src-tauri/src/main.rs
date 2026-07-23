@@ -91,7 +91,11 @@ fn init_logging() {
     // (operators set it in the service unit / launch config). `RUST_LOG` still
     // overrides via `from_default_env` for ad-hoc debugging.
     let filter = EnvFilter::from_default_env()
-        .add_directive(resolve_log_directive(debug_logging_opt_in()).parse().unwrap())
+        .add_directive(
+            resolve_log_directive(debug_logging_opt_in())
+                .parse()
+                .unwrap(),
+        )
         .add_directive("eventsource_client=info".parse().unwrap());
 
     tracing_subscriber::registry()
