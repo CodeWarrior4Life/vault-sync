@@ -32,6 +32,32 @@ set-mode   Change the materializer mode of an ALREADY-PAIRED host: loads the sto
 /// write failures, etc.) was invisible. S476 root-cause hunt for the
 /// "shadow materializer doesn't write" bug burned hours guessing because
 /// these errors weren't observable.
+/// R7 / F-A6 (TKT-989ad5f2): the crate's tracing directive. DEBUG only when
+/// opted in; INFO otherwise. PURE + unit-tested.
+fn resolve_log_directive(debug: bool) -> &'static str {
+    if debug {
+        "vault_sync_daemon=debug"
+    } else {
+        "vault_sync_daemon=info"
+    }
+}
+
+/// R7 / F-A6: DEBUG-logging opt-in via the `VAULT_SYNC_LOG_DEBUG` env var.
+/// Truthy = `1`/`true`/`yes`/`on`/`debug` (case-insensitive). Default (unset or
+/// anything else) is INFO. Logging inits before the daemon config is loaded, so
+/// the env var is the config knob available at this point.
+fn debug_logging_opt_in() -> bool {
+    std::env::var("VAULT_SYNC_LOG_DEBUG")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "debug"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn init_logging() {
     let log_dir: PathBuf = dirs::data_local_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(std::env::temp_dir))
@@ -57,8 +83,15 @@ fn init_logging() {
         .with_writer(std::io::stderr)
         .with_ansi(false);
 
+    // R7 / F-A6 (TKT-989ad5f2): default the daemon log level to INFO, with
+    // DEBUG opt-in. Pre-fix this hardcoded `vault_sync_daemon=debug`, forcing
+    // DEBUG for the crate regardless of env — 1.4GB/day on trinity. Logging
+    // initializes before the daemon config is loaded and a tracing subscriber
+    // cannot be re-inited, so the opt-in is the `VAULT_SYNC_LOG_DEBUG` env
+    // (operators set it in the service unit / launch config). `RUST_LOG` still
+    // overrides via `from_default_env` for ad-hoc debugging.
     let filter = EnvFilter::from_default_env()
-        .add_directive("vault_sync_daemon=debug".parse().unwrap())
+        .add_directive(resolve_log_directive(debug_logging_opt_in()).parse().unwrap())
         .add_directive("eventsource_client=info".parse().unwrap());
 
     tracing_subscriber::registry()
@@ -437,5 +470,13 @@ mod tests {
         assert_eq!(extract_flag(&args, "--b").unwrap(), Some("2".into()));
         assert_eq!(extract_flag(&args, "--c").unwrap(), None);
         assert!(extract_flag(&v(&["--a"]), "--a").is_err());
+    }
+
+    /// R7 / F-A6 (TKT-989ad5f2): the default daemon log level is INFO; DEBUG is
+    /// opt-in only. This pins that the hardcoded `=debug` directive is gone.
+    #[test]
+    fn log_directive_defaults_to_info_debug_is_opt_in() {
+        assert_eq!(resolve_log_directive(false), "vault_sync_daemon=info");
+        assert_eq!(resolve_log_directive(true), "vault_sync_daemon=debug");
     }
 }

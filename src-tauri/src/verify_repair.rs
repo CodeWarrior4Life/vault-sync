@@ -188,6 +188,11 @@ pub struct VerifyRepairReport {
     pub delete_paths_sample: Vec<String>,
     pub substrate_refused_count: usize,
     pub extension_filtered_count: usize,
+    /// R6 / F-A4.1 (TKT-989ad5f2): count of symlinks encountered inside the
+    /// vault scan path and SKIPPED by the walker. Each is also WARN-logged
+    /// (pre-fix they were dropped with zero log — trinity's 6 dangling conductor
+    /// symlinks appeared 0 times in a 1.4GB daily log, RC-A4).
+    pub symlinks_skipped: usize,
     pub errors: Vec<(String, String)>,
     pub elapsed_ms: u64,
 
@@ -816,6 +821,22 @@ impl VerifyRepair {
                     continue;
                 }
             };
+            // R6 / F-A4.1 (TKT-989ad5f2): a symlink inside the vault scan path
+            // is SKIPPED, but VISIBLY — WARN + a report counter. `follow_links`
+            // is false, so a symlink surfaces as a symlink entry (never a file),
+            // and the pre-fix `!is_file() -> continue` dropped it with zero log.
+            // Symlinks are not synced (their target's identity/containment is
+            // ambiguous and a dangling one has no content), but the operator MUST
+            // be able to see they exist (trinity's 6 dangling conductor symlinks
+            // were invisible in a 1.4GB daily log, RC-A4).
+            if entry.file_type().is_symlink() {
+                report.symlinks_skipped += 1;
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "verify_repair: SYMLINK inside vault scan path — SKIPPED (not synced; symlinks_skipped counter bumped)"
+                );
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }

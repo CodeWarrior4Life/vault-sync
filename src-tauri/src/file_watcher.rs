@@ -241,6 +241,12 @@ pub struct FileWatcher {
     /// auto-recover a dead/fenced watcher REGARDLESS of pending count. `None`
     /// keeps pre-S511 behavior (no heartbeat); the production wire-up sets it.
     sync_health: Option<Arc<crate::sync_health::SyncHealth>>,
+    /// R6 / F-A4.1 (TKT-989ad5f2): count of symlinks encountered inside the
+    /// vault scan path and skipped by `normalize_event`. Each is also
+    /// WARN-logged. Pre-fix the watcher silently followed internal symlinks and
+    /// silently dropped symlink escapes (zero log, RC-A4). `Arc` so clones share
+    /// the count; readable via [`Self::symlinks_skipped`].
+    symlinks_skipped: Arc<AtomicU64>,
 }
 
 impl FileWatcher {
@@ -264,7 +270,14 @@ impl FileWatcher {
             enqueued_hashes: Arc::new(Mutex::new(HashMap::new())),
             shadow_store: None,
             sync_health: None,
+            symlinks_skipped: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// R6 / F-A4.1 (TKT-989ad5f2): number of symlinks the watcher has skipped
+    /// inside the vault scan path this session (see [`Self::normalize_event`]).
+    pub fn symlinks_skipped(&self) -> u64 {
+        self.symlinks_skipped.load(Ordering::Relaxed)
     }
 
     /// D6 (S511): attach the shared shadow store so the enqueue dedup is gated
@@ -691,6 +704,26 @@ impl FileWatcher {
     /// variant kind. Used by the FS-watcher loop (per-path, post kind-filter).
     /// Public for integration tests that bypass the spawned task.
     pub fn normalize_event(&self, abs: &Path, kind: WatchEventKindHint) -> Option<WatchEvent> {
+        // R6 / F-A4.1 (TKT-989ad5f2): a symlink inside the vault scan path is
+        // SKIPPED, but VISIBLY — WARN + a counter. Pre-fix the watcher silently
+        // FOLLOWED internal symlinks (normalize_path canonicalizes the target)
+        // and silently DROPPED escapes (returns None), so a symlink appeared 0
+        // times in the log (RC-A4). We check the raw path's OWN metadata (a
+        // no-follow lstat) BEFORE normalization. A Deleted symlink can no longer
+        // be stat'd, so the check naturally no-ops there and the delete
+        // propagates as before.
+        if !matches!(kind, WatchEventKindHint::Deleted) {
+            if let Ok(md) = std::fs::symlink_metadata(abs) {
+                if md.file_type().is_symlink() {
+                    self.symlinks_skipped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        path = %abs.display(),
+                        "file_watcher: SYMLINK inside vault scan path — SKIPPED (not synced; symlinks_skipped counter bumped)"
+                    );
+                    return None;
+                }
+            }
+        }
         let p = self.normalize_path(abs)?;
         Some(match kind {
             WatchEventKindHint::Created => WatchEvent::Created { path: p },
