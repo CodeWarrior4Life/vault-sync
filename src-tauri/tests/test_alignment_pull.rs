@@ -179,34 +179,42 @@ fn test_r1_raw_equal_still_noop() {
     assert_eq!(fx.shadow.get(&rel).as_deref(), Some(p.sha256.as_str()));
 }
 
-/// Anti-strip interplay (spec D1 acceptance): an alignment pull can never
-/// strip frontmatter BY CONSTRUCTION - a local file WITH frontmatter and a
-/// server body WITHOUT it are not normalized-equal, so the flow lands in the
-/// S513 anti-strip guard (PreserveLocalEdit), never in the alignment rewrite.
+/// Anti-strip interplay (spec D1 + R1 / F-B1.1 two-arm, TKT-989ad5f2): a local
+/// file WITH frontmatter vs a server body WITHOUT it is never "aligned"
+/// (stripped). When the frontmatter-normalized BODIES are byte-equal (here
+/// local "body\r\n" and server "body\n" both normalize to "body\n") this is a
+/// PURE server-strip, so the guard resolves it as ARM 1: PRESERVE the local
+/// frontmatter-bearing copy (and, when a push-journal is wired, enqueue a
+/// compensating UP push). This fixture wires no journal, so no push is
+/// enqueued (`enqueued_push: false`), but the local file is still preserved
+/// verbatim — the strip is refused, exactly as before the two-arm change; only
+/// the (now honest, RED-classified) skip reason changed from LocalEditPreserved.
 #[test]
 fn test_alignment_pull_respects_anti_strip() {
     let fx = fixture();
     let rel = format!("{VAULT}/notes/c.md");
     let local = "---\ntitle: keep me\n---\nbody\r\n"; // frontmatter + CRLF
-    let server = "body\n"; // frontmatter-stripped server copy
+    let server = "body\n"; // frontmatter-stripped server copy, SAME body
     let abs = fx.vault_root.join(&rel);
     std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
     std::fs::write(&abs, local).unwrap();
     // No shadow entry: raw decision would be R5 Conflict, and the pull would
-    // strip -> the guard downgrades to PreserveLocalEdit.
+    // strip -> the guard resolves the pure-strip case via ARM 1.
 
     let p = payload(&rel, server);
     let outcome = fx.mat.write(&p).unwrap();
 
-    assert_eq!(
-        outcome,
-        MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved),
-        "a frontmatter-stripping server copy must be refused, never 'aligned'"
+    assert!(
+        matches!(
+            outcome,
+            MaterializeOutcome::Skipped(SkipReason::GuardPreserveLocalPushUp { .. })
+        ),
+        "a frontmatter-stripping server copy (pure strip) must be refused via ARM 1, never 'aligned'; got {outcome:?}"
     );
     assert_eq!(
         std::fs::read(&abs).unwrap(),
         local.as_bytes(),
-        "local file must be untouched"
+        "local file must be untouched (guard never strips)"
     );
 }
 
