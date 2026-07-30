@@ -1269,6 +1269,52 @@ impl Materializer {
             .map(|r| r.to_string_lossy().replace('\\', "/"))
     }
 
+    /// TKT-6222df34 (ruling 1A, S511 D4 delete leg): preserve a divergent
+    /// unpushed local edit as a `<stem>.conflict-from-<device>-<seq>.md`
+    /// sibling BEFORE a server DELETE renames the file away. Same
+    /// ConflictStash mechanism + naming as the push leg's CAS-409 stash
+    /// (`PushClient::stash_local_on_conflict`); seq comes from the
+    /// base_seq_store when known, else 0 (the push leg's unknown-seq value).
+    /// Best-effort: a stash failure is logged and MUST NOT abort the delete
+    /// (delete still wins; the fork is the preservation, not a veto).
+    fn stash_local_before_delete(&self, path: &str, local_bytes: &[u8], local_raw_sha: &str) {
+        let stash_root = match self.mode {
+            MaterializerMode::Live => self.vaults_root.clone(),
+            _ => self.shadow_root(),
+        };
+        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
+        let seq: u64 = self
+            .base_seq_store
+            .as_ref()
+            .and_then(|s| s.get(path))
+            .and_then(|s| u64::try_from(s).ok())
+            .unwrap_or(0);
+        // D5: key the echo_guard BEFORE the stash write so the file_watcher
+        // never enqueues the conflict copy as a push (same belt-and-braces as
+        // the R4/R5 Conflict arm in write_with_change_seq).
+        let stash_target = stasher.compute_stash_path_public(path, &self.config.device_id, seq);
+        if let (Some(g), Some(rel)) = (&self.echo_guard, self.rel_for_stash(&stash_target)) {
+            g.record(&rel, local_raw_sha);
+        }
+        match stasher.write_stash(path, local_bytes, &self.config.device_id, seq) {
+            Ok(stash) => {
+                warn!(
+                    path = %path,
+                    stash = %stash.display(),
+                    seq,
+                    "materializer: server DELETE vs local edit, stashed local bytes before soft-delete (TKT-6222df34, S511 D4 delete leg)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %path,
+                    error = ?e,
+                    "materializer: delete-leg conflict stash FAILED, soft-delete proceeds, local bytes may be at risk (TKT-6222df34)"
+                );
+            }
+        }
+    }
+
     /// Soft-delete preserves the v0.2 contract (move to `<name>.deleted-<ts>`).
     /// In live mode it operates on the vault tree; in shadow mode on the
     /// runtime tree.  Disabled mode no-ops.
@@ -1290,6 +1336,34 @@ impl Materializer {
         if !target.exists() {
             info!("soft_delete: nothing to delete at {}", path);
             return Ok(());
+        }
+        // TKT-6222df34 (ruling 1A): a server DELETE wins, but an unpushed
+        // divergent local edit must survive as a conflict fork, exactly like
+        // the push leg's CAS-409 stash (S511 D4). Divergence uses the SAME
+        // basis as write()'s R2 check: the shadow store holds the last-synced
+        // server RAW sha; a differing raw sha of the on-disk bytes means an
+        // unpushed local edit. Shadow ABSENT = unknown provenance = NO stash
+        // (deliberate: ~33k notes carry no baseline yet, and stashing on
+        // absent shadow would spray forks on routine cleanups). Empty bytes
+        // are never worth a fork. A read failure is logged and the delete
+        // proceeds (stash is best-effort, the delete is the contract).
+        if let Some(shadow) = self.shadow_store.as_ref().and_then(|s| s.get(path)) {
+            match fs::read(&target) {
+                Ok(local_bytes) if !local_bytes.is_empty() => {
+                    let local_raw_sha = hex::encode(Sha256::digest(&local_bytes));
+                    if shadow != local_raw_sha {
+                        self.stash_local_before_delete(path, &local_bytes, &local_raw_sha);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = ?e,
+                        "soft_delete: could not read local bytes for divergence check, deleting without stash (TKT-6222df34)"
+                    );
+                }
+            }
         }
         // D13 (S511): the suffix carries NANOSECOND precision, not just
         // second-granularity. Two deletes of the same path within one second
@@ -2479,6 +2553,141 @@ mod tests {
         // no target present it is a no-op Ok (same as any missing content path).
         let (_v, _w, m) = mk(MaterializerMode::Shadow, default_cfg());
         assert!(m.soft_delete("00_VAULT.md").is_ok());
+    }
+
+    // ---- TKT-6222df34: delete-leg conflict stash ---------------------------
+
+    /// Live-mode fixture with an attached ShadowStore, plus the wire path and
+    /// on-disk target for one note. Files are written directly to the vault
+    /// tree (the divergence basis is raw on-disk bytes vs shadow, same as R2).
+    fn mk_delete_leg() -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        Materializer,
+        std::sync::Arc<crate::sync_shadow::ShadowStore>,
+        String,
+        PathBuf,
+    ) {
+        use crate::sync_shadow::ShadowStore;
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let (vaults, ws, m_base) = mk(MaterializerMode::Live, default_cfg());
+        let m = m_base.with_shadow_store(shadow.clone());
+        let wire = format!("{VAULT}/01_Inbox/foo.md");
+        let target = vaults.path().join(&wire);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        (vaults, ws, sdir, m, shadow, wire, target)
+    }
+
+    fn count_by_prefix(dir: &Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    /// Shadow present + local raw sha differs => the local bytes survive as a
+    /// `.conflict-from-<device>-0.md` sibling (seq 0: no base_seq known, same
+    /// as the push leg's bare-409 stash) AND the delete still wins.
+    #[test]
+    fn delete_leg_divergent_local_edit_stashed_then_soft_deleted() {
+        let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
+        shadow.record(&wire, &sha256_hex("server v1"));
+        std::fs::write(&target, "local edit v2").unwrap();
+
+        m.soft_delete(&wire).unwrap();
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(!target.exists(), "delete must still win");
+        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        let stash = dir.join("foo.conflict-from-morpheus-0.md");
+        assert!(stash.exists(), "divergent local edit must be forked");
+        assert_eq!(
+            std::fs::read_to_string(&stash).unwrap(),
+            "local edit v2",
+            "stash must hold the LOCAL bytes, not the server tombstone"
+        );
+    }
+
+    /// Shadow present + local raw sha EQUALS shadow (nothing unpushed) => no
+    /// fork, plain soft-delete.
+    #[test]
+    fn delete_leg_identical_local_content_no_stash() {
+        let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
+        std::fs::write(&target, "synced bytes").unwrap();
+        shadow.record(&wire, &sha256_hex("synced bytes"));
+
+        m.soft_delete(&wire).unwrap();
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(!target.exists());
+        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        assert_eq!(
+            count_by_prefix(&dir, "foo.conflict-from-"),
+            0,
+            "in-sync local must not fork"
+        );
+    }
+
+    /// Shadow ABSENT (unknown provenance, the ~33k no-baseline population) =>
+    /// no fork, plain soft-delete. Stash is scoped to shadow-present-and-
+    /// differs by ruling 1A.
+    #[test]
+    fn delete_leg_no_shadow_entry_no_stash() {
+        let (vaults, _ws, _s, m, _shadow, wire, target) = mk_delete_leg();
+        std::fs::write(&target, "whatever local holds").unwrap();
+
+        m.soft_delete(&wire).unwrap();
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(!target.exists());
+        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        assert_eq!(
+            count_by_prefix(&dir, "foo.conflict-from-"),
+            0,
+            "absent shadow must not fork"
+        );
+    }
+
+    /// Re-deleting the same divergent state (recreate + second DELETE) reuses
+    /// the byte-identical stash (S514 idempotency) instead of appending -2/-3.
+    #[test]
+    fn delete_leg_repeated_divergent_delete_stash_is_idempotent() {
+        let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
+        shadow.record(&wire, &sha256_hex("server v1"));
+
+        for _ in 0..2 {
+            std::fs::write(&target, "local edit v2").unwrap();
+            m.soft_delete(&wire).unwrap();
+        }
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert_eq!(
+            count_by_prefix(&dir, "foo.conflict-from-"),
+            1,
+            "identical divergent bytes must converge on ONE stash"
+        );
+        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 2);
+    }
+
+    /// A known base_seq names the stash (`-<seq>`), mirroring the push leg's
+    /// deterministic naming; unknown stays 0 (covered above).
+    #[test]
+    fn delete_leg_stash_uses_base_seq_when_known() {
+        let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
+        let bdir = TempDir::new().unwrap();
+        let bs = crate::base_seq_store::BaseSeqStore::load(bdir.path().join("base_seq.json"));
+        bs.record(&wire, 7);
+        let m = m.with_base_seq_store(bs);
+        shadow.record(&wire, &sha256_hex("server v1"));
+        std::fs::write(&target, "local edit v2").unwrap();
+
+        m.soft_delete(&wire).unwrap();
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(dir.join("foo.conflict-from-morpheus-7.md").exists());
     }
 
     // ---- Wave 4: tray-state wire-up ---------------------------------------
