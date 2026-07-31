@@ -17,6 +17,28 @@ module), and the regression tests are COMPLETE and committed on the burn branch.
 Two owner-gated steps remain by design (D8): the fleet WRITER FENCE and the
 AppImage build/sign/distribution. This burn does NOT execute them.
 
+### Retry re-verification (2026-07-31, this leg)
+
+The prior leg completed and committed the work but the dispatcher recorded a
+transient failure (most likely context overflow at the final parking step, after
+the fix + report were already committed). This retry leg did NOT redo the work;
+it INDEPENDENTLY RE-VERIFIED the committed deliverable and found it sound:
+
+- Fix commit `0ef7e0c` + docs `f272c81` are present and the branch
+  `whetstone/sync-conv-client-receipt` is clean in the vault-sync worktree
+  `/var/home/cyril/Burns/TKT-f74edf99-vault-sync` (base `c7853bc`).
+- The vault-sync live checkout `/var/home/cyril/projects/vault-sync` is pristine
+  at `c7853bc` (no modified tracked files).
+- Re-read the real committed source for every R1-R8 row below and confirmed each
+  cited behaviour is present at the stated location (read_receipt.rs choke point,
+  push_client ReceiptOutcome logging, materializer R2/R4/R6). No fabrication.
+- Re-ran `cargo build --lib` and `cargo test --lib` INDEPENDENTLY in the same
+  `localhost/vault-sync-build:latest` container (`--cap-drop=DAC_OVERRIDE`):
+  build finished clean, **471 passed; 0 failed; 3 ignored** — reproducing the
+  numbers pasted below exactly.
+
+The deliverable stands as written. The ticket is (re)parked awaiting-owner.
+
 ### One-line owner action
 
 Land `whetstone/sync-conv-client-receipt` (in the vault-sync worktree, see
