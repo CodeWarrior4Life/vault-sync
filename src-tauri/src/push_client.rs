@@ -27,9 +27,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::api_client::{
-    ApiClient, ApiError, PushApiAction, PushRequest, PushResponse, PushStatus,
+    ApiClient, ApiError, NotePayload, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
 use crate::push_journal::{JournalCursor, PushAction, PushEvent, PushJournal};
+use crate::read_receipt::verify_receipt;
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
 
@@ -171,6 +172,16 @@ pub struct PushClient {
     /// tests / degraded wiring); the push then declares `base_seq: null` which
     /// the server (flag on) fails closed, exactly the unknown-lineage path (R4).
     base_seq_store: Option<Arc<crate::base_seq_store::BaseSeqStore>>,
+    /// R1 (Vault Sync Convergence P2b, TKT-f74edf99): durable verified
+    /// read-receipt store. On a typed 409 the client fetches the exact server
+    /// revision body, byte-verifies its hash via
+    /// [`read_receipt::verify_receipt`](crate::read_receipt::verify_receipt),
+    /// and records a receipt here BEFORE it may declare that revision's seq as a
+    /// push baseline. A receipt is the ONLY thing that authorises a baseline for
+    /// a divergent, baseline-absent note — recording a baseline from a bare
+    /// number is forbidden. `None` = no receipt recovery (unit tests / degraded
+    /// wiring); the 409 path then only surfaces the conflict and pull converges.
+    read_receipt_store: Option<Arc<crate::read_receipt::ReadReceiptStore>>,
     /// opfix-vaultsync-dormancy: shared progress-tracking handle. When set,
     /// every `drain_once` that processed at least one event stamps a fresh
     /// progress marker so the watchdog can distinguish "pipeline healthy"
@@ -213,6 +224,7 @@ impl PushClient {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -257,6 +269,20 @@ impl PushClient {
     /// Backwards-compatible - without it, pushes declare `base_seq: null`.
     pub fn with_base_seq_store(mut self, store: Arc<crate::base_seq_store::BaseSeqStore>) -> Self {
         self.base_seq_store = Some(store);
+        self
+    }
+
+    /// R1 (TKT-f74edf99): attach the durable verified read-receipt store. After
+    /// this, a typed 409 fetches the exact server revision body, byte-verifies
+    /// its hash, records a receipt, and (only then) records the revision's seq
+    /// as the note's observed base_seq — the verified-recovery leg that lets a
+    /// divergent, baseline-absent note escape the deadlock. Backwards-compatible;
+    /// without it the 409 path only surfaces the conflict (pull converges).
+    pub fn with_read_receipt_store(
+        mut self,
+        store: Arc<crate::read_receipt::ReadReceiptStore>,
+    ) -> Self {
+        self.read_receipt_store = Some(store);
         self
     }
 
@@ -797,7 +823,11 @@ impl PushClient {
                     // losing local bytes are already stashed above (never dropped);
                     // now converge the canonical file to the server head
                     // (byte-verified) and learn the fresh observed base_seq (R3).
-                    self.refetch_and_merge_on_conflict(&evt.path).await;
+                    // R1 (TKT-f74edf99): pass the head hash the 409 named so the
+                    // refetch can bind the verified receipt to the exact revision
+                    // (a body that hashes to some OTHER head is refused).
+                    self.refetch_and_merge_on_conflict(&evt.path, expected_hash.as_deref())
+                        .await;
                     // Still surface the conflict so Burn C accounting counts it
                     // (R6) and the journal entry is acked (the edit survives as the
                     // stash, not an infinite blind retry).
@@ -1065,7 +1095,7 @@ impl PushClient {
     /// BEFORE this runs. Best-effort and fail-honest: with no materializer wired,
     /// or on a fetch/materialize error, convergence falls to the next reconcile
     /// pull and the conflict is still surfaced to the accounting layer (R6).
-    async fn refetch_and_merge_on_conflict(&self, path: &str) {
+    async fn refetch_and_merge_on_conflict(&self, path: &str, expected_head_hash: Option<&str>) {
         let Some(mat) = &self.materializer else {
             tracing::info!(
                 path,
@@ -1074,24 +1104,60 @@ impl PushClient {
             return;
         };
         match self.api.fetch_note(path).await {
-            Ok(payload) => match mat.write(&payload) {
-                Ok(outcome) => tracing::info!(
-                    path,
-                    ?outcome,
-                    "409 refetch/merge: server head materialized (observed base_seq recorded post-verify, R3)"
-                ),
-                Err(e) => tracing::warn!(
-                    path,
-                    error = %e,
-                    "409 refetch/merge: materialize failed - pull converges next reconcile pass"
-                ),
-            },
+            Ok(payload) => {
+                // R1 (TKT-f74edf99): verify the refetched body and record the
+                // baseline ONLY via a verified receipt. This runs INDEPENDENTLY
+                // of the merge direction below, so a divergent note whose local
+                // edit is PRESERVED (R2) still earns its baseline from the
+                // verified server OBSERVATION — the client half of the certified
+                // deadlock. The baseline never comes from the preserve branch
+                // firing (R2) nor from a bare number (forbidden): only from a
+                // body whose hash matched the revision the server named.
+                let receipt = self.record_verified_receipt(path, &payload, expected_head_hash);
+                // R5 (TKT-f74edf99): thread the REAL server change_seq so any
+                // conflict stash minted during the merge is named
+                // deterministically (never the -0-NN hardwire).
+                let change_seq = payload.change_seq.unwrap_or(0).max(0) as u64;
+                match mat.write_with_change_seq(&payload, change_seq) {
+                    // R3 (TKT-f74edf99): state what ACTUALLY happened. The prior
+                    // line claimed "observed base_seq recorded post-verify"
+                    // UNCONDITIONALLY, including on Skipped(LocalEditPreserved)
+                    // where nothing was recorded — a false all-clear. Report the
+                    // receipt result and the materialize outcome, truthfully.
+                    Ok(outcome) => match &receipt {
+                        ReceiptOutcome::Recorded { seq } => tracing::info!(
+                            path,
+                            ?outcome,
+                            base_seq = seq,
+                            "409 refetch/merge: VERIFIED read-receipt recorded (retry authorised); merge outcome as shown (R1/R3)"
+                        ),
+                        ReceiptOutcome::VerifyFailed => tracing::warn!(
+                            path,
+                            ?outcome,
+                            "409 refetch/merge: refetched body FAILED hash verification - NO baseline recorded (fail-closed); pull converges next pass (R1/R3)"
+                        ),
+                        ReceiptOutcome::Unverifiable => tracing::warn!(
+                            path,
+                            ?outcome,
+                            "409 refetch/merge: server omitted revision seq / enriched body - NO baseline recorded (fail-closed) (R1/R3)"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        path,
+                        error = %e,
+                        "409 refetch/merge: materialize failed - pull converges next reconcile pass"
+                    ),
+                }
+            }
             Err(ApiError::NotFound(_)) => {
                 // The server has no such note (deleted since our push). Drop the
-                // stale lineage so a later re-create starts from unknown lineage
-                // (fail-closed, R4) rather than a stale observed seq.
+                // stale lineage AND any stale receipt so a later re-create starts
+                // from unknown lineage (fail-closed, R4) rather than a stale seq.
                 if let Some(bs) = &self.base_seq_store {
                     bs.remove(path);
+                }
+                if let Some(rs) = &self.read_receipt_store {
+                    rs.remove(path);
                 }
                 tracing::info!(
                     path,
@@ -1105,6 +1171,66 @@ impl PushClient {
             ),
         }
     }
+
+    /// R1 (TKT-f74edf99): the single verified-receipt choke point. Given a
+    /// refetched server `payload` and the hash the 409 named as the expected
+    /// head, byte-verify the body via [`verify_receipt`] and — ONLY on a match —
+    /// record the durable receipt AND the wire baseline (`base_seq`). Returns
+    /// what happened so the caller logs truthfully (R3) and tests assert without
+    /// capturing logs. On any verification failure NOTHING is recorded: a
+    /// baseline is never minted from a bare number or an unverified body.
+    fn record_verified_receipt(
+        &self,
+        path: &str,
+        payload: &NotePayload,
+        expected_head_hash: Option<&str>,
+    ) -> ReceiptOutcome {
+        // The server sends the EXACT bytes it hashed as `enriched_body` (S486);
+        // that is the only thing we can verify the declared sha against. A server
+        // that omits it cannot authorise a baseline (fail-closed).
+        let Some(body) = payload.enriched_body.as_deref() else {
+            return ReceiptOutcome::Unverifiable;
+        };
+        match verify_receipt(
+            body.as_bytes(),
+            &payload.sha256,
+            expected_head_hash,
+            payload.change_seq,
+        ) {
+            Some(receipt) => {
+                let seq = receipt.revision_seq;
+                // Durable proof of HOW this baseline was earned.
+                if let Some(rs) = &self.read_receipt_store {
+                    rs.record_verified(path, receipt);
+                }
+                // The verified receipt is the ONLY thing that authorises the
+                // wire baseline (R1). Recorded here, off the preserve branch.
+                if let Some(bs) = &self.base_seq_store {
+                    bs.record(path, seq);
+                }
+                ReceiptOutcome::Recorded { seq }
+            }
+            None if payload.change_seq.is_none() => ReceiptOutcome::Unverifiable,
+            None => ReceiptOutcome::VerifyFailed,
+        }
+    }
+}
+
+/// R1/R3 (TKT-f74edf99): outcome of the verified read-receipt step, returned so
+/// the caller can log TRUTHFULLY (R3) and tests can assert without capturing
+/// tracing output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiptOutcome {
+    /// The refetched body byte-verified against the revision the server named;
+    /// a durable receipt + the wire baseline were recorded. The retry is now
+    /// authorised to declare `seq`.
+    Recorded { seq: i64 },
+    /// The refetched body FAILED hash verification (or the server named a
+    /// different head): NOTHING recorded (fail-closed). Never a forged baseline.
+    VerifyFailed,
+    /// The server omitted a revision seq (pre-R7b) or an enriched body, so no
+    /// baseline can be authorised: NOTHING recorded (fail-closed).
+    Unverifiable,
 }
 
 // ---------------------------------------------------------------------------
@@ -2077,6 +2203,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -2106,6 +2233,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -2131,6 +2259,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -2155,6 +2284,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -2820,6 +2950,7 @@ mod tests {
             tray_state: None,
             shadow_store: None,
             base_seq_store: None,
+            read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
@@ -3159,6 +3290,249 @@ mod tests {
             found_stash,
             "losing local bytes must be stashed, not dropped"
         );
+    }
+
+    // --- R1 (TKT-f74edf99): verified read-receipt recovery of the deadlock ---
+
+    /// Like [`make_baseseq_client`] but also wires the durable read-receipt
+    /// store, returned so tests can assert the verified receipt landed.
+    async fn make_receipt_client(
+        base_url: &str,
+        journal: Arc<Mutex<PushJournal>>,
+    ) -> (
+        PushClient,
+        TempDir,
+        Arc<crate::base_seq_store::BaseSeqStore>,
+        Arc<ShadowStore>,
+        Arc<crate::read_receipt::ReadReceiptStore>,
+    ) {
+        let vault = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+        let rr = crate::read_receipt::ReadReceiptStore::load(sdir.path().join("read_receipt.json"));
+        let mat = Materializer::new(
+            vault.path().to_path_buf(),
+            None,
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            MaterializerConfig {
+                device_id: "dev-test".into(),
+                ..Default::default()
+            },
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_echo_guard(Arc::new(EchoGuard::new()));
+        let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
+        let client = PushClient::new(
+            api,
+            journal,
+            "dev-test".into(),
+            config_for_test(),
+            vault.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_read_receipt_store(rr.clone())
+        .with_materializer(mat);
+        (client, vault, bs, shadow, rr)
+    }
+
+    /// THE deadlock-recovery acceptance test (TKT-f74edf99, R1). A DIVERGENT,
+    /// baseline-ABSENT note (known ancestry: shadow == server head, local edited
+    /// on top) is exactly the state where `mat.write` returns
+    /// `Skipped(LocalEditPreserved)` and records NOTHING — the certified client
+    /// deadlock: base_seq stays `None` forever, every push 409s, the note never
+    /// converges. The fix records the baseline from a VERIFIED read-receipt
+    /// (the refetched server body, hash-checked against the revision the 409
+    /// named) — NOT from the preserve branch, NOT from a bare number, and WITHOUT
+    /// overwriting the local edit. After one 409 the note has a baseline and its
+    /// retry is authorised.
+    ///
+    /// RED on pre-fix code: there is no read-receipt store nor
+    /// `record_verified_receipt`, and the refetch path delegates to `mat.write`
+    /// which returns early on `PreserveLocalEdit` before any recording — so
+    /// `bs.get` stays `None` and this test's `Some(77)` assertion fails.
+    #[tokio::test]
+    async fn divergent_baseline_absent_note_recovers_via_verified_receipt_not_forged_baseline() {
+        let mut srv = Server::new_async().await;
+        let server_body = "line A\nline B\n";
+        let server_sha = sha256_hex(server_body.as_bytes());
+        // The 409 names the REAL current head hash as expected_hash (as a real
+        // server does), so the receipt can bind to that exact revision.
+        let mp = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{server_sha}"}}"#))
+            .expect(1) // NO blind retry
+            .create_async()
+            .await;
+        let note = serde_json::json!({
+            "path": "01_Notes/x.md",
+            "frontmatter": {},
+            "body": server_body,
+            "sha256": server_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 77,
+            "enriched_body": server_body,
+        })
+        .to_string();
+        let mn = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+
+        // local diverges from (and is a superset of) the server head.
+        let local_body: &[u8] = b"line A\nline B\nlocal extra\n";
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", local_body)]);
+        let (client, vault, bs, shadow, rr) = make_receipt_client(&srv.url(), journal).await;
+        // Known ancestry: shadow == server head => decide() = PreserveLocalEdit.
+        shadow.record("01_Notes/x.md", &server_sha);
+        // The divergent local file must EXIST so the materializer takes the
+        // exists()/PreserveLocalEdit branch (not create-from-server).
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join("01_Notes/x.md"), local_body).unwrap();
+        // Precondition: baseline-absent (primed to deadlock on pre-fix code).
+        assert_eq!(bs.get("01_Notes/x.md"), None);
+        assert!(rr.get("01_Notes/x.md").is_none());
+
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(
+                outcomes[0].1,
+                PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+            ),
+            "got {:?}",
+            outcomes[0].1
+        );
+        mp.assert_async().await;
+        mn.assert_async().await;
+
+        // RECOVERY: the note now carries a baseline, so its retry is authorised.
+        assert_eq!(
+            bs.get("01_Notes/x.md"),
+            Some(77),
+            "baseline must be recovered from the verified receipt"
+        );
+        // ...and it was earned by a VERIFIED receipt bound to the body hash.
+        let receipt = rr.get("01_Notes/x.md").expect("a verified receipt exists");
+        assert_eq!(receipt.revision_seq, 77);
+        assert_eq!(
+            receipt.body_sha, server_sha,
+            "receipt is bound to the verified body hash"
+        );
+        // NOT a forged materialize: the local edit was PRESERVED, byte-for-byte.
+        let on_disk = std::fs::read(vault.path().join("01_Notes/x.md")).unwrap();
+        assert_eq!(
+            on_disk, local_body,
+            "recovery came from the receipt, not from overwriting local"
+        );
+    }
+
+    /// R1 (fail-closed): a refetched body that does NOT hash to the revision the
+    /// server named must NEVER mint a baseline (the "record a number without the
+    /// body" forgery hazard GPT-5.6 refuted). No baseline, no receipt.
+    #[tokio::test]
+    async fn hash_mismatched_refetch_mints_no_baseline() {
+        let mut srv = Server::new_async().await;
+        let claimed_body = "the real head\n";
+        let claimed_sha = sha256_hex(claimed_body.as_bytes());
+        let _mp = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{claimed_sha}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+        // enriched_body does NOT hash to the declared sha256: an inconsistent /
+        // tampered revision. The receipt gate must refuse it.
+        let note = serde_json::json!({
+            "path": "01_Notes/x.md",
+            "frontmatter": {},
+            "body": claimed_body,
+            "sha256": claimed_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 88,
+            "enriched_body": "TAMPERED DIFFERENT BYTES\n",
+        })
+        .to_string();
+        let _mn = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+
+        let local_body: &[u8] = b"line A\nlocal\n";
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", local_body)]);
+        let (client, vault, bs, shadow, rr) = make_receipt_client(&srv.url(), journal).await;
+        shadow.record("01_Notes/x.md", &claimed_sha);
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join("01_Notes/x.md"), local_body).unwrap();
+
+        let _ = client.drain_once().await;
+        assert_eq!(
+            bs.get("01_Notes/x.md"),
+            None,
+            "a hash-mismatched body must NOT mint a baseline (fail-closed)"
+        );
+        assert!(
+            rr.get("01_Notes/x.md").is_none(),
+            "no receipt for an unverified body"
+        );
+    }
+
+    /// R1 (unit): the verified-receipt choke point in isolation — a matching
+    /// body records the receipt + baseline and returns `Recorded`; a mismatched
+    /// body records NOTHING and returns `VerifyFailed`.
+    #[tokio::test]
+    async fn record_verified_receipt_gates_on_the_body_hash() {
+        let (client, _vault, bs, _shadow, rr) =
+            make_receipt_client("http://127.0.0.1:1", make_journal_with(vec![]).1).await;
+
+        let good = NotePayload {
+            path: "01_Notes/g.md".into(),
+            frontmatter: serde_json::json!({}),
+            body: "good body\n".into(),
+            sha256: sha256_hex(b"good body\n"),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: Some(55),
+            enriched_body: Some("good body\n".into()),
+        };
+        let out = client.record_verified_receipt("01_Notes/g.md", &good, Some(&good.sha256));
+        assert_eq!(out, ReceiptOutcome::Recorded { seq: 55 });
+        assert_eq!(bs.get("01_Notes/g.md"), Some(55));
+        assert_eq!(rr.get("01_Notes/g.md").unwrap().revision_seq, 55);
+
+        // Body whose bytes do not hash to the declared sha => refused.
+        let bad = NotePayload {
+            path: "01_Notes/b.md".into(),
+            frontmatter: serde_json::json!({}),
+            body: "x".into(),
+            sha256: sha256_hex(b"the declared bytes"),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: Some(66),
+            enriched_body: Some("ACTUALLY OTHER BYTES".into()),
+        };
+        let out = client.record_verified_receipt("01_Notes/b.md", &bad, None);
+        assert_eq!(out, ReceiptOutcome::VerifyFailed);
+        assert_eq!(bs.get("01_Notes/b.md"), None, "no baseline from a bad body");
+        assert!(rr.get("01_Notes/b.md").is_none());
     }
 
     /// R7: a push client backed by a shadow store in the suspect state

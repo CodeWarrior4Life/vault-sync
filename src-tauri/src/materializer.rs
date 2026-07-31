@@ -713,6 +713,24 @@ impl Materializer {
                             if let Some(sh) = &self.shadow_store {
                                 sh.record(&payload.path, &local_raw_sha);
                             }
+                            // R4 (TKT-f74edf99): CLOSE THE R1-NOOP NON-RECORDING
+                            // HOLE. This arm previously recorded only the shadow
+                            // and RETURNED, so the base_seq recorder further down
+                            // (the sole other recording point) was unreachable —
+                            // a note that converged by ALREADY being byte-identical
+                            // to the server never earned a base_seq and stayed
+                            // primed to deadlock on its next local edit. The bytes
+                            // are byte-verified here BY CONSTRUCTION (local_bytes ==
+                            // content_bytes == the server canonical the sha256 is
+                            // computed over), so recording the server-provided
+                            // change_seq is a genuine OBSERVATION, not a forged
+                            // baseline. Same Live-only + Some(seq) gate as the main
+                            // recording point below.
+                            if let (Some(bs), Some(seq)) =
+                                (&self.base_seq_store, payload.change_seq)
+                            {
+                                bs.record(&payload.path, seq);
+                            }
                         }
                         return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
                     }
@@ -743,9 +761,23 @@ impl Materializer {
                     // it with the older server copy. Leave the file untouched so
                     // the file_watcher/push pipeline carries the edit UP. This is
                     // the exact silent-revert the operator hit (TKT-2dc9a17e).
+                    //
+                    // R6 (TKT-f74edf99): CONTENT-LEVEL direction-safety signal.
+                    // Ancestry is KNOWN here (shadow == server), so the current
+                    // server head IS the base this local edit descends from; a
+                    // server line absent from local is therefore an INTENTIONAL
+                    // local deletion, not lossy divergence, and preserving-local
+                    // is safe. We still compute the line-level containment (never
+                    // size/mtime) and surface it, so any surprising "local-wins
+                    // would drop a server line" case is visible to accounting
+                    // instead of silent. The unknown-ancestry case (no such base)
+                    // is handled by decide() as Conflict => PRESERVE BOTH.
+                    let server_contained =
+                        server_lines_contained_in_local(content_bytes, &local_bytes);
                     warn!(
                         path = %payload.path,
                         change_seq,
+                        server_contained,
                         "materializer R2: local edit diverges, server unchanged since last sync, PRESERVING local (will push up), NOT overwriting"
                     );
                     return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
@@ -1298,6 +1330,42 @@ pub fn guard_no_frontmatter_strip(
         return Decision::PreserveLocalEdit;
     }
     decision
+}
+
+/// R6 (TKT-f74edf99): CONTENT-LEVEL direction safety. Returns true iff every
+/// line of `server` appears in `local`, IN ORDER (a line-ordered subsequence) —
+/// i.e. a local-wins push of `local` would drop NO server line. This is the
+/// content-level containment check the requirement mandates: never mtime, never
+/// size. The measured evidence for keying on this and not size: of 114 divergent
+/// notes during the 2026-07-29/30 manual repair, size-direction called
+/// local-larger 113/113, but line-level containment excluded 41 as unsafe — a
+/// naive "newest/larger wins" would have discarded real server content.
+///
+/// PURE + exhaustively testable. A trailing final newline difference is ignored
+/// (both sides are split on `\n`, so an empty trailing segment matches an empty
+/// trailing segment or is absent on both). Bytes that are not valid UTF-8 fall
+/// back to a whole-blob equality test (no line structure to reason about).
+pub fn server_lines_contained_in_local(server: &[u8], local: &[u8]) -> bool {
+    let (server, local) = match (std::str::from_utf8(server), std::str::from_utf8(local)) {
+        (Ok(s), Ok(l)) => (s, l),
+        // Non-text: the only safe containment claim is exact equality.
+        _ => return server == local,
+    };
+    // Order-preserving subsequence match: walk local once, advancing through the
+    // server lines as each is found. If we consume all server lines, every server
+    // line is present in local in order — nothing would be lost.
+    let mut server_lines = server.lines();
+    let mut want = server_lines.next();
+    for have in local.lines() {
+        if let Some(w) = want {
+            if w == have {
+                want = server_lines.next();
+            }
+        } else {
+            break;
+        }
+    }
+    want.is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -3015,5 +3083,171 @@ mod tests {
             "got {out2:?}"
         );
         assert_eq!(bs.get("01_Inbox/noseq.md"), None);
+    }
+
+    // --- TKT-f74edf99: close the client-half deadlock holes ---------------
+
+    /// R4: CLOSE THE R1-NOOP NON-RECORDING HOLE. A note that converges by
+    /// ALREADY being byte-identical to the server must still earn its baseline;
+    /// pre-fix the identical-Noop arm recorded only the shadow and returned,
+    /// leaving base_seq `None` forever (primed to deadlock on the next edit).
+    /// RED on pre-fix: the second write returns IdenticalToLocal WITHOUT
+    /// recording, so the `Some(4242)` assertion fails.
+    #[tokio::test]
+    async fn noop_identical_records_base_seq_r4() {
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
+            sdir.path().join("base_seq.json"),
+            vec!["Mainframe".to_string()],
+        );
+        let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_base_seq_store(bs.clone());
+
+        let mut p = payload("01_Inbox/noop.md", "identical body");
+        p.change_seq = Some(4242);
+        // Sync it once (materializes + records), then simulate the PRIMED state:
+        // byte-identical to the server, but baseline absent.
+        assert!(matches!(
+            m.write(&p).unwrap(),
+            MaterializeOutcome::Wrote { .. }
+        ));
+        bs.remove("01_Inbox/noop.md");
+        assert_eq!(bs.get("01_Inbox/noop.md"), None);
+
+        // Second write: local already identical => Noop / IdenticalToLocal.
+        let out = m.write(&p).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)),
+            "got {out:?}"
+        );
+        assert_eq!(
+            bs.get("01_Inbox/noop.md"),
+            Some(4242),
+            "R4: an already-identical note must still earn its baseline"
+        );
+    }
+
+    /// R2 (binding): the PreserveLocalEdit branch must record NOTHING. A genuine
+    /// local edit (shadow == server, local diverged) is preserved and pushed up;
+    /// recording a baseline HERE would forge an in-sync marker the vault never
+    /// received. Recovery may come ONLY from a verified receipt (push_client),
+    /// never from this branch firing. This test pins the invariant.
+    #[tokio::test]
+    async fn preserve_local_edit_never_records_base_seq_r2() {
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
+            sdir.path().join("base_seq.json"),
+            vec!["Mainframe".to_string()],
+        );
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_base_seq_store(bs.clone());
+
+        let mut p = payload("01_Inbox/pres.md", "server body v1");
+        p.change_seq = Some(500);
+        // Sync v1 down: shadow == server head.
+        assert!(matches!(
+            m.write(&p).unwrap(),
+            MaterializeOutcome::Wrote { .. }
+        ));
+        // User edits locally: file diverges, shadow still == server head.
+        let target = vaults.path().join(VAULT).join("01_Inbox/pres.md");
+        std::fs::write(&target, b"server body v1 + LOCAL EDIT").unwrap();
+        // Simulate the primed state so any stray record would be visible.
+        bs.remove("01_Inbox/pres.md");
+        assert_eq!(bs.get("01_Inbox/pres.md"), None);
+
+        // Re-materialize the SAME server head => decide() = PreserveLocalEdit.
+        let out = m.write(&p).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved)),
+            "got {out:?}"
+        );
+        assert_eq!(
+            bs.get("01_Inbox/pres.md"),
+            None,
+            "R2: the preserve branch must NEVER record a baseline"
+        );
+    }
+
+    /// R5: the REAL server change_seq threads through write/stash naming, so a
+    /// conflict fork is named `-<seq>` deterministically — never the `-0-NN`
+    /// hardwire that `write()` (change_seq 0) produced.
+    #[tokio::test]
+    async fn write_with_change_seq_names_stash_with_real_seq_r5() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        // Pre-existing divergent local file, NO shadow => decide() = Conflict.
+        let target = vaults.path().join(VAULT).join("01_Inbox/fork.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"local divergent bytes").unwrap();
+
+        let p = payload("01_Inbox/fork.md", "server canonical bytes");
+        let out = m.write_with_change_seq(&p, 4242).unwrap();
+        let stash = match out {
+            MaterializeOutcome::Stashed { stash_path } => stash_path,
+            other => panic!("expected Stashed, got {other:?}"),
+        };
+        let name = stash.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.contains("4242"),
+            "R5: stash must embed the real change_seq, got {name}"
+        );
+        assert!(
+            !name.contains("-0.md") && !name.contains("-0-"),
+            "R5: must not be the -0 hardwire, got {name}"
+        );
+    }
+
+    /// R6: where ancestry is UNKNOWN (no shadow), the daemon PRESERVES BOTH
+    /// sides — the local loser is stashed and the server head is materialized —
+    /// never a size/mtime-based local-wins that could drop server content.
+    #[tokio::test]
+    async fn unknown_ancestry_preserves_both_sides_r6() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let target = vaults.path().join(VAULT).join("01_Inbox/amb.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let local: &[u8] = b"LOCAL only line\n";
+        std::fs::write(&target, local).unwrap();
+
+        let p = payload("01_Inbox/amb.md", "SERVER only line");
+        let out = m.write_with_change_seq(&p, 7).unwrap();
+        let stash = match out {
+            MaterializeOutcome::Stashed { stash_path } => stash_path,
+            o => panic!("expected Stashed (preserve both), got {o:?}"),
+        };
+        assert_eq!(
+            std::fs::read(&stash).unwrap(),
+            local,
+            "local side preserved in the stash"
+        );
+        let server_content = p.enriched_body.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            server_content,
+            "server side materialized to the live target"
+        );
+    }
+
+    /// R6 (pure): content-level containment — every server line present in local
+    /// IN ORDER — and the proof that SIZE is not the signal (a larger local can
+    /// still drop a server line).
+    #[test]
+    fn server_lines_contained_in_local_r6() {
+        // local is a superset: contains every server line, in order.
+        assert!(server_lines_contained_in_local(b"a\nb\n", b"a\nx\nb\nc\n"));
+        assert!(server_lines_contained_in_local(b"a\nb\n", b"a\nb\n"));
+        // empty server is trivially contained.
+        assert!(server_lines_contained_in_local(b"", b"anything\n"));
+        // a dropped server line => NOT contained (would lose content).
+        assert!(!server_lines_contained_in_local(b"a\nb\nc\n", b"a\nc\n"));
+        // reordered => NOT contained (order matters).
+        assert!(!server_lines_contained_in_local(b"a\nb\n", b"b\na\n"));
+        // SIZE is not the signal: local is LARGER yet drops a server line.
+        assert!(!server_lines_contained_in_local(b"keep\nDROP\n", b"keep\nx\ny\nz\n"));
     }
 }

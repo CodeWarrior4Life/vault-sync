@@ -554,8 +554,15 @@ impl VerifyRepair {
                             async move {
                                 match api.fetch_note(&path).await {
                                     Ok(payload) => {
+                                        // R5 (TKT-f74edf99): thread the real server
+                                        // change_seq so a conflict stash minted
+                                        // during verify/repair is named
+                                        // deterministically (never -0-NN).
                                         let r = mat
-                                            .write(&payload)
+                                            .write_with_change_seq(
+                                                &payload,
+                                                payload.change_seq.unwrap_or(0).max(0) as u64,
+                                            )
                                             .map_err(|e| format!("materialize: {e}"));
                                         (path, r)
                                     }
