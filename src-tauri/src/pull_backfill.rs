@@ -167,7 +167,10 @@ pub async fn run_pull_backfill(
         let outcomes: Vec<Result<MaterializeOutcome, ()>> = stream::iter(to_pull)
             .map(|path| async move {
                 match api.fetch_note(&path).await {
-                    Ok(payload) => materializer.write(&payload).map_err(|e| {
+                    // R5 (TKT-f74edf99): thread the real server change_seq so a
+                    // conflict stash minted during backfill is named
+                    // deterministically (never the -0-NN hardwire of write()).
+                    Ok(payload) => materializer.write_with_change_seq(&payload, payload.change_seq.unwrap_or(0).max(0) as u64).map_err(|e| {
                         tracing::warn!(path = %path, error = %format!("{e:?}"), "pull_backfill: write failed");
                     }),
                     Err(e) => {

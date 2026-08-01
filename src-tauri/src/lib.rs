@@ -17,6 +17,7 @@ pub mod pull_backfill;
 pub mod push_client;
 pub mod push_journal;
 pub mod rasp_fence;
+pub mod read_receipt;
 pub mod reconciliation;
 pub mod redflag;
 pub mod retry_ledger;
@@ -632,6 +633,25 @@ fn spawn_sse_consumer(
                 .collect(),
         );
         base_seq_store::BaseSeqStore::spawn_periodic_flush(base_seq.clone());
+        // R1 (Vault Sync Convergence P2b, TKT-f74edf99): the durable READ-RECEIPT
+        // store, keyed IDENTICALLY to the shadow / base_seq stores and persisted
+        // to a sibling file. On a typed 409 the push client fetches the exact
+        // server revision body, byte-verifies its hash, and records a receipt
+        // here BEFORE it may declare that revision's seq as a push baseline. This
+        // is the verified-recovery leg that lets a divergent, baseline-absent note
+        // escape the certified deadlock without ever forging an in-sync baseline.
+        let read_receipt = read_receipt::ReadReceiptStore::load_with_vault_folders(
+            commands::resolve_workspace_root()
+                .join(".lattice-runtime")
+                .join(&cfg.subscriber_id)
+                .join("sync-state")
+                .join("read_receipt.json"),
+            watch_roots
+                .iter()
+                .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect(),
+        );
+        read_receipt::ReadReceiptStore::spawn_periodic_flush(read_receipt.clone());
         // D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path. If the shadow store
         // loaded EMPTY (fresh install / corrupt reset / manual delete), seed
         // shadow=server for every already-mirrored note BEFORE the push pipeline
@@ -773,6 +793,7 @@ fn spawn_sse_consumer(
                     materializer.clone(),
                     shadow.clone(),
                     base_seq.clone(),
+                    read_receipt.clone(),
                     sync_health.clone(),
                 )
             })
@@ -889,6 +910,7 @@ fn spawn_push_pipeline(
     materializer: materializer::Materializer,
     shadow: std::sync::Arc<sync_shadow::ShadowStore>,
     base_seq: std::sync::Arc<base_seq_store::BaseSeqStore>,
+    read_receipt: std::sync::Arc<read_receipt::ReadReceiptStore>,
     sync_health: std::sync::Arc<sync_health::SyncHealth>,
 ) -> Option<file_watcher::WatchHandle> {
     use std::sync::Arc;
@@ -1036,6 +1058,8 @@ fn spawn_push_pipeline(
     .with_shadow_store(shadow.clone())
     // R1/R2/R3 (TKT-166e1c07): push leg declares + records base_seq.
     .with_base_seq_store(base_seq.clone())
+    // R1 (TKT-f74edf99): verified read-receipt recovery on a typed 409.
+    .with_read_receipt_store(read_receipt.clone())
     .with_sync_health(sync_health.clone())
     // D2 (v0.4.28): ack-materialize-back rides the same materializer clone
     // the reconcile backstop uses (echo-guarded + shadow-backed).
