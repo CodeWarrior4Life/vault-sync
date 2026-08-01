@@ -3676,7 +3676,10 @@ mod tests {
         // Second write: local already identical => Noop / IdenticalToLocal.
         let out = m.write(&p).unwrap();
         assert!(
-            matches!(out, MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)),
+            matches!(
+                out,
+                MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)
+            ),
             "got {out:?}"
         );
         assert_eq!(
@@ -3721,7 +3724,10 @@ mod tests {
         // Re-materialize the SAME server head => decide() = PreserveLocalEdit.
         let out = m.write(&p).unwrap();
         assert!(
-            matches!(out, MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved)),
+            matches!(
+                out,
+                MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved)
+            ),
             "got {out:?}"
         );
         assert_eq!(
@@ -3804,6 +3810,9 @@ mod tests {
         // reordered => NOT contained (order matters).
         assert!(!server_lines_contained_in_local(b"a\nb\n", b"b\na\n"));
         // SIZE is not the signal: local is LARGER yet drops a server line.
-        assert!(!server_lines_contained_in_local(b"keep\nDROP\n", b"keep\nx\ny\nz\n"));
+        assert!(!server_lines_contained_in_local(
+            b"keep\nDROP\n",
+            b"keep\nx\ny\nz\n"
+        ));
     }
 }

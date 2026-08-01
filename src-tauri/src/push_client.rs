@@ -32,8 +32,8 @@ use crate::api_client::{
 use crate::push_journal::{
     new_event_id, JournalCursor, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
 };
-use crate::read_receipt::verify_receipt;
 use crate::rasp_fence::{classify_path, PathClassification};
+use crate::read_receipt::verify_receipt;
 use crate::tray_state::SharedTrayState;
 
 /// S5 (v0.4.28): how long `drain_once` stands down after the server's
@@ -836,8 +836,12 @@ impl PushClient {
                     // R1 (TKT-f74edf99): pass the head hash the 409 named so the
                     // refetch can bind the verified receipt to the exact revision
                     // (a body that hashes to some OTHER head is refused).
-                    self.refetch_and_merge_on_conflict(&evt.path, expected_hash.as_deref(), evt.action)
-                        .await;
+                    self.refetch_and_merge_on_conflict(
+                        &evt.path,
+                        expected_hash.as_deref(),
+                        evt.action,
+                    )
+                    .await;
                     // Still surface the conflict so Burn C accounting counts it
                     // (R6) and the journal entry is acked (the edit survives as the
                     // stash, not an infinite blind retry).
