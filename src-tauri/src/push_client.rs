@@ -29,7 +29,9 @@ use tokio::sync::Mutex;
 use crate::api_client::{
     ApiClient, ApiError, NotePayload, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
-use crate::push_journal::{JournalCursor, PushAction, PushEvent, PushJournal};
+use crate::push_journal::{
+    new_event_id, JournalCursor, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+};
 use crate::read_receipt::verify_receipt;
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::tray_state::SharedTrayState;
@@ -662,10 +664,18 @@ impl PushClient {
         // → 409 → edit-beats-delete, no silent wipe; a never-synced file has no
         // shadow → "" → server no-op. A genuine new file's CREATE still has no
         // shadow → "" → CREATE, unchanged.
-        let backfilled_base: Option<String> = match &evt.base_hash {
-            Some(b) => Some(b.clone()),
-            None => self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
-        };
+        // R4 / F-B3.2 (TKT-989ad5f2): three-state scoping of the I29 backfill.
+        // `KnownBase(h)` (reconcile drift) is honored verbatim. `NoRow`
+        // (reconcile determined the server has no row) forces a CREATE (base
+        // "") and is NEVER shadow-backfilled — the pre-fix code conflated it
+        // with `Unknown` under `None` and backfilled a stale shadow hash, which
+        // 409'd forever against a row the server does not hold (the perpetual
+        // CAS-409 push loop). Only `Unknown` (a real-time watcher event) sources
+        // the base from the shadow store.
+        let backfilled_base: Option<String> = resolve_backfilled_base(
+            &evt.base_hash,
+            self.shadow_store.as_ref().and_then(|s| s.get(&evt.path)),
+        );
 
         // R1 (THESEUS AR-002, TKT-166e1c07): declare our last-observed base_seq
         // (proof-of-observation) on EVERY push and delete. `None` when we have
@@ -826,7 +836,7 @@ impl PushClient {
                     // R1 (TKT-f74edf99): pass the head hash the 409 named so the
                     // refetch can bind the verified receipt to the exact revision
                     // (a body that hashes to some OTHER head is refused).
-                    self.refetch_and_merge_on_conflict(&evt.path, expected_hash.as_deref())
+                    self.refetch_and_merge_on_conflict(&evt.path, expected_hash.as_deref(), evt.action)
                         .await;
                     // Still surface the conflict so Burn C accounting counts it
                     // (R6) and the journal entry is acked (the edit survives as the
@@ -1095,7 +1105,12 @@ impl PushClient {
     /// BEFORE this runs. Best-effort and fail-honest: with no materializer wired,
     /// or on a fetch/materialize error, convergence falls to the next reconcile
     /// pull and the conflict is still surfaced to the accounting layer (R6).
-    async fn refetch_and_merge_on_conflict(&self, path: &str, expected_head_hash: Option<&str>) {
+    async fn refetch_and_merge_on_conflict(
+        &self,
+        path: &str,
+        expected_head_hash: Option<&str>,
+        action: PushAction,
+    ) {
         let Some(mat) = &self.materializer else {
             tracing::info!(
                 path,
@@ -1150,19 +1165,45 @@ impl PushClient {
                 }
             }
             Err(ApiError::NotFound(_)) => {
-                // The server has no such note (deleted since our push). Drop the
-                // stale lineage AND any stale receipt so a later re-create starts
-                // from unknown lineage (fail-closed, R4) rather than a stale seq.
+                // R5 / F-B3.3 terminal 409+404 (TKT-989ad5f2): our push lost the
+                // CAS (409) AND the refetch shows the server has NO row (404).
+                // The losing local bytes are already stashed by the caller
+                // (never dropped). Resolve EXPLICITLY — never a silent
+                // drop-and-requeue that re-drifts and re-409s every pass:
+                //   1. Clear the stale shadow + lineage (fail-closed, R4).
+                //   2. Per tombstone: a DELETE that 404s is already gone
+                //      server-side -> accept-delete. A CREATE/MODIFY has NO
+                //      local delete intent (no tombstone) + no server row -> a
+                //      CREATE (content preserved, re-created on the server),
+                //      NEVER a local delete.
+                if let Some(sh) = &self.shadow_store {
+                    sh.remove(path);
+                }
                 if let Some(bs) = &self.base_seq_store {
                     bs.remove(path);
                 }
+                // R1 (TKT-f74edf99): drop any stale verified receipt too, so a
+                // later re-create earns a fresh baseline from a verified
+                // observation rather than a stale seq (fail-closed, R4).
                 if let Some(rs) = &self.read_receipt_store {
                     rs.remove(path);
                 }
-                tracing::info!(
-                    path,
-                    "409 refetch/merge: server has no such note (deleted) - lineage dropped (fail-closed)"
-                );
+                match action {
+                    PushAction::Delete => {
+                        tracing::info!(
+                            path,
+                            "terminal 409+404 (R5 F-B3.3): DELETE accepted - server already has no row; shadow+lineage cleared"
+                        );
+                    }
+                    PushAction::Create | PushAction::Modify => {
+                        let enqueued = self.enqueue_recreate_after_terminal_404(path).await;
+                        tracing::info!(
+                            path,
+                            enqueued,
+                            "terminal 409+404 (R5 F-B3.3): no server row + no tombstone -> enqueued CREATE (content preserved, never a local delete)"
+                        );
+                    }
+                }
             }
             Err(e) => tracing::warn!(
                 path,
@@ -1214,6 +1255,49 @@ impl PushClient {
             None => ReceiptOutcome::VerifyFailed,
         }
     }
+
+    /// R5 / F-B3.3 (TKT-989ad5f2): after a terminal 409+404 on a create/modify
+    /// with no server row and no local delete intent, enqueue an explicit CREATE
+    /// so the locally-preserved content is re-created on the server rather than
+    /// silently dropped-and-requeued. Base `NoRow` -> the server CREATEs (never
+    /// backfilled). A LAZY ref (`content_bytes: None`) — push_client reads the
+    /// local file at drain time, so the content is exactly what is on disk.
+    /// Returns true iff the append succeeded. Best-effort: a failure is logged,
+    /// the conflict is still surfaced, and the next reconcile pass retries.
+    async fn enqueue_recreate_after_terminal_404(&self, path: &str) -> bool {
+        // Only re-create if the file is still on disk (it usually is: a push
+        // never deletes local). If it is gone, there is nothing to re-create.
+        let abs = self.vault_root.join(forward_slash_to_path(path));
+        let local_sha = match std::fs::read(&abs) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(_) => {
+                tracing::info!(
+                    path,
+                    "terminal 409+404 (R5): local file absent - nothing to re-create"
+                );
+                return false;
+            }
+        };
+        let evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: new_event_id(),
+            path: path.to_string(),
+            action: PushAction::Create,
+            base_hash: PushBase::NoRow,
+            content_sha: local_sha,
+            content_bytes: None,
+            queued_at: chrono::Utc::now(),
+            device_id: self.device_id.clone(),
+        };
+        let mut j = self.journal.lock().await;
+        match j.append(evt) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(path, error = %e, "terminal 409+404 (R5): re-create append failed");
+                false
+            }
+        }
+    }
 }
 
 /// R1/R3 (TKT-f74edf99): outcome of the verified read-receipt step, returned so
@@ -1236,6 +1320,22 @@ enum ReceiptOutcome {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// R4 / F-B3.2 (TKT-989ad5f2): resolve the wire CAS base for a push from its
+/// three-state `PushBase` and the shadow-store hash for the path. PURE +
+/// table-tested. The I29 shadow backfill applies ONLY to `Unknown` (watcher
+/// events); `KnownBase` is honored verbatim and `NoRow` forces a CREATE (base
+/// "") and is NEVER backfilled — the pre-fix code conflated `NoRow` and
+/// `Unknown` under `None` and backfilled a stale shadow hash onto a path the
+/// server has no row for (the perpetual CAS-409 push loop). `None` return means
+/// "no known base" -> the caller sends "".
+fn resolve_backfilled_base(base: &PushBase, shadow: Option<String>) -> Option<String> {
+    match base {
+        PushBase::KnownBase(b) => Some(b.clone()),
+        PushBase::NoRow => Some(String::new()),
+        PushBase::Unknown => shadow,
+    }
+}
 
 /// Decide which hash (if any) to record into the ShadowStore for a push the
 /// server acked. Pure + table-tested.
@@ -1429,7 +1529,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: path.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(body),
             content_bytes: Some(body.to_vec()),
             queued_at: Utc::now(),
@@ -1554,7 +1654,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: path.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(enqueue_sha_of),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2400,7 +2500,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: rel.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: sha256_hex(body),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2431,7 +2531,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/gone.md".to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: "a".repeat(64),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2562,7 +2662,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/edited.md".to_string(),
             action: PushAction::Modify,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: sha256_hex(b"new local body"),
             content_bytes: Some(b"new local body".to_vec()),
             queued_at: Utc::now(),
@@ -2610,7 +2710,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/brand-new.md".to_string(),
             action: PushAction::Modify,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: sha256_hex(b"brand new"),
             content_bytes: Some(b"brand new".to_vec()),
             queued_at: Utc::now(),
@@ -2662,7 +2762,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: "notes/deleted.md".to_string(),
             action: PushAction::Delete,
-            base_hash: None,
+            base_hash: PushBase::Unknown,
             content_sha: String::new(),
             content_bytes: None,
             queued_at: Utc::now(),
@@ -2801,7 +2901,14 @@ mod tests {
         let client = make_client(&srv.url(), journal.clone())
             .await
             .with_tray_state(tray.clone());
-        let _ = client.drain_once().await;
+        let __out = client.drain_once().await;
+        eprintln!(
+            "DRAIN_OUT: {:?}",
+            __out
+                .iter()
+                .map(|(e, o)| (e.path.clone(), format!("{o:?}")))
+                .collect::<Vec<_>>()
+        );
         let s = tray.read().unwrap();
         assert_eq!(s.uploads_sent, 1);
         assert_eq!(s.uploads_failed, 0);
@@ -2891,7 +2998,7 @@ mod tests {
             id: crate::push_journal::new_event_id(),
             path: rel.to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: "a".repeat(64),
             content_bytes: None, // lazy — will be read from vault_root at drain time
             queued_at: chrono::Utc::now(),
@@ -3588,5 +3695,101 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- R8 regression tests (TKT-989ad5f2) --------------------------------
+
+    /// T7 (R4 / F-B3.2): the I29 shadow backfill is scoped to the THREE-STATE
+    /// base. A reconcile-determined `NoRow` forces a CREATE (base "") and is
+    /// NEVER shadow-backfilled, even when a (stale) shadow entry exists —
+    /// pre-fix this conflated with `Unknown` under `None` and backfilled the
+    /// stale hash, 409'ing forever against a row the server does not hold.
+    /// `Unknown` (watcher) IS backfilled; `KnownBase` is honored verbatim.
+    #[test]
+    fn t7_no_row_base_is_never_shadow_backfilled() {
+        let stale_shadow = Some("staleshadowhash".to_string());
+        // NoRow: force CREATE ("" base), even with a shadow present.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::NoRow, stale_shadow.clone()),
+            Some(String::new()),
+            "NoRow must force CREATE (empty base), NEVER the stale shadow hash"
+        );
+        // Unknown (watcher): backfill from shadow.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::Unknown, stale_shadow.clone()),
+            stale_shadow.clone(),
+            "Unknown must shadow-backfill (I29)"
+        );
+        // Unknown with no shadow: no base -> "" (CREATE).
+        assert_eq!(resolve_backfilled_base(&PushBase::Unknown, None), None);
+        // KnownBase: honored verbatim, never overridden by the shadow.
+        assert_eq!(
+            resolve_backfilled_base(&PushBase::KnownBase("deadbeef".into()), stale_shadow),
+            Some("deadbeef".to_string()),
+            "KnownBase must be honored verbatim"
+        );
+    }
+
+    /// T8 (R5 / F-B3.3): a terminal 409+404 on a create/modify with no server
+    /// row and no local delete intent resolves as an explicit CREATE (content
+    /// preserved, re-created on the server), NEVER a silent drop-and-requeue and
+    /// NEVER a local delete. The stale shadow is cleared.
+    #[tokio::test]
+    async fn t8_terminal_409_404_recreates_content_never_local_delete() {
+        let mut server = Server::new_async().await;
+        // Every push loses the CAS (409).
+        let _push = server
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"detail":"conflict","expected_hash":"beef"}"#)
+            .create_async()
+            .await;
+        // The refetch shows the server has NO row (404).
+        let _note = server
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+
+        let path = "Mainframe/01_Inbox/orphan.md";
+        let content = b"orphan body that must survive\n";
+        let (_jdir, journal) = make_journal_with(vec![lazy_evt(path, content)]);
+        let (client, fx) = make_align_client(&server.url(), journal.clone()).await;
+
+        // The local file exists (a push never deletes local); re-create reads it.
+        let abs = fx.vault_root.join("Mainframe/01_Inbox/orphan.md");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+        // A stale shadow entry that must be cleared on the terminal 404.
+        fx.shadow.record(path, "staleshadowhash");
+
+        let _ = client.drain_once().await;
+
+        // The losing event was acked; a NEW explicit CREATE was enqueued.
+        let remaining = journal.lock().await.drain(10).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "a re-create must be enqueued (never a silent drop-and-requeue)"
+        );
+        assert_eq!(remaining[0].0.action, PushAction::Create);
+        assert_eq!(
+            remaining[0].0.base_hash,
+            PushBase::NoRow,
+            "re-create must carry a NoRow base so the server CREATEs it"
+        );
+        assert_eq!(remaining[0].0.path, path);
+        // The local content is preserved — NEVER a local delete.
+        assert!(abs.exists(), "local file must never be deleted");
+        assert_eq!(std::fs::read(&abs).unwrap(), content);
+        // The stale shadow was cleared (stops re-arming a CAS conflict).
+        assert_eq!(
+            fx.shadow.get(path),
+            None,
+            "terminal 404 must clear the stale shadow"
+        );
     }
 }

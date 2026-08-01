@@ -156,6 +156,73 @@ pub enum PushAction {
     Delete,
 }
 
+/// R4 / F-B3.2 (TKT-989ad5f2): three-state CAS base for a push event.
+///
+/// The I29 shadow backfill in `push_client` must apply to real-time WATCHER
+/// events ONLY — never to a reconcile-determined "the server has no row for
+/// this path". The pre-fix two-state `Option<String>` conflated the two under
+/// `None`, so a reconcile `missing-on-server` push had a stale shadow hash
+/// backfilled onto it and 409'd forever against a row the server does not hold
+/// (the perpetual CAS-409 push loop, 40/pass trinity + 17/pass link).
+///
+/// * `KnownBase(h)` — an explicit CAS base the server must match (reconcile
+///   drift passes the delta's server hash). Honored verbatim; NEVER backfilled.
+/// * `NoRow` — reconcile determined the server has no row. Force a CREATE
+///   (wire base `""`); NEVER shadow-backfilled.
+/// * `Unknown` — a real-time watcher event with no known base. `push_client`
+///   sources the base from the shadow store (I29).
+///
+/// The wire form is UNCHANGED (`Option<String>`) via `#[serde(from/into)]`, so
+/// pre-fix journal lines still load AND pre-fix daemons still read new lines:
+///   `KnownBase(h)` <-> non-empty string; `NoRow` <-> `""`; `Unknown` <-> `null`.
+/// (A pre-fix `null` line — which historically meant either watcher OR
+/// missing-on-server — loads as `Unknown`. That is benign: a never-synced
+/// path has no shadow entry, so the Unknown backfill yields nothing -> `""` ->
+/// CREATE, the same resolution `NoRow` produces.)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PushBase {
+    /// Explicit CAS base (reconcile drift). Honored verbatim.
+    KnownBase(String),
+    /// Reconcile determined no server row. Force CREATE; never backfill.
+    NoRow,
+    /// Watcher event, base unknown. push_client shadow-backfills (I29).
+    #[default]
+    Unknown,
+}
+
+impl From<Option<String>> for PushBase {
+    fn from(o: Option<String>) -> Self {
+        match o {
+            None => PushBase::Unknown,
+            Some(s) if s.is_empty() => PushBase::NoRow,
+            Some(s) => PushBase::KnownBase(s),
+        }
+    }
+}
+
+impl From<PushBase> for Option<String> {
+    fn from(b: PushBase) -> Self {
+        match b {
+            PushBase::Unknown => None,
+            PushBase::NoRow => Some(String::new()),
+            PushBase::KnownBase(s) => Some(s),
+        }
+    }
+}
+
+// `#[serde(from/into)]` needs Serialize/Deserialize derived on the type even
+// though the wire delegates to Option<String>; supply them via the derive.
+impl Serialize for PushBase {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        Option::<String>::from(self.clone()).serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for PushBase {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(PushBase::from(Option::<String>::deserialize(d)?))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PushEvent {
     pub schema_version: u32,
@@ -168,8 +235,12 @@ pub struct PushEvent {
     /// Canonical forward-slash relative-to-vault-root path.
     pub path: String,
     pub action: PushAction,
-    /// None when action == Create.
-    pub base_hash: Option<String>,
+    /// R4 / F-B3.2 (TKT-989ad5f2): three-state CAS base. `Unknown` (wire
+    /// `null`) for a watcher event, `NoRow` (wire `""`) for a reconcile
+    /// no-server-row, `KnownBase(h)` (wire non-empty string) for an explicit
+    /// reconcile CAS base. Wire-compatible with the pre-fix `Option<String>`.
+    #[serde(default)]
+    pub base_hash: PushBase,
     pub content_sha: String,
     /// `Some(bytes)`: body embedded inline (caller already had the bytes).
     /// `None`: content not embedded — the reader loads it from disk at push
@@ -580,8 +651,8 @@ mod tests {
             path: path.to_string(),
             action,
             base_hash: match action {
-                PushAction::Create => None,
-                _ => Some("0".repeat(64)),
+                PushAction::Create => PushBase::Unknown,
+                _ => PushBase::KnownBase("0".repeat(64)),
             },
             content_sha: "a".repeat(64),
             content_bytes: Some(b"hello world".to_vec()),
@@ -887,6 +958,37 @@ mod tests {
         assert_eq!(j.len(), 99);
     }
 
+    /// R4 / F-B3.2 (TKT-989ad5f2): `PushBase` is wire-compatible with the
+    /// pre-fix `Option<String>`. `null` -> Unknown, `""` -> NoRow, a non-empty
+    /// string -> KnownBase, and each round-trips back to the same wire byte.
+    #[test]
+    fn push_base_wire_is_option_string_compatible() {
+        // Deserialize the three wire forms.
+        assert_eq!(
+            serde_json::from_str::<PushBase>("null").unwrap(),
+            PushBase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<PushBase>("\"\"").unwrap(),
+            PushBase::NoRow
+        );
+        assert_eq!(
+            serde_json::from_str::<PushBase>("\"deadbeef\"").unwrap(),
+            PushBase::KnownBase("deadbeef".to_string())
+        );
+        // Serialize back to the identical wire form (pre-fix daemons read it).
+        assert_eq!(serde_json::to_string(&PushBase::Unknown).unwrap(), "null");
+        assert_eq!(serde_json::to_string(&PushBase::NoRow).unwrap(), "\"\"");
+        assert_eq!(
+            serde_json::to_string(&PushBase::KnownBase("deadbeef".into())).unwrap(),
+            "\"deadbeef\""
+        );
+        // A pre-fix journal line (base_hash null on a modify) still loads.
+        let legacy = r#"{"schema_version":1,"id":"x","path":"notes/a.md","action":"modify","base_hash":null,"content_sha":"aaaa","queued_at":"2026-06-01T00:00:00+00:00","device_id":"dev"}"#;
+        let ev: PushEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(ev.base_hash, PushBase::Unknown);
+    }
+
     #[test]
     fn schema_version_forward_compat() {
         let dir = TempDir::new().unwrap();
@@ -934,7 +1036,7 @@ mod tests {
             id: new_event_id(),
             path: "notes/lazy.md".to_string(),
             action: PushAction::Modify,
-            base_hash: Some("0".repeat(64)),
+            base_hash: PushBase::KnownBase("0".repeat(64)),
             content_sha: "a".repeat(64),
             content_bytes: None,
             queued_at: Utc::now(),
