@@ -598,8 +598,10 @@ fn spawn_sse_consumer(
         // (from SyncHealth's wall-clock stamp), so the vault_subscribers row
         // stays fresh for the daemon's lifetime instead of freezing at the
         // one-shot startup patch_self_version. Tolerates an older server (405)
-        // by logging once and continuing. Fire-and-forget: failures are
-        // non-fatal and never block the sync pipeline.
+        // by logging once and continuing -- escalating to a periodic WARN if
+        // the 405 persists past the tolerance window (a routing gap must stay
+        // visible; PR #10 review). Fire-and-forget: failures are non-fatal and
+        // never block the sync pipeline.
         heartbeat::spawn(api.clone(), sync_health.clone());
         // fix/reconcile-server-wins-shadow: persistent per-file "last-synced
         // server hash" marker. Shared (Arc) across the materializer (records on

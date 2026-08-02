@@ -664,10 +664,12 @@ impl ApiClient {
     ///   and the push-journal convention); `last_sync` is omitted entirely when
     ///   `None` so the server never records a fabricated sync time.
     /// * HTTP 405 (an older server without the route) returns
-    ///   [`HeartbeatOutcome::Unsupported`], NOT an error — the caller log-once
-    ///   tolerates it and keeps beating (a later server upgrade then starts
-    ///   refreshing the row without a daemon restart). Every other non-200 maps
-    ///   to the usual [`ApiError`]; the caller treats those as non-fatal too.
+    ///   [`HeartbeatOutcome::Unsupported`], NOT an error — the caller tolerates
+    ///   it (log-once, then a periodic escalated WARN if the 405 persists past
+    ///   the tolerance window; see `heartbeat::unsupported_log_action`) and
+    ///   keeps beating (a later server upgrade then starts refreshing the row
+    ///   without a daemon restart). Every other non-200 maps to the usual
+    ///   [`ApiError`]; the caller treats those as non-fatal too.
     /// * The response body is intentionally ignored: the heartbeat is a
     ///   fire-and-observe freshness ping, and tolerating an empty or differently
     ///   shaped body keeps it compatible across server versions that do mount
