@@ -120,7 +120,9 @@ pub async fn run_once(
             );
         }
         Ok(HeartbeatOutcome::Unsupported) => {
-            let n = unsupported_ticks.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let n = unsupported_ticks
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             match unsupported_log_action(n) {
                 UnsupportedLog::Once => {
                     tracing::warn!(
@@ -206,7 +208,11 @@ mod tests {
 
         let first = run_once(&api, &health, now, &ticks).await.unwrap();
         assert_eq!(first, HeartbeatOutcome::Unsupported);
-        assert_eq!(ticks.load(Ordering::Relaxed), 1, "first 405 starts the streak");
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            1,
+            "first 405 starts the streak"
+        );
         assert_eq!(unsupported_log_action(1), UnsupportedLog::Once);
 
         let second = run_once(&api, &health, now, &ticks).await.unwrap();
@@ -284,7 +290,11 @@ mod tests {
             .await;
         let out = run_once(&api, &health, now, &ticks).await.unwrap();
         assert_eq!(out, HeartbeatOutcome::Acknowledged);
-        assert_eq!(ticks.load(Ordering::Relaxed), 0, "200 clears the 405 streak");
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            0,
+            "200 clears the 405 streak"
+        );
         m200.assert_async().await;
     }
 
@@ -299,7 +309,9 @@ mod tests {
             .mock("PATCH", "/api/sync/subscribers/me")
             // Assert the RFC3339 date derived from the SyncHealth stamp lands
             // on the wire, so the stamp really flows through to the PATCH body.
-            .match_body(mockito::Matcher::Regex(r#""last_sync":"2026-08-02T"#.into()))
+            .match_body(mockito::Matcher::Regex(
+                r#""last_sync":"2026-08-02T"#.into(),
+            ))
             .with_status(200)
             .with_body("{}")
             .expect(1)

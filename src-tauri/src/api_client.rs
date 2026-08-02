@@ -41,10 +41,7 @@ pub fn user_agent_string() -> String {
 /// ONLY when known — a bare `null` could clobber a good `last_sync_at` on a
 /// daemon that has not pushed since restart, so absence means "no update to
 /// that column".
-fn heartbeat_body(
-    last_seen: DateTime<Utc>,
-    last_sync: Option<DateTime<Utc>>,
-) -> serde_json::Value {
+fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "daemon_version": daemon_version(),
         "daemon_platform": daemon_platform(),

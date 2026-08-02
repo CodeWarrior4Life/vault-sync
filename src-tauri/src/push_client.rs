@@ -524,9 +524,9 @@ impl PushClient {
             // Sent, or Merged). Skips/failures/idle-catch-up are NOT a sync, so
             // the registry heartbeat never reports a fake `last_sync`. This is
             // the honest "last time this subscriber pushed a change upstream".
-            let synced = out.iter().any(|(_, o)| {
-                matches!(o, PushOutcome::Sent { .. } | PushOutcome::Merged { .. })
-            });
+            let synced = out
+                .iter()
+                .any(|(_, o)| matches!(o, PushOutcome::Sent { .. } | PushOutcome::Merged { .. }));
             if synced {
                 health.mark_synced_now();
             }
@@ -3928,7 +3928,11 @@ mod tests {
         shadow.record("01_Notes/x.md", &server_sha);
         std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
         std::fs::write(vault.path().join("01_Notes/x.md"), local_v1).unwrap();
-        assert_eq!(bs.get("01_Notes/x.md"), None, "starts baseline-absent (stuck)");
+        assert_eq!(
+            bs.get("01_Notes/x.md"),
+            None,
+            "starts baseline-absent (stuck)"
+        );
 
         let out1 = client.drain_once().await;
         assert!(
