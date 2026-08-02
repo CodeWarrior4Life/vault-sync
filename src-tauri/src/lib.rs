@@ -7,6 +7,7 @@ pub mod config;
 pub mod conflict_stash;
 pub mod echo_guard;
 pub mod file_watcher;
+pub mod heartbeat;
 pub mod integrity_check;
 pub mod keyring;
 pub mod materializer;
@@ -531,8 +532,10 @@ fn spawn_sse_consumer(
                 }
             }
         }
+        // Arc so the same client (and its connection pool) is shared with the
+        // RC-1 subscriber-registry heartbeat task spawned below (TKT-a38b7c26).
         let api = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-            Ok(a) => a,
+            Ok(a) => std::sync::Arc::new(a),
             Err(e) => {
                 tracing::error!("api client init failed: {e}");
                 return;
@@ -589,6 +592,17 @@ fn spawn_sse_consumer(
         // a stall on ANY root trips the watchdog (and the restarted process
         // re-arms a fresh watchdog covering all roots).
         let sync_health = sync_health::SyncHealth::new();
+        // RC-1 client half (TKT-a38b7c26): spawn the subscriber-registry
+        // heartbeat. Periodically PATCHes /api/sync/subscribers/me with the
+        // running daemon version + a fresh last_seen + the truthful last_sync
+        // (from SyncHealth's wall-clock stamp), so the vault_subscribers row
+        // stays fresh for the daemon's lifetime instead of freezing at the
+        // one-shot startup patch_self_version. Tolerates an older server (405)
+        // by logging once and continuing -- escalating to a periodic WARN if
+        // the 405 persists past the tolerance window (a routing gap must stay
+        // visible; PR #10 review). Fire-and-forget: failures are non-fatal and
+        // never block the sync pipeline.
+        heartbeat::spawn(api.clone(), sync_health.clone());
         // fix/reconcile-server-wins-shadow: persistent per-file "last-synced
         // server hash" marker. Shared (Arc) across the materializer (records on
         // every pull), the push_client (records on every accepted push), and the

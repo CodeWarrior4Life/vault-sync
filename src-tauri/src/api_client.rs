@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -31,6 +32,25 @@ pub fn user_agent_string() -> String {
         daemon_version(),
         daemon_platform()
     )
+}
+
+/// RC-1 client half (TKT-a38b7c26): build the subscriber-registry heartbeat
+/// PATCH body. Pure (no clock, no IO) so the field contract is unit-testable
+/// without a mock server. `daemon_version`/`daemon_platform` mirror the startup
+/// self-PATCH; `last_seen` is always present (RFC3339); `last_sync` is inserted
+/// ONLY when known — a bare `null` could clobber a good `last_sync_at` on a
+/// daemon that has not pushed since restart, so absence means "no update to
+/// that column".
+fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "daemon_version": daemon_version(),
+        "daemon_platform": daemon_platform(),
+        "last_seen": last_seen.to_rfc3339(),
+    });
+    if let Some(ls) = last_sync {
+        body["last_sync"] = serde_json::Value::String(ls.to_rfc3339());
+    }
+    body
 }
 
 /// AR-009 (TKT-c41c2225): deserialize a `200 OK` body into `T`, and on failure
@@ -162,6 +182,21 @@ pub struct HealthSnapshot {
     pub scope_excludes: Vec<String>,
     pub materializer_mode: String,
     pub shadow_path: Option<String>,
+}
+
+/// RC-1 client half (TKT-a38b7c26): result of the subscriber-registry
+/// heartbeat PATCH. Distinguishes "the server accepted the freshness update"
+/// from "this server predates the route" (HTTP 405) so the caller can tolerate
+/// an older server with a single log line and never treat 405 as a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    /// The server accepted the PATCH and refreshed the registry row.
+    Acknowledged,
+    /// HTTP 405 Method Not Allowed — the server does not mount the
+    /// `PATCH /api/sync/subscribers/me` heartbeat route (pre-RC-1 server).
+    /// NOT an error: the caller logs once and keeps beating so a later
+    /// server upgrade starts refreshing the row without a daemon restart.
+    Unsupported,
 }
 
 /// v0.3.2: response shape from `PATCH /api/sync/subscribers/me`.
@@ -613,6 +648,54 @@ impl ApiClient {
         }
     }
 
+    /// RC-1 client half (TKT-a38b7c26): the periodic subscriber-registry
+    /// HEARTBEAT. PATCHes `/api/sync/subscribers/me` with the running daemon's
+    /// version + platform (same source as [`patch_self_version`]) PLUS wall-clock
+    /// `last_seen` (now) and `last_sync` (the last time an upstream sync actually
+    /// landed, or omitted when none has). This keeps the `vault_subscribers` row
+    /// fresh while the daemon is alive; before this, the row went stale even
+    /// though the daemon and the server route were both live (the RC-1 client
+    /// gap).
+    ///
+    /// * Timestamps are serialized RFC3339 (matching the `_at` timestamp columns
+    ///   and the push-journal convention); `last_sync` is omitted entirely when
+    ///   `None` so the server never records a fabricated sync time.
+    /// * HTTP 405 (an older server without the route) returns
+    ///   [`HeartbeatOutcome::Unsupported`], NOT an error — the caller tolerates
+    ///   it (log-once, then a periodic escalated WARN if the 405 persists past
+    ///   the tolerance window; see `heartbeat::unsupported_log_action`) and
+    ///   keeps beating (a later server upgrade then starts refreshing the row
+    ///   without a daemon restart). Every other non-200 maps to the usual
+    ///   [`ApiError`]; the caller treats those as non-fatal too.
+    /// * The response body is intentionally ignored: the heartbeat is a
+    ///   fire-and-observe freshness ping, and tolerating an empty or differently
+    ///   shaped body keeps it compatible across server versions that do mount
+    ///   the route.
+    pub async fn patch_self_heartbeat(
+        &self,
+        last_seen: DateTime<Utc>,
+        last_sync: Option<DateTime<Utc>>,
+    ) -> Result<HeartbeatOutcome, ApiError> {
+        let body = heartbeat_body(last_seen, last_sync);
+        let resp = self
+            .http
+            .patch(format!("{}/api/sync/subscribers/me", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(HeartbeatOutcome::Acknowledged),
+            // Older server without the RC-1 route: tolerated, not fatal.
+            StatusCode::METHOD_NOT_ALLOWED => Ok(HeartbeatOutcome::Unsupported),
+            StatusCode::BAD_REQUEST => Err(ApiError::Server(400)),
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
+            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+            s => Err(ApiError::Server(s.as_u16())),
+        }
+    }
+
     pub async fn push(&self, req: &PushRequest<'_>) -> Result<PushResponse, ApiError> {
         let resp = self
             .http
@@ -793,6 +876,101 @@ mod tests {
             }
             other => panic!("expected UpgradeRequired, got {other:?}"),
         }
+    }
+
+    // --- RC-1 client half: subscriber-registry heartbeat (TKT-a38b7c26) ---
+
+    /// (Deliverable 3b) The heartbeat ISSUES `PATCH /api/sync/subscribers/me`
+    /// carrying daemon version + platform + `last_seen` + `last_sync`, and a
+    /// 200 maps to `Acknowledged`. The mock only matches when the wire body
+    /// contains every required field, so a green assert PROVES the PATCH was
+    /// issued with the freshness fields (the RC-1 gap was that it was never
+    /// issued at all).
+    #[tokio::test]
+    async fn heartbeat_issues_patch_with_version_and_timestamps() {
+        let mut srv = mockito::Server::new_async().await;
+        let m = srv
+            .mock("PATCH", "/api/sync/subscribers/me")
+            // Body must carry the daemon version, both timestamps, and platform.
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""daemon_version":"#.into()),
+                mockito::Matcher::Regex(r#""daemon_platform":"#.into()),
+                mockito::Matcher::Regex(r#""last_seen":"2026-08-02T"#.into()),
+                mockito::Matcher::Regex(r#""last_sync":"2026-08-02T"#.into()),
+            ]))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let api = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+
+        let last_seen = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let last_sync = DateTime::parse_from_rfc3339("2026-08-02T09:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = api
+            .patch_self_heartbeat(last_seen, Some(last_sync))
+            .await
+            .expect("heartbeat succeeds");
+        assert_eq!(out, HeartbeatOutcome::Acknowledged);
+        m.assert_async().await; // the PATCH was actually issued with the fields
+    }
+
+    /// A daemon that has not landed an upstream sync since restart passes
+    /// `last_sync: None`; the field is then OMITTED entirely (never sent as a
+    /// bare `null`) so it cannot clobber a good `last_sync_at` server-side.
+    /// Asserted on the pure body builder (Rust's `regex` has no lookahead, so a
+    /// mock "body must NOT contain last_sync" matcher is not expressible).
+    #[test]
+    fn heartbeat_body_omits_last_sync_when_unknown_and_includes_it_when_known() {
+        let last_seen = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Unknown => key absent entirely (not null).
+        let absent = heartbeat_body(last_seen, None);
+        assert!(absent.get("last_seen").is_some());
+        assert!(
+            absent.get("last_sync").is_none(),
+            "last_sync must be OMITTED when unknown, not sent as null: {absent}"
+        );
+        assert_eq!(absent["daemon_version"], daemon_version());
+        // Known => present as an RFC3339 string.
+        let last_sync = DateTime::parse_from_rfc3339("2026-08-02T09:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let present = heartbeat_body(last_seen, Some(last_sync));
+        assert_eq!(present["last_sync"], "2026-08-02T09:59:00+00:00");
+    }
+
+    /// (Deliverable 3c) An OLDER server that does not mount the route answers
+    /// HTTP 405. That maps to `Unsupported`, NOT an error — the caller tolerates
+    /// it (log-once, no crash). The API layer must never surface 405 as a
+    /// hard `ApiError` here.
+    #[tokio::test]
+    async fn heartbeat_tolerates_405_from_older_server() {
+        let mut srv = mockito::Server::new_async().await;
+        let _m = srv
+            .mock("PATCH", "/api/sync/subscribers/me")
+            .with_status(405)
+            .with_body("Method Not Allowed")
+            .create_async()
+            .await;
+        let api = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        let last_seen = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = api
+            .patch_self_heartbeat(last_seen, None)
+            .await
+            .expect("405 is tolerated, not an error");
+        assert_eq!(
+            out,
+            HeartbeatOutcome::Unsupported,
+            "405 must map to Unsupported so the caller keeps beating"
+        );
     }
 
     // --- R7b base_seq daemon leg (THESEUS AR-002, TKT-166e1c07) ---
