@@ -25,12 +25,46 @@
 //! server (flag on) fails the causal gate closed (409), and the daemon takes
 //! the refetch/merge path (R2/R4). We NEVER fabricate or default a seq.
 //!
+//! ## Provenance (TKT-372e31b2, PR #11 review Finding 1)
+//!
+//! Since the verified read-receipt landed (TKT-f74edf99), a seq can enter this
+//! store two causally DIFFERENT ways, and consumers now care which:
+//!
+//! * **Adopted** (`record_adopted`) — the local FS was byte-verified to hold
+//!   EXACTLY this server version's bytes at record time (post-integrity
+//!   materialize, ack-align rewrite, or an accepted push whose bytes were
+//!   already canonical). Local bytes that later differ from this version are
+//!   therefore a write layered ON TOP of it — proof of DESCENT. Only this
+//!   provenance may enable the materializer's causal-preserve arm.
+//! * **Observed** (`record_observed`) — a verified read-receipt proved we SAW
+//!   this server version (hash-verified body), but the local file was never
+//!   confirmed to hold its bytes. It authorises the WIRE `base_seq` on the
+//!   retry push (the whole point of the receipt), but it proves NOTHING about
+//!   the ancestry of the local bytes, so it must NEVER enable the
+//!   causal-preserve arm: on a 409 refetch of a genuinely divergent note the
+//!   receipt records the server head seq, and the immediately following
+//!   materialize of that same head would otherwise see `incoming == observed`
+//!   and swallow every true conflict as "local is newer".
+//!
+//! `get()` is provenance-blind (wire declaration, stash naming);
+//! `get_adopted()` is the causal-preserve gate.
+//!
 //! ## Persistence
 //!
-//! Backed by a flat JSON `HashMap<path, i64>` on disk, dirty-gated + atomic
-//! (tmp+rename), exactly like the shadow store. A missing OR corrupt file loads
-//! as EMPTY (never a panic) which simply means "no lineage known yet" for every
-//! note: fail-closed, refetch/merge on the first push under the flag.
+//! Backed by a flat JSON map on disk, dirty-gated + atomic (tmp+rename),
+//! exactly like the shadow store. A missing OR corrupt file loads as EMPTY
+//! (never a panic) which simply means "no lineage known yet" for every note:
+//! fail-closed, refetch/merge on the first push under the flag.
+//!
+//! Values are `{"seq": N, "prov": "adopted"|"observed"}`. LEGACY entries (a
+//! bare `N` from a pre-provenance daemon) load as **Observed** — the SAFE
+//! default. A v0.4.36 store already contains receipt-recorded seqs that are
+//! indistinguishable from adopted ones, so mapping legacy to Adopted would
+//! enable the preserve arm on exactly the entries it must not trust. Mapping
+//! legacy to Observed keeps the wire declaration intact (no re-409 storm) and
+//! merely makes the causal arm stand down to the always-stash floor (both
+//! byte-sets preserved — safe, at worst one extra fork) until the entry
+//! re-earns Adopted on its next byte-verified materialize / accepted push.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -47,10 +81,42 @@ use crate::sync_shadow::canonical_sync_path;
 /// Periodic flush cadence, matching the shadow store.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// HOW a recorded seq was earned (TKT-372e31b2, Finding 1). See module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeqProvenance {
+    /// Byte-verified adoption: the local FS held exactly this version's bytes
+    /// at record time. Proof of DESCENT for later local edits — the ONLY
+    /// provenance that may enable the causal-preserve arm.
+    Adopted,
+    /// Verified read-receipt observation (TKT-f74edf99): we provably SAW this
+    /// version, but the local file was never confirmed to hold it. Authorises
+    /// the wire `base_seq`; never the causal-preserve arm.
+    Observed,
+}
+
+/// One recorded lineage entry: the seq plus how it was earned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SeqEntry {
+    seq: i64,
+    prov: SeqProvenance,
+}
+
+/// On-disk value: either the legacy bare seq (pre-provenance daemons) or the
+/// tagged entry. Legacy maps to `Observed` — the safe, non-preserve-enabling
+/// default (module docs, "Persistence").
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawSeqEntry {
+    Tagged(SeqEntry),
+    Legacy(i64),
+}
+
 /// Persistent per-file observed-`change_seq` store: path -> last-observed
-/// server `change_seq` (proof-of-observation for the R7b causal gate).
+/// server `change_seq` (proof-of-observation for the R7b causal gate), tagged
+/// with the provenance that earned it.
 pub struct BaseSeqStore {
-    inner: Mutex<HashMap<String, i64>>,
+    inner: Mutex<HashMap<String, SeqEntry>>,
     path: PathBuf,
     dirty: AtomicBool,
     /// Sync-root basenames whose leading `<vault_folder>/` prefix is stripped
@@ -83,10 +149,29 @@ impl BaseSeqStore {
     /// for every note, which is the fail-closed default (refetch/merge on the
     /// first push under the flag). Legacy prefixed keys are migrated to the
     /// canonical sync-root-relative form on load, mirroring the shadow store.
+    /// Legacy BARE-SEQ values (pre-provenance daemons) load as `Observed` —
+    /// the safe, non-preserve-enabling default (module docs, "Persistence") —
+    /// and are persisted in the tagged form on the next flush.
     pub fn load_with_vault_folders(path: PathBuf, vault_folders: Vec<String>) -> Arc<BaseSeqStore> {
-        let raw = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<HashMap<String, i64>>(&bytes) {
-                Ok(m) => m,
+        let mut value_migrated = false;
+        let raw: HashMap<String, SeqEntry> = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<HashMap<String, RawSeqEntry>>(&bytes) {
+                Ok(m) => m
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let entry = match v {
+                            RawSeqEntry::Tagged(e) => e,
+                            RawSeqEntry::Legacy(seq) => {
+                                value_migrated = true;
+                                SeqEntry {
+                                    seq,
+                                    prov: SeqProvenance::Observed,
+                                }
+                            }
+                        };
+                        (k, entry)
+                    })
+                    .collect(),
                 Err(e) => {
                     warn!(
                         path = %path.display(),
@@ -119,8 +204,8 @@ impl BaseSeqStore {
             }
             k.to_string()
         };
-        let mut map: HashMap<String, i64> = HashMap::with_capacity(raw.len());
-        let mut legacy: Vec<(String, i64)> = Vec::new();
+        let mut map: HashMap<String, SeqEntry> = HashMap::with_capacity(raw.len());
+        let mut legacy: Vec<(String, SeqEntry)> = Vec::new();
         let mut migrated = false;
         for (k, v) in raw.into_iter() {
             let nk = strip(&canonical_sync_path(&k));
@@ -140,32 +225,85 @@ impl BaseSeqStore {
                 "base_seq store: migrated keys to canonical form (NFC + vault-prefix strip)"
             );
         }
+        if value_migrated {
+            warn!(
+                path = %path.display(),
+                "base_seq store: legacy bare-seq entries loaded as prov=observed (safe default: wire declaration intact, causal-preserve arm disabled until re-earned as adopted)"
+            );
+        }
         Arc::new(BaseSeqStore {
             inner: Mutex::new(map),
             path,
-            dirty: AtomicBool::new(migrated),
+            dirty: AtomicBool::new(migrated || value_migrated),
             vault_folders,
         })
     }
 
-    /// Upsert `path -> seq`. No I/O; sets the dirty flag. The seq MUST come
-    /// from a server response (push `server_seq` / note `change_seq`), NEVER a
-    /// local assumption, and MUST be recorded only AFTER the corresponding
-    /// bytes are byte-verified on the local FS (R3). Callers enforce both.
-    pub fn record(&self, path: &str, seq: i64) {
+    /// Upsert `path -> seq` with ADOPTED provenance. No I/O; sets the dirty
+    /// flag. The seq MUST come from a server response (push `server_seq` /
+    /// note `change_seq`), NEVER a local assumption, and MUST be recorded only
+    /// AFTER the corresponding bytes are byte-verified on the local FS (R3).
+    /// Callers enforce both — this is what makes Adopted a proof of descent.
+    pub fn record_adopted(&self, path: &str, seq: i64) {
+        self.record_with(path, seq, SeqProvenance::Adopted);
+    }
+
+    /// Upsert `path -> seq` with OBSERVED provenance (verified read-receipt,
+    /// TKT-f74edf99). Authorises the wire `base_seq` retry declaration but
+    /// never the causal-preserve arm. When the entry already holds the SAME
+    /// seq as Adopted, the stronger proof is kept (an observation of a version
+    /// we already byte-verified adds nothing and must not weaken it).
+    pub fn record_observed(&self, path: &str, seq: i64) {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
-            m.insert(key, seq);
+            if let Some(existing) = m.get(&key) {
+                if existing.prov == SeqProvenance::Adopted && existing.seq == seq {
+                    return;
+                }
+            }
+            m.insert(
+                key,
+                SeqEntry {
+                    seq,
+                    prov: SeqProvenance::Observed,
+                },
+            );
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
-    /// The last-observed server `change_seq` for `path`, if any. `None` is the
-    /// fail-closed "unknown/empty lineage" signal (R4): the caller sends
-    /// `base_seq: null` and takes the refetch/merge path on the server's 409.
+    fn record_with(&self, path: &str, seq: i64, prov: SeqProvenance) {
+        let key = self.canon_key(path);
+        if let Ok(mut m) = self.inner.lock() {
+            m.insert(key, SeqEntry { seq, prov });
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The last-observed server `change_seq` for `path`, if any — PROVENANCE-
+    /// BLIND (wire declaration, stash naming). `None` is the fail-closed
+    /// "unknown/empty lineage" signal (R4): the caller sends `base_seq: null`
+    /// and takes the refetch/merge path on the server's 409.
     pub fn get(&self, path: &str) -> Option<i64> {
         let key = self.canon_key(path);
-        self.inner.lock().ok().and_then(|m| m.get(&key).copied())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).map(|e| e.seq))
+    }
+
+    /// The last ADOPTED server `change_seq` for `path` — the causal-preserve
+    /// gate (TKT-372e31b2, Finding 1). Returns `None` for Observed/legacy
+    /// entries: a receipt-earned or unknown-provenance seq proves nothing
+    /// about the ancestry of the local bytes, so the preserve arm must stand
+    /// down to the always-stash floor.
+    pub fn get_adopted(&self, path: &str) -> Option<i64> {
+        let key = self.canon_key(path);
+        self.inner.lock().ok().and_then(|m| {
+            m.get(&key)
+                .filter(|e| e.prov == SeqProvenance::Adopted)
+                .map(|e| e.seq)
+        })
     }
 
     /// Drop the lineage for `path` (e.g. after a confirmed delete tombstone so
@@ -195,7 +333,7 @@ impl BaseSeqStore {
         if !self.dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let snapshot: HashMap<String, i64> = match self.inner.lock() {
+        let snapshot: HashMap<String, SeqEntry> = match self.inner.lock() {
             Ok(m) => m.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
@@ -258,14 +396,92 @@ mod tests {
         let path = tmp_path("roundtrip");
         {
             let s = BaseSeqStore::load(path.clone());
-            s.record("01_Notes/x.md", 4242);
+            s.record_adopted("01_Notes/x.md", 4242);
             assert_eq!(s.get("01_Notes/x.md"), Some(4242));
             s.flush().unwrap();
         }
-        // Reload from disk: the observed seq survives a restart.
+        // Reload from disk: the seq AND its provenance survive a restart.
         let s2 = BaseSeqStore::load(path.clone());
         assert_eq!(s2.get("01_Notes/x.md"), Some(4242));
+        assert_eq!(s2.get_adopted("01_Notes/x.md"), Some(4242));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Finding 1 (TKT-372e31b2, PR #11 review): an Observed (receipt-earned)
+    /// entry authorises the wire declaration (`get`) but NEVER the
+    /// causal-preserve gate (`get_adopted`).
+    #[test]
+    fn observed_provenance_feeds_wire_but_not_causal_gate() {
+        let path = tmp_path("observed");
+        {
+            let s = BaseSeqStore::load(path.clone());
+            s.record_observed("01_Notes/x.md", 77);
+            assert_eq!(s.get("01_Notes/x.md"), Some(77), "wire declaration intact");
+            assert_eq!(
+                s.get_adopted("01_Notes/x.md"),
+                None,
+                "a receipt-earned seq must not enable the preserve arm"
+            );
+            s.flush().unwrap();
+        }
+        // Provenance survives a restart too.
+        let s2 = BaseSeqStore::load(path.clone());
+        assert_eq!(s2.get("01_Notes/x.md"), Some(77));
+        assert_eq!(s2.get_adopted("01_Notes/x.md"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Finding 1 migration: a LEGACY store (bare `path -> seq` values, written
+    /// by a pre-provenance daemon — including v0.4.36 stores that already mix
+    /// receipt-recorded and adopted seqs indistinguishably) loads with every
+    /// entry as Observed: `get` intact (no re-409 storm), `get_adopted` None
+    /// (legacy entries never NEWLY enable the preserve arm). The upgraded
+    /// tagged form is persisted on the next flush.
+    #[test]
+    fn legacy_bare_seq_entries_load_as_observed_safe_default() {
+        let path = tmp_path("legacy");
+        std::fs::write(&path, br#"{"01_Notes/x.md": 91, "01_Notes/y.md": 12}"#).unwrap();
+        {
+            let s = BaseSeqStore::load(path.clone());
+            assert_eq!(s.get("01_Notes/x.md"), Some(91));
+            assert_eq!(s.get("01_Notes/y.md"), Some(12));
+            assert_eq!(s.get_adopted("01_Notes/x.md"), None);
+            assert_eq!(s.get_adopted("01_Notes/y.md"), None);
+            // The load marked the store dirty; flush writes the tagged form.
+            s.flush().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let txt = String::from_utf8(bytes).unwrap();
+        assert!(
+            txt.contains("\"prov\":\"observed\""),
+            "flush must persist the tagged form, got: {txt}"
+        );
+        let s2 = BaseSeqStore::load(path.clone());
+        assert_eq!(s2.get("01_Notes/x.md"), Some(91));
+        assert_eq!(s2.get_adopted("01_Notes/x.md"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An observation of a version we already byte-verified ADOPTED must not
+    /// weaken the stronger proof; a DIFFERENT observed seq replaces it (the
+    /// adoption proves nothing about the newer version's ancestry).
+    #[test]
+    fn observed_same_seq_keeps_adopted_different_seq_replaces() {
+        let s = BaseSeqStore::load(tmp_path("keep_adopted"));
+        s.record_adopted("a.md", 100);
+        s.record_observed("a.md", 100);
+        assert_eq!(
+            s.get_adopted("a.md"),
+            Some(100),
+            "same-seq observation must not downgrade an adoption"
+        );
+        s.record_observed("a.md", 105);
+        assert_eq!(s.get("a.md"), Some(105), "newer observation wins the wire");
+        assert_eq!(
+            s.get_adopted("a.md"),
+            None,
+            "the newer version was never adopted"
+        );
     }
 
     #[test]
@@ -276,7 +492,7 @@ mod tests {
             tmp_path("prefix"),
             vec!["Mainframe".to_string()],
         );
-        s.record("Mainframe/01_Notes/x.md", 7);
+        s.record_adopted("Mainframe/01_Notes/x.md", 7);
         assert_eq!(s.get("01_Notes/x.md"), Some(7));
     }
 
@@ -293,7 +509,7 @@ mod tests {
     #[test]
     fn remove_drops_lineage() {
         let s = BaseSeqStore::load(tmp_path("remove"));
-        s.record("a.md", 9);
+        s.record_adopted("a.md", 9);
         assert_eq!(s.get("a.md"), Some(9));
         s.remove("a.md");
         assert_eq!(s.get("a.md"), None);

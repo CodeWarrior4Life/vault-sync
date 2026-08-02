@@ -128,6 +128,22 @@ pub enum SkipReason {
     /// fail-honest degrade: local is still preserved, but convergence then
     /// waits on the next reconcile pass).
     GuardPreserveLocalPushUp { enqueued_push: bool },
+    /// R1 (TKT-372e31b2): this write resolved to an R5 `Conflict` (shadow absent
+    /// => "unknown provenance"), but the shadow store loaded in the
+    /// `vault_scope_suspect` state - `vault_folders` resolved EMPTY while the
+    /// store holds vault-prefixed keys, so EVERY `shadow.get()` mis-keys and
+    /// misses (`sync_shadow::detect_vault_scope_suspect`, the 2026-07-18 trinity
+    /// incident). In that state "shadow absent" is a KNOWN MISCONFIGURATION
+    /// artifact, not real ambiguity, so a conflict copy is false BY
+    /// CONSTRUCTION: it says "two writers diverged" when the only thing that
+    /// happened is that the daemon cannot read its own sync history. The push
+    /// leg already PARKS wholesale on this state (lib.rs, `spawn_push_pipeline`;
+    /// push_client `drain_once`), so continuing to mint pull-side forks while no
+    /// push can ever leave the host is incoherent as well as wrong. We refuse
+    /// the whole write: local untouched, no stash, no overwrite (fail-closed
+    /// toward local, exactly like `ConflictStormBreakerOpen`). The operator
+    /// fixes `vault_name` in the config and restarts.
+    ShadowScopeSuspect,
 }
 
 /// Outcome of a single `write()` call.
@@ -851,7 +867,9 @@ impl Materializer {
                             if let (Some(bs), Some(seq)) =
                                 (&self.base_seq_store, payload.change_seq)
                             {
-                                bs.record(&payload.path, seq);
+                                // ADOPTED: local bytes == server canonical by
+                                // construction on this arm (Finding 1).
+                                bs.record_adopted(&payload.path, seq);
                             }
                         }
                         return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
@@ -920,6 +938,119 @@ impl Materializer {
                     );
                 }
                 Decision::Conflict => {
+                    // R2 (TKT-372e31b2): CAUSAL GATE, BEFORE ANY STASH.
+                    //
+                    // `decide()` is content-relational only: it can see that
+                    // local and server both differ from the last-synced shadow,
+                    // but it CANNOT see which one is causally newer, so it calls
+                    // every such pair a conflict. For a SINGLE-WRITER file that
+                    // is provably wrong whenever the incoming server version is
+                    // one this daemon has ALREADY observed: the local bytes are
+                    // then a write layered ON TOP of that observed version (a
+                    // fresh local edit racing our own materialization of the same
+                    // path), and materializing the server copy would move the
+                    // file BACKWARD while sidelining the newer bytes into a
+                    // conflict copy that no other writer ever contested. That is
+                    // the exact defect: `_sync/canary-<host>.md` is written by
+                    // exactly one host by construction and still acquired
+                    // `canary-trinity.conflict-from-<device>-<lsn>.md` holding
+                    // the nonce of a write that then never reached the server.
+                    //
+                    // The proof-of-observation store (R7b, TKT-166e1c07) is
+                    // exactly the missing causal input. `payload.change_seq` is
+                    // the server's per-note version token for the bytes we are
+                    // being asked to write; `base_seq_store.get_adopted(path)`
+                    // is the token of the newest version this daemon
+                    // byte-verified ONTO ITS OWN FS for that path — ADOPTED
+                    // provenance only (recorded after a post-write integrity
+                    // pass, `write_with_change_seq` tail / Noop-identical arm,
+                    // or after a push the server accepted). PROVENANCE MATTERS
+                    // (Finding 1, PR #11 review): since TKT-f74edf99 the store
+                    // also holds OBSERVED entries minted by the verified
+                    // read-receipt on the 409 refetch path. A receipt proves we
+                    // SAW the server head, not that the local file ever held
+                    // its bytes — and the 409 refetch materializes that same
+                    // head immediately after recording it, so a provenance-
+                    // blind read would see `incoming == observed` on EVERY
+                    // genuinely divergent 409 and misclassify the true conflict
+                    // as "local is newer": no stash, no pull, and the receipt-
+                    // authorised retry push would land local over the head
+                    // without the always-stash floor ever firing. Gating on
+                    // adopted provenance restores the old base's invariant
+                    // (observed => those bytes were on this disk). So:
+                    //
+                    //   incoming <= observed  =>  the incoming version is NOT
+                    //   causally newer than something we already materialized.
+                    //   Local must therefore be a descendant of it (local !=
+                    //   server here, else R1 Noop caught it). Resolution:
+                    //   PRESERVE LOCAL, write nothing, stash nothing - the
+                    //   file_watcher/push pipeline carries the newer local bytes
+                    //   UP. R2's "the local write must still reach the server" is
+                    //   satisfied structurally: we leave the newer bytes at the
+                    //   canonical path, and the pending push is LAZY (it reads
+                    //   the file at drain time, push_client `process_event`), so
+                    //   it POSTs the new bytes. The old behavior overwrote the
+                    //   canonical path first, which is why the pending push then
+                    //   re-read server bytes and pushed nothing.
+                    //
+                    //   incoming > observed  =>  the server genuinely advanced
+                    //   past everything we have seen. Fall through: this may be a
+                    //   real multi-writer divergence and the always-stash floor
+                    //   stands.
+                    //
+                    // Uses ONLY tokens we already hold; records nothing, so it
+                    // cannot forge lineage (B1 hazard) and does not touch the
+                    // owner-gated R6 conflict-policy question. No token on either
+                    // side (pre-R7b server omits `change_seq`, the note has no
+                    // ADOPTED lineage, or its lineage is merely Observed /
+                    // legacy-unprovenanced) => no causal evidence => fall
+                    // through to the pre-existing behavior (always-stash
+                    // floor). Fail-closed by construction.
+                    let causally_not_newer = match (&self.base_seq_store, payload.change_seq) {
+                        (Some(bs), Some(incoming)) => bs
+                            .get_adopted(&payload.path)
+                            .is_some_and(|adopted| incoming <= adopted),
+                        _ => false,
+                    };
+                    if causally_not_newer {
+                        warn!(
+                            path = %payload.path,
+                            change_seq,
+                            incoming_seq = ?payload.change_seq,
+                            adopted_seq = ?self
+                                .base_seq_store
+                                .as_ref()
+                                .and_then(|bs| bs.get_adopted(&payload.path)),
+                            "materializer R2 CAUSAL: incoming server version is NOT newer than the version we already ADOPTED (byte-verified) for this path - local bytes are a LATER local write racing our own materialization. PRESERVING local (push carries it up), NO conflict copy"
+                        );
+                        return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
+                    }
+
+                    // R1 (TKT-372e31b2): shadow-store scope-suspect. "Shadow
+                    // absent" is R5's unknown-provenance signal ONLY when the
+                    // store is readable. When it loaded in the suspect state
+                    // every lookup mis-keys and misses, so R5 fires for the whole
+                    // vault and every fork it mints is false. Refuse the write
+                    // instead (local untouched, no stash, no overwrite); the push
+                    // leg is already parked for the same reason. See
+                    // SkipReason::ShadowScopeSuspect. Deliberately narrow: it
+                    // does NOT touch the general R5 policy, which the S514 revert
+                    // note below `decide()` and the owner-gated R6 conflict-policy
+                    // ruling both reserve.
+                    if shadow.is_none()
+                        && self
+                            .shadow_store
+                            .as_ref()
+                            .is_some_and(|s| s.vault_scope_suspect())
+                    {
+                        warn!(
+                            path = %payload.path,
+                            change_seq,
+                            "materializer R1: shadow store is SCOPE-SUSPECT (vault_folders empty, prefixed keys present) so every lookup misses and R5 would fire vault-wide - REFUSING to mint a conflict copy, local preserved, pull skipped. Fix config vault_name and restart."
+                        );
+                        return Ok(MaterializeOutcome::Skipped(SkipReason::ShadowScopeSuspect));
+                    }
+
                     // Conflict-storm circuit breaker (TKT-86ae42a3): a mass
                     // server-side divergence event (consolidation, managed-
                     // region contamination, a bulk server rewrite) resolves
@@ -1106,7 +1237,9 @@ impl Materializer {
             // IntegrityFailed write returned earlier), so the exact bytes are
             // confirmed materialized before we claim the observation.
             if let (Some(bs), Some(seq)) = (&self.base_seq_store, payload.change_seq) {
-                bs.record(&payload.path, seq);
+                // ADOPTED: reached only after the post-write integrity check
+                // confirmed the exact bytes on the local FS (Finding 1).
+                bs.record_adopted(&payload.path, seq);
             }
         }
 
@@ -2747,7 +2880,7 @@ mod tests {
         let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
         let bdir = TempDir::new().unwrap();
         let bs = crate::base_seq_store::BaseSeqStore::load(bdir.path().join("base_seq.json"));
-        bs.record(&wire, 7);
+        bs.record_adopted(&wire, 7);
         let m = m.with_base_seq_store(bs);
         shadow.record(&wire, &sha256_hex("server v1"));
         std::fs::write(&target, "local edit v2").unwrap();
@@ -3814,5 +3947,337 @@ mod tests {
             b"keep\nDROP\n",
             b"keep\nx\ny\nz\n"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // TKT-372e31b2: false-conflict-copy generator (R1/R2/R3/R5)
+    // -----------------------------------------------------------------------
+
+    /// (vaults, ws, materializer, shadow, base_seq) with BOTH stores attached,
+    /// keyed with the vault-folder strip so `payload()`'s prefixed paths and the
+    /// stores agree (same discipline as production).
+    fn mk_with_stores(
+        mode: MaterializerMode,
+    ) -> (
+        TempDir,
+        TempDir,
+        Materializer,
+        Arc<ShadowStore>,
+        Arc<crate::base_seq_store::BaseSeqStore>,
+    ) {
+        let (v, w, m) = mk(mode, default_cfg());
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load_with_vault_folders(
+            sdir.path().join("shadow.json"),
+            vec![VAULT.to_string()],
+        );
+        let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
+            sdir.path().join("base_seq.json"),
+            vec![VAULT.to_string()],
+        );
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_base_seq_store(bs.clone());
+        (v, w, m, shadow, bs)
+    }
+
+    /// Count `*.conflict-from-*.md` siblings in a directory.
+    fn conflict_copies(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".conflict-from-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The canary shape sync-verify actually writes: YAML frontmatter + a nonce
+    /// line that changes on EVERY session-init (R5's trigger profile).
+    fn canary_bytes(host: &str, nonce: u64) -> String {
+        format!("---\ntype: sync-canary\nhost: {host}\n---\nnonce: {host}-{nonce}\n")
+    }
+
+    /// R1 + R2 + R5 (TKT-372e31b2), the load-bearing regression.
+    ///
+    /// A single-writer file (`_sync/canary-<host>.md`, written by exactly one
+    /// host by construction) is rewritten rapidly, and each rewrite races the
+    /// daemon's own materialization of the SAME path - the materialization
+    /// carries a server `change_seq` this daemon has ALREADY observed (the echo
+    /// of its own earlier push). Requirements:
+    ///
+    /// * R1: ZERO conflict copies, ever, across every rewrite.
+    /// * R2: resolved causally (incoming is not newer than what we observed), and
+    ///   the local write still reaches the server - asserted structurally, by the
+    ///   final local bytes still being at the canonical path, which is what the
+    ///   LAZY push re-reads at drain time (push_client::process_event).
+    ///
+    /// FAILS ON THE OLD CODE: `decide()` returns `Conflict` for this state (R4:
+    /// shadow present, server moved, local moved), and the old Conflict arm
+    /// stashed the local bytes and overwrote the canonical path - one fork per
+    /// rewrite, and the racing nonce pushed nowhere.
+    #[test]
+    fn r1_single_writer_rapid_rewrite_race_mints_zero_conflict_copies() {
+        let (vaults, _ws, m, shadow, bs) = mk_with_stores(MaterializerMode::Live);
+        let rel = "_sync/canary-trinity.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        // Lineage: this daemon pushed and byte-verified server version 1_000_500
+        // for this path, so that seq is its ADOPTED proof-of-observation
+        // (byte-verified on this FS — the only provenance that arms the
+        // causal-preserve gate, Finding 1).
+        const OBSERVED: i64 = 1_000_500;
+        bs.record_adopted(&wire, OBSERVED);
+        // The shadow holds a hash that is neither the local bytes nor the
+        // incoming server bytes (a stale baseline - the ordinary state once the
+        // file has been rewritten since the last recorded sync). That is exactly
+        // the R4 input triple that used to resolve to Conflict.
+        shadow.record(&wire, &sha256_hex("some older synced revision"));
+
+        // Five rapid successive rewrites, each racing an in-flight
+        // materialization for the same path.
+        let mut last_local = String::new();
+        for i in 1..=5u64 {
+            last_local = canary_bytes("trinity", 1_785_615_000 + i);
+            std::fs::write(&target, &last_local).unwrap();
+
+            // The daemon materializes the server copy of the SAME path. Its
+            // change_seq is <= OBSERVED: it is the echo of a version we already
+            // materialized, NOT a newer peer revision.
+            let mut server = payload(rel, "server side canary body");
+            server.change_seq = Some(OBSERVED - (5 - i as i64));
+
+            let out = m.write_with_change_seq(&server, 1_003_646_077).unwrap();
+            assert_eq!(
+                out,
+                MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved),
+                "rewrite {i}: a not-newer server version must resolve to preserve-local, got {out:?}"
+            );
+            // R1: no fork at any point in the sequence.
+            assert!(
+                conflict_copies(&dir).is_empty(),
+                "rewrite {i}: single-writer file must NEVER acquire a conflict copy, found {:?}",
+                conflict_copies(&dir)
+            );
+            // R2: the racing write is still at the canonical path, so the lazy
+            // push reads THESE bytes and they reach the server.
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                last_local,
+                "rewrite {i}: the racing local write must stay at the canonical path"
+            );
+        }
+
+        // Final state: the newest nonce is what a push would carry up.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), last_local);
+        assert!(last_local.contains("nonce: trinity-1785615005"));
+        assert!(conflict_copies(&dir).is_empty());
+        // Nothing was recorded: the causal arm reads lineage, it never forges it
+        // (B1 hazard / R4 no-regression) — and the adopted provenance is intact.
+        assert_eq!(bs.get(rel), Some(OBSERVED));
+        assert_eq!(bs.get_adopted(rel), Some(OBSERVED));
+    }
+
+    /// R2 (TKT-372e31b2): the causal arm is NOT a blanket local-wins. When the
+    /// incoming server version IS strictly newer than everything we observed, a
+    /// genuinely divergent local file is still a real conflict: stash the loser,
+    /// materialize the winner. This is the guard that keeps the fix from
+    /// swallowing true multi-writer divergence.
+    #[test]
+    fn causal_arm_does_not_suppress_a_genuinely_newer_server_version() {
+        let (vaults, _ws, m, shadow, bs) = mk_with_stores(MaterializerMode::Live);
+        let rel = "01_Inbox/contested.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        bs.record_adopted(&wire, 500);
+        shadow.record(&wire, &sha256_hex("stale baseline"));
+        let local = "---\ntitle: Test\n---\n\nmy divergent local revision\n";
+        std::fs::write(&target, local).unwrap();
+
+        // Strictly newer than the observed 500 => a real peer revision.
+        let mut server = payload(rel, "a genuinely newer peer revision");
+        server.change_seq = Some(501);
+
+        let out = m.write_with_change_seq(&server, 501).unwrap();
+        match out {
+            MaterializeOutcome::Stashed { .. } => {}
+            other => panic!("a strictly-newer server version must still stash (R4), got {other:?}"),
+        }
+        assert_eq!(
+            conflict_copies(&dir).len(),
+            1,
+            "true divergence keeps the always-stash floor"
+        );
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("a genuinely newer peer revision"));
+    }
+
+    /// Finding 1 (TKT-372e31b2, PR #11 review): the causal-preserve arm is
+    /// gated on ADOPTED provenance ONLY. An OBSERVED entry — what the verified
+    /// read-receipt (TKT-f74edf99) records on the 409 refetch path — proves we
+    /// SAW the server head, not that the local file ever held its bytes. This
+    /// reproduces the exact rebased-code hazard: the receipt records the head
+    /// seq and the SAME head is materialized immediately after, so
+    /// `incoming == observed`. A provenance-blind gate would preserve-local and
+    /// swallow the true conflict; the adopted-gated arm must stand down to the
+    /// always-stash floor (both byte-sets preserved).
+    ///
+    /// FAILS ON THE PROVENANCE-BLIND CODE: the causal arm returned
+    /// `Skipped(LocalEditPreserved)`, minting no stash and skipping the pull.
+    #[test]
+    fn causal_arm_ignores_receipt_observed_lineage_and_keeps_stash_floor() {
+        let (vaults, _ws, m, shadow, bs) = mk_with_stores(MaterializerMode::Live);
+        let rel = "01_Inbox/receipt-divergent.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        // A genuinely divergent local edit (never pushed) against a stale
+        // baseline: the R4 conflict triple.
+        shadow.record(&wire, &sha256_hex("stale baseline"));
+        let local = "---\ntitle: Test\n---\n\nmy divergent local revision\n";
+        std::fs::write(&target, local).unwrap();
+
+        // The push 409'd and the refetch recorded a VERIFIED READ-RECEIPT for
+        // the server head (seq 900) — observation, not adoption.
+        bs.record_observed(&wire, 900);
+        assert_eq!(bs.get(rel), Some(900), "wire declaration armed (PR #9)");
+        assert_eq!(bs.get_adopted(rel), None, "no adopted lineage");
+
+        // The same head is now materialized: incoming == observed == 900.
+        let mut server = payload(rel, "the server head named by the 409");
+        server.change_seq = Some(900);
+        let out = m.write_with_change_seq(&server, 900).unwrap();
+        match out {
+            MaterializeOutcome::Stashed { .. } => {}
+            other => panic!(
+                "an observed-only lineage must NOT enable preserve-local; expected the \
+                 always-stash floor (Stashed), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            conflict_copies(&dir).len(),
+            1,
+            "the true conflict keeps the always-stash floor"
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("the server head named by the 409"),
+            "the server head materialized to the canonical path"
+        );
+    }
+
+    /// R1 (TKT-372e31b2): when the shadow store loaded SCOPE-SUSPECT
+    /// (`vault_folders` empty while the store holds vault-prefixed keys, the
+    /// 2026-07-18 trinity incident), EVERY lookup mis-keys and misses, so R5
+    /// fires vault-wide and every fork it mints is false. The materializer must
+    /// refuse the write entirely: no stash, no overwrite, local preserved -
+    /// matching the push leg, which already parks wholesale on this state.
+    ///
+    /// FAILS ON THE OLD CODE: the old R5 arm minted a conflict copy and
+    /// overwrote the local file.
+    #[test]
+    fn r1_scope_suspect_shadow_mints_no_conflict_copy() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let sdir = TempDir::new().unwrap();
+        let spath = sdir.path().join("shadow.json");
+        // A store holding vault-prefixed keys, loaded with EMPTY vault_folders.
+        let mut seed = std::collections::HashMap::new();
+        seed.insert(format!("{VAULT}/01_Notes/other.md"), "deadbeef".to_string());
+        std::fs::write(&spath, serde_json::to_vec(&seed).unwrap()).unwrap();
+        let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
+        assert!(
+            shadow.vault_scope_suspect(),
+            "fixture must reproduce the suspect state"
+        );
+        let m = m.with_shadow_store(shadow);
+
+        let rel = "_sync/canary-link.md";
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+        let local = canary_bytes("link", 1_784_439_675);
+        std::fs::write(&target, &local).unwrap();
+
+        // No shadow entry for this path (every lookup misses in the suspect
+        // state) => R5 Conflict on the old code.
+        let server = payload(rel, "server canary body");
+        let out = m.write_with_change_seq(&server, 1_003_627_563).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::ShadowScopeSuspect),
+            "a scope-suspect shadow must refuse the write, not mint a fork"
+        );
+        assert!(
+            conflict_copies(&dir).is_empty(),
+            "no fork may be minted on a known store misconfiguration, found {:?}",
+            conflict_copies(&dir)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            local,
+            "local bytes must be untouched (fail-closed toward local)"
+        );
+    }
+
+    /// R3 (TKT-372e31b2): stash idempotency under REPEATED sweeps with
+    /// byte-identical content. The same divergence re-materialized N times must
+    /// converge on ONE `.conflict-from-*` sibling, never N of them.
+    ///
+    /// This one PASSES on the old code too (`conflict_stash::find_identical_stash`
+    /// already dedups byte-identical content, and the field record confirms it:
+    /// `-0-37` was reused across 5 ticks). It is kept as the boundedness guard
+    /// that the new causal/scope arms must not weaken, and it pins the half of
+    /// the v0.4.26 idempotency claim that DOES hold.
+    #[test]
+    fn r3_repeated_sweeps_with_identical_content_keep_exactly_one_stash() {
+        let (vaults, _ws, m, shadow, bs) = mk_with_stores(MaterializerMode::Live);
+        let rel = "01_Inbox/resweep.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let local = "---\ntitle: Test\n---\n\nlocal divergent bytes\n";
+        // A reconcile-pull / pre-R7b payload carries NO change_seq, so there is
+        // no causal evidence either way and the new causal arm stands down by
+        // construction (fail-closed to the pre-existing behavior). That isolates
+        // the property under test: stash dedup, not causal resolution. `bs` is
+        // attached but deliberately left empty for the same reason.
+        let server = payload(rel, "server winner bytes");
+        assert_eq!(server.change_seq, None);
+        assert_eq!(bs.get(rel), None);
+
+        for pass in 1..=4 {
+            // Re-create the exact same divergence each sweep: same local bytes,
+            // same server bytes, stale shadow.
+            std::fs::write(&target, local).unwrap();
+            shadow.record(&wire, &sha256_hex("stale baseline"));
+
+            let out = m.write_with_change_seq(&server, 9_000).unwrap();
+            match out {
+                MaterializeOutcome::Stashed { .. } => {}
+                other => panic!("sweep {pass}: expected Stashed, got {other:?}"),
+            }
+            assert_eq!(
+                conflict_copies(&dir).len(),
+                1,
+                "sweep {pass}: byte-identical content must reuse the ONE stash, found {:?}",
+                conflict_copies(&dir)
+            );
+        }
+        // And the single stash holds the losing bytes verbatim.
+        let forks = conflict_copies(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join(&forks[0])).unwrap(), local);
     }
 }
