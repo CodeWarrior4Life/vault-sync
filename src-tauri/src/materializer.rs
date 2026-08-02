@@ -867,7 +867,9 @@ impl Materializer {
                             if let (Some(bs), Some(seq)) =
                                 (&self.base_seq_store, payload.change_seq)
                             {
-                                bs.record(&payload.path, seq);
+                                // ADOPTED: local bytes == server canonical by
+                                // construction on this arm (Finding 1).
+                                bs.record_adopted(&payload.path, seq);
                             }
                         }
                         return Ok(MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal));
@@ -957,11 +959,25 @@ impl Materializer {
                     // The proof-of-observation store (R7b, TKT-166e1c07) is
                     // exactly the missing causal input. `payload.change_seq` is
                     // the server's per-note version token for the bytes we are
-                    // being asked to write; `base_seq_store.get(path)` is the
-                    // token of the newest version this daemon byte-verified for
-                    // that path (recorded ONLY after a post-write integrity pass,
-                    // materializer.rs `write_with_change_seq` tail, or after a
-                    // push the server accepted). So:
+                    // being asked to write; `base_seq_store.get_adopted(path)`
+                    // is the token of the newest version this daemon
+                    // byte-verified ONTO ITS OWN FS for that path — ADOPTED
+                    // provenance only (recorded after a post-write integrity
+                    // pass, `write_with_change_seq` tail / Noop-identical arm,
+                    // or after a push the server accepted). PROVENANCE MATTERS
+                    // (Finding 1, PR #11 review): since TKT-f74edf99 the store
+                    // also holds OBSERVED entries minted by the verified
+                    // read-receipt on the 409 refetch path. A receipt proves we
+                    // SAW the server head, not that the local file ever held
+                    // its bytes — and the 409 refetch materializes that same
+                    // head immediately after recording it, so a provenance-
+                    // blind read would see `incoming == observed` on EVERY
+                    // genuinely divergent 409 and misclassify the true conflict
+                    // as "local is newer": no stash, no pull, and the receipt-
+                    // authorised retry push would land local over the head
+                    // without the always-stash floor ever firing. Gating on
+                    // adopted provenance restores the old base's invariant
+                    // (observed => those bytes were on this disk). So:
                     //
                     //   incoming <= observed  =>  the incoming version is NOT
                     //   causally newer than something we already materialized.
@@ -985,13 +1001,15 @@ impl Materializer {
                     // Uses ONLY tokens we already hold; records nothing, so it
                     // cannot forge lineage (B1 hazard) and does not touch the
                     // owner-gated R6 conflict-policy question. No token on either
-                    // side (pre-R7b server omits `change_seq`, or the note has no
-                    // observed lineage) => no causal evidence => fall through to
-                    // the pre-existing behavior. Fail-closed by construction.
+                    // side (pre-R7b server omits `change_seq`, the note has no
+                    // ADOPTED lineage, or its lineage is merely Observed /
+                    // legacy-unprovenanced) => no causal evidence => fall
+                    // through to the pre-existing behavior (always-stash
+                    // floor). Fail-closed by construction.
                     let causally_not_newer = match (&self.base_seq_store, payload.change_seq) {
                         (Some(bs), Some(incoming)) => bs
-                            .get(&payload.path)
-                            .is_some_and(|observed| incoming <= observed),
+                            .get_adopted(&payload.path)
+                            .is_some_and(|adopted| incoming <= adopted),
                         _ => false,
                     };
                     if causally_not_newer {
@@ -999,11 +1017,11 @@ impl Materializer {
                             path = %payload.path,
                             change_seq,
                             incoming_seq = ?payload.change_seq,
-                            observed_seq = ?self
+                            adopted_seq = ?self
                                 .base_seq_store
                                 .as_ref()
-                                .and_then(|bs| bs.get(&payload.path)),
-                            "materializer R2 CAUSAL: incoming server version is NOT newer than the version we already observed for this path - local bytes are a LATER local write racing our own materialization. PRESERVING local (push carries it up), NO conflict copy"
+                                .and_then(|bs| bs.get_adopted(&payload.path)),
+                            "materializer R2 CAUSAL: incoming server version is NOT newer than the version we already ADOPTED (byte-verified) for this path - local bytes are a LATER local write racing our own materialization. PRESERVING local (push carries it up), NO conflict copy"
                         );
                         return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
                     }
@@ -1219,7 +1237,9 @@ impl Materializer {
             // IntegrityFailed write returned earlier), so the exact bytes are
             // confirmed materialized before we claim the observation.
             if let (Some(bs), Some(seq)) = (&self.base_seq_store, payload.change_seq) {
-                bs.record(&payload.path, seq);
+                // ADOPTED: reached only after the post-write integrity check
+                // confirmed the exact bytes on the local FS (Finding 1).
+                bs.record_adopted(&payload.path, seq);
             }
         }
 
@@ -2860,7 +2880,7 @@ mod tests {
         let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
         let bdir = TempDir::new().unwrap();
         let bs = crate::base_seq_store::BaseSeqStore::load(bdir.path().join("base_seq.json"));
-        bs.record(&wire, 7);
+        bs.record_adopted(&wire, 7);
         let m = m.with_base_seq_store(bs);
         shadow.record(&wire, &sha256_hex("server v1"));
         std::fs::write(&target, "local edit v2").unwrap();
@@ -4007,9 +4027,11 @@ mod tests {
         let dir = target.parent().unwrap().to_path_buf();
 
         // Lineage: this daemon pushed and byte-verified server version 1_000_500
-        // for this path, so that seq is its observed proof-of-observation.
+        // for this path, so that seq is its ADOPTED proof-of-observation
+        // (byte-verified on this FS — the only provenance that arms the
+        // causal-preserve gate, Finding 1).
         const OBSERVED: i64 = 1_000_500;
-        bs.record(&wire, OBSERVED);
+        bs.record_adopted(&wire, OBSERVED);
         // The shadow holds a hash that is neither the local bytes nor the
         // incoming server bytes (a stale baseline - the ordinary state once the
         // file has been rewritten since the last recorded sync). That is exactly
@@ -4055,8 +4077,9 @@ mod tests {
         assert!(last_local.contains("nonce: trinity-1785615005"));
         assert!(conflict_copies(&dir).is_empty());
         // Nothing was recorded: the causal arm reads lineage, it never forges it
-        // (B1 hazard / R4 no-regression).
+        // (B1 hazard / R4 no-regression) — and the adopted provenance is intact.
         assert_eq!(bs.get(rel), Some(OBSERVED));
+        assert_eq!(bs.get_adopted(rel), Some(OBSERVED));
     }
 
     /// R2 (TKT-372e31b2): the causal arm is NOT a blanket local-wins. When the
@@ -4073,7 +4096,7 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let dir = target.parent().unwrap().to_path_buf();
 
-        bs.record(&wire, 500);
+        bs.record_adopted(&wire, 500);
         shadow.record(&wire, &sha256_hex("stale baseline"));
         let local = "---\ntitle: Test\n---\n\nmy divergent local revision\n";
         std::fs::write(&target, local).unwrap();
@@ -4095,6 +4118,63 @@ mod tests {
         assert!(std::fs::read_to_string(&target)
             .unwrap()
             .contains("a genuinely newer peer revision"));
+    }
+
+    /// Finding 1 (TKT-372e31b2, PR #11 review): the causal-preserve arm is
+    /// gated on ADOPTED provenance ONLY. An OBSERVED entry — what the verified
+    /// read-receipt (TKT-f74edf99) records on the 409 refetch path — proves we
+    /// SAW the server head, not that the local file ever held its bytes. This
+    /// reproduces the exact rebased-code hazard: the receipt records the head
+    /// seq and the SAME head is materialized immediately after, so
+    /// `incoming == observed`. A provenance-blind gate would preserve-local and
+    /// swallow the true conflict; the adopted-gated arm must stand down to the
+    /// always-stash floor (both byte-sets preserved).
+    ///
+    /// FAILS ON THE PROVENANCE-BLIND CODE: the causal arm returned
+    /// `Skipped(LocalEditPreserved)`, minting no stash and skipping the pull.
+    #[test]
+    fn causal_arm_ignores_receipt_observed_lineage_and_keeps_stash_floor() {
+        let (vaults, _ws, m, shadow, bs) = mk_with_stores(MaterializerMode::Live);
+        let rel = "01_Inbox/receipt-divergent.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        // A genuinely divergent local edit (never pushed) against a stale
+        // baseline: the R4 conflict triple.
+        shadow.record(&wire, &sha256_hex("stale baseline"));
+        let local = "---\ntitle: Test\n---\n\nmy divergent local revision\n";
+        std::fs::write(&target, local).unwrap();
+
+        // The push 409'd and the refetch recorded a VERIFIED READ-RECEIPT for
+        // the server head (seq 900) — observation, not adoption.
+        bs.record_observed(&wire, 900);
+        assert_eq!(bs.get(rel), Some(900), "wire declaration armed (PR #9)");
+        assert_eq!(bs.get_adopted(rel), None, "no adopted lineage");
+
+        // The same head is now materialized: incoming == observed == 900.
+        let mut server = payload(rel, "the server head named by the 409");
+        server.change_seq = Some(900);
+        let out = m.write_with_change_seq(&server, 900).unwrap();
+        match out {
+            MaterializeOutcome::Stashed { .. } => {}
+            other => panic!(
+                "an observed-only lineage must NOT enable preserve-local; expected the \
+                 always-stash floor (Stashed), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            conflict_copies(&dir).len(),
+            1,
+            "the true conflict keeps the always-stash floor"
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("the server head named by the 409"),
+            "the server head materialized to the canonical path"
+        );
     }
 
     /// R1 (TKT-372e31b2): when the shadow store loaded SCOPE-SUSPECT

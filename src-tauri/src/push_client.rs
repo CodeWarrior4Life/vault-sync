@@ -796,7 +796,9 @@ impl PushClient {
                                 // recording would violate R3 (converges via pull).
                                 (PushStatus::Accepted, _) => {
                                     if let Some(seq) = server_seq {
-                                        bs.record(&evt.path, seq);
+                                        // ADOPTED: the local FS holds exactly
+                                        // the accepted bytes (Finding 1).
+                                        bs.record_adopted(&evt.path, seq);
                                     }
                                 }
                                 _ => {}
@@ -943,14 +945,18 @@ impl PushClient {
     /// Why skipping is safe when they ARE identical (no silent loss, I-83 holds).
     /// The only thing that can destroy those bytes afterwards is the
     /// `refetch_and_merge_on_conflict` materialize below, and every branch of it
-    /// preserves them:
+    /// preserves them (re-verified against the v0.4.36 rewrite of that path —
+    /// receipt recording, TKT-f74edf99, writes stores, never the FS):
     ///
     /// | materializer decision | outcome for the bytes |
     /// | --- | --- |
     /// | `Conflict` (R4/R5) | stashes the CURRENT local bytes (== `pushed_bytes`) BEFORE overwriting |
-    /// | `PreserveLocalEdit` (R2, incl. the new causal arm) | no overwrite at all |
+    /// | `PreserveLocalEdit` (R2, incl. the causal arm) | no overwrite at all |
     /// | `PullClean` (R3) | local == last-synced shadow, so the bytes were never a local edit |
     /// | `Noop` / `AlignedToCanonical` (R1/D1) | content-identical by definition |
+    /// | `GuardPreserveLocalPushUp` (anti-strip ARM 1, TKT-989ad5f2) | local preserved + compensating push |
+    /// | `ShadowScopeSuspect` / `ConflictStormBreakerOpen` | whole write refused, local untouched |
+    /// | terminal 409+404 (R5 F-B3.3, TKT-989ad5f2) | no local write; stores cleared + CREATE re-enqueued, bytes stay at the canonical path |
     /// | no materializer wired, or the refetch failed | returns before any write |
     ///
     /// i.e. the overwrite-time stash inside the materializer is the real floor;
@@ -1118,7 +1124,9 @@ impl PushClient {
                 // and the error/other arms did not write, so both stay unobserved
                 // (fail-closed - the next push declares base_seq=null and refetches).
                 if let (Some(bs), Some(seq)) = (&self.base_seq_store, server_seq) {
-                    bs.record(path, seq);
+                    // ADOPTED: write_aligned_bytes byte-verified the canonical
+                    // bytes onto the local FS (Finding 1).
+                    bs.record_adopted(path, seq);
                 }
                 tracing::info!(
                     path,
@@ -1307,8 +1315,14 @@ impl PushClient {
                 }
                 // The verified receipt is the ONLY thing that authorises the
                 // wire baseline (R1). Recorded here, off the preserve branch.
+                // OBSERVED provenance (TKT-372e31b2 Finding 1): the receipt
+                // proves we SAW this server version, not that the local file
+                // ever held its bytes — so it feeds the wire declaration but
+                // must never enable the materializer's causal-preserve arm
+                // (which would otherwise see incoming == observed on the very
+                // merge this 409 triggers and swallow true conflicts).
                 if let Some(bs) = &self.base_seq_store {
-                    bs.record(path, seq);
+                    bs.record_observed(path, seq);
                 }
                 ReceiptOutcome::Recorded { seq }
             }
@@ -2936,7 +2950,8 @@ mod tests {
             id: "lazy-1".into(),
             path: "_sync/canary-trinity.md".into(),
             action: PushAction::Modify,
-            base_hash: None,
+            // Watcher events carry an unknown base (v0.4.36 PushBase shape).
+            base_hash: PushBase::Unknown,
             content_sha: sha256_hex(canary.as_bytes()),
             content_bytes: None,
             queued_at: chrono::Utc::now(),
@@ -3461,8 +3476,10 @@ mod tests {
 
         let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", body.as_bytes())]);
         let (client, _vault, bs, _shadow) = make_baseseq_client(&srv.url(), journal).await;
-        // Record a prior observation so the push declares it.
-        bs.record("01_Notes/x.md", 91);
+        // Record a prior observation so the push declares it. OBSERVED
+        // provenance deliberately: the wire declaration must be provenance-
+        // blind (a receipt-earned seq authorises the retry push — PR #9).
+        bs.record_observed("01_Notes/x.md", 91);
 
         let outcomes = client.drain_once().await;
         assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
@@ -3493,6 +3510,10 @@ mod tests {
         let outcomes = client.drain_once().await;
         assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
         assert_eq!(bs.get("01_Notes/c.md"), Some(4242)); // observed after (R3)
+
+        // Finding 1: an accepted push whose bytes are on the FS earns ADOPTED
+        // provenance (enables the causal-preserve arm for descendants).
+        assert_eq!(bs.get_adopted("01_Notes/c.md"), Some(4242));
     }
 
     /// R2 + R4: on a 409 (causal gate / CAS) the daemon REFETCHES the current
@@ -3704,6 +3725,15 @@ mod tests {
             Some(77),
             "baseline must be recovered from the verified receipt"
         );
+        // Finding 1 (TKT-372e31b2): the receipt-earned baseline is OBSERVED,
+        // not ADOPTED — it authorises the wire retry but must never arm the
+        // materializer's causal-preserve gate (the local file never held the
+        // server head's bytes).
+        assert_eq!(
+            bs.get_adopted("01_Notes/x.md"),
+            None,
+            "a receipt must not mint adopted (preserve-enabling) lineage"
+        );
         // ...and it was earned by a VERIFIED receipt bound to the body hash.
         let receipt = rr.get("01_Notes/x.md").expect("a verified receipt exists");
         assert_eq!(receipt.revision_seq, 77);
@@ -3797,6 +3827,8 @@ mod tests {
         let out = client.record_verified_receipt("01_Notes/g.md", &good, Some(&good.sha256));
         assert_eq!(out, ReceiptOutcome::Recorded { seq: 55 });
         assert_eq!(bs.get("01_Notes/g.md"), Some(55));
+        // Finding 1: receipt-earned => OBSERVED, never adopted.
+        assert_eq!(bs.get_adopted("01_Notes/g.md"), None);
         assert_eq!(rr.get("01_Notes/g.md").unwrap().revision_seq, 55);
 
         // Body whose bytes do not hash to the declared sha => refused.
