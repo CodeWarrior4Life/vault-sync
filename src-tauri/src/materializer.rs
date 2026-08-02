@@ -4113,10 +4113,7 @@ mod tests {
         let spath = sdir.path().join("shadow.json");
         // A store holding vault-prefixed keys, loaded with EMPTY vault_folders.
         let mut seed = std::collections::HashMap::new();
-        seed.insert(
-            format!("{VAULT}/01_Notes/other.md"),
-            "deadbeef".to_string(),
-        );
+        seed.insert(format!("{VAULT}/01_Notes/other.md"), "deadbeef".to_string());
         std::fs::write(&spath, serde_json::to_vec(&seed).unwrap()).unwrap();
         let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
         assert!(
@@ -4201,9 +4198,6 @@ mod tests {
         }
         // And the single stash holds the losing bytes verbatim.
         let forks = conflict_copies(&dir);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(&forks[0])).unwrap(),
-            local
-        );
+        assert_eq!(std::fs::read_to_string(dir.join(&forks[0])).unwrap(), local);
     }
 }
