@@ -327,6 +327,9 @@ pub enum PullResultClass {
 ///   until the watcher-enqueued push lands.
 /// * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
 ///   a compensating push; still divergent until it lands.
+/// * `ShadowScopeSuspect` (TKT-372e31b2) — the shadow store loaded scope-
+///   suspect, the whole write was refused; still divergent until the operator
+///   fixes `vault_name` and the daemon restarts.
 ///
 /// A `Wrote`/`Stashed`/`AlignedToCanonical` (incl. anti-strip ARM 2, which
 /// stashes then aligns local to server) and a benign in-sync/no-op Skipped
@@ -341,6 +344,7 @@ pub fn classify_pull_outcome(
         Ok(O::Skipped(S::ConflictStormBreakerOpen)) => PullResultClass::Deferred,
         Ok(O::Skipped(S::LocalEditPreserved)) => PullResultClass::Deferred,
         Ok(O::Skipped(S::GuardPreserveLocalPushUp { .. })) => PullResultClass::Deferred,
+        Ok(O::Skipped(S::ShadowScopeSuspect)) => PullResultClass::Deferred,
         Ok(_) => PullResultClass::Succeeded,
     }
 }
@@ -1867,6 +1871,13 @@ mod tests {
             }))),
             PullResultClass::Deferred,
             "the anti-strip ARM-1 preserve+push skip is still divergent (Deferred)"
+        );
+        // TKT-372e31b2 G2: a scope-suspect refusal is a NOT-converged outcome —
+        // Deferred (still divergent), never a silently Succeeded pull.
+        assert_eq!(
+            classify_pull_outcome(&Ok(O::Skipped(S::ShadowScopeSuspect))),
+            PullResultClass::Deferred,
+            "a scope-suspect refusal is still divergent (Deferred), never Succeeded"
         );
     }
 
