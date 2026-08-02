@@ -821,7 +821,13 @@ impl PushClient {
                     // failure is logged and the conflict still surfaces, but we
                     // never block on it. Only stash real content (a Delete carries
                     // none).
-                    if !content_bytes.is_empty() {
+                    // R1/R3 (TKT-372e31b2): stash ONLY when the stash would
+                    // actually preserve something. See
+                    // `stash_would_preserve_bytes` - the unconditional form was
+                    // the dominant false-conflict generator fleet-wide.
+                    if !content_bytes.is_empty()
+                        && self.stash_would_preserve_bytes(&evt.path, &content_bytes)
+                    {
                         self.stash_local_on_conflict(&evt.path, &content_bytes);
                     }
                     // R2/R4 (causal gate, TKT-166e1c07): under
@@ -911,6 +917,57 @@ impl PushClient {
     /// excluded from sync by name (D5) and surfaced in the tray count.
     /// Best-effort: any stash error is logged, never fatal (the conflict is
     /// still surfaced to the caller).
+    /// R1/R3 (TKT-372e31b2): would a `.conflict-from-*` stash of `pushed_bytes`
+    /// actually PRESERVE anything?
+    ///
+    /// The D4 pre-stash above used to be unconditional, and that made it the
+    /// dominant false-conflict generator in the fleet (16,086 forks measured
+    /// 2026-07-29; ~430 on link alone, all from one device uuid). The reason is
+    /// structural, not incidental:
+    ///
+    /// * file_watcher pushes are LAZY - it hashes the body but embeds nothing
+    ///   (`to_push_event`: `content_bytes: None`), so `process_event` reads the
+    ///   bytes off disk at DRAIN time.
+    /// * Therefore, on a 409, `pushed_bytes` is normally byte-for-byte the live
+    ///   canonical file. The "losing revision" we preserved was the winning
+    ///   revision, still sitting at its own path. The fork preserved nothing and
+    ///   the operator got one junk sibling per local-bytes-change - which for a
+    ///   nonce-per-rewrite file like `_sync/canary-<host>.md` is one per session.
+    /// * Field corroboration (2026-07-29 Convergence operation): "the 'losing'
+    ///   bytes stashed to `conflict-from-*` are byte-identical to local".
+    ///
+    /// So: stash iff the pushed bytes are NOT what the canonical path currently
+    /// holds (or the file is gone / unreadable, in which case the bytes exist
+    /// nowhere else and MUST be preserved - that is the genuine D4 case).
+    ///
+    /// Why skipping is safe when they ARE identical (no silent loss, I-83 holds).
+    /// The only thing that can destroy those bytes afterwards is the
+    /// `refetch_and_merge_on_conflict` materialize below, and every branch of it
+    /// preserves them:
+    ///
+    /// | materializer decision | outcome for the bytes |
+    /// | --- | --- |
+    /// | `Conflict` (R4/R5) | stashes the CURRENT local bytes (== `pushed_bytes`) BEFORE overwriting |
+    /// | `PreserveLocalEdit` (R2, incl. the new causal arm) | no overwrite at all |
+    /// | `PullClean` (R3) | local == last-synced shadow, so the bytes were never a local edit |
+    /// | `Noop` / `AlignedToCanonical` (R1/D1) | content-identical by definition |
+    /// | no materializer wired, or the refetch failed | returns before any write |
+    ///
+    /// i.e. the overwrite-time stash inside the materializer is the real floor;
+    /// this pre-stash is only needed for bytes that are NOT at their canonical
+    /// path, and that is exactly the condition tested here.
+    fn stash_would_preserve_bytes(&self, wire_path: &str, pushed_bytes: &[u8]) -> bool {
+        let abs = self.vault_root.join(forward_slash_to_path(wire_path));
+        match std::fs::read(&abs) {
+            // Identical to the live canonical file => a stash would duplicate
+            // the winner. Skip it.
+            Ok(on_disk) => on_disk != pushed_bytes,
+            // Missing / unreadable => these bytes may exist ONLY in the journal
+            // event. Preserve them (the genuine S511 D4 case).
+            Err(_) => true,
+        }
+    }
+
     fn stash_local_on_conflict(&self, wire_path: &str, local_bytes: &[u8]) {
         let stasher = crate::conflict_stash::ConflictStash::new(
             self.vault_root.clone(),
@@ -2838,6 +2895,120 @@ mod tests {
             stashed, body,
             "stash must hold the exact local bytes pushed"
         );
+    }
+
+    /// R1 + R3 (TKT-372e31b2): the dominant false-conflict generator.
+    ///
+    /// file_watcher pushes are LAZY, so on a 409 the bytes we tried to push are
+    /// byte-for-byte the live canonical file. The old code stashed them anyway -
+    /// one junk `.conflict-from-*` sibling per local-bytes-change, which for a
+    /// single-writer nonce-per-rewrite file like `_sync/canary-<host>.md` is one
+    /// per session-init. That is the R1 violation and the 16,086-fork fleet-wide
+    /// count. Requirement: ZERO forks when the stash would preserve nothing, and
+    /// the bytes must still be on disk afterwards (nothing lost).
+    ///
+    /// FAILS ON THE OLD CODE: `stash_local_on_conflict` was called
+    /// unconditionally, so this asserted-empty directory held one fork.
+    #[tokio::test]
+    async fn causal_409_does_not_fork_when_pushed_bytes_are_the_canonical_file() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path().join("_sync");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The single-writer canary, as it sits on disk right now.
+        let canary = "---\ntype: sync-canary\nhost: trinity\n---\nnonce: trinity-1785615447\n";
+        let target = dir.join("canary-trinity.md");
+        std::fs::write(&target, canary).unwrap();
+
+        // The causal gate fail-closes on unknown lineage (base_seq=None) -> 409.
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv_hash"}"#)
+            .create_async()
+            .await;
+
+        // A LAZY event, exactly as file_watcher emits it: content_bytes = None,
+        // so process_event reads the canonical file at drain time.
+        let lazy = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: "lazy-1".into(),
+            path: "_sync/canary-trinity.md".into(),
+            action: PushAction::Modify,
+            base_hash: None,
+            content_sha: sha256_hex(canary.as_bytes()),
+            content_bytes: None,
+            queued_at: chrono::Utc::now(),
+            device_id: "dev-test".into(),
+        };
+        let (_d, journal) = make_journal_with(vec![lazy]);
+        let client =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf()).await;
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+        ));
+
+        let forks: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".conflict-from-"))
+            .collect();
+        assert!(
+            forks.is_empty(),
+            "a 409 whose pushed bytes ARE the canonical file must mint no fork, found {forks:?}"
+        );
+        // Nothing was lost: the bytes are still where they always were.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), canary);
+    }
+
+    /// The other half of the same guard: when the pushed bytes are NOT at the
+    /// canonical path (the file changed or vanished since drain), they exist
+    /// nowhere else and MUST still be preserved. This is the genuine S511 D4
+    /// case and it keeps working.
+    #[tokio::test]
+    async fn cas_409_still_stashes_when_bytes_are_not_the_canonical_file() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path().join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The canonical file now holds DIFFERENT bytes than the event carries.
+        std::fs::write(dir.join("raced.md"), b"the file moved on since drain").unwrap();
+
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv_hash"}"#)
+            .create_async()
+            .await;
+
+        let body = b"bytes that exist ONLY in the journal event";
+        let (_d, journal) = make_journal_with(vec![evt("notes/raced.md", body)]);
+        let client =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf()).await;
+
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+        ));
+
+        let forks: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".conflict-from-"))
+            .collect();
+        assert_eq!(
+            forks.len(),
+            1,
+            "bytes not at their canonical path must still be preserved, got {forks:?}"
+        );
+        assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), body);
     }
 
     #[tokio::test]
