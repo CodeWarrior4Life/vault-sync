@@ -109,4 +109,311 @@ diagnosed in the spec anchor. Reporting only, per the ticket's park gate:
 
 ## PART 2: FIX
 
-(filled in after implementation)
+Three targeted changes. Every one **fails closed to the pre-existing behavior** when its
+evidence is absent, so a pre-R7b server, an unobserved note, or a readable shadow store all
+behave exactly as before. Commit `20b33f4` (+ `0fb98fe` fmt).
+
+### Fix 1 - causal gate before the stash (R1 + R2). `materializer.rs:778-848`
+
+New first arm of `Decision::Conflict`, before the storm breaker and before any stash:
+
+```rust
+let causally_not_newer = match (&self.base_seq_store, payload.change_seq) {   // :830
+    (Some(bs), Some(incoming)) => bs
+        .get(&payload.path)
+        .is_some_and(|observed| incoming <= observed),
+    _ => false,
+};
+if causally_not_newer {                                                       // :836
+    warn!(...);
+    return Ok(MaterializeOutcome::Skipped(SkipReason::LocalEditPreserved));
+}
+```
+
+`decide()` is content-relational only: it sees that local and server both differ from the
+last-synced shadow and calls every such pair a conflict. It cannot see which side is
+causally newer. The R7b proof-of-observation store shipped in TKT-166e1c07 is exactly the
+missing input: `payload.change_seq` is the server's version token for the bytes we are
+being asked to write, and `base_seq_store.get(path)` is the newest token this daemon
+byte-verified for that path. `incoming <= observed` therefore proves the incoming version
+is one we already materialized, so the local bytes (which differ from it, else R1 `Noop`
+would have caught them) are a **later local write** - the racing write. Resolution:
+preserve local, write nothing, stash nothing.
+
+R2's "the local write must still reach the server" is then satisfied **structurally**: the
+newer bytes stay at the canonical path, and the pending push is lazy
+(`push_client.rs:566-591` reads the file at drain time), so it POSTs them. The old code
+overwrote the canonical path first, which is precisely why the pending push re-read server
+bytes and pushed nothing.
+
+Deliberate non-actions: it **reads** lineage and never records any, so it cannot forge a
+baseline (the B1 hazard) and it does not pre-empt the owner-gated R6 conflict-policy
+ruling. No token on either side => no causal evidence => falls through unchanged.
+
+### Fix 2 - scope-suspect shadow mints no fork (R1). `materializer.rs:850-874`
+
+```rust
+if shadow.is_none()
+    && self.shadow_store.as_ref().is_some_and(|s| s.vault_scope_suspect())   // :861
+{
+    warn!(...);
+    return Ok(MaterializeOutcome::Skipped(SkipReason::ShadowScopeSuspect));
+}
+```
+
+"Shadow absent" is R5's unknown-provenance signal only when the store is *readable*. When
+it loaded `vault_scope_suspect` (`vault_folders` empty while the store holds
+vault-prefixed keys, `sync_shadow.rs:102-115`, the 2026-07-18 trinity incident) every
+lookup mis-keys and misses, so R5 fires vault-wide and **every** fork it mints is false by
+construction. The push leg already parks wholesale on this state (`lib.rs:873`,
+`push_client.rs:369`), so continuing to mint pull-side forks while no push can leave the
+host was incoherent as well as wrong. We refuse the whole write: local untouched, no
+stash, no overwrite. New `SkipReason::ShadowScopeSuspect` (`materializer.rs:113-132`).
+
+Deliberately narrow: it does **not** touch the general R5 policy, which the S514 revert
+note (`materializer.rs:1243-1249` pre-fix numbering) and the owner-gated R6 ruling both
+reserve.
+
+### Fix 3 - stash only when the stash preserves something (R1 + R3). `push_client.rs:788-795`, `:875-928`
+
+```rust
+if !content_bytes.is_empty()
+    && self.stash_would_preserve_bytes(&evt.path, &content_bytes)   // :793
+{
+    self.stash_local_on_conflict(&evt.path, &content_bytes);
+}
+```
+
+```rust
+fn stash_would_preserve_bytes(&self, wire_path: &str, pushed_bytes: &[u8]) -> bool {  // :915
+    let abs = self.vault_root.join(forward_slash_to_path(wire_path));
+    match std::fs::read(&abs) {
+        Ok(on_disk) => on_disk != pushed_bytes,   // identical to the live file => no-op fork
+        Err(_) => true,                           // bytes exist nowhere else => genuine D4
+    }
+}
+```
+
+This is the dominant generator. Because file_watcher pushes are lazy, on a 409 the pushed
+bytes are normally byte-for-byte the live canonical file, so the "losing revision" we
+preserved was the winning revision still sitting at its own path. One junk sibling per
+local-bytes-change; for a nonce-per-rewrite file, one per session-init.
+
+Safety argument (no silent loss, I-83 holds). The only thing that can destroy those bytes
+afterwards is the `refetch_and_merge_on_conflict` materialize, and every branch preserves
+them - table in the doc comment at `push_client.rs:895-911`: `Conflict` stashes the current
+local bytes before overwriting; `PreserveLocalEdit` (including the new Fix 1 arm) does not
+overwrite; `PullClean` means local was never a local edit; `Noop`/`AlignedToCanonical` are
+content-identical; and no-materializer / failed-refetch return before any write. The
+overwrite-time stash inside the materializer is the real floor; this pre-stash is only
+needed for bytes **not** at their canonical path, which is exactly what the guard tests.
+
+### What this does NOT change (scope discipline)
+
+* `decide()` itself is untouched - the R1-R5 truth table is byte-identical.
+* The always-stash floor for genuine divergence is untouched (proved by
+  `causal_arm_does_not_suppress_a_genuinely_newer_server_version`).
+* No recording site added, moved, or reordered => R4 no-regression.
+* `conflict_stash.rs` untouched.
+* No version bump, no build, no deploy, no cross-repo edit, no fork deletion.
+
+---
+
+## PART 3: REGRESSION TESTS
+
+| Test | file:line | Requirement | Fails on old code? |
+| --- | --- | --- | --- |
+| `r1_single_writer_rapid_rewrite_race_mints_zero_conflict_copies` | materializer.rs:3202 | **R1 + R2 + R5 (deliverable a)** | **YES** |
+| `r1_scope_suspect_shadow_mints_no_conflict_copy` | materializer.rs:3311 | R1 | **YES** |
+| `causal_409_does_not_fork_when_pushed_bytes_are_the_canonical_file` | push_client.rs:2679 | **R1 + R3 (deliverable b)** | **YES** |
+| `causal_arm_does_not_suppress_a_genuinely_newer_server_version` | materializer.rs:3269 | R2 counter-guard (true divergence still stashes) | No (guard) |
+| `cas_409_still_stashes_when_bytes_are_not_the_canonical_file` | push_client.rs:2740 | No-silent-loss guard for Fix 3 | No (guard) |
+| `r3_repeated_sweeps_with_identical_content_keep_exactly_one_stash` | materializer.rs:3364 | R3 idempotency under re-sweep | No (already held) |
+
+The R5 deliverable test drives **five rapid successive rewrites** of `_sync/canary-trinity.md`,
+each racing an in-flight materialization of the same path, and asserts after **every** one:
+outcome is `Skipped(LocalEditPreserved)`, the conflict-copy count is zero, and the racing
+bytes are still at the canonical path (which is what the lazy push reads). The final
+assertion pins the newest nonce as the content a push would carry up.
+
+### Proof the tests fail on the old code
+
+Production hunks reverted (tests kept verbatim), same container, real output:
+
+```
+---- materializer::tests::r1_single_writer_rapid_rewrite_race_mints_zero_conflict_copies stdout ----
+assertion `left == right` failed: rewrite 1: a not-newer server version must resolve to
+preserve-local, got Stashed { stash_path:
+".../Mainframe/_sync/canary-trinity.conflict-from-morpheus-1003646077.md" }
+  left: Stashed { stash_path: ".../canary-trinity.conflict-from-morpheus-1003646077.md" }
+ right: Skipped(LocalEditPreserved)
+
+---- materializer::tests::r1_scope_suspect_shadow_mints_no_conflict_copy stdout ----
+assertion `left == right` failed: a scope-suspect shadow must refuse the write, not mint a fork
+  left: Stashed { stash_path: ".../Mainframe/_sync/canary-link.conflict-from-morpheus-1003627563.md" }
+ right: Skipped(ShadowScopeSuspect)
+
+---- push_client::tests::causal_409_does_not_fork_when_pushed_bytes_are_the_canonical_file ----
+a 409 whose pushed bytes ARE the canonical file must mint no fork, found
+["canary-trinity.conflict-from-dev-test-0.md"]
+
+test result: FAILED. 458 passed; 4 failed; 3 ignored
+```
+
+Note the shapes the old code produced: `canary-trinity.conflict-from-<device>-1003646077.md`
+reproduces the live G2 artifact in `_sync/`, and `canary-trinity.conflict-from-dev-test-0.md`
+reproduces the **lsn-0** R1 evidence artifact from the ticket. The reverted-hunk run also
+carries the one pre-existing failure described below.
+
+---
+
+## PART 4: VERIFICATION OUTPUT (real, pasted)
+
+Host is immutable Bazzite with no native cargo, so everything ran in the pinned
+`localhost/vsync-ci` container. **`--userns=keep-id` matters**: as root, the
+pre-existing test `test_ack_materialize_failed_rewrite_leaves_shadow_stale` fails because
+its fixture makes a directory `0o555` and root bypasses directory permissions. Under a
+non-root uid the suite is fully green. That failure is **inherited, not caused by this
+burn** - proved by `git stash`ing all changes and running the single test at the base
+commit c7853bc, where it fails identically.
+
+### `cargo test --manifest-path src-tauri/Cargo.toml`
+
+```
+$ podman run --rm --userns=keep-id -v .:/w:z -w /w -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
+    localhost/vsync-ci bash -c 'export PATH=/usr/local/cargo/bin:$PATH; \
+    cargo test --manifest-path src-tauri/Cargo.toml'
+
+   Compiling vault-sync-daemon v0.4.33 (/w/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s)
+     Running unittests src/lib.rs
+
+running 465 tests
+...
+test conflict_stash::tests::write_stash_idempotent_for_identical_content ... ok
+test materializer::tests::decide_truth_table_r1_to_r5 ... ok
+test materializer::tests::guard_downgrades_frontmatter_stripping_pulls ... ok
+test materializer::tests::b1_shadow_mode_write_does_not_record_baseline ... ok
+test materializer::tests::conflict_storm_breaker_caps_mints ... ok
+test materializer::tests::causal_arm_does_not_suppress_a_genuinely_newer_server_version ... ok
+test materializer::tests::integrity_failed_write_does_not_record_shadow ... ok
+test materializer::tests::r1_scope_suspect_shadow_mints_no_conflict_copy ... ok
+test materializer::tests::r2_local_edit_is_preserved_not_overwritten ... ok
+test materializer::tests::r1_single_writer_rapid_rewrite_race_mints_zero_conflict_copies ... ok
+test materializer::tests::records_observed_base_seq_only_from_server_change_seq ... ok
+test materializer::tests::r3_clean_pull_no_stash ... ok
+test materializer::tests::r3_repeated_sweeps_with_identical_content_keep_exactly_one_stash ... ok
+test push_client::tests::cas_409_stashes_local_bytes_before_ack ... ok
+test push_client::tests::cas_409_still_stashes_when_bytes_are_not_the_canonical_file ... ok
+test push_client::tests::causal_409_does_not_fork_when_pushed_bytes_are_the_canonical_file ... ok
+
+test result: ok. 462 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 5.04s
+
+     (integration suites)
+test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok.  7 passed; 0 failed; 0 ignored
+test result: ok.  7 passed; 0 failed; 0 ignored
+test result: ok.  2 passed; 0 failed; 0 ignored
+test result: ok.  3 passed; 0 failed; 0 ignored
+test result: ok.  3 passed; 0 failed; 0 ignored
+test result: ok.  7 passed; 0 failed; 0 ignored
+test result: ok.  4 passed; 0 failed; 0 ignored
+test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok.  4 passed; 0 failed; 2 ignored
+test result: ok.  0 passed; 0 failed; 0 ignored
+```
+
+**Totals: 462 lib tests + 63 integration tests pass, 0 failed, 5 ignored.**
+
+### `cargo clippy --all-targets -- -D warnings`
+
+```
+$ podman run --rm -v .:/w:z -w /w -e CARGO_HOME=/usr/local/cargo localhost/vsync-ci \
+    bash -c 'export PATH=/usr/local/cargo/bin:$PATH; \
+    cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings'
+
+   Compiling vault-sync-daemon v0.4.33 (/w/src-tauri)
+    Checking tauri-plugin-single-instance v2.4.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 42.20s
+```
+
+Zero warnings, zero errors.
+
+### `cargo fmt -- --check`
+
+```
+$ ... cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+FMT CLEAN
+```
+
+### `cargo build`
+
+```
+   Compiling vault-sync-daemon v0.4.33 (/w/src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 03s
+```
+
+`src-tauri/Cargo.lock` moved `vault-sync-daemon 0.4.32 -> 0.4.33` on first build: a
+mechanical catch-up to the `Cargo.toml` version the previous burn already set. **This burn
+performed no version bump.**
+
+---
+
+## ACCEPTANCE CHECKLIST
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| BURN_REPORT.md review table complete, R1..R5 each with file:line evidence | **DONE** | Part 1 review table; every cell carries `file:line @ c7853bc` |
+| Root cause of the sideline race named at file:line | **DONE** | `push_client.rs:788-790` -> `:870-891` (G1, the lsn-0 R1 artifact) and `materializer.rs:1250-1252` + `:761-826` (G2, the live `_sync/` forks). Forensic attribution by stash filename lsn + device uuid |
+| Fix + regression tests on the burn branch | **DONE** | `20b33f4`, `0fb98fe` on `whetstone/opfix-vaultsync-conflict-generator` |
+| cargo test output pasted green | **DONE** | Part 4: 462 + 63 pass, 0 failed. Pre-existing root-only fixture failure diagnosed and proved inherited |
+| No push, no merge, no deploy, no cross-repo edits | **HELD** | Three local commits only; no `git push`; Nexus repo read for contract facts, never edited; no build artifacts distributed |
+| Parked awaiting-owner with the exact owner actions listed | **DONE** | Below |
+| Single-writer files never produce conflict copies | **DONE for both confirmed generators**; one residual class is owner-gated | Fixes 1-3 + tests. Residual: the general R5 shadow-absent case (see Open decisions #1) |
+| A racing local write still reaches the server | **DONE (structurally)** | Fix 1 leaves the newer bytes at the canonical path; the lazy push re-reads them at drain time. Asserted per-rewrite in `r1_single_writer_rapid_rewrite_race_mints_zero_conflict_copies` |
+| Stash reserved for true multi-writer divergence | **DONE for the paths fixed** | `causal_arm_does_not_suppress_a_genuinely_newer_server_version` + `cas_409_still_stashes_when_bytes_are_not_the_canonical_file` pin that true divergence still stashes |
+
+### Honest limits of this fix
+
+1. **The general R5 case is NOT fixed and must not be, by me.** When the shadow is absent
+   for an ordinary reason (D9 left a `drift` path unseeded, `reconciliation.rs:252-254`)
+   and no observed base_seq exists either, the daemon has no local evidence at all and the
+   always-stash floor stands. Narrowing that is the **R6 conflict-policy ruling** already
+   parked on the operator (Operation log lines 205, 285). A global flip was tried and
+   reverted once (S514, TKT-d1a41f94).
+2. **The 409 fixed point still exists.** Fix 3 stops the *forks*; it does not make a
+   `base_seq=None` push succeed. That needs the server-side `current_seq`-in-409 change
+   (Operation log line 309a) - reported, not touched.
+3. **Verified by unit test, not on the fleet.** No daemon was built or installed, so the
+   end-to-end canary behavior on trinity/link/icarus is unverified by construction. That is
+   the first owner gate.
+
+### Open decisions flagged for the owner
+
+1. **R6 conflict-policy ruling** (materialized-vs-read): does an unknown-provenance local
+   copy lose to the server, or is it preserved? Blocks narrowing the general R5 case
+   (limit 1 above). Already parked; this burn did not pre-empt it.
+2. **Server-side `current_seq` in the 409 body** (Nexus, ~3 lines, `sync_routes_p1.py:1569`
+   per the Operation log). Root fix for the deadlock that drives G1. Cross-repo: reported
+   only.
+3. **F3 / base_seq on the PreserveLocalEdit path.** `materializer.rs` returns before the
+   base_seq record, so a preserved local edit never acquires lineage. Fixing it requires
+   the #1 ruling, since recording a seq for bytes we did not materialize breaks
+   proof-of-observation.
+4. **Pre-existing red test under root.** `test_ack_materialize_failed_rewrite_leaves_shadow_stale`
+   fails when the suite runs as uid 0 (its `0o555` fixture is a no-op for root). Suggest
+   either gating it on `uid != 0` or documenting `--userns=keep-id` as the required CI
+   invocation. Inherited from TKT-166e1c07, left alone here.
+
+---
+
+## PARK: AWAITING OWNER
+
+**Ticket state: awaiting-owner.**
+
+**Owner action:** approve and perform the gated steps - (1) version bump + release build of
+the Tauri daemon, (2) distribute/install to trinity (LaunchAgent), link and icarus (systemd
+units), (3) decide the Nexus server-side `current_seq`-in-409 change reported above (the
+review concludes the defect is partly server-side; no cross-repo edit was made), and (4)
+delete the existing `.conflict-from-*` copies in `_sync/` as post-fix operator cleanup.
+
