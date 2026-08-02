@@ -519,6 +519,17 @@ impl PushClient {
             if !out.is_empty() || pending_after == 0 {
                 health.mark_progress();
             }
+            // RC-1 client half (TKT-a38b7c26): stamp the WALL-CLOCK last_sync
+            // only when the server actually took bytes this tick (Accepted =>
+            // Sent, or Merged). Skips/failures/idle-catch-up are NOT a sync, so
+            // the registry heartbeat never reports a fake `last_sync`. This is
+            // the honest "last time this subscriber pushed a change upstream".
+            let synced = out.iter().any(|(_, o)| {
+                matches!(o, PushOutcome::Sent { .. } | PushOutcome::Merged { .. })
+            });
+            if synced {
+                health.mark_synced_now();
+            }
         }
         out
     }
@@ -3847,6 +3858,119 @@ mod tests {
         assert_eq!(out, ReceiptOutcome::VerifyFailed);
         assert_eq!(bs.get("01_Notes/b.md"), None, "no baseline from a bad body");
         assert!(rr.get("01_Notes/b.md").is_none());
+    }
+
+    /// RC-2 acceptance (TKT-a38b7c26, Deliverable 3a): the STUCK-NOTE class is
+    /// broken end-to-end. A divergent, baseline-absent note 409s on its first
+    /// push (base_seq declared `null`); the 409 handler refetches, byte-verifies,
+    /// and records the server's observed base_seq WITHOUT overwriting the local
+    /// edit. Then a FRESH local edit is pushed: because the note now carries a
+    /// real baseline, the second push DECLARES `base_seq:77` and the server
+    /// ACCEPTS it -- proving the note no longer 409s forever (the RC-2 eternal
+    /// CONFLICT). The two push mocks are keyed on the declared base_seq, so a
+    /// green run PROVES the second push carried the recovered baseline on the
+    /// wire, not `null` again.
+    #[tokio::test]
+    async fn stuck_note_recovers_second_push_accepted_after_409() {
+        let mut srv = Server::new_async().await;
+        let server_body = "line A\nline B\n";
+        let server_sha = sha256_hex(server_body.as_bytes());
+
+        // Push #1: unknown lineage on the wire (`base_seq:null`) => causal-gate
+        // 409 naming the real head hash. Exactly one such push.
+        let push_conflict = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::Regex(r#""base_seq":null"#.into()))
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{server_sha}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+        // The refetch source the 409 handler pulls (change_seq 77, enriched).
+        let note = serde_json::json!({
+            "path": "01_Notes/x.md",
+            "frontmatter": {},
+            "body": server_body,
+            "sha256": server_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 77,
+            "enriched_body": server_body,
+        })
+        .to_string();
+        let note_mock = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+        // Push #2: the recovered baseline is DECLARED (`base_seq:77`) and the
+        // server ACCEPTS (returns a new observed seq). No server_hash => the
+        // accept records the seq via the non-align branch (no re-materialize).
+        let push_accept = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::Regex(r#""base_seq":77"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"accepted","seq":1,"content_hash":null,"server_hash":null,"server_seq":78,"merged_content":null,"message":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Round 1: the divergent local edit (known ancestry: shadow == head).
+        let local_v1: &[u8] = b"line A\nline B\nlocal extra\n";
+        let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", local_v1)]);
+        let (client, vault, bs, shadow, _rr) =
+            make_receipt_client(&srv.url(), journal.clone()).await;
+        shadow.record("01_Notes/x.md", &server_sha);
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join("01_Notes/x.md"), local_v1).unwrap();
+        assert_eq!(bs.get("01_Notes/x.md"), None, "starts baseline-absent (stuck)");
+
+        let out1 = client.drain_once().await;
+        assert!(
+            matches!(
+                out1[0].1,
+                PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+            ),
+            "first push 409s (stuck state), got {:?}",
+            out1[0].1
+        );
+        assert_eq!(
+            bs.get("01_Notes/x.md"),
+            Some(77),
+            "the 409 handler recorded the verified server base_seq (unstick)"
+        );
+
+        // Round 2: a FRESH local edit on the same note. It must now push with
+        // the recovered baseline and be ACCEPTED -- the note is no longer stuck.
+        let local_v2: &[u8] = b"line A\nline B\nlocal extra\nand more\n";
+        journal
+            .lock()
+            .await
+            .append(evt("01_Notes/x.md", local_v2))
+            .unwrap();
+        std::fs::write(vault.path().join("01_Notes/x.md"), local_v2).unwrap();
+
+        let out2 = client.drain_once().await;
+        assert!(
+            matches!(out2[0].1, PushOutcome::Sent { .. }),
+            "second push must be ACCEPTED (no eternal CONFLICT), got {:?}",
+            out2[0].1
+        );
+        // The accept advanced the observed baseline to the server's new seq.
+        assert_eq!(
+            bs.get("01_Notes/x.md"),
+            Some(78),
+            "accepted push records the fresh observed base_seq"
+        );
+
+        push_conflict.assert_async().await; // exactly one 409 push (no blind retry)
+        note_mock.assert_async().await; // the refetch happened
+        push_accept.assert_async().await; // the second push was accepted
     }
 
     /// R7: a push client backed by a shadow store in the suspect state

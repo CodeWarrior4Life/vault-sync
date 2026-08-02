@@ -55,9 +55,9 @@
 //! Both env vars share the same reader trait as [`crate::reconciliation`]
 //! so tests do not touch process env.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::reconciliation::EnvReader;
 
@@ -97,6 +97,15 @@ pub struct SyncHealth {
     /// True once `mark_watcher_alive` has ever been called, so the watchdog's
     /// staleness check does not fire during the pre-watch startup window.
     watcher_started: AtomicBool,
+    /// RC-1 client half (TKT-a38b7c26): WALL-CLOCK unix seconds of the last
+    /// time an upstream sync actually landed (a push the server Accepted or
+    /// Merged). Unlike the monotonic `last_progress_secs` above (which drives
+    /// the stall watchdog and also stamps on idle catch-up), this is a real
+    /// timestamp the subscriber-registry heartbeat reports as `last_sync` so
+    /// the server row reflects genuine sync activity, never process-relative
+    /// seconds. `0` = no sync has landed since this process started (the
+    /// heartbeat then omits `last_sync` rather than reporting a fake time).
+    last_sync_epoch: AtomicI64,
     start: Instant,
 }
 
@@ -108,6 +117,9 @@ impl SyncHealth {
             last_watcher_alive_secs: AtomicU64::new(0),
             watcher_fenced: AtomicBool::new(false),
             watcher_started: AtomicBool::new(false),
+            // 0 = "no upstream sync landed yet this process". The heartbeat
+            // reports last_sync only once this becomes non-zero.
+            last_sync_epoch: AtomicI64::new(0),
             start: Instant::now(),
         })
     }
@@ -158,6 +170,36 @@ impl SyncHealth {
     /// D7 (S511): true iff the watcher storm-fence has tripped.
     pub fn is_watcher_fenced(&self) -> bool {
         self.watcher_fenced.load(Ordering::Relaxed)
+    }
+
+    /// RC-1 client half (TKT-a38b7c26): stamp the wall-clock time at which an
+    /// upstream sync actually landed. `epoch_secs` is unix seconds. Pure
+    /// setter (no clock read) so tests can drive it deterministically; the
+    /// `mark_synced_now` wrapper supplies the real clock in production.
+    pub fn mark_synced_at(&self, epoch_secs: i64) {
+        self.last_sync_epoch.store(epoch_secs, Ordering::Relaxed);
+    }
+
+    /// RC-1 client half: stamp "an upstream sync just landed" using the real
+    /// wall clock. Called from the push drain only when the server actually
+    /// Accepted/Merged at least one event this tick (a genuine sync), never on
+    /// idle catch-up. A clock reading before UNIX_EPOCH (impossible in
+    /// practice) degrades to a no-op rather than storing a negative stamp.
+    pub fn mark_synced_now(&self) {
+        if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            self.mark_synced_at(d.as_secs() as i64);
+        }
+    }
+
+    /// RC-1 client half: the wall-clock unix seconds of the last landed
+    /// upstream sync, or `None` if none has landed since process start. The
+    /// heartbeat reports this as `last_sync`; `None` means the field is
+    /// omitted rather than reported as a fabricated time.
+    pub fn last_sync_epoch(&self) -> Option<i64> {
+        match self.last_sync_epoch.load(Ordering::Relaxed) {
+            0 => None,
+            e => Some(e),
+        }
     }
 }
 
@@ -516,6 +558,25 @@ mod tests {
         );
         h.set_watcher_fenced();
         assert!(h.is_watcher_fenced());
+    }
+
+    /// RC-1 client half (TKT-a38b7c26): last_sync starts absent (never a fake
+    /// time), records a real wall-clock stamp, and reads it back. This is the
+    /// value the subscriber-registry heartbeat reports as `last_sync`.
+    #[test]
+    fn sync_health_last_sync_epoch_absent_until_stamped() {
+        let h = SyncHealth::new();
+        // No sync landed yet => None (heartbeat omits last_sync, never fakes it).
+        assert_eq!(h.last_sync_epoch(), None);
+        // Deterministic pure setter (no clock) for the round-trip assertion.
+        h.mark_synced_at(1_785_000_000);
+        assert_eq!(h.last_sync_epoch(), Some(1_785_000_000));
+        // The real-clock wrapper lands a plausible, positive, non-zero stamp.
+        h.mark_synced_now();
+        assert!(
+            h.last_sync_epoch().is_some_and(|e| e > 1_700_000_000),
+            "mark_synced_now stamps a real unix timestamp"
+        );
     }
 
     // ------------- SyncHealth state-machine tests -------------
