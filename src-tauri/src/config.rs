@@ -76,9 +76,13 @@ pub struct Config {
     /// present in the on-disk file, the deserializer accepts the legacy
     /// field via the alias below.
     ///
-    /// Legacy `vault_name` field (v0.2.0 – v0.3.6) is silently ignored on
-    /// load — serde tolerates unknown TOML keys by default, so existing
-    /// configs continue to deserialize without manual migration.
+    /// Legacy `vault_name` field (v0.2.0 – v0.3.6) is NOT modelled here —
+    /// it is parsed by `RawConfig` and consumed by `from_toml_back_compat`
+    /// to synthesise `sync_roots`. Because `Config` cannot represent it,
+    /// serializing a `Config` over a user's config file DROPS `vault_name`
+    /// (and any other unmodelled key) — the root cause of the P0 2026-08-05
+    /// echo loop. Rewrites of the on-disk file must therefore go through
+    /// `apply_enrollment` (untyped `toml::Table` merge), never `save_to`.
     ///
     /// TODO(B2): once the watch loop is rewired to iterate `sync_roots`,
     /// `vaults_root` can be removed and `sync_roots[0].path` used instead.
@@ -155,6 +159,12 @@ impl Config {
         Self::from_toml_back_compat(&s)
     }
 
+    /// Serialize ONLY the typed fields of `Config` to `path`.
+    ///
+    /// WARNING (P0 2026-08-05): this drops every key `Config` does not
+    /// model — `vault_name`, unknown/future fields. Never use it to rewrite
+    /// a user's existing on-disk config; enrollment goes through
+    /// `apply_enrollment`, which merges into the existing file.
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -163,6 +173,77 @@ impl Config {
         fs::write(path, s)?;
         Ok(())
     }
+}
+
+/// The fields the enrollment (pairing) flow OWNS on the on-disk config.
+///
+/// Invariant (P0 2026-08-05): enrollment may only ADD or UPDATE the fields
+/// listed here (plus the `last_event_id` cursor it also owns); it must never
+/// remove or alter anything else in the file — in particular `vault_name`,
+/// `[[sync_roots]]`, and any unknown/future keys must survive a re-pair.
+#[derive(Debug, Clone)]
+pub struct EnrollmentFields {
+    pub nexus_url: String,
+    pub subscriber_id: String,
+    pub vaults_root: PathBuf,
+    pub daemon_version: String,
+    pub daemon_platform: String,
+}
+
+/// Merge the enrollment-owned fields into the on-disk config file,
+/// preserving every other key verbatim (`vault_name`, `[[sync_roots]]`,
+/// unknown/future fields).
+///
+/// The previous implementation constructed a typed `Config` and serialized
+/// it over the file. `Config` has no `vault_name` field, so every
+/// enroll/re-enroll silently dropped it; root-synthesis rule 2b then rooted
+/// the daemon at `vaults_root` itself, mis-keying every path (P0 2026-08-05
+/// echo loop). This path goes through an untyped `toml::Table` instead, so
+/// the save is structurally incapable of touching keys enrollment does not
+/// own.
+pub fn apply_enrollment(path: &Path, fields: &EnrollmentFields) -> Result<(), ConfigError> {
+    let mut table: toml::Table = match fs::read_to_string(path) {
+        Ok(s) => toml::from_str(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+
+    // Re-enrolling under a DIFFERENT subscriber invalidates the (legacy,
+    // in-config) SSE cursor; a same-subscriber re-pair keeps it so resume
+    // semantics are unchanged. The live cursor is the per-subscriber
+    // `last_event_id` sidecar file (lib.rs), which re-scopes itself by
+    // subscriber_id automatically.
+    let same_subscriber =
+        table.get("subscriber_id").and_then(|v| v.as_str()) == Some(fields.subscriber_id.as_str());
+    if !same_subscriber {
+        table.remove("last_event_id");
+    }
+
+    // `vaults_root` supersedes the legacy `vault_root` alias; leaving both
+    // keys in the file would make the next load fail as a duplicate field.
+    table.remove("vault_root");
+
+    table.insert("nexus_url".into(), fields.nexus_url.clone().into());
+    table.insert("subscriber_id".into(), fields.subscriber_id.clone().into());
+    table.insert(
+        "vaults_root".into(),
+        fields.vaults_root.to_string_lossy().into_owned().into(),
+    );
+    table.insert(
+        "daemon_version".into(),
+        fields.daemon_version.clone().into(),
+    );
+    table.insert(
+        "daemon_platform".into(),
+        fields.daemon_platform.clone().into(),
+    );
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let s = toml::to_string_pretty(&table)?;
+    fs::write(path, s)?;
+    Ok(())
 }
 
 /// Returns the OS-appropriate config path:

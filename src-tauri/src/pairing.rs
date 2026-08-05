@@ -1,5 +1,7 @@
 use crate::api_client::{ApiClient, ApiError, HealthSnapshot};
-use crate::config::{default_config_path, Config, ConfigError};
+use crate::config::{
+    apply_enrollment, default_config_path, Config, ConfigError, EnrollmentFields,
+};
 use crate::keyring::KeyringError;
 use crate::token_store::{self, TokenStoreError};
 use serde::{Deserialize, Serialize};
@@ -54,18 +56,23 @@ pub async fn pair_inner(
     let snap: HealthSnapshot = client.health().await?;
     let backend = token_store::store(&snap.subscriber_id, &input.token)?;
     tracing::info!("token persisted via {backend} backend");
-    let cfg = Config {
-        nexus_url: input.nexus_url,
-        subscriber_id: snap.subscriber_id.clone(),
-        vaults_root: input.vaults_root,
-        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        daemon_platform: detect_platform(),
-        last_event_id: None,
-        // TODO(B2): populate sync_roots from pairing wizard input once
-        // the watch loop iterates sync_roots instead of vaults_root.
-        sync_roots: vec![],
-    };
-    cfg.save_to(&config_path)?;
+    // P0 2026-08-05: MERGE — never overwrite — the on-disk config.
+    // Enrollment owns exactly the fields in `EnrollmentFields` (plus the
+    // last_event_id cursor); everything else (`vault_name`, `[[sync_roots]]`,
+    // unknown/future keys) must survive a re-pair. The old path serialized a
+    // typed `Config` (which has no `vault_name` field) over the file,
+    // silently dropping the field and mis-rooting the daemon at
+    // `vaults_root` itself on the next load.
+    apply_enrollment(
+        &config_path,
+        &EnrollmentFields {
+            nexus_url: input.nexus_url,
+            subscriber_id: snap.subscriber_id.clone(),
+            vaults_root: input.vaults_root,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            daemon_platform: detect_platform(),
+        },
+    )?;
 
     // v0.3.2: if the wizard sent a mode preference, push it to the server
     // via the subscriber self-PATCH endpoint. Failure here is non-fatal --
