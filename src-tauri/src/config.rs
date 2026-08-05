@@ -13,6 +13,20 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
+    /// P0 2026-08-05 mis-root guard: legacy root synthesis (rule 2b) was
+    /// about to root the daemon at `vaults_root` ITSELF, but that directory
+    /// visibly contains a vault folder — syncing the parent tree would
+    /// mis-key every path, orphan the shadow baseline, and echo-loop against
+    /// the server. Fail closed and make the operator pin the root.
+    #[error(
+        "config is mis-rooted (refusing to sync — fail closed): the config has no `vault_name` \
+         and no `[[sync_roots]]`, so the daemon would sync vaults_root `{root}` itself, but that \
+         directory contains the vault folder `{child}`. Rooting at the parent mis-keys every \
+         sync path (P0 2026-08-05 echo loop). Pin the root explicitly in config.toml:\n\n\
+         [[sync_roots]]\npath = \"{root}/{child}\"\nroute = \"\"\n\n\
+         (or restore `vault_name = \"{child}\"`), then restart the daemon."
+    )]
+    MisRooted { root: String, child: String },
 }
 
 /// B1 (Nexus Sync): an independent sync root — one directory tree whose
@@ -115,7 +129,12 @@ impl Config {
     ///    a. If `vault_name` is non-empty, synthesise
     ///       `SyncRoot { path: vaults_root.join(vault_name), route: "" }`.
     ///    b. Otherwise synthesise
-    ///       `SyncRoot { path: vaults_root, route: "" }`.
+    ///       `SyncRoot { path: vaults_root, route: "" }` — UNLESS
+    ///       `vaults_root` visibly contains a vault child directory (one
+    ///       holding `.obsidian/`, or one named after the bare vault name
+    ///       when the config carries it), in which case return
+    ///       `ConfigError::MisRooted` instead of silently syncing the whole
+    ///       parent tree (P0 2026-08-05 fail-closed guard).
     #[allow(clippy::doc_overindented_list_items)]
     pub fn from_toml_back_compat(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
@@ -131,7 +150,22 @@ impl Config {
             // subscriber they always have.
             let path = match raw.vault_name.as_deref() {
                 Some(name) if !name.is_empty() => raw.vaults_root.join(name),
-                _ => raw.vaults_root.clone(),
+                _ => {
+                    // Rule 2b would root the daemon at vaults_root ITSELF.
+                    // If vaults_root demonstrably contains a vault child,
+                    // that is the mis-rooted shape that caused the
+                    // 2026-08-05 P0 (vault_name dropped on re-enroll) —
+                    // refuse instead of silently syncing the parent tree.
+                    if let Some(child) =
+                        find_vault_child_of(&raw.vaults_root, raw.vault_name.as_deref())
+                    {
+                        return Err(ConfigError::MisRooted {
+                            root: raw.vaults_root.display().to_string(),
+                            child,
+                        });
+                    }
+                    raw.vaults_root.clone()
+                }
             };
             vec![SyncRoot {
                 path,
@@ -173,6 +207,35 @@ impl Config {
         fs::write(path, s)?;
         Ok(())
     }
+}
+
+/// P0 2026-08-05 mis-root guard helper: when legacy root synthesis (rule
+/// 2b) is about to root the daemon at `vaults_root` ITSELF, look for
+/// evidence that `vaults_root` is actually the PARENT of a vault — a child
+/// directory that (a) contains `.obsidian/`, or (b) is named exactly after
+/// the server's bare vault name when the config carries one. Returns the
+/// first matching child name (sorted, for deterministic errors).
+///
+/// A non-existent or unreadable `vaults_root` yields `None`: fresh installs
+/// pair before the directory exists, and the guard must not brick them —
+/// it only fires on positive evidence of mis-rooting.
+fn find_vault_child_of(vaults_root: &Path, bare_vault_name: Option<&str>) -> Option<String> {
+    let entries = fs::read_dir(vaults_root).ok()?;
+    let mut matches: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let named_after_vault = bare_vault_name.is_some_and(|v| !v.is_empty() && name == v);
+            if named_after_vault || e.path().join(".obsidian").is_dir() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
 }
 
 /// The fields the enrollment (pairing) flow OWNS on the on-disk config.
