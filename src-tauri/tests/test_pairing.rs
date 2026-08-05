@@ -124,6 +124,81 @@ async fn dns_failure_yields_network_error() {
     }
 }
 
+/// P0 2026-08-05: a re-pair must MERGE into the existing config.toml —
+/// `vault_name` and unknown/future keys survive the pair/save cycle; only
+/// the enrollment-owned fields change. (The old path serialized a typed
+/// `Config`, which has no `vault_name` field, over the file — silently
+/// dropping it and mis-rooting the daemon at `vaults_root` on next load.)
+#[tokio::test]
+async fn repair_preserves_vault_name_and_unknown_keys() {
+    let mut srv = Server::new_async().await;
+    let _m = srv
+        .mock("GET", "/api/sync/health")
+        .with_status(200)
+        .with_body(health_body("sub-p0-roundtrip"))
+        .match_header("authorization", "Bearer vsk_test_token")
+        .expect_at_least(0)
+        .expect_at_most(1)
+        .create_async()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let (input, config_path) = make_input(&srv.url(), &tmp);
+
+    // Pre-existing enrolled config carrying vault_name + a future key.
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+nexus_url = "https://stale.example.com"
+subscriber_id = "sub-p0-roundtrip"
+vaults_root = '{}'
+vault_name = "Mainframe"
+daemon_version = "0.4.32"
+daemon_platform = "linux-x86_64"
+future_unknown_key = "must-survive"
+"#,
+            tmp.path().join("vault").display()
+        ),
+    )
+    .unwrap();
+
+    let result = pair_inner(input, config_path.clone()).await;
+
+    match result {
+        Ok(success) => {
+            assert_eq!(success.subscriber_id, "sub-p0-roundtrip");
+            let saved = std::fs::read_to_string(&config_path).unwrap();
+            assert!(
+                saved.contains(r#"vault_name = "Mainframe""#),
+                "vault_name dropped by re-pair; config now:\n{saved}"
+            );
+            assert!(
+                saved.contains("future_unknown_key") && saved.contains("must-survive"),
+                "unknown key dropped by re-pair; config now:\n{saved}"
+            );
+            assert!(
+                saved.contains(&srv.url()),
+                "nexus_url not updated by re-pair; config now:\n{saved}"
+            );
+            assert!(
+                !saved.contains("stale.example.com"),
+                "stale nexus_url survived re-pair; config now:\n{saved}"
+            );
+            let _ = vault_sync_daemon::keyring::delete_token("sub-p0-roundtrip");
+        }
+        Err(e) => {
+            // Only acceptable failure on CI is a keyring error (see the
+            // other tests in this file).
+            let msg = e.to_string();
+            assert!(
+                msg.contains("keyring"),
+                "unexpected error (not keyring): {msg}"
+            );
+        }
+    }
+}
+
 /// Full happy path: after pair_inner, config.toml must exist and (if keyring available) token readable.
 ///
 /// The keyring assertion is skipped on CI hosts that lack a Secret Service backend.

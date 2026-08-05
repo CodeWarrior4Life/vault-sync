@@ -515,6 +515,287 @@ route = "dev"
         );
     }
 
+    // --- P0 2026-08-05: enrollment round-trip ---
+
+    /// The core round-trip invariant: a config carrying `vault_name` plus an
+    /// unknown/future key survives an enrollment save byte-meaningfully —
+    /// vault_name still present, unknown key still present, only the
+    /// enrollment-owned fields updated.
+    #[test]
+    fn apply_enrollment_preserves_vault_name_and_unknown_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+nexus_url = "https://stale.example.com"
+subscriber_id = "sub-old"
+vaults_root = "/Users/test/Vaults"
+vault_name = "Mainframe"
+daemon_version = "0.4.32"
+daemon_platform = "linux-x86_64"
+future_unknown_key = "must-survive"
+"#,
+        )
+        .unwrap();
+
+        apply_enrollment(
+            &path,
+            &EnrollmentFields {
+                nexus_url: "https://new.example.com".into(),
+                subscriber_id: "sub-new".into(),
+                vaults_root: PathBuf::from("/Users/test/Vaults"),
+                daemon_version: "0.4.37".into(),
+                daemon_platform: "linux-x86_64".into(),
+            },
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            table.get("vault_name").and_then(|v| v.as_str()),
+            Some("Mainframe"),
+            "vault_name dropped by enrollment save; got:\n{saved}"
+        );
+        assert_eq!(
+            table.get("future_unknown_key").and_then(|v| v.as_str()),
+            Some("must-survive"),
+            "unknown key dropped by enrollment save; got:\n{saved}"
+        );
+        assert_eq!(
+            table.get("nexus_url").and_then(|v| v.as_str()),
+            Some("https://new.example.com")
+        );
+        assert_eq!(
+            table.get("subscriber_id").and_then(|v| v.as_str()),
+            Some("sub-new")
+        );
+        assert_eq!(
+            table.get("daemon_version").and_then(|v| v.as_str()),
+            Some("0.4.37")
+        );
+
+        // And the daemon parse still roots at vaults_root/vault_name (2a).
+        let cfg = Config::from_toml_back_compat(&saved).expect("saved config must parse");
+        assert!(
+            cfg.sync_roots[0].path.ends_with("Mainframe"),
+            "post-enrollment root must still be the vault, got {:?}",
+            cfg.sync_roots[0].path
+        );
+    }
+
+    /// First pair on a fresh machine: no existing file — enrollment writes a
+    /// loadable config from scratch.
+    #[test]
+    fn apply_enrollment_creates_fresh_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        apply_enrollment(
+            &path,
+            &EnrollmentFields {
+                nexus_url: "https://nexus.example.com".into(),
+                subscriber_id: "sub-fresh".into(),
+                vaults_root: PathBuf::from("/Users/test/Vaults"),
+                daemon_version: "0.4.37".into(),
+                daemon_platform: "macos-aarch64".into(),
+            },
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).expect("fresh enrollment config must load");
+        assert_eq!(cfg.subscriber_id, "sub-fresh");
+        assert_eq!(cfg.vaults_root, PathBuf::from("/Users/test/Vaults"));
+    }
+
+    /// Same-subscriber re-pair keeps the legacy in-config cursor; enrolling
+    /// under a different subscriber clears it (stale cursor for a different
+    /// identity).
+    #[test]
+    fn apply_enrollment_last_event_id_scoped_to_subscriber() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-same"
+vaults_root = "/v"
+vault_name = "Mainframe"
+daemon_version = "0.4.32"
+daemon_platform = "linux-x86_64"
+last_event_id = "evt-99"
+"#;
+        let fields = |sub: &str| EnrollmentFields {
+            nexus_url: "https://nexus.example.com".into(),
+            subscriber_id: sub.into(),
+            vaults_root: PathBuf::from("/v"),
+            daemon_version: "0.4.37".into(),
+            daemon_platform: "linux-x86_64".into(),
+        };
+
+        fs::write(&path, base).unwrap();
+        apply_enrollment(&path, &fields("sub-same")).unwrap();
+        let table: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            table.get("last_event_id").and_then(|v| v.as_str()),
+            Some("evt-99"),
+            "same-subscriber re-pair must keep the cursor"
+        );
+
+        fs::write(&path, base).unwrap();
+        apply_enrollment(&path, &fields("sub-DIFFERENT")).unwrap();
+        let table: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            table.get("last_event_id").is_none(),
+            "subscriber change must clear the stale cursor"
+        );
+    }
+
+    /// A legacy file using the `vault_root` alias must not end up with BOTH
+    /// keys after enrollment (serde would reject the duplicate field).
+    #[test]
+    fn apply_enrollment_migrates_legacy_vault_root_alias() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-legacy"
+vault_root = "/old/Vaults"
+vault_name = "Mainframe"
+daemon_version = "0.1.9"
+daemon_platform = "linux-x86_64"
+"#,
+        )
+        .unwrap();
+        apply_enrollment(
+            &path,
+            &EnrollmentFields {
+                nexus_url: "https://nexus.example.com".into(),
+                subscriber_id: "sub-legacy".into(),
+                vaults_root: PathBuf::from("/new/Vaults"),
+                daemon_version: "0.4.37".into(),
+                daemon_platform: "linux-x86_64".into(),
+            },
+        )
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert!(table.get("vault_root").is_none(), "alias must be migrated");
+        assert_eq!(
+            table.get("vaults_root").and_then(|v| v.as_str()),
+            Some("/new/Vaults")
+        );
+        assert_eq!(
+            table.get("vault_name").and_then(|v| v.as_str()),
+            Some("Mainframe")
+        );
+        Config::load_from(&path).expect("migrated config must load");
+    }
+
+    // --- P0 2026-08-05: mis-root refusal guard (rule 2b) ---
+
+    /// vaults_root containing a `Mainframe/.obsidian` child + no vault_name
+    /// ⇒ from_toml_back_compat must fail closed instead of rooting the
+    /// daemon at the parent tree.
+    #[test]
+    fn misroot_guard_refuses_rule_2b_when_vault_child_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("Mainframe").join(".obsidian")).unwrap();
+        let toml_str = format!(
+            r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-p0"
+vaults_root = '{}'
+daemon_version = "0.4.37"
+daemon_platform = "linux-x86_64"
+"#,
+            dir.path().display()
+        );
+        let err = Config::from_toml_back_compat(&toml_str)
+            .expect_err("must refuse to root at a vaults_root containing a vault child");
+        match &err {
+            ConfigError::MisRooted { child, .. } => {
+                assert_eq!(child, "Mainframe", "guard must name the vault child")
+            }
+            other => panic!("expected MisRooted, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[[sync_roots]]") && msg.contains("Mainframe"),
+            "error must be actionable (mention [[sync_roots]] + the child); got: {msg}"
+        );
+    }
+
+    /// A child directory WITHOUT `.obsidian/` is not vault evidence — rule
+    /// 2b still roots at vaults_root itself (existing behavior preserved).
+    #[test]
+    fn misroot_guard_ignores_non_vault_children() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("just-some-folder")).unwrap();
+        let toml_str = format!(
+            r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-ok"
+vaults_root = '{}'
+daemon_version = "0.4.37"
+daemon_platform = "linux-x86_64"
+"#,
+            dir.path().display()
+        );
+        let cfg = Config::from_toml_back_compat(&toml_str)
+            .expect("non-vault children must not trip the guard");
+        assert_eq!(cfg.sync_roots[0].path, dir.path().to_path_buf());
+    }
+
+    /// vault_name present ⇒ rule 2a applies and the guard is never
+    /// consulted, even with a real vault child on disk (synthesis works).
+    #[test]
+    fn misroot_guard_not_consulted_when_vault_name_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("Mainframe").join(".obsidian")).unwrap();
+        let toml_str = format!(
+            r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-2a"
+vaults_root = '{}'
+vault_name = "Mainframe"
+daemon_version = "0.4.37"
+daemon_platform = "linux-x86_64"
+"#,
+            dir.path().display()
+        );
+        let cfg = Config::from_toml_back_compat(&toml_str)
+            .expect("vault_name synthesis must keep working");
+        assert_eq!(cfg.sync_roots[0].path, dir.path().join("Mainframe"));
+    }
+
+    /// Explicit [[sync_roots]] ⇒ rule 1 applies and the guard is never
+    /// consulted, even with a real vault child on disk (existing behavior
+    /// preserved — the operator's pinned roots always win).
+    #[test]
+    fn misroot_guard_not_consulted_with_explicit_sync_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("Mainframe").join(".obsidian")).unwrap();
+        let toml_str = format!(
+            r#"
+nexus_url = "https://nexus.example.com"
+subscriber_id = "sub-pinned"
+vaults_root = '{root}'
+daemon_version = "0.4.37"
+daemon_platform = "linux-x86_64"
+
+[[sync_roots]]
+path = '{root}/Mainframe'
+route = ""
+"#,
+            root = dir.path().display()
+        );
+        let cfg = Config::from_toml_back_compat(&toml_str)
+            .expect("explicit [[sync_roots]] must parse unchanged");
+        assert_eq!(cfg.sync_roots.len(), 1);
+        assert!(cfg.sync_roots[0].path.ends_with("Mainframe"));
+    }
+
     /// Legacy on-disk config (no `[[sync_roots]]` block): the synthesised
     /// `SyncRoot` must inherit the top-level `subscriber_id` so existing
     /// installs keep pushing under the same subscriber they always have.
