@@ -1,7 +1,5 @@
 use crate::api_client::{ApiClient, ApiError, HealthSnapshot};
-use crate::config::{
-    apply_enrollment, default_config_path, Config, ConfigError, EnrollmentFields,
-};
+use crate::config::{apply_enrollment, default_config_path, Config, ConfigError, EnrollmentFields};
 use crate::keyring::KeyringError;
 use crate::token_store::{self, TokenStoreError};
 use serde::{Deserialize, Serialize};
