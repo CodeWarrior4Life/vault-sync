@@ -752,13 +752,12 @@ mod tests {
     /// startup PATCH /subscribers/me the server's S5 min-version gate reads)
     /// must be the control-plane P0 version. Guards against shipping under a
     /// version string the fleet would mistake for an older release. Bumped for
-    /// the TKT-f74edf99 client read-receipt recovery landing (the 0.4.35
-    /// release bumped the manifests but missed this pin — it asserted 0.4.34
-    /// against a 0.4.35 build, red on main since dac4815).
+    /// the P0 2026-08-05 vault_name round-trip + mis-root guard fix. (Was
+    /// stale at 0.4.34 through the 0.4.35 release — pre-existing red.)
     #[test]
-    fn daemon_version_is_0_4_36() {
-        assert_eq!(daemon_version(), "0.4.36");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.36/"));
+    fn daemon_version_is_0_4_37() {
+        assert_eq!(daemon_version(), "0.4.37");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.37/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
