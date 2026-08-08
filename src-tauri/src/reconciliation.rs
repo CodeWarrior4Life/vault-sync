@@ -121,6 +121,17 @@ impl EnvReader for MapEnv {
     }
 }
 
+/// AR-003 (TKT-c41c2225): where the durable reconcile retry ledger lives —
+/// beside the daemon config (NOT in the vault). Routed through
+/// `default_config_path()` so managed-instance mode (`NEXUS_SYNC_CONFIG_DIR`)
+/// relocates it together with config.toml and the token files.
+pub fn retry_ledger_path() -> PathBuf {
+    crate::config::default_config_path()
+        .parent()
+        .map(|d| d.join("reconcile-retry-ledger.json"))
+        .unwrap_or_else(|| PathBuf::from("reconcile-retry-ledger.json"))
+}
+
 /// Run ONE reconciliation pass.
 ///
 /// Calls `VerifyRepair::run()` against the same vault/api/journal the
@@ -155,11 +166,7 @@ pub async fn run_reconciliation_pass(
     // AR-003 (TKT-c41c2225): durable retry ledger for failed/deferred pulls,
     // stored beside the daemon config (NOT in the vault). Loaded per pass; state
     // persists across passes and daemon restarts.
-    let ledger_path = crate::config::default_config_path()
-        .parent()
-        .map(|d| d.join("reconcile-retry-ledger.json"))
-        .unwrap_or_else(|| PathBuf::from("reconcile-retry-ledger.json"));
-    let retry_ledger = Arc::new(crate::retry_ledger::RetryLedger::load(ledger_path));
+    let retry_ledger = Arc::new(crate::retry_ledger::RetryLedger::load(retry_ledger_path()));
 
     let vr = VerifyRepair::new(
         vault_root,

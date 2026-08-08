@@ -10,6 +10,7 @@ pub mod file_watcher;
 pub mod heartbeat;
 pub mod integrity_check;
 pub mod keyring;
+pub mod managed_instance;
 pub mod materializer;
 pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
@@ -94,8 +95,43 @@ fn list_vault_folders(vaults_root: String) -> Vec<commands_vaults::VaultFolderIn
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+    // Managed-instance mode (spec §5, 2026-08-08): resolve ONCE, up front.
+    // `managed_config_dir()` canonicalizes (and creates) the dir — or panics
+    // if the env is set but unresolvable (fail closed; never fall back to the
+    // vault instance's config).
+    let managed_dir = managed_instance::managed_config_dir();
+    let policy = managed_instance::plugin_policy(managed_dir.is_some());
+
+    // Exclusive advisory lock, fail-closed: one daemon per canonical config
+    // dir, acquired BEFORE any pipeline starts and held for the process
+    // lifetime (leaked on purpose — the daemon never re-enters run()). A
+    // second process against the same dir exits non-zero with the distinct
+    // "managed-instance lock held by another process" message.
+    if let Some(dir) = &managed_dir {
+        match managed_instance::acquire_daemon_lock(dir) {
+            Ok(lock) => {
+                tracing::info!(
+                    lock = %lock.path.display(),
+                    config_dir = %dir.display(),
+                    "managed-instance mode: config dir lock acquired"
+                );
+                Box::leak(Box::new(lock));
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut builder = tauri::Builder::default();
+    // R12: tauri_plugin_single_instance is app-global (keyed by app identity,
+    // not config dir) — in managed mode it would wrongly couple the vault
+    // instance and every managed instance of the same binary. The per-config-
+    // dir daemon.lock above is the managed-mode exclusivity mechanism.
+    if policy.single_instance {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _| {
             // S477 §3.3 (v0.3.7): second-launch "find-me" path -- raise the
             // wizard if it's hidden or minimized, then focus it. Without
             // .show() + .unminimize() the user clicking the dock/.app a
@@ -118,12 +154,23 @@ pub fn run() {
                 let _ = w.unminimize();
                 let _ = w.set_focus();
             }
-        }))
-        .plugin(tauri_plugin_autostart::init(
+        }));
+    }
+    // Autostart: login-item registration is app-global; a managed instance's
+    // lifecycle belongs to the unit manager, so it never touches login items.
+    if policy.autostart {
+        builder = builder.plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--silent"]),
-        ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        ));
+    }
+    // Updater: the vault instance is the sole update leader for the shared
+    // binary; managed instances never self-update (the plugin is not even
+    // registered, and spawn_updater_check below is policy-gated to match).
+    if policy.updater {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -137,7 +184,7 @@ pub fn run() {
             commands::list_conflicts,
             list_vault_folders
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // v0.1.6: set_activation_policy returns () on macOS (infallible).
             // The static LSUIElement=true in Info.plist is the canonical
             // path; this is defense-in-depth.
@@ -171,7 +218,12 @@ pub fn run() {
             // /admin/api/vault-sync/releases/<platform>/latest never blocks SSE
             // startup; on a staged update it restarts the daemon when idle.
             // Failures log only — never block the daemon.
-            spawn_updater_check(app.handle().clone(), shared_state.clone());
+            // Managed-instance mode: NOT spawned — the updater plugin is not
+            // registered (policy.updater=false) and managed instances never
+            // self-update; the vault instance is the sole update leader.
+            if policy.updater {
+                spawn_updater_check(app.handle().clone(), shared_state.clone());
+            }
 
             // v0.3: app has no meaning without a valid pairing. Open the
             // wizard window automatically if config OR token is missing.
@@ -202,12 +254,21 @@ pub fn run() {
             if decision.start_sync {
                 spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
             }
-            if decision.show_wizard {
+            // Managed-instance mode implies --silent semantics: NEVER raise
+            // the wizard/GUI (policy.allow_wizard=false). An unpaired managed
+            // instance logs and stays headless — pairing it is the launcher/
+            // provisioning flow's job, not an interactive window's.
+            if decision.show_wizard && policy.allow_wizard {
                 tracing::info!("not paired (no persisted token file) — opening pairing wizard");
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
                 }
+            } else if decision.show_wizard {
+                tracing::warn!(
+                    "not paired, but managed-instance mode is silent — wizard suppressed; \
+                     pair headlessly (`vault-sync-daemon pair …`) with NEXUS_SYNC_CONFIG_DIR set"
+                );
             }
 
             // v0.3.3: intercept the main window's close button so it HIDES
@@ -1046,6 +1107,12 @@ fn spawn_push_pipeline(
             return None;
         }
     };
+    // Managed-instance mode (spec §5): arm the additional conflict-artifact
+    // payload excludes on BOTH the watcher and push gates. Env-derived and
+    // constant for the process lifetime; false in vault mode keeps both
+    // filters byte-identical to pre-0.4.38.
+    let managed = managed_instance::is_managed_mode();
+
     // PushClientConfig.allowed_extensions carry a LEADING DOT (".md").
     let push_cfg = push_client::PushClientConfig {
         allowed_extensions: vec![".md".into(), ".canvas".into()],
@@ -1053,6 +1120,7 @@ fn spawn_push_pipeline(
         max_retry_attempts: 5,
         initial_backoff_ms: 500,
         max_backoff_ms: 60_000,
+        managed_payload_excludes: managed,
         ..Default::default()
     };
     // D2/B2'd (v0.4.28): ONE enqueue-dedup map shared by the file_watcher
@@ -1248,6 +1316,7 @@ fn spawn_push_pipeline(
         scope_roots,
         scope_excludes,
         debounce_ms: 500,
+        managed_payload_excludes: managed,
     };
     let watcher = match file_watcher::FileWatcher::new(
         vault_root,

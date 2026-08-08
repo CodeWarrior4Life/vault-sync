@@ -112,8 +112,10 @@ pub enum TokenStoreError {
     Keyring(#[from] keyring::KeyringError),
 }
 
-fn token_file_path(subscriber_id: &str) -> PathBuf {
+pub(crate) fn token_file_path(subscriber_id: &str) -> PathBuf {
     // Sibling of config.toml — same directory, so cleanup is one rm -rf.
+    // Managed-instance mode: rides default_config_path()'s NEXUS_SYNC_CONFIG_DIR
+    // override, so per-instance tokens land in the per-instance config dir.
     let mut p = default_config_path();
     p.set_file_name(format!("token-{subscriber_id}.bin"));
     p

@@ -309,11 +309,26 @@ pub fn apply_enrollment(path: &Path, fields: &EnrollmentFields) -> Result<(), Co
     Ok(())
 }
 
-/// Returns the OS-appropriate config path:
+/// Returns the config path. This is the ONLY config-path resolution in the
+/// codebase — every consumer (token_store, pairing, reconciliation retry
+/// ledger, commands, lib/main) routes through here, which is what makes the
+/// managed-instance override below total. A grep-fence test in this module
+/// pins that no second derivation appears.
+///
+/// Managed-instance mode (spec §5, 2026-08-08): when `NEXUS_SYNC_CONFIG_DIR`
+/// is set, the path is `<canonicalized dir>/config.toml`. The dir is created
+/// if absent and realpath-canonicalized BEFORE any use, so two spellings of
+/// one directory cannot yield two config paths (or two daemon locks). A set
+/// but unresolvable env PANICS rather than falling back (fail closed).
+///
+/// Vault mode (env unset) — unchanged OS defaults:
 /// - Windows: `%APPDATA%\Nexus\vault-sync\config.toml`
 /// - macOS:   `~/Library/Application Support/Nexus/vault-sync/config.toml`
 /// - Linux:   `$XDG_CONFIG_HOME/nexus-vault-sync/config.toml` (default `~/.config/nexus-vault-sync/config.toml`)
 pub fn default_config_path() -> PathBuf {
+    if let Some(dir) = crate::managed_instance::managed_config_dir() {
+        return dir.join("config.toml");
+    }
     let base = dirs::config_dir().expect("config dir resolvable");
     #[cfg(target_os = "linux")]
     return base.join("nexus-vault-sync").join("config.toml");
@@ -819,6 +834,137 @@ daemon_platform = "macos-aarch64"
         assert_eq!(
             cfg.sync_roots[0].subscriber_id, "sub-legacy-123",
             "synthesised vault sync_root must carry the top-level subscriber_id"
+        );
+    }
+}
+
+/// Managed-instance mode (spec §5, 2026-08-08): config-path resolution tests.
+///
+/// Every test here that touches `NEXUS_SYNC_CONFIG_DIR` holds the process-wide
+/// env lock (`managed_instance::test_env`) — `default_config_path()` reads the
+/// env at call time, so unserialized mutation would race parallel tests.
+#[cfg(test)]
+mod managed_mode_tests {
+    use super::*;
+    use crate::managed_instance::test_env::ScopedConfigDirEnv;
+    use tempfile::TempDir;
+
+    /// Spec §5.1: env set → `<canonicalized dir>/config.toml`, and the SAME
+    /// canonical path is used by every consumer that derives from
+    /// `default_config_path()` — pinned here for the token file and the
+    /// reconcile retry ledger (journal/ledger leg of the env-override test).
+    #[test]
+    fn env_override_respected_across_config_token_and_ledger_paths() {
+        let dir = TempDir::new().unwrap();
+        let _env = ScopedConfigDirEnv::set(dir.path());
+
+        let canon = dunce::canonicalize(dir.path()).unwrap();
+        let cfg_path = default_config_path();
+        assert_eq!(cfg_path, canon.join("config.toml"));
+
+        // token_store: sibling of config.toml in the SAME managed dir.
+        let tok = crate::token_store::token_file_path("sub-managed");
+        assert_eq!(tok, canon.join("token-sub-managed.bin"));
+
+        // reconciliation retry ledger: sibling of config.toml too.
+        let ledger = crate::reconciliation::retry_ledger_path();
+        assert_eq!(ledger, canon.join("reconcile-retry-ledger.json"));
+    }
+
+    /// Spec §5.1 canonicalization: a SYMLINKED spelling of the same directory
+    /// must resolve to the IDENTICAL config path (and hence the identical
+    /// daemon.lock — asserted in managed_instance's own tests).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_dir_spelling_maps_to_same_config_path() {
+        let base = TempDir::new().unwrap();
+        let real = base.path().join("managed-config");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.path().join("managed-alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let via_real = {
+            let _env = ScopedConfigDirEnv::set(&real);
+            default_config_path()
+        };
+        let via_alias = {
+            let _env = ScopedConfigDirEnv::set(&alias);
+            default_config_path()
+        };
+        assert_eq!(
+            via_real, via_alias,
+            "two spellings of one dir must yield ONE config path"
+        );
+    }
+
+    /// The managed dir is CREATED if absent, then canonicalized — a fresh
+    /// (not-yet-existing) dir works on first launch.
+    #[test]
+    fn missing_managed_dir_is_created_before_canonicalization() {
+        let base = TempDir::new().unwrap();
+        let fresh = base.path().join("new").join("instance-a");
+        assert!(!fresh.exists());
+        let _env = ScopedConfigDirEnv::set(&fresh);
+        let cfg_path = default_config_path();
+        assert!(fresh.is_dir(), "managed config dir must be auto-created");
+        assert_eq!(
+            cfg_path,
+            dunce::canonicalize(&fresh).unwrap().join("config.toml")
+        );
+    }
+
+    /// VAULT-MODE REGRESSION FENCE (spec §5 test list): with the env unset,
+    /// resolution is byte-identical to pre-0.4.38 — the OS default path.
+    #[test]
+    fn vault_mode_env_unset_resolves_to_os_default_path() {
+        let _env = ScopedConfigDirEnv::unset();
+        let expected = {
+            let base = dirs::config_dir().expect("config dir resolvable");
+            #[cfg(target_os = "linux")]
+            {
+                base.join("nexus-vault-sync").join("config.toml")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                base.join("Nexus").join("vault-sync").join("config.toml")
+            }
+        };
+        assert_eq!(default_config_path(), expected);
+    }
+
+    /// Spec §5.1 uniqueness fence: `default_config_path()` must remain the
+    /// ONLY config-path derivation in the crate. This greps the source tree:
+    /// no file other than config.rs may reference `dirs::config_dir` or the
+    /// `config.toml` filename (tests aside, consumers must go through
+    /// `default_config_path()` / `Config::load_from(default_config_path())`).
+    #[test]
+    fn no_alternate_config_path_derivation_exists_in_source() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("src dir readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "config.rs" {
+                continue; // the single canonical resolution site
+            }
+            let body = std::fs::read_to_string(&path).expect("source readable");
+            if body.contains("dirs::config_dir") {
+                offenders.push(format!("{name}: calls dirs::config_dir"));
+            }
+            // The QUOTED literal is what a code-level join/path-build needs;
+            // prose mentions of config.toml in comments are not derivations.
+            if body.contains("\"config.toml\"") {
+                offenders.push(format!("{name}: builds a \"config.toml\" path directly"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "alternate config-path derivations found — every consumer must route \
+             through config::default_config_path():\n{}",
+            offenders.join("\n")
         );
     }
 }
