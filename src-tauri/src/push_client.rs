@@ -75,6 +75,13 @@ pub struct PushClientConfig {
     /// short so the loop drains a deep backlog fast instead of waiting a full
     /// `loop_interval_ms` between each batch.
     pub busy_loop_interval_ms: u64,
+    /// Managed-instance mode (spec §5, 2026-08-08): additionally refuse ANY
+    /// `*.conflict-from-*` basename and the conflict-stash manifest
+    /// (`.sync-conflict-stash-manifest.jsonl`) at BOTH the pre-journal gate
+    /// and the drain gate — defense-in-depth behind the file_watcher's
+    /// classify exclude (reconciliation/verify_repair can enqueue directly).
+    /// `false` (vault mode) keeps behavior byte-identical to pre-0.4.38.
+    pub managed_payload_excludes: bool,
 }
 
 impl Default for PushClientConfig {
@@ -89,6 +96,7 @@ impl Default for PushClientConfig {
             loop_interval_ms: 5_000,
             push_concurrency: 6,
             busy_loop_interval_ms: 250,
+            managed_payload_excludes: false,
         }
     }
 }
@@ -117,6 +125,11 @@ pub enum SkipReason {
     ServerRejected {
         status: u16,
     },
+    /// Managed-instance mode (spec §5, 2026-08-08): a `*.conflict-from-*`
+    /// sibling or the conflict-stash manifest reached the push path — refused
+    /// so conflict artifacts written INSIDE a managed root never become
+    /// payload. Never produced in vault mode.
+    ManagedConflictArtifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +342,12 @@ impl PushClient {
         // 1. Substrate fence (R11).
         if let PathClassification::Substrate { rule } = classify_path(path) {
             return Some(SkipReason::SubstrateRefused { rule });
+        }
+        // 1b. Managed-instance conflict-artifact exclude (spec §5).
+        if self.config.managed_payload_excludes
+            && crate::file_watcher::is_managed_conflict_artifact(path)
+        {
+            return Some(SkipReason::ManagedConflictArtifact);
         }
         // 2. Extension gate (§1 row 11).
         if let Some(ext_skip) = check_extension(path, &self.config.allowed_extensions) {
@@ -586,6 +605,12 @@ impl PushClient {
         if let PathClassification::Substrate { rule } = classify_path(&evt.path) {
             tracing::warn!(path = %evt.path, rule, "substrate path reached journal — refusing to POST");
             return PushOutcome::Skipped(SkipReason::SubstrateRefused { rule });
+        }
+        if self.config.managed_payload_excludes
+            && crate::file_watcher::is_managed_conflict_artifact(&evt.path)
+        {
+            tracing::warn!(path = %evt.path, "managed-instance conflict artifact reached journal — refusing to POST");
+            return PushOutcome::Skipped(SkipReason::ManagedConflictArtifact);
         }
         if let Some(ext_skip) = check_extension(&evt.path, &self.config.allowed_extensions) {
             return PushOutcome::Skipped(ext_skip);
@@ -1606,6 +1631,7 @@ mod tests {
             loop_interval_ms: 50,
             push_concurrency: 4,
             busy_loop_interval_ms: 5,
+            managed_payload_excludes: false,
         }
     }
 
@@ -2373,6 +2399,48 @@ mod tests {
             Some(SkipReason::IdenticalToServer { hash }) => assert_eq!(hash, server_hash),
             other => panic!("expected IdenticalToServer, got {other:?}"),
         }
+    }
+
+    /// Managed-instance mode (spec §5): conflict artifacts are refused at the
+    /// pre-journal gate; vault mode (flag off) keeps prior behavior (the same
+    /// non-canonical name passes the gate — pinned regression fence).
+    #[tokio::test]
+    async fn managed_conflict_artifacts_refused_at_pre_journal_gate() {
+        let (_d, journal) = make_journal_with(vec![]);
+        let client = make_client("http://127.0.0.1:1", journal).await;
+
+        // Vault mode (config_for_test: managed_payload_excludes=false):
+        // a non-canonical conflict-from .md passes (current behavior).
+        assert_eq!(
+            client.pre_journal_filter("notes/a.conflict-from-weird.md", b"body", None),
+            None,
+            "vault mode must NOT specially refuse non-canonical conflict-from names"
+        );
+
+        // Managed mode: both the broad glob and the stash manifest refuse.
+        let mut managed_cfg = config_for_test();
+        managed_cfg.managed_payload_excludes = true;
+        let managed = PushClient {
+            config: managed_cfg,
+            ..client
+        };
+        assert_eq!(
+            managed.pre_journal_filter("notes/a.conflict-from-weird.md", b"body", None),
+            Some(SkipReason::ManagedConflictArtifact)
+        );
+        assert_eq!(
+            managed.pre_journal_filter("notes/a.conflict-from-h-12.md", b"body", None),
+            Some(SkipReason::ManagedConflictArtifact)
+        );
+        assert_eq!(
+            managed.pre_journal_filter(".sync-conflict-stash-manifest.jsonl", b"{}", None),
+            Some(SkipReason::ManagedConflictArtifact)
+        );
+        // Ordinary notes still pass in managed mode.
+        assert_eq!(
+            managed.pre_journal_filter("notes/regular.md", b"body", None),
+            None
+        );
     }
 
     #[test]

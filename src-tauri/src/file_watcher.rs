@@ -93,6 +93,14 @@ pub struct FileWatcherConfig {
     pub scope_excludes: Vec<String>,
     /// notify debouncer collection window (ms). 500 is the spec default.
     pub debounce_ms: u64,
+    /// Managed-instance mode (spec §5, 2026-08-08): additionally exclude ANY
+    /// `*.conflict-from-*` basename (broader than the structural D5 parser)
+    /// and the conflict-stash manifest (`.sync-conflict-stash-manifest.jsonl`)
+    /// from the push payload. The conflict stash writes copies INSIDE the
+    /// sync root as `.md` (conflict_stash.rs `write_stash`); in a managed
+    /// memory root they must never become payload. `false` (vault mode)
+    /// keeps classification byte-identical to pre-0.4.38.
+    pub managed_payload_excludes: bool,
 }
 
 impl Default for FileWatcherConfig {
@@ -105,6 +113,7 @@ impl Default for FileWatcherConfig {
             scope_roots: Vec::new(),
             scope_excludes: Vec::new(),
             debounce_ms: 500,
+            managed_payload_excludes: false,
         }
     }
 }
@@ -492,6 +501,19 @@ impl FileWatcher {
             return FilterDecision::DropExclude {
                 path: norm,
                 exclude_rule: "conflict-copy".to_string(),
+            };
+        }
+
+        // (2e) Managed-instance mode ONLY (spec §5, 2026-08-08): broader
+        // conflict-artifact exclusion — ANY basename containing
+        // `.conflict-from-` (glob `*.conflict-from-*`, superset of the
+        // structural D5 parser above) plus the conflict-stash manifest
+        // `.sync-conflict-stash-manifest.jsonl`. Vault mode (flag false)
+        // skips this block entirely, keeping behavior byte-identical.
+        if self.config.managed_payload_excludes && is_managed_conflict_artifact(&norm) {
+            return FilterDecision::DropExclude {
+                path: norm,
+                exclude_rule: "managed-conflict-artifact".to_string(),
             };
         }
 
@@ -1100,6 +1122,23 @@ fn is_conflict_copy(rel: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Managed-instance payload exclude (spec §5, 2026-08-08): true iff the
+/// path's basename is a conflict artifact under the BROAD rule — any name
+/// containing `.conflict-from-` (i.e. glob `*.conflict-from-*`; a strict
+/// superset of [`is_conflict_copy`]'s structural parser, catching collision-
+/// suffixed or otherwise non-canonical spellings) OR the conflict-stash
+/// manifest file itself. Shared by the watcher classify path and the
+/// push_client drain gate. Only consulted when managed mode arms it.
+pub fn is_managed_conflict_artifact(rel: &str) -> bool {
+    match rel.rsplit('/').next() {
+        Some(name) => {
+            name.contains(".conflict-from-")
+                || name == crate::conflict_stash::ConflictStash::MANIFEST_RELPATH
+        }
+        None => false,
+    }
+}
+
 fn path_extension(p: &str) -> String {
     match p.rfind('.') {
         Some(i) if i + 1 < p.len() => {
@@ -1220,6 +1259,7 @@ mod tests {
             scope_roots: scope_roots.into_iter().map(String::from).collect(),
             scope_excludes: scope_excludes.into_iter().map(String::from).collect(),
             debounce_ms: 500,
+            managed_payload_excludes: false,
         };
         FileWatcher::new(
             dir.path().to_path_buf(),
@@ -1424,6 +1464,121 @@ mod tests {
             FilterDecision::Allow(_) => {}
             other => panic!("legit 'conflict' note must pass, got {other:?}"),
         }
+    }
+
+    // ---------- managed-instance payload excludes (spec §5, 2026-08-08) ----------
+
+    fn make_managed_watcher(dir: &TempDir) -> FileWatcher {
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: true,
+        };
+        FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(dir),
+            make_burst(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+    }
+
+    /// Managed mode: ANY `*.conflict-from-*` basename (including non-canonical
+    /// spellings the structural D5 parser does NOT match) plus the conflict-
+    /// stash manifest are dropped as `managed-conflict-artifact`.
+    #[test]
+    fn managed_mode_excludes_broad_conflict_artifacts_and_stash_manifest() {
+        let dir = TempDir::new().unwrap();
+        let w = make_managed_watcher(&dir);
+        for p in [
+            // Non-canonical: no `<device>-<lsn>` tail — invisible to D5's
+            // structural parser, caught only by the managed glob.
+            "01_Notes/note.conflict-from-weird.md",
+            "deep/dir/x.conflict-from-.md",
+            // The stash manifest itself (written at the sync-root top level).
+            ".sync-conflict-stash-manifest.jsonl",
+        ] {
+            match w.classify(&modified(p)) {
+                FilterDecision::DropExclude { exclude_rule, .. } => {
+                    assert_eq!(exclude_rule, "managed-conflict-artifact", "for {p}");
+                }
+                other => {
+                    panic!("expected DropExclude(managed-conflict-artifact) for {p}, got {other:?}")
+                }
+            }
+        }
+        // Canonical stashes are still caught FIRST by the D5 structural rule
+        // (managed adds on top, it does not replace).
+        match w.classify(&modified("01_Notes/note.conflict-from-trinity-123.md")) {
+            FilterDecision::DropExclude { exclude_rule, .. } => {
+                assert_eq!(exclude_rule, "conflict-copy");
+            }
+            other => panic!("expected DropExclude(conflict-copy), got {other:?}"),
+        }
+        // A legit note still passes in managed mode.
+        match w.classify(&modified("01_Notes/My conflict resolution notes.md")) {
+            FilterDecision::Allow(_) => {}
+            other => panic!("legit 'conflict' note must pass in managed mode, got {other:?}"),
+        }
+    }
+
+    /// VAULT-MODE REGRESSION FENCE (spec §5 test list): with the flag off
+    /// (env unset — the default config), classification is byte-identical to
+    /// pre-0.4.38. Pinned current behavior, verified before this change:
+    /// - canonical `.conflict-from-<dev>-<lsn>.md` stashes WERE already
+    ///   excluded (D5 structural rule) — stays excluded, same rule string;
+    /// - a NON-canonical `.conflict-from-weird.md` name was NOT specially
+    ///   excluded (Allow) — stays Allow;
+    /// - the stash manifest was dropped by the EXTENSION gate (`.jsonl` is
+    ///   not an allowed extension), NOT by any conflict rule — stays so.
+    #[test]
+    fn vault_mode_conflict_artifact_handling_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+
+        // Canonical stash: excluded by the pre-existing D5 rule.
+        match w.classify(&modified("01_Notes/note.conflict-from-trinity-123.md")) {
+            FilterDecision::DropExclude { exclude_rule, .. } => {
+                assert_eq!(exclude_rule, "conflict-copy");
+            }
+            other => panic!("expected DropExclude(conflict-copy), got {other:?}"),
+        }
+        // Non-canonical conflict-from name: NOT specially excluded (current
+        // vault behavior — it is an ordinary .md to the vault pipeline).
+        match w.classify(&modified("01_Notes/note.conflict-from-weird.md")) {
+            FilterDecision::Allow(_) => {}
+            other => panic!(
+                "vault mode must NOT add a managed exclude for non-canonical names, got {other:?}"
+            ),
+        }
+        // Stash manifest: dropped by the extension gate, not a conflict rule.
+        match w.classify(&modified(".sync-conflict-stash-manifest.jsonl")) {
+            FilterDecision::DropExtension { ext, .. } => assert_eq!(ext, "jsonl"),
+            other => panic!("expected DropExtension(jsonl) in vault mode, got {other:?}"),
+        }
+    }
+
+    /// The shared basename matcher used by BOTH the watcher and push gates.
+    #[test]
+    fn is_managed_conflict_artifact_matcher() {
+        assert!(is_managed_conflict_artifact("a/b/x.conflict-from-h-1.md"));
+        assert!(is_managed_conflict_artifact("x.conflict-from-weird.md"));
+        assert!(is_managed_conflict_artifact(
+            ".sync-conflict-stash-manifest.jsonl"
+        ));
+        assert!(is_managed_conflict_artifact(
+            "sub/.sync-conflict-stash-manifest.jsonl"
+        ));
+        assert!(!is_managed_conflict_artifact("notes/regular.md"));
+        assert!(!is_managed_conflict_artifact("notes/My conflict notes.md"));
+        // A DIRECTORY segment containing the marker does not condemn a clean
+        // basename (basename-scoped rule, like is_conflict_copy).
+        assert!(!is_managed_conflict_artifact(
+            "x.conflict-from-h-1.md/inner.md"
+        ));
     }
 
     /// A delete clears the remembered enqueue-hash, so recreating the file with
