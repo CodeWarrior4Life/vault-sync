@@ -13,6 +13,7 @@ USAGE:
   vault-sync-daemon                      Launch the GUI/daemon (default, unchanged)
   vault-sync-daemon pair    --url <URL> --root <VAULTS_ROOT> --mode <live|shadow|disabled> [--token <TOKEN>]
   vault-sync-daemon set-mode <live|shadow|disabled>
+  vault-sync-daemon --version                          Print the daemon version and exit 0
   vault-sync-daemon --help
 
 pair       Pair this host WITHOUT the GUI: verify the token against <URL>, persist
@@ -130,6 +131,13 @@ fn main() {
 
     match parse_cli(&args) {
         Ok(CliCommand::Gui) => vault_sync_daemon::run(),
+        // Managed-instance spec §5 (launcher gate): `--version` prints the
+        // exact crate version and exits 0 — the launch script asserts EXACT
+        // equality against the provisioning file's approved version.
+        Ok(CliCommand::Version) => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
         Ok(cmd) => run_cli(cmd),
         Err(msg) => {
             eprintln!("error: {msg}\n\n{USAGE}");
@@ -152,6 +160,8 @@ enum CliCommand {
     SetMode {
         mode: String,
     },
+    /// `--version` / `-V`: print the crate version to stdout and exit 0.
+    Version,
 }
 
 /// PURE argument parser (no I/O, no env, no stdin) so it is exhaustively unit
@@ -183,6 +193,10 @@ fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             validate_mode(&mode)?;
             Ok(CliCommand::SetMode { mode })
         }
+        // `--version` MUST precede the generic leading-flag fall-through
+        // below, or it would launch the GUI. `version` (bare word) stays an
+        // error like any unknown subcommand — the launcher passes the flag.
+        Some("--version" | "-V") => Ok(CliCommand::Version),
         // A leading FLAG (e.g. `--silent`, passed by the LaunchAgent / `open
         // -a … --args --silent` / the updater relaunch) is NOT a headless
         // subcommand — fall through to the normal GUI/daemon launch, which owns
@@ -246,6 +260,7 @@ fn run_cli(cmd: CliCommand) -> ! {
             } => cli_pair(url, token, root, mode).await,
             CliCommand::SetMode { mode } => cli_set_mode(mode).await,
             CliCommand::Gui => unreachable!("Gui is dispatched by main, not run_cli"),
+            CliCommand::Version => unreachable!("Version is dispatched by main, not run_cli"),
         }
     });
     match result {
@@ -465,6 +480,17 @@ mod tests {
             CliCommand::Gui
         );
         assert_eq!(parse_cli(&v(&[])).unwrap(), CliCommand::Gui);
+    }
+
+    /// Managed-instance spec §5: `--version` is a real CLI verb (the launcher
+    /// gate asserts exact-version equality on its output) — it must parse to
+    /// Version, NOT fall through to the GUI like other leading flags.
+    #[test]
+    fn version_flag_parses_to_version_not_gui() {
+        assert_eq!(parse_cli(&v(&["--version"])), Ok(CliCommand::Version));
+        assert_eq!(parse_cli(&v(&["-V"])), Ok(CliCommand::Version));
+        // Other leading flags still fall through to Gui (v0.4.31 invariant).
+        assert_eq!(parse_cli(&v(&["--silent"])), Ok(CliCommand::Gui));
     }
 
     #[test]
