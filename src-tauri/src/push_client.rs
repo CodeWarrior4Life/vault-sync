@@ -152,10 +152,12 @@ pub struct PushClient {
     journal: Arc<Mutex<PushJournal>>,
     device_id: String,
     config: PushClientConfig,
-    /// Absolute path to the configured `vaults_root`. Used to resolve a
-    /// `PushEvent.path` (forward-slash, relative to vaults_root with the
-    /// vault folder as its first segment per S477) to an on-disk file so
-    /// `content_bytes: None` (lazy) events can be read at drain time.
+    /// Absolute path to THIS pipeline's sync root (`SyncRoot.path` — the
+    /// field name is pre-B2 residue; lib.rs passes `watch_root =
+    /// sync_root.path`). Used to resolve a `PushEvent.path` — forward-slash,
+    /// **relative to the sync root** (post-B2 contract I12; the old S477
+    /// "vault folder as first segment" shape is retired) — to an on-disk
+    /// file so `content_bytes: None` (lazy) events can be read at drain time.
     vault_root: PathBuf,
     /// Optional tray telemetry sink (mandate §9 AG13). If set, the client
     /// increments `uploads_sent` / `uploads_failed` and updates
