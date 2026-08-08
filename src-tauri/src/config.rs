@@ -81,10 +81,16 @@ struct RawConfig {
 pub struct Config {
     pub nexus_url: String,
     pub subscriber_id: String,
-    /// v0.2.0: PARENT directory holding one or more Obsidian vaults (e.g.
-    /// `D:\Vaults`). Post-S477, this IS the daemon's watch + materialize
-    /// root; the vault folder name becomes the first segment of every
-    /// payload path (no per-config vault_name needed).
+    /// LEGACY (pre-B2). PARENT directory holding one or more Obsidian
+    /// vaults (e.g. `D:\Vaults`). At HEAD the daemon's watch/materialize
+    /// roots are `sync_roots` — NOT this field (see lib.rs `spawn_watchers`:
+    /// "The old `cfg.vaults_root` field is no longer used in this path").
+    /// Retained for two reasons only: back-compat synthesis of `sync_roots`
+    /// in `from_toml_back_compat` (guarded by the mis-root rule 2b), and
+    /// enrollment round-trip. NOTE: this field is currently PARSER-REQUIRED
+    /// even when `[[sync_roots]]` is authoritative — deleting the key from
+    /// config.toml makes startup fail (audit D-C2; make Optional via a
+    /// versioned migration, never a casual removal).
     ///
     /// Back-compat: if `vaults_root` is missing but legacy `vault_root` is
     /// present in the on-disk file, the deserializer accepts the legacy
