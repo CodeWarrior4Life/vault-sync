@@ -752,12 +752,11 @@ mod tests {
     /// startup PATCH /subscribers/me the server's S5 min-version gate reads)
     /// must be the control-plane P0 version. Guards against shipping under a
     /// version string the fleet would mistake for an older release. Bumped for
-    /// the P0 2026-08-05 vault_name round-trip + mis-root guard fix. (Was
-    /// stale at 0.4.34 through the 0.4.35 release — pre-existing red.)
+    /// the 0.4.38 managed-instance-mode release (spec §5, 2026-08-08).
     #[test]
-    fn daemon_version_is_0_4_37() {
-        assert_eq!(daemon_version(), "0.4.37");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.37/"));
+    fn daemon_version_is_0_4_38() {
+        assert_eq!(daemon_version(), "0.4.38");
+        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.38/"));
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
