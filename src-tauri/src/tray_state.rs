@@ -89,6 +89,14 @@ pub struct TrayState {
     pub redflag_tripped: bool,
     /// True iff the DeleteBurstDetector is currently Paused.
     pub delete_burst_paused: bool,
+    /// True iff the materializer's conflict-storm breaker has LATCHED open
+    /// (2026-08-12 P1). While latched, R4/R5 Conflict paths are refused
+    /// wholesale: local bytes preserved, nothing stashed, nothing overwritten —
+    /// and the affected paths are deliberately left DIVERGENT. That is a
+    /// deliberate stale state, so it has to be visible; a latched daemon which
+    /// looked healthy would be the same "absence read as health" failure that
+    /// made the 07-23 storm invisible for two days.
+    pub conflict_storm_latched: bool,
     /// True while an owner-invoked "Verify and repair all files" sweep is
     /// running. Set true the instant the tray menu item is clicked (before the
     /// walk+hash+reconcile await) and false when it completes. Drives the
@@ -137,6 +145,7 @@ impl TrayState {
             integrity_failures: 0,
             redflag_tripped: false,
             delete_burst_paused: false,
+            conflict_storm_latched: false,
             verify_in_progress: false,
             recon_pulls_total: 0,
             recon_pushes_total: 0,
@@ -219,6 +228,10 @@ impl TrayState {
 
     pub fn set_delete_burst_paused(&mut self, paused: bool) {
         self.delete_burst_paused = paused;
+    }
+
+    pub fn set_conflict_storm_latched(&mut self, latched: bool) {
+        self.conflict_storm_latched = latched;
     }
 
     pub fn set_verify_in_progress(&mut self, in_progress: bool) {

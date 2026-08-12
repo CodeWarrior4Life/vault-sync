@@ -42,11 +42,11 @@ use std::os::darwin::fs::FileTimesExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileTimesExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -362,6 +362,33 @@ pub struct Materializer {
     /// so every clone (SSE consumer, reconcile backstop, pull backfill) counts
     /// against ONE budget — the storm arrived through the reconcile clone.
     conflict_mints: Arc<Mutex<std::collections::VecDeque<std::time::Instant>>>,
+    /// TKT-372e31b2 / 2026-08-12 P1: LATCH for the conflict-storm breaker.
+    ///
+    /// The pruning window in `conflict_breaker_open` is a sliding-window RATE
+    /// LIMITER: it drops mints older than `conflict_storm_window_secs` and then
+    /// re-admits `conflict_storm_threshold` more, so it **re-arms every window,
+    /// forever**. The TKT-86ae42a3 design-of-record states the invariant as "a
+    /// mass server-side divergence event can never again mint thousands of
+    /// conflict copies" — and the field falsified that sentence: the 2026-07-23
+    /// storm minted **7,371** stashes between 15:38:48 and the next day 16:26:34
+    /// (89,266 s / 600 s = 148.8 windows x 50 = 7,440 predicted, within 1%),
+    /// alongside 546,523 `BREAKER OPEN` log lines.
+    ///
+    /// Once tripped we therefore LATCH: the breaker stays open for the rest of
+    /// the process, bounding a single storm to `threshold` mints instead of
+    /// `threshold` per window. This costs nothing in convergence *during* the
+    /// storm — the open arm already refused the pull as well as the stash — and
+    /// it converts an unbounded fork generator into a bounded one that a human
+    /// or a reconcile pass resolves. `Arc`-shared for the same reason
+    /// `conflict_mints` is: every clone must count against ONE latch, because
+    /// the 07-23 storm arrived through the reconcile clone.
+    ///
+    /// Cleared by process restart (in-memory by construction) or explicitly via
+    /// [`Materializer::reset_conflict_storm_breaker`]. Surfaced to the tray as
+    /// `conflict_storm_latched` so a latched daemon can never be silently stale
+    /// — the failure mode this project keeps paying for is absence read as
+    /// health.
+    conflict_breaker_latched: Arc<AtomicBool>,
     /// R1 / F-B1.1 (TKT-989ad5f2): optional push-journal handle used to enqueue
     /// the ARM-1 compensating UP push (pure server-strip: the server merely
     /// dropped the frontmatter block; the body is byte-identical after
@@ -390,6 +417,7 @@ impl Clone for Materializer {
             base_seq_store: self.base_seq_store.clone(),
             path_locks: self.path_locks.clone(),
             conflict_mints: self.conflict_mints.clone(),
+            conflict_breaker_latched: self.conflict_breaker_latched.clone(),
             push_journal: self.push_journal.clone(),
         }
     }
@@ -425,6 +453,7 @@ impl Materializer {
             base_seq_store: None,
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             conflict_mints: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            conflict_breaker_latched: Arc::new(AtomicBool::new(false)),
             push_journal: None,
         }
     }
@@ -481,14 +510,30 @@ impl Materializer {
         }
     }
 
-    /// Conflict-storm circuit breaker (TKT-86ae42a3). Called on every R4/R5
-    /// Conflict decision BEFORE stashing. Prunes mints older than the window,
-    /// then either admits this mint (recording it, returns `false`) or reports
-    /// the breaker OPEN (returns `true`). Threshold 0 disables the breaker.
-    fn conflict_breaker_open(&self) -> bool {
+    /// Conflict-storm circuit breaker (TKT-86ae42a3, LATCHED 2026-08-12).
+    ///
+    /// Called on every R4/R5 Conflict decision BEFORE stashing. Returns `true`
+    /// when the breaker is OPEN (caller must refuse the write entirely — no
+    /// stash, no overwrite, fail-closed toward local bytes).
+    ///
+    /// `threshold` mints are admitted inside `conflict_storm_window_secs`; the
+    /// `threshold+1`-th TRIPS THE LATCH and the breaker stays open for the rest
+    /// of the process. See [`Self::conflict_breaker_latched`] for why the
+    /// original pure sliding window did not hold its own documented invariant.
+    /// Threshold 0 disables the breaker (and can never latch).
+    ///
+    /// Returns `(open, just_latched)` so the caller can log the transition
+    /// exactly once instead of once per refused path — the 07-23 storm wrote
+    /// 546,523 identical WARN lines, and this daemon's log reached 442 MB in a
+    /// day on trinity during the 07-30 storm.
+    fn conflict_breaker_open(&self) -> (bool, bool) {
         let threshold = self.config.conflict_storm_threshold;
         if threshold == 0 {
-            return false;
+            return (false, false);
+        }
+        // Latched from a previous trip: open, and NOT a fresh transition.
+        if self.conflict_breaker_latched.load(Ordering::Relaxed) {
+            return (true, false);
         }
         let window = std::time::Duration::from_secs(self.config.conflict_storm_window_secs);
         let now = std::time::Instant::now();
@@ -503,10 +548,37 @@ impl Materializer {
             mints.pop_front();
         }
         if mints.len() >= threshold as usize {
-            return true;
+            // `swap` under the mints lock: concurrent clones (SSE consumer,
+            // reconcile, backfill) race here, and exactly one must observe the
+            // transition so exactly one ERROR line is emitted.
+            let was_latched = self.conflict_breaker_latched.swap(true, Ordering::Relaxed);
+            return (true, !was_latched);
         }
         mints.push_back(now);
-        false
+        (false, false)
+    }
+
+    /// True iff the conflict-storm breaker has LATCHED open in this process.
+    /// While latched, every R4/R5 Conflict decision is refused: local bytes are
+    /// preserved and the server version is NOT materialized, so the affected
+    /// paths are deliberately left divergent pending human or reconcile action.
+    pub fn conflict_storm_latched(&self) -> bool {
+        self.conflict_breaker_latched.load(Ordering::Relaxed)
+    }
+
+    /// Clear a latched conflict-storm breaker and its mint budget.
+    ///
+    /// For explicit operator recovery once the mass-divergence cause is fixed
+    /// (and for tests). Deliberately NOT called from any timer or watchdog: an
+    /// automatic reset would restore the re-arming behavior this latch exists to
+    /// remove, and an auto-restart on a recurring storm would restart-loop.
+    pub fn reset_conflict_storm_breaker(&self) {
+        self.conflict_breaker_latched
+            .store(false, Ordering::Relaxed);
+        self.conflict_mints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     /// Builder-style: attach the shared persistent
@@ -1059,14 +1131,34 @@ impl Materializer {
                     // refuse the whole write: local untouched, no stash, no
                     // overwrite — fail-closed toward local bytes; reconcile
                     // retries after the window.
-                    if self.conflict_breaker_open() {
-                        warn!(
-                            path = %payload.path,
-                            change_seq,
-                            threshold = self.config.conflict_storm_threshold,
-                            window_secs = self.config.conflict_storm_window_secs,
-                            "materializer CONFLICT-STORM BREAKER OPEN: refusing conflict mint, local preserved, pull skipped (mass server-side divergence suspected)"
-                        );
+                    let (breaker_open, just_latched) = self.conflict_breaker_open();
+                    if breaker_open {
+                        if just_latched {
+                            // Exactly once per process: the transition is the
+                            // event worth paging on. Subsequent refusals are
+                            // debug-level so a storm cannot flood the journal
+                            // (07-23: 546,523 identical WARN lines).
+                            error!(
+                                path = %payload.path,
+                                change_seq,
+                                threshold = self.config.conflict_storm_threshold,
+                                window_secs = self.config.conflict_storm_window_secs,
+                                "materializer CONFLICT-STORM BREAKER LATCHED: {} conflict mints inside {}s means mass server-side divergence, NOT organic concurrent editing. Refusing all further conflict mints for the lifetime of this process: local bytes preserved, pulls skipped, nothing stashed, nothing overwritten. Affected paths stay divergent ON PURPOSE. Fix the divergence cause, then restart the daemon (or call reset_conflict_storm_breaker) to re-arm.",
+                                self.config.conflict_storm_threshold,
+                                self.config.conflict_storm_window_secs,
+                            );
+                            if let Some(tray) = &self.tray_state {
+                                if let Ok(mut w) = tray.write() {
+                                    w.set_conflict_storm_latched(true);
+                                }
+                            }
+                        } else {
+                            debug!(
+                                path = %payload.path,
+                                change_seq,
+                                "materializer CONFLICT-STORM BREAKER OPEN (latched): refusing conflict mint, local preserved, pull skipped"
+                            );
+                        }
                         return Ok(MaterializeOutcome::Skipped(
                             SkipReason::ConflictStormBreakerOpen,
                         ));
@@ -2594,6 +2686,193 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
             .count();
         assert_eq!(stash_files, 3, "exactly threshold stash files on disk");
+    }
+
+    /// THE 2026-07-23 EPIDEMIC, in miniature. The pre-latch breaker pruned its
+    /// mint deque to the window and then admitted `threshold` MORE, so a
+    /// sustained mass-divergence event minted `threshold` forks every window
+    /// forever: 7,371 real stashes over ~24.8 h at 50/600 s (148.8 windows x 50
+    /// = 7,440 predicted, measured within 1%).
+    ///
+    /// A 1-second window makes that re-arm observable in a unit test. On the
+    /// pre-fix code the post-window writes are `Stashed` again and this fails
+    /// with 6 stash files; latched, the storm is bounded to `threshold` for the
+    /// lifetime of the process no matter how many windows elapse.
+    #[test]
+    fn conflict_storm_breaker_latches_and_never_rearms_after_the_window() {
+        let cfg = MaterializerConfig {
+            conflict_storm_threshold: 3,
+            // 2 s (not 1 s) so the four in-window writes below cannot themselves
+            // outlive the window on a loaded CI box and prune the deque early —
+            // that would silently turn this regression test green for the wrong
+            // reason. The sleep is sized against this, not the reverse.
+            conflict_storm_window_secs: 2,
+            ..default_cfg()
+        };
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = vaults.path().join(VAULT).join("01_Notes");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write_one = |i: usize| {
+            let rel = format!("01_Notes/storm-{i}.md");
+            std::fs::write(dir.join(format!("storm-{i}.md")), "local bytes").unwrap();
+            m.write(&payload(&rel, "server bytes")).unwrap()
+        };
+
+        // Window 1: threshold admitted, then the latch trips.
+        for i in 0..3 {
+            assert!(
+                matches!(write_one(i), MaterializeOutcome::Stashed { .. }),
+                "mint {i} is inside the threshold and must stash"
+            );
+        }
+        assert!(!m.conflict_storm_latched(), "not latched until exceeded");
+        assert_eq!(
+            write_one(3),
+            MaterializeOutcome::Skipped(SkipReason::ConflictStormBreakerOpen),
+            "the threshold+1-th mint must trip the breaker"
+        );
+
+        // Let the sliding window fully expire — this is the exact moment the old
+        // code re-armed and resumed minting. Asserted BEFORE the latch getter so
+        // that on pre-fix code this test fails on the OBSERVABLE EPIDEMIC
+        // MECHANISM (forks resuming after the window) rather than on an
+        // implementation detail of the latch flag.
+        std::thread::sleep(std::time::Duration::from_millis(2_500));
+
+        for i in 4..8 {
+            assert_eq!(
+                write_one(i),
+                MaterializeOutcome::Skipped(SkipReason::ConflictStormBreakerOpen),
+                "write {i}: a LATCHED breaker must stay open across window \
+                 expiry — re-arming is what minted 7,371 forks on 2026-07-23"
+            );
+            // Fail-closed toward local on every refusal, exactly as before.
+            assert_eq!(
+                std::fs::read_to_string(dir.join(format!("storm-{i}.md"))).unwrap(),
+                "local bytes",
+                "write {i}: refused means local bytes untouched"
+            );
+        }
+
+        let stash_files = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(
+            stash_files, 3,
+            "a whole storm must be bounded to `threshold` forks, not \
+             `threshold` per window"
+        );
+        assert!(
+            m.conflict_storm_latched(),
+            "the breaker must report itself LATCHED so the state is observable"
+        );
+    }
+
+    /// The latch is shared through clones. The 07-23 storm arrived via the
+    /// reconcile clone while the SSE consumer held its own handle; a per-clone
+    /// latch would have given each lane its own budget and multiplied the cap by
+    /// the number of lanes.
+    #[test]
+    fn conflict_storm_latch_is_shared_across_clones() {
+        let cfg = MaterializerConfig {
+            conflict_storm_threshold: 2,
+            conflict_storm_window_secs: 600,
+            ..default_cfg()
+        };
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = vaults.path().join(VAULT).join("01_Notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clone = m.clone();
+
+        for i in 0..3 {
+            let rel = format!("01_Notes/shared-{i}.md");
+            std::fs::write(dir.join(format!("shared-{i}.md")), "local bytes").unwrap();
+            let _ = m.write(&payload(&rel, "server bytes")).unwrap();
+        }
+        assert!(m.conflict_storm_latched(), "primary latched");
+        assert!(
+            clone.conflict_storm_latched(),
+            "a clone must observe the SAME latch, not its own budget"
+        );
+
+        // And the clone refuses too, rather than starting a fresh window.
+        std::fs::write(dir.join("shared-via-clone.md"), "local bytes").unwrap();
+        assert_eq!(
+            clone
+                .write(&payload("01_Notes/shared-via-clone.md", "server bytes"))
+                .unwrap(),
+            MaterializeOutcome::Skipped(SkipReason::ConflictStormBreakerOpen),
+            "clone must honor the shared latch"
+        );
+    }
+
+    /// Explicit reset is the documented recovery path (fix the cause, then
+    /// re-arm) and must restore normal minting — otherwise the latch would be a
+    /// one-way wedge with no remedy short of a restart.
+    #[test]
+    fn reset_conflict_storm_breaker_re_arms_the_mint_budget() {
+        let cfg = MaterializerConfig {
+            conflict_storm_threshold: 1,
+            conflict_storm_window_secs: 600,
+            ..default_cfg()
+        };
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = vaults.path().join(VAULT).join("01_Notes");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for i in 0..2 {
+            let rel = format!("01_Notes/reset-{i}.md");
+            std::fs::write(dir.join(format!("reset-{i}.md")), "local bytes").unwrap();
+            let _ = m.write(&payload(&rel, "server bytes")).unwrap();
+        }
+        assert!(m.conflict_storm_latched(), "latched after exceeding");
+
+        m.reset_conflict_storm_breaker();
+        assert!(!m.conflict_storm_latched(), "reset clears the latch");
+
+        std::fs::write(dir.join("reset-after.md"), "local bytes").unwrap();
+        assert!(
+            matches!(
+                m.write(&payload("01_Notes/reset-after.md", "server bytes"))
+                    .unwrap(),
+                MaterializeOutcome::Stashed { .. }
+            ),
+            "after reset the always-stash floor for genuine divergence is back"
+        );
+    }
+
+    /// Threshold 0 disables the breaker entirely (documented behavior) and must
+    /// therefore never latch, or setting 0 would silently become "latch on the
+    /// first conflict".
+    #[test]
+    fn threshold_zero_disables_the_breaker_and_never_latches() {
+        let cfg = MaterializerConfig {
+            conflict_storm_threshold: 0,
+            conflict_storm_window_secs: 600,
+            ..default_cfg()
+        };
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = vaults.path().join(VAULT).join("01_Notes");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for i in 0..6 {
+            let rel = format!("01_Notes/nobreaker-{i}.md");
+            std::fs::write(dir.join(format!("nobreaker-{i}.md")), "local bytes").unwrap();
+            assert!(
+                matches!(
+                    m.write(&payload(&rel, "server bytes")).unwrap(),
+                    MaterializeOutcome::Stashed { .. }
+                ),
+                "mint {i}: threshold 0 means no breaker at all"
+            );
+        }
+        assert!(
+            !m.conflict_storm_latched(),
+            "a disabled breaker must never latch"
+        );
     }
 
     #[test]
