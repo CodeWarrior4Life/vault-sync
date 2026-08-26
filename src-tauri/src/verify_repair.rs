@@ -87,6 +87,12 @@ use crate::push_journal::{
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 
+/// P0 2026-08-26 fail-safe: most local soft-deletes the reconcile backstop will
+/// perform in ONE pass on the server's word. Above this it refuses ALL of them.
+/// Sized so an ordinary tidy-up converges in a pass or two while the 295-note
+/// class of event — and anything larger — is refused pending investigation.
+pub const MAX_RECONCILE_LOCAL_DELETES: usize = 50;
+
 const SAMPLE_CAP: usize = 50;
 
 /// Static configuration for VerifyRepair runs.
@@ -249,6 +255,19 @@ pub enum Direction {
     Push,
     /// Server is authoritative — fetch + overwrite local (server-wins).
     Pull,
+    /// P0 2026-08-26: the server has RETIRED this note (`state=deleted-on-server`)
+    /// but it is still present locally — soft-delete the local copy.
+    ///
+    /// Pre-fix this state fell into `Noop` (`_ => Direction::Noop`), logging
+    /// "reconcile-batch: unknown delta state — skipping (noop)" every 10 minutes
+    /// forever. That made the reconcile backstop structurally unable to converge
+    /// a delete: `pull_backfill` only CREATES, live SSE deletes are the ONLY
+    /// working delete path to a peer, and SSE is intermittently lossy (MEASURED
+    /// on icarus 2026-08-26: hourly backfill `created=11`, `created=3`,
+    /// `created=4` in three windows, i.e. ~18 events SSE dropped that day). A
+    /// create SSE drops is repaired within the hour; a DELETE it drops was
+    /// divergent forever. This closes that hole.
+    DeleteLocal,
     /// In sync — do nothing.
     Noop,
 }
@@ -290,6 +309,10 @@ pub fn decide_direction(
             }
         }
         "missing-on-server" => Direction::Push,
+        // P0 2026-08-26: the server retired the note. Converge by soft-deleting
+        // local. `soft_delete` RENAMES to `<name>.deleted-<ts>` and forks on
+        // divergence, so this is recoverable, never a destructive unlink.
+        "deleted-on-server" => Direction::DeleteLocal,
         "match" => Direction::Noop,
         _ => Direction::Noop,
     }
@@ -454,6 +477,8 @@ impl VerifyRepair {
         // prior-materialization (server moved since we synced) — resolve these
         // server-wins (PULL + overwrite local), NOT push (which 409-churned).
         let mut pending_pulls: Vec<String> = Vec::new();
+        // P0 2026-08-26: paths the server has retired that are still local.
+        let mut pending_local_deletes: Vec<String> = Vec::new();
 
         for delta in &deltas {
             let server_hash = delta.server_hash.as_deref();
@@ -522,6 +547,14 @@ impl VerifyRepair {
                     );
                     pending_pulls.push(delta.path.clone());
                 }
+                Direction::DeleteLocal => {
+                    tracing::info!(
+                        path = %delta.path,
+                        state = %delta.state,
+                        "reconciliation: server retired this note — converging by SOFT-DELETING local (P0 2026-08-26)"
+                    );
+                    pending_local_deletes.push(delta.path.clone());
+                }
                 Direction::Noop => {
                     if delta.state != "match" {
                         // Forward-compat: an unrecognized state is handled
@@ -561,6 +594,59 @@ impl VerifyRepair {
                     tracing::warn!(error = %e, "verify_repair: append_batch failed");
                     report.errors.push(("<journal>".to_string(), e.to_string()));
                 }
+            }
+        }
+
+        // P0 2026-08-26: EXECUTE the local soft-deletes for notes the server has
+        // retired. This is the ONLY non-SSE path by which a delete converges to a
+        // peer, so without it a delete SSE drops is divergent forever.
+        //
+        // FAIL-SAFE CIRCUIT BREAKER. This is the one place the reconciler removes
+        // local files on the SERVER's word, so a wrong/rolled-back server state
+        // could otherwise sweep a vault. If one pass would soft-delete more than
+        // `MAX_RECONCILE_LOCAL_DELETES` paths, we do NONE of them and log loudly:
+        // a legitimate bulk delete converges over several passes or via the live
+        // SSE path, whereas a mass mis-report is refused outright. Deliberately
+        // biased toward leaving a stale file present over removing a live one.
+        if !pending_local_deletes.is_empty() {
+            let n = pending_local_deletes.len();
+            if n > MAX_RECONCILE_LOCAL_DELETES {
+                tracing::error!(
+                    would_delete = n,
+                    cap = MAX_RECONCILE_LOCAL_DELETES,
+                    "reconciliation: REFUSING to soft-delete {n} local notes in one pass (cap {MAX_RECONCILE_LOCAL_DELETES}) — this many server-retired paths at once looks like a server-side mis-report or rollback, not an owner delete. NOTHING was deleted. Investigate the server's vault_notes state before trusting this signal.",
+                );
+                report.errors.push((
+                    "<reconcile-local-delete>".to_string(),
+                    format!("refused {n} local soft-deletes in one pass (cap {MAX_RECONCILE_LOCAL_DELETES})"),
+                ));
+            } else if let Some(mz) = self.materializer.as_ref() {
+                let mut done = 0usize;
+                for path in &pending_local_deletes {
+                    match mz.soft_delete(path) {
+                        Ok(()) => {
+                            done += 1;
+                            report.delete_count += 1;
+                            if report.delete_paths_sample.len() < SAMPLE_CAP {
+                                report.delete_paths_sample.push(path.clone());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %path, error = %e, "reconciliation: local soft-delete failed; retried next pass");
+                            report.errors.push((path.clone(), e.to_string()));
+                        }
+                    }
+                }
+                tracing::warn!(
+                    soft_deleted = done,
+                    requested = n,
+                    "reconciliation: converged {done}/{n} server-retired note(s) by soft-deleting local (renamed to .deleted-<ts>, recoverable)"
+                );
+            } else {
+                tracing::info!(
+                    pending = n,
+                    "reconciliation: {n} server-retired note(s) pending local soft-delete but no materializer is wired (unit-test path); nothing removed"
+                );
             }
         }
 
@@ -1733,6 +1819,56 @@ mod tests {
             decide_direction("weird", "local", Some("srv"), None),
             Direction::Noop
         );
+        // P0 2026-08-26: deleted-on-server → DeleteLocal, NOT Noop.
+        //
+        // THE FIELD FAILURE. Pre-fix this fell through `_ => Noop`, logging
+        // "reconcile-batch: unknown delta state — skipping (noop)" every 10
+        // minutes forever while a deleted note sat undead on a peer. Since
+        // pull_backfill only CREATES and live SSE is intermittently lossy
+        // (MEASURED on icarus 2026-08-26: hourly backfill created=11/3/4 across
+        // three windows), the reconcile backstop was the ONLY thing that could
+        // converge a delete SSE dropped — and it did nothing.
+        assert_eq!(
+            decide_direction("deleted-on-server", "local", None, Some("srv-old")),
+            Direction::DeleteLocal,
+            "a server-retired note that is still local must converge by deleting local"
+        );
+        // Independent of shadow/server hash presence: the state alone decides.
+        assert_eq!(
+            decide_direction("deleted-on-server", "local", None, None),
+            Direction::DeleteLocal
+        );
+        assert_eq!(
+            decide_direction("deleted-on-server", "", Some("srv"), Some("srv")),
+            Direction::DeleteLocal
+        );
+    }
+
+    /// P0 2026-08-26 fail-safe: the cap that stops a server mis-report from
+    /// sweeping a vault. This is the ONE place the reconciler removes local
+    /// files on the server's word, so the bound is load-bearing.
+    #[test]
+    fn reconcile_local_delete_cap_is_a_sane_fail_safe() {
+        // A cap of 0 would disable convergence entirely; an unbounded cap would
+        // let one bad server response delete everything. Assert the property the
+        // breaker relies on, so a later "tidy-up" cannot quietly remove it.
+        // `const { assert!(..) }`: these are COMPILE-TIME gates, so a later edit
+        // that widens or zeroes the cap fails the BUILD rather than a test run.
+        const _: () = assert!(
+            MAX_RECONCILE_LOCAL_DELETES > 0,
+            "a zero cap would make the reconcile backstop unable to converge ANY delete"
+        );
+        const _: () = assert!(
+            MAX_RECONCILE_LOCAL_DELETES <= 100,
+            "the cap must stay small enough that a server mis-report is refused, not applied"
+        );
+        // The motivating incident (295 paths) must be refused outright.
+        const _: () = assert!(
+            295 > MAX_RECONCILE_LOCAL_DELETES,
+            "the 2026-08-25 295-note event must trip the breaker, not execute"
+        );
+        // Runtime read so the test is not vacuous if the consts are ever removed.
+        assert_eq!(MAX_RECONCILE_LOCAL_DELETES, 50);
     }
 
     /// End-to-end: a stale-local drift (shadow ABSENT) resolves server-wins —
