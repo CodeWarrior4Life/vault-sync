@@ -240,6 +240,16 @@ impl SseConsumer {
         Ok(())
     }
 
+    // clippy::result_large_err — `SseError` is an ALIAS for the foreign
+    // `eventsource_client::Error` (152 bytes), so its variants cannot be boxed
+    // here, and `Box<SseError>` would only move the cost to a cold path: this is
+    // a long-lived session loop whose Err is returned once per disconnect, then
+    // reconnected with backoff. Surfaced 2026-08-26 when CI's stable moved to
+    // Rust 1.98 and the lint began firing on pre-existing code (the 0.4.38 CI
+    // run on 2026-08-08 was green on the same source), turning main red for any
+    // commit pushed that day. Allowed deliberately rather than restructuring a
+    // foreign error type under time pressure.
+    #[allow(clippy::result_large_err)]
     async fn run_one_session(&self, last_event_id: &mut Option<String>) -> Result<(), SseError> {
         let url = format!("{}/api/sync/events", self.nexus_url);
         let mut builder = eventsource_client::ClientBuilder::for_url(&url)?
