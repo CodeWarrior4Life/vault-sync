@@ -1303,10 +1303,19 @@ fn spawn_push_pipeline(
         }
     };
     // FileWatcherConfig.allowed_extensions are WITHOUT a leading dot ("md").
-    let burst = Arc::new(std::sync::Mutex::new(redflag::DeleteBurstDetector::new(
-        20,
-        std::time::Duration::from_secs(30),
-    )));
+    // P0 2026-08-26: attach the pause marker next to the push journal in
+    // sync-state. `paused` is sticky and its only pre-fix exit was the tray
+    // action, which is unreachable on the headless `cage` daemon — so the valve
+    // was a one-way trapdoor that silently discarded every delete for 13.5h
+    // after it tripped. Removing this file is now the headless resume.
+    let burst_marker = journal_path
+        .parent()
+        .map(|d| d.join("delete-burst-PAUSED"))
+        .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-PAUSED"));
+    let burst = Arc::new(std::sync::Mutex::new(
+        redflag::DeleteBurstDetector::new(20, std::time::Duration::from_secs(30))
+            .with_pause_marker(burst_marker),
+    ));
     // S484: expose the valve so the tray "Resume delete propagation" action
     // can reset it in place (no daemon restart). Register before `burst` is
     // moved into the file watcher below.

@@ -843,6 +843,27 @@ impl FileWatcher {
                     _ = heartbeat.tick() => {
                         // Idle or busy, the loop is alive: stamp the heartbeat.
                         me.mark_watcher_alive();
+                        // P0 2026-08-26: headless resume for the delete-burst
+                        // valve. The tray action is unreachable on a daemon
+                        // running under `cage`, so the operator clears the
+                        // latch by removing the pause marker and we pick that
+                        // up here. Without this the latch is permanent until a
+                        // restart, which is how every delete on link was
+                        // silently discarded for 13.5 hours.
+                        let resumed = match me.burst.lock() {
+                            Ok(mut b) => b.poll_marker_resume(),
+                            Err(_) => false,
+                        };
+                        if resumed {
+                            tracing::warn!(
+                                "file_watcher: delete-burst pause marker removed by operator — OUTBOUND DELETE PROPAGATION RESUMED"
+                            );
+                            if let Some(tray) = &me.tray_state {
+                                if let Ok(mut w) = tray.write() {
+                                    w.set_delete_burst_paused(false);
+                                }
+                            }
+                        }
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -1077,6 +1098,31 @@ impl FileWatcher {
                     Err(e) => {
                         tracing::warn!("file_watcher: journal mutex poisoned: {e}");
                     }
+                }
+            }
+            // P0 2026-08-26: a delete suppressed by the latched burst valve is
+            // DATA LOSS from the operator's point of view (the note stays alive
+            // fleet-wide and leaves no tombstone), so it must never be silent.
+            // Pre-fix this fell into the `other` arm below at DEBUG level, and
+            // the daemon runs at INFO — so 13.5 hours of discarded deletes
+            // produced exactly zero log lines and the nightly battery could
+            // only observe an absence. Always loud on the FIRST suppression,
+            // then throttled so a genuine mass delete cannot flood the log.
+            FilterDecision::DropDeleteBurst { path } => {
+                let (n, marker) = match self.burst.lock() {
+                    Ok(mut b) => (
+                        b.note_suppressed(),
+                        b.pause_marker_path().map(|p| p.display().to_string()),
+                    ),
+                    Err(_) => (1, None),
+                };
+                if n == 1 || n % 50 == 0 {
+                    tracing::warn!(
+                        path = %path,
+                        suppressed_since_pause = n,
+                        resume_by = %marker.as_deref().unwrap_or("<tray action: Resume delete propagation>"),
+                        "file_watcher: DELETE SUPPRESSED — the delete-burst safety valve is PAUSED, so this delete is NOT propagating: the note stays alive on every host and leaves no recoverable tombstone. Remove the pause marker to resume (the daemon picks it up within ~30s, no restart needed)."
+                    );
                 }
             }
             other => {

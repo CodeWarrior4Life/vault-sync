@@ -91,6 +91,24 @@ pub struct DeleteBurstDetector {
     window: Duration,
     events: VecDeque<Instant>,
     paused: bool,
+    /// P0 2026-08-26: filesystem marker for the latched state. Written when the
+    /// valve trips; its REMOVAL by the operator is the headless resume action
+    /// (see [`Self::poll_marker_resume`]). `None` disables the marker entirely,
+    /// preserving pre-fix behavior for unit tests.
+    ///
+    /// WHY THIS EXISTS: `paused` is sticky and, pre-fix, its ONLY exit was
+    /// [`resume_delete_propagation`] driven by the tray menu item. The
+    /// production daemon on link runs headless under `cage`, so nobody could
+    /// ever click it. On 2026-08-25T23:37:35 exactly 20 deletes landed inside
+    /// one second (the 20/30s threshold), the valve latched, and EVERY delete
+    /// fleet-wide was silently discarded for the next 13.5 hours — deletes did
+    /// not retire notes, left no tombstone, and never reached peers. A valve
+    /// whose only reset is unreachable in the real deployment is a one-way
+    /// trapdoor, not a safety valve.
+    pause_marker: Option<PathBuf>,
+    /// Deletes suppressed since the valve latched. Drives throttled WARN
+    /// logging at the call site so a latched valve can never again be silent.
+    suppressed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +130,99 @@ impl DeleteBurstDetector {
             window,
             events: VecDeque::new(),
             paused: false,
+            pause_marker: None,
+            suppressed: 0,
         }
+    }
+
+    /// Attach the filesystem pause marker (P0 2026-08-26). The production
+    /// wire-up always sets this; `new()` alone keeps the marker-less behavior.
+    pub fn with_pause_marker(mut self, marker: impl Into<PathBuf>) -> Self {
+        self.pause_marker = Some(marker.into());
+        self
+    }
+
+    /// Path of the pause marker, if one is configured.
+    pub fn pause_marker_path(&self) -> Option<&PathBuf> {
+        self.pause_marker.as_ref()
+    }
+
+    /// Write the pause marker, explaining in the file itself how to resume.
+    /// The marker is advisory: a write failure must never block the valve from
+    /// latching, so errors are logged and swallowed.
+    fn write_pause_marker(&self) {
+        let Some(path) = &self.pause_marker else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "vault-sync: OUTBOUND DELETE PROPAGATION IS PAUSED\n\
+             \n\
+             The delete-burst safety valve tripped: {} or more deletes were\n\
+             observed within {}s, which is the signature of a catastrophic mass\n\
+             delete that must NOT be propagated to the rest of the fleet.\n\
+             \n\
+             While this file exists, local deletes are NOT sent to the server:\n\
+             deleted notes stay alive fleet-wide and leave no tombstone.\n\
+             \n\
+             TO RESUME: delete this file.\n\
+             \n\
+                 rm {}\n\
+             \n\
+             The daemon polls for its removal and resumes within ~30s. No\n\
+             restart is needed. Verify first that the deletes that tripped the\n\
+             valve were intentional.\n",
+            self.threshold,
+            self.window.as_secs(),
+            path.display(),
+        );
+        if let Err(e) = std::fs::write(path, body) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "redflag: could not write delete-burst pause marker; headless resume unavailable — use the tray action or restart the daemon"
+            );
+        }
+    }
+
+    /// Remove the pause marker (best-effort; absence is the desired state).
+    fn clear_pause_marker(&self) {
+        if let Some(path) = &self.pause_marker {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// HEADLESS RESUME (P0 2026-08-26). If the valve is latched and the
+    /// operator has removed the pause marker, clear the latch. Returns `true`
+    /// iff this call resumed propagation, so the caller can log it once.
+    ///
+    /// Called from the file-watcher heartbeat, so a headless daemon recovers
+    /// without a tray click and without a restart.
+    pub fn poll_marker_resume(&mut self) -> bool {
+        if !self.paused {
+            return false;
+        }
+        let Some(path) = self.pause_marker.clone() else {
+            return false;
+        };
+        if path.exists() {
+            return false;
+        }
+        self.events.clear();
+        self.paused = false;
+        self.suppressed = 0;
+        true
+    }
+
+    /// Record that one delete was suppressed by the latched valve, returning
+    /// the running count. The caller uses this to throttle its WARN so a mass
+    /// delete cannot flood the log while still guaranteeing the FIRST
+    /// suppression is always loud.
+    pub fn note_suppressed(&mut self) -> u64 {
+        self.suppressed = self.suppressed.saturating_add(1);
+        self.suppressed
     }
 
     /// Record a delete event at `Instant::now()` and return the resulting
@@ -155,11 +265,13 @@ impl DeleteBurstDetector {
         // Threshold-zero edge case: any event trips immediately.
         if self.threshold == 0 {
             self.paused = true;
+            self.write_pause_marker();
             return BurstStatus::AtThreshold { window_start: now };
         }
 
         if self.events.len() >= self.threshold {
             self.paused = true;
+            self.write_pause_marker();
             let window_start = *self.events.front().unwrap_or(&now);
             BurstStatus::AtThreshold { window_start }
         } else {
@@ -172,9 +284,16 @@ impl DeleteBurstDetector {
 
     /// Clear the deque and exit the paused state. Invoked when the owner
     /// confirms the tray prompt (Confirm → resume propagation).
+    ///
+    /// Also removes the pause marker so the on-disk state cannot disagree with
+    /// the in-memory state (a stale marker would make the next heartbeat's
+    /// [`Self::poll_marker_resume`] a no-op and leave the operator with a file
+    /// that claims deletes are paused when they are not).
     pub fn reset(&mut self) {
         self.events.clear();
         self.paused = false;
+        self.suppressed = 0;
+        self.clear_pause_marker();
     }
 
     /// Is the detector currently in the paused state?
@@ -491,5 +610,123 @@ mod tests {
             let r = det.record_delete_at(now + Duration::from_millis(100 + i));
             assert_eq!(r, BurstStatus::Paused);
         }
+    }
+
+    // ----- P0 2026-08-26: the latch must be recoverable headlessly ----- //
+    //
+    // These assert on the FAILURE that was measured in production, not on the
+    // happy path. On 2026-08-25T23:37:35 exactly 20 deletes landed inside one
+    // second, the valve latched, and every delete on link was silently
+    // discarded for the next 13.5 hours because the ONLY reset was a tray click
+    // and the daemon runs headless under `cage`.
+
+    fn tripped_with_marker(dir: &TempDir) -> (DeleteBurstDetector, PathBuf) {
+        let marker = dir.path().join("sync-state").join("delete-burst-PAUSED");
+        let mut det =
+            DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&marker);
+        let now = Instant::now();
+        for i in 0..20 {
+            det.record_delete_at(now + Duration::from_millis(i));
+        }
+        assert!(det.is_paused(), "20 deletes in 20ms must trip a 20/30s valve");
+        (det, marker)
+    }
+
+    #[test]
+    fn trip_writes_a_pause_marker_that_explains_how_to_resume() {
+        // The latched state must be VISIBLE on disk. Pre-fix nothing was
+        // written and nothing was logged, so a latched valve was
+        // indistinguishable from a working delete path.
+        let dir = TempDir::new().unwrap();
+        let (_det, marker) = tripped_with_marker(&dir);
+        assert!(marker.exists(), "trip must write the pause marker");
+        let body = fs::read_to_string(&marker).unwrap();
+        assert!(
+            body.contains("TO RESUME"),
+            "marker must tell the operator how to clear it, got: {body}"
+        );
+        assert!(
+            body.contains(&marker.display().to_string()),
+            "marker must name its own path so the rm is copy-pasteable"
+        );
+    }
+
+    #[test]
+    fn removing_the_marker_resumes_deletes_without_a_tray_click() {
+        // THE REGRESSION TEST. This is the exact production failure: a latched
+        // valve on a headless daemon. Recovery must need no tray and no
+        // restart.
+        let dir = TempDir::new().unwrap();
+        let (mut det, marker) = tripped_with_marker(&dir);
+
+        // While the marker is present the latch holds — deletes stay suppressed.
+        assert!(!det.poll_marker_resume(), "marker present ⇒ no resume");
+        assert!(det.is_paused());
+
+        // The operator removes the marker. The next heartbeat must resume.
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            det.poll_marker_resume(),
+            "marker removed ⇒ poll must resume propagation"
+        );
+        assert!(
+            !det.is_paused(),
+            "valve must be OPEN after the marker is cleared"
+        );
+
+        // And a subsequent delete is actually allowed through, not Paused.
+        let r = det.record_delete_at(Instant::now());
+        assert!(
+            matches!(r, BurstStatus::BelowThreshold { .. }),
+            "post-resume delete must be allowed, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn poll_is_a_noop_when_not_paused_or_when_unmarked() {
+        // An unpaused valve must never "resume" (that would zero a live
+        // window), and a marker-less detector keeps pre-fix behavior so the
+        // existing tray path and unit tests are unaffected.
+        let mut open = DeleteBurstDetector::new(20, Duration::from_secs(30));
+        assert!(!open.poll_marker_resume());
+
+        let mut unmarked = DeleteBurstDetector::new(2, Duration::from_secs(30));
+        let now = Instant::now();
+        unmarked.record_delete_at(now);
+        unmarked.record_delete_at(now + Duration::from_millis(1));
+        assert!(unmarked.is_paused());
+        assert!(
+            !unmarked.poll_marker_resume(),
+            "no marker configured ⇒ poll must not silently unlatch"
+        );
+        assert!(unmarked.is_paused());
+    }
+
+    #[test]
+    fn reset_clears_the_marker_so_disk_and_memory_agree() {
+        // A stale marker after a tray reset would make the next poll a no-op
+        // and tell the operator deletes are paused when they are not.
+        let dir = TempDir::new().unwrap();
+        let (mut det, marker) = tripped_with_marker(&dir);
+        assert!(marker.exists());
+        det.reset();
+        assert!(!det.is_paused());
+        assert!(!marker.exists(), "reset must remove the pause marker");
+    }
+
+    #[test]
+    fn suppressed_deletes_are_counted_for_throttled_logging() {
+        // The count is what makes the FIRST suppression loud and the rest
+        // throttled, so a mass delete is visible without flooding the log.
+        let dir = TempDir::new().unwrap();
+        let (mut det, _marker) = tripped_with_marker(&dir);
+        assert_eq!(det.note_suppressed(), 1);
+        assert_eq!(det.note_suppressed(), 2);
+        det.reset();
+        assert_eq!(
+            det.note_suppressed(),
+            1,
+            "reset must zero the suppression count"
+        );
     }
 }
