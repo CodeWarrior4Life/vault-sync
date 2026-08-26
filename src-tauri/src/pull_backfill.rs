@@ -90,7 +90,28 @@ pub fn read_backfill_interval(env: &dyn EnvReader) -> Duration {
 /// [`Materializer::write`] applies internally, but evaluated BEFORE fetching
 /// the body so we never download a note we would only skip or refuse.
 pub fn should_backfill(path: &str, target_exists: bool) -> bool {
+    should_backfill_with_intent(path, target_exists, false)
+}
+
+/// As [`should_backfill`], plus the P0 2026-08-26 resurrection guard.
+///
+/// `delete_pending` is true when the burst valve suppressed a delete for this
+/// path (see [`crate::delete_ledger`]). In that case the path is missing
+/// locally BECAUSE THE OWNER DELETED IT, and the server still has the row only
+/// because the delete never propagated. Backfilling it re-creates the note the
+/// owner removed — MEASURED 2026-08-26T00:05:37, `created=275`, which silently
+/// reverted a crash fix. So a pending local delete intent BEATS canonical
+/// presence, and we refuse the pull.
+///
+/// This is deliberately narrow: it only suppresses a CREATE we would otherwise
+/// perform, so the failure mode is a note that stays deleted locally slightly
+/// longer than canonical says it should — recoverable, and strictly safer than
+/// resurrecting content the owner deleted.
+pub fn should_backfill_with_intent(path: &str, target_exists: bool, delete_pending: bool) -> bool {
     if target_exists {
+        return false;
+    }
+    if delete_pending {
         return false;
     }
     if !is_safe_path(path) {
@@ -107,9 +128,29 @@ pub fn should_backfill(path: &str, target_exists: bool) -> bool {
 /// enumeration→filter core — the heart of the R6 fix — is unit-testable
 /// without HTTP or a filesystem.
 pub fn plan_backfill<F: Fn(&str) -> bool>(changes: &[ChangeRow], target_exists: F) -> Vec<String> {
+    plan_backfill_with_intent(changes, target_exists, |_| false)
+}
+
+/// As [`plan_backfill`], with the suppressed-delete oracle threaded through so
+/// the resurrection guard is exercised by the same pure, table-tested core.
+pub fn plan_backfill_with_intent<F, G>(
+    changes: &[ChangeRow],
+    target_exists: F,
+    delete_pending: G,
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+    G: Fn(&str) -> bool,
+{
     changes
         .iter()
-        .filter(|row| should_backfill(&row.path, target_exists(&row.path)))
+        .filter(|row| {
+            should_backfill_with_intent(
+                &row.path,
+                target_exists(&row.path),
+                delete_pending(&row.path),
+            )
+        })
         .map(|row| row.path.clone())
         .collect()
 }
@@ -140,10 +181,37 @@ pub async fn run_pull_backfill(
     page_limit: u32,
     concurrency: usize,
 ) -> PullBackfillStats {
+    run_pull_backfill_guarded(api, materializer, page_limit, concurrency, None).await
+}
+
+/// As [`run_pull_backfill`], with the P0 2026-08-26 resurrection guard.
+///
+/// `ledger` is the suppressed-delete ledger. Any canonical path in it has a
+/// PENDING LOCAL DELETE INTENT and must NOT be re-created — otherwise this pass
+/// undoes the owner's delete, which is exactly what `created=275` did at
+/// 2026-08-26T00:05:37. The ledger snapshot is read ONCE per pass so a pass
+/// cannot half-apply the guard.
+pub async fn run_pull_backfill_guarded(
+    api: &ApiClient,
+    materializer: &Materializer,
+    page_limit: u32,
+    concurrency: usize,
+    ledger: Option<&crate::delete_ledger::DeleteLedger>,
+) -> PullBackfillStats {
     use futures::stream::{self, StreamExt};
 
     let mut stats = PullBackfillStats::default();
     let mut since: i64 = 0;
+    // ONE snapshot per pass (see doc comment): a mid-pass change must not make
+    // the guard apply to some pages and not others.
+    let suppressed = ledger.map(|l| l.paths()).unwrap_or_default();
+    if !suppressed.is_empty() {
+        tracing::warn!(
+            pending_deletes = suppressed.len(),
+            "pull_backfill: {} path(s) have a SUPPRESSED LOCAL DELETE and will NOT be re-created this pass (P0 2026-08-26 resurrection guard). Clear the delete-burst pause marker to let those deletes propagate.",
+            suppressed.len()
+        );
+    }
 
     loop {
         let page = match api.get_changes(since, page_limit).await {
@@ -159,7 +227,11 @@ pub async fn run_pull_backfill(
         stats.enumerated += page.changes.len();
 
         // Plan: which paths are genuinely missing locally? (No body fetched yet.)
-        let to_pull = plan_backfill(&page.changes, |p| materializer.target_path(p).exists());
+        let to_pull = plan_backfill_with_intent(
+            &page.changes,
+            |p| materializer.target_path(p).exists(),
+            |p| suppressed.contains(p),
+        );
         stats.already_present += page.changes.len() - to_pull.len();
 
         // Execute fetch+write with bounded concurrency. `api`/`materializer`
@@ -221,6 +293,16 @@ pub fn spawn_pull_backfill_task(
     api: Arc<ApiClient>,
     materializer: Materializer,
 ) -> tauri::async_runtime::JoinHandle<()> {
+    spawn_pull_backfill_task_guarded(api, materializer, None)
+}
+
+/// As [`spawn_pull_backfill_task`], carrying the suppressed-delete ledger so
+/// every hourly pass honours the resurrection guard.
+pub fn spawn_pull_backfill_task_guarded(
+    api: Arc<ApiClient>,
+    materializer: Materializer,
+    ledger: Option<crate::delete_ledger::DeleteLedger>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let env = ProcessEnv;
         if is_backfill_disabled(&env) {
@@ -237,7 +319,14 @@ pub fn spawn_pull_backfill_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate tick; we run explicitly below
         loop {
-            let _ = run_pull_backfill(&api, &materializer, PAGE_LIMIT, FETCH_CONCURRENCY).await;
+            let _ = run_pull_backfill_guarded(
+                &api,
+                &materializer,
+                PAGE_LIMIT,
+                FETCH_CONCURRENCY,
+                ledger.as_ref(),
+            )
+            .await;
             ticker.tick().await;
         }
     })
@@ -268,6 +357,60 @@ mod tests {
     #[test]
     fn should_backfill_pulls_missing_safe_nonsubstrate() {
         assert!(should_backfill("Mainframe/01_Notes/server-only.md", false));
+    }
+
+    // ---- P0 2026-08-26: the resurrection guard ---- //
+
+    #[test]
+    fn refuses_to_resurrect_a_path_with_a_suppressed_delete() {
+        // THE FIELD FAILURE. 2026-08-25 19:38: 295 notes deleted on link. Only
+        // 20 deletes propagated (the 20/30s valve latched on the 20th), so the
+        // server still held 275 rows. At 2026-08-26T00:05:37 this pass ran
+        // `created=275` and re-created every one of them, byte-identical with
+        // server mtimes -- silently reverting a crash fix.
+        //
+        // Missing locally + safe + non-substrate is normally a PULL. With a
+        // pending local delete intent it MUST NOT be.
+        assert!(
+            should_backfill_with_intent("02_Projects/x/big.md", false, false),
+            "control: a genuinely server-only note must still be pulled"
+        );
+        assert!(
+            !should_backfill_with_intent("02_Projects/x/big.md", false, true),
+            "a path whose delete was SUPPRESSED must NOT be re-created"
+        );
+    }
+
+    #[test]
+    fn plan_backfill_filters_out_suppressed_deletes_only() {
+        // Mixed page: one server-only note the owner never touched (must pull)
+        // and one the owner deleted while the valve was latched (must not).
+        let rows = vec![
+            row("keep/server-only.md", 1),
+            row("gone/deleted-by-owner.md", 2),
+        ];
+        let plan = plan_backfill_with_intent(
+            &rows,
+            |_| false, // nothing present locally
+            |p| p == "gone/deleted-by-owner.md",
+        );
+        assert_eq!(
+            plan,
+            vec!["keep/server-only.md".to_string()],
+            "only the suppressed-delete path may be filtered; the completeness \
+             guarantee for genuinely server-only notes must survive"
+        );
+    }
+
+    #[test]
+    fn resurrection_guard_does_not_weaken_the_r6_completeness_fix() {
+        // Regression fence: with an EMPTY ledger, behaviour must be byte-identical
+        // to the pre-guard planner, or we have traded the June FM2 fix for this one.
+        let rows = vec![row("a.md", 1), row("b/c.md", 2)];
+        let with_guard = plan_backfill_with_intent(&rows, |_| false, |_| false);
+        let legacy = plan_backfill(&rows, |_| false);
+        assert_eq!(with_guard, legacy);
+        assert_eq!(with_guard.len(), 2);
     }
 
     #[test]

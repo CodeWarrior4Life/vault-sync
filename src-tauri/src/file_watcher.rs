@@ -256,6 +256,11 @@ pub struct FileWatcher {
     /// silently dropped symlink escapes (zero log, RC-A4). `Arc` so clones share
     /// the count; readable via [`Self::symlinks_skipped`].
     symlinks_skipped: Arc<AtomicU64>,
+    /// P0 2026-08-26 second pass: paths whose delete the burst valve suppressed.
+    /// Recorded so (a) `pull_backfill` refuses to resurrect them and (b) they
+    /// can be REPLAYED when the owner clears the pause marker, so an intentional
+    /// bulk delete actually completes. `None` keeps pre-fix behaviour.
+    delete_ledger: Option<crate::delete_ledger::DeleteLedger>,
 }
 
 impl FileWatcher {
@@ -273,6 +278,7 @@ impl FileWatcher {
             config,
             device_id: device_id.into(),
             tray_state: None,
+            delete_ledger: None,
             cap_fail_streak: Arc::new(AtomicU64::new(0)),
             fenced: Arc::new(AtomicBool::new(false)),
             echo_guard: None,
@@ -291,6 +297,12 @@ impl FileWatcher {
 
     /// D6 (S511): attach the shared shadow store so the enqueue dedup is gated
     /// on the last-server-ACCEPTED hash (not the in-memory enqueued hash alone).
+    /// Attach the suppressed-delete ledger (P0 2026-08-26 second pass).
+    pub fn with_delete_ledger(mut self, ledger: crate::delete_ledger::DeleteLedger) -> Self {
+        self.delete_ledger = Some(ledger);
+        self
+    }
+
     pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
         self.shadow_store = Some(store);
         self
@@ -863,6 +875,13 @@ impl FileWatcher {
                                     w.set_delete_burst_paused(false);
                                 }
                             }
+                            // REPLAY the deletes the valve swallowed. Without
+                            // this, clearing the marker only permits FUTURE
+                            // deletes and the already-suppressed ones stay
+                            // un-propagated forever while pull_backfill keeps
+                            // restoring them — which is why the 295-note delete
+                            // of 2026-08-25 could never complete.
+                            me.replay_suppressed_deletes();
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -932,6 +951,78 @@ impl FileWatcher {
             shutdown_tx,
             _task: task,
         })
+    }
+
+    /// Re-enqueue every delete the burst valve suppressed, then clear the
+    /// ledger (P0 2026-08-26 second pass).
+    ///
+    /// SAFETY: this enqueues DELETES, so it is the most dangerous code in this
+    /// module. Three properties keep it safe:
+    ///
+    /// 1. It only ever runs because the OWNER removed the pause marker — an
+    ///    explicit, deliberate confirmation. It never fires on its own.
+    /// 2. Each replayed delete goes through the normal push path, so it still
+    ///    carries a CAS base from the shadow store. If the server was edited
+    ///    since suppression the push 409s and EDIT BEATS DELETE (S520). A stale
+    ///    ledger entry therefore costs a redundant delete attempt, never a
+    ///    silent wipe of newer content.
+    /// 3. A path that EXISTS locally again (the owner restored it, or a pull
+    ///    re-created it before the guard landed) is SKIPPED — we never delete a
+    ///    file that is currently present on disk.
+    fn replay_suppressed_deletes(&self) {
+        let Some(ledger) = &self.delete_ledger else {
+            return;
+        };
+        let paths = ledger.paths();
+        if paths.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let mut events = Vec::with_capacity(paths.len());
+        let mut skipped_present = 0usize;
+        for rel in &paths {
+            if self.vault_root.join(rel).exists() {
+                skipped_present += 1;
+                continue;
+            }
+            events.push(PushEvent {
+                schema_version: CURRENT_SCHEMA,
+                id: new_event_id(),
+                path: rel.clone(),
+                action: PushAction::Delete,
+                base_hash: PushBase::Unknown,
+                content_sha: String::new(),
+                content_bytes: None,
+                queued_at: now,
+                device_id: self.device_id.clone(),
+            });
+        }
+        let queued = events.len();
+        match self.journal.lock() {
+            Ok(mut j) => match j.append_batch(events) {
+                Ok(n) => {
+                    tracing::warn!(
+                        replayed = n,
+                        skipped_present,
+                        total_in_ledger = paths.len(),
+                        "file_watcher: REPLAYED suppressed deletes after operator resume — these were dropped while the burst valve was latched and are now propagating"
+                    );
+                    // Only clear once the batch is durably appended; a failure
+                    // must leave the ledger intact so the next resume retries.
+                    ledger.clear();
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        queued,
+                        "file_watcher: FAILED to replay suppressed deletes; ledger RETAINED so the next resume retries. Those deletes are still un-propagated."
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "file_watcher: journal mutex poisoned during suppressed-delete replay; ledger retained");
+            }
+        }
     }
 
     async fn handle_fs_path(&self, abs: &Path) {
@@ -1109,6 +1200,17 @@ impl FileWatcher {
             // only observe an absence. Always loud on the FIRST suppression,
             // then throttled so a genuine mass delete cannot flood the log.
             FilterDecision::DropDeleteBurst { path } => {
+                // Record the intent BEFORE logging: this is what stops the
+                // hourly pull_backfill re-creating the note (the created=275
+                // resurrection) and what lets the delete be replayed on resume.
+                if let Some(l) = &self.delete_ledger {
+                    if !l.record(&path) {
+                        tracing::warn!(
+                            path = %path,
+                            "file_watcher: could NOT record suppressed delete in the ledger — this delete may be RESURRECTED by the next pull_backfill pass and will not be replayed on resume"
+                        );
+                    }
+                }
                 let (n, marker) = match self.burst.lock() {
                     Ok(mut b) => (
                         b.note_suppressed(),

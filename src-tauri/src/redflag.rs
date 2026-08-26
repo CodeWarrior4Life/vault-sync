@@ -109,7 +109,28 @@ pub struct DeleteBurstDetector {
     /// Deletes suppressed since the valve latched. Drives throttled WARN
     /// logging at the call site so a latched valve can never again be silent.
     suppressed: u64,
+    /// P0 2026-08-26 second pass — INTENTIONAL BULK DELETE.
+    ///
+    /// Clearing the pause marker is the owner saying "yes, I meant to delete
+    /// those". Without a grace window that consent buys only 20 more deletes
+    /// before the valve re-latches, so a 295-note delete needed ~15 manual
+    /// clear cycles while an hourly `pull_backfill` raced to resurrect whatever
+    /// was still suppressed — i.e. the delete could never actually complete.
+    ///
+    /// While grace is active the window does not accumulate and cannot trip.
+    /// Grace is bounded on BOTH axes (deadline and count), so an accidental
+    /// mass delete that happens to land inside a grace period is still capped,
+    /// and an unattended one never gets grace at all (nobody clears the
+    /// marker).
+    grace_until: Option<Instant>,
+    grace_remaining: usize,
 }
+
+/// Deletes allowed without re-tripping after an owner-confirmed resume.
+/// Generous next to the 295-note incident, far below a whole-vault wipe.
+pub const GRACE_DELETES: usize = 5_000;
+/// Wall-clock bound on that grace, so consent cannot be open-ended.
+pub const GRACE_WINDOW: Duration = Duration::from_secs(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BurstStatus {
@@ -132,6 +153,8 @@ impl DeleteBurstDetector {
             paused: false,
             pause_marker: None,
             suppressed: 0,
+            grace_until: None,
+            grace_remaining: 0,
         }
     }
 
@@ -213,7 +236,22 @@ impl DeleteBurstDetector {
         self.events.clear();
         self.paused = false;
         self.suppressed = 0;
+        self.grant_grace_at(Instant::now());
         true
+    }
+
+    /// Grant the post-resume grace window. Split out for time-injected tests.
+    pub fn grant_grace_at(&mut self, now: Instant) {
+        self.grace_until = Some(now + GRACE_WINDOW);
+        self.grace_remaining = GRACE_DELETES;
+    }
+
+    /// Deletes still allowed under the current grace window (0 when inactive).
+    pub fn grace_remaining(&self) -> usize {
+        match self.grace_until {
+            Some(_) => self.grace_remaining,
+            None => 0,
+        }
     }
 
     /// Record that one delete was suppressed by the latched valve, returning
@@ -236,6 +274,20 @@ impl DeleteBurstDetector {
     pub fn record_delete_at(&mut self, now: Instant) -> BurstStatus {
         if self.paused {
             return BurstStatus::Paused;
+        }
+        // Owner-confirmed bulk delete in progress: let it through without
+        // accumulating, until either bound is exhausted.
+        if let Some(deadline) = self.grace_until {
+            if now < deadline && self.grace_remaining > 0 {
+                self.grace_remaining -= 1;
+                return BurstStatus::BelowThreshold {
+                    current: 0,
+                    threshold: self.threshold,
+                };
+            }
+            // Expired or spent: drop grace and fall through to normal gating.
+            self.grace_until = None;
+            self.grace_remaining = 0;
         }
         // Window-zero edge case: a zero-duration window means we can never
         // accumulate two events at the "same" instant in a way that crosses
@@ -628,7 +680,10 @@ mod tests {
         for i in 0..20 {
             det.record_delete_at(now + Duration::from_millis(i));
         }
-        assert!(det.is_paused(), "20 deletes in 20ms must trip a 20/30s valve");
+        assert!(
+            det.is_paused(),
+            "20 deletes in 20ms must trip a 20/30s valve"
+        );
         (det, marker)
     }
 
@@ -712,6 +767,90 @@ mod tests {
         det.reset();
         assert!(!det.is_paused());
         assert!(!marker.exists(), "reset must remove the pause marker");
+    }
+
+    // ---- P0 2026-08-26 second pass: intentional BULK delete ---- //
+
+    #[test]
+    fn resume_grants_grace_so_a_bulk_delete_can_actually_complete() {
+        // THE FIELD FAILURE, second half. 295 notes were deleted; only 20 got
+        // through. Pre-grace, clearing the marker bought exactly 20 MORE before
+        // re-latching, so completing 295 needed ~15 manual clear cycles while an
+        // hourly pull_backfill raced to restore the remainder. Consent must buy
+        // enough headroom to finish the job.
+        let dir = TempDir::new().unwrap();
+        let (mut det, marker) = tripped_with_marker(&dir);
+        fs::remove_file(&marker).unwrap();
+        assert!(det.poll_marker_resume());
+
+        // Push through far more than `threshold` deletes in a tight burst.
+        let t = Instant::now();
+        for i in 0..295u64 {
+            let r = det.record_delete_at(t + Duration::from_millis(i));
+            assert!(
+                matches!(r, BurstStatus::BelowThreshold { .. }),
+                "delete #{i} must be allowed under post-resume grace, got {r:?}"
+            );
+        }
+        assert!(
+            !det.is_paused(),
+            "a 295-note owner-confirmed bulk delete must NOT re-latch the valve"
+        );
+    }
+
+    #[test]
+    fn grace_is_bounded_by_count_then_the_valve_re_arms() {
+        // Grace must not be a permanent bypass: once the budget is spent the
+        // valve protects again, so an accidental mass delete inside a grace
+        // period is still capped.
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("m");
+        let mut det =
+            DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&marker);
+        let t = Instant::now();
+        det.grant_grace_at(t);
+        assert_eq!(det.grace_remaining(), GRACE_DELETES);
+        // Spend the entire budget.
+        for i in 0..GRACE_DELETES {
+            det.record_delete_at(t + Duration::from_micros(i as u64));
+        }
+        assert_eq!(det.grace_remaining(), 0, "budget must be exhausted");
+        // Now the normal sliding window applies again.
+        let mut tripped = false;
+        for i in 0..threshold_plus_one() {
+            if matches!(
+                det.record_delete_at(t + Duration::from_millis(i as u64)),
+                BurstStatus::AtThreshold { .. }
+            ) {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "valve must RE-ARM once the grace budget is spent");
+        assert!(det.is_paused());
+    }
+
+    #[test]
+    fn grace_expires_on_the_clock_even_if_unspent() {
+        // Consent is time-bounded: an unused grace window must not sit open.
+        let dir = TempDir::new().unwrap();
+        let mut det = DeleteBurstDetector::new(20, Duration::from_secs(30))
+            .with_pause_marker(dir.path().join("m"));
+        let t = Instant::now();
+        det.grant_grace_at(t);
+        // One delete AFTER the window closes must not consume grace; it goes
+        // through the normal window instead.
+        let after = t + GRACE_WINDOW + Duration::from_secs(1);
+        det.record_delete_at(after);
+        assert_eq!(
+            det.grace_remaining(),
+            0,
+            "an expired grace window must be dropped, not honoured"
+        );
+    }
+
+    fn threshold_plus_one() -> usize {
+        21
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod commands;
 pub mod commands_vaults;
 pub mod config;
 pub mod conflict_stash;
+pub mod delete_ledger;
 pub mod echo_guard;
 pub mod file_watcher;
 pub mod heartbeat;
@@ -1026,6 +1027,20 @@ fn spawn_push_pipeline(
 
     // Shared journal — SAME path verify_repair uses (commands.rs SoT).
     let journal_path = commands::push_journal_path(&workspace_root, &subscriber_id);
+    // P0 2026-08-26 second pass: the suppressed-delete ledger lives beside the
+    // journal in sync-state. It stops pull_backfill resurrecting a suppressed
+    // delete (MEASURED: created=275 at 2026-08-26T00:05:37, which silently
+    // reverted a crash fix) and lets those deletes be REPLAYED when the owner
+    // clears the pause marker, so an intentional bulk delete can complete.
+    // Constructed here because both the backfill task and the file watcher
+    // need the same ledger.
+    let delete_ledger = crate::delete_ledger::DeleteLedger::new(
+        journal_path
+            .parent()
+            .map(|d| d.join("delete-burst-SUPPRESSED"))
+            .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-SUPPRESSED")),
+    );
+    let delete_ledger_for_backfill = delete_ledger.clone();
     if let Some(parent) = journal_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::error!(
@@ -1267,9 +1282,10 @@ fn spawn_push_pipeline(
     // Non-fatal on api-client init failure.
     match api_client::ApiClient::new(&cfg.nexus_url, &token) {
         Ok(backfill_api) => {
-            let _backfill_task = pull_backfill::spawn_pull_backfill_task(
+            let _backfill_task = pull_backfill::spawn_pull_backfill_task_guarded(
                 Arc::new(backfill_api),
                 materializer.clone(),
+                Some(delete_ledger_for_backfill.clone()),
             );
         }
         Err(e) => {
@@ -1342,7 +1358,8 @@ fn spawn_push_pipeline(
             .with_echo_guard(echo_guard)
             .with_shadow_store(shadow.clone())
             .with_sync_health(sync_health.clone())
-            .with_enqueued_hashes(enqueued_hashes.clone()),
+            .with_enqueued_hashes(enqueued_hashes.clone())
+            .with_delete_ledger(delete_ledger),
         Err(e) => {
             tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
             notify_user(

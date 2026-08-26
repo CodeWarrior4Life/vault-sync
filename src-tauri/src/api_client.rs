@@ -754,9 +754,32 @@ mod tests {
     /// version string the fleet would mistake for an older release. Bumped for
     /// the 0.4.38 managed-instance-mode release (spec §5, 2026-08-08).
     #[test]
-    fn daemon_version_is_0_4_38() {
-        assert_eq!(daemon_version(), "0.4.38");
-        assert!(user_agent_string().starts_with("lattice-vault-sync/0.4.38/"));
+    fn daemon_version_tracks_the_crate_and_shapes_the_user_agent() {
+        // 2026-08-26: this test used to pin a LITERAL version ("0.4.38"), which
+        // added no safety — `daemon_version()` IS `env!("CARGO_PKG_VERSION")`, so
+        // the literal could only ever restate the manifest — while guaranteeing a
+        // red main on every release bump. It rotted at least twice: the 0.4.35
+        // bump (fixed in the 0.4.36 release commit) and the 0.4.39 bump, which
+        // left main red for ~5.5h. Assert the INVARIANT instead of the value:
+        // the UA is derived from the crate version and is well-formed.
+        assert_eq!(daemon_version(), env!("CARGO_PKG_VERSION"));
+        assert!(
+            !daemon_version().is_empty(),
+            "a blank version would ship an unattributable User-Agent"
+        );
+        let ua = user_agent_string();
+        assert_eq!(
+            ua,
+            format!(
+                "lattice-vault-sync/{}/{}",
+                daemon_version(),
+                daemon_platform()
+            ),
+            "the UA must stay <product>/<version>/<platform> — the server parses it"
+        );
+        assert!(ua.starts_with(&format!("lattice-vault-sync/{}/", daemon_version())));
+        // Guard the shape the server actually relies on: exactly three segments.
+        assert_eq!(ua.split('/').count(), 3, "UA must have exactly 3 segments");
     }
 
     /// v0.4.10 contract guard: deserialize the EXACT `/api/sync/reconcile-batch`
