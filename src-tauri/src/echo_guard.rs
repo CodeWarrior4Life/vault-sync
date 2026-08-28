@@ -36,12 +36,23 @@ const PRUNE_AT: usize = 4096;
 #[derive(Default)]
 pub struct EchoGuard {
     inner: Mutex<HashMap<String, (String, Instant)>>,
+    /// TKT-c3605db8: paths the materializer itself just soft-deleted (inbound
+    /// server deletes it materialized as `<name>.deleted-<ts>` renames). The
+    /// file_watcher sees those renames as local Deleted events; without this
+    /// registry it counts them toward the DeleteBurstDetector (the valve then
+    /// self-trips on every fleet-wide delete wave reaching a peer) and
+    /// re-pushes the delete to the server as a pointless echo. No sha — the
+    /// file is gone; path + TTL identity is exact enough because a genuine
+    /// user delete of the SAME path in the same instant is indistinguishable
+    /// from (and converges identically to) the materialized one.
+    deletes: Mutex<HashMap<String, Instant>>,
 }
 
 impl EchoGuard {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            deletes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -54,6 +65,46 @@ impl EchoGuard {
             }
             m.insert(path.to_string(), (sha.to_string(), now));
         }
+    }
+
+    /// TKT-c3605db8: record that the materializer is about to soft-delete
+    /// `path` (an INBOUND server delete, not a user action). Called before the
+    /// rename so the guard entry always precedes the filesystem event.
+    pub fn record_delete(&self, path: &str) {
+        if let Ok(mut m) = self.deletes.lock() {
+            let now = Instant::now();
+            if m.len() > PRUNE_AT {
+                m.retain(|_, at| now.duration_since(*at) < ECHO_TTL);
+            }
+            m.insert(path.to_string(), now);
+        }
+    }
+
+    /// TKT-c3605db8: undo a [`record_delete`](Self::record_delete) whose rename
+    /// then FAILED — the file still exists, so a genuine user delete inside the
+    /// TTL must not be suppressed.
+    pub fn unrecord_delete(&self, path: &str) {
+        if let Ok(mut m) = self.deletes.lock() {
+            m.remove(path);
+        }
+    }
+
+    /// True iff a file_watcher Deleted event for `path` matches a recent
+    /// materializer soft-delete — i.e. it is the echo of an inbound server
+    /// delete, not a user delete. Consumes the entry (a LATER user delete of a
+    /// recreated file at the same path is never suppressed). Fail-open like
+    /// [`is_echo`](Self::is_echo): unwired or expired means no suppression.
+    pub fn is_delete_echo(&self, path: &str) -> bool {
+        if let Ok(mut m) = self.deletes.lock() {
+            if let Some(at) = m.get(path) {
+                if Instant::now().duration_since(*at) < ECHO_TTL {
+                    m.remove(path);
+                    return true;
+                }
+                m.remove(path);
+            }
+        }
+        false
     }
 
     /// True iff a file_watcher event for `path` at content hash `sha` matches a
@@ -100,6 +151,40 @@ mod tests {
     fn unrecorded_path_is_not_suppressed() {
         let g = EchoGuard::new();
         assert!(!g.is_echo("notes/never-written.md", "sha"));
+    }
+
+    #[test]
+    fn delete_echo_is_suppressed_once_then_consumed() {
+        let g = EchoGuard::new();
+        g.record_delete("notes/a.md");
+        assert!(g.is_delete_echo("notes/a.md"));
+        // Consumed: a later user delete of a recreated file is not suppressed.
+        assert!(!g.is_delete_echo("notes/a.md"));
+    }
+
+    #[test]
+    fn unrecorded_delete_is_a_user_delete() {
+        let g = EchoGuard::new();
+        assert!(!g.is_delete_echo("notes/user-deleted.md"));
+    }
+
+    #[test]
+    fn unrecord_delete_after_failed_rename_restores_user_semantics() {
+        let g = EchoGuard::new();
+        g.record_delete("notes/a.md");
+        g.unrecord_delete("notes/a.md");
+        assert!(!g.is_delete_echo("notes/a.md"));
+    }
+
+    #[test]
+    fn write_and_delete_registries_are_independent() {
+        let g = EchoGuard::new();
+        g.record("notes/a.md", "sha1");
+        assert!(!g.is_delete_echo("notes/a.md"));
+        g.record_delete("notes/b.md");
+        assert!(!g.is_echo("notes/b.md", "sha1"));
+        assert!(g.is_delete_echo("notes/b.md"));
+        assert!(g.is_echo("notes/a.md", "sha1"));
     }
 
     #[test]

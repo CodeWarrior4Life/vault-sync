@@ -1559,7 +1559,24 @@ impl Materializer {
                 }
             }
         }
-        fs::rename(&target, &renamed)?;
+        // TKT-c3605db8: this delete is daemon-originated (an inbound server
+        // delete being materialized), so the file_watcher's resulting Deleted
+        // event is an echo — it must not tick the DeleteBurstDetector (the
+        // valve self-tripped on every fleet delete wave) nor re-push the
+        // delete. Live tree only: shadow-tree renames are never watched
+        // (same rule as rel_for_stash). Recorded BEFORE the rename so the
+        // guard entry always precedes the filesystem event; un-recorded if
+        // the rename fails, so a genuine user delete is never suppressed.
+        let record_echo = matches!(self.mode, MaterializerMode::Live);
+        if let (Some(g), true) = (&self.echo_guard, record_echo) {
+            g.record_delete(path);
+        }
+        if let Err(e) = fs::rename(&target, &renamed) {
+            if let (Some(g), true) = (&self.echo_guard, record_echo) {
+                g.unrecord_delete(path);
+            }
+            return Err(e.into());
+        }
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())
     }
@@ -2713,6 +2730,41 @@ mod tests {
             out.is_ok(),
             "trailing-dots name should write, got {:?}",
             out
+        );
+    }
+
+    /// TKT-c3605db8: a LIVE-mode soft_delete records its path in the shared
+    /// EchoGuard so the file_watcher recognizes the resulting Deleted event as
+    /// a materializer echo (no burst tick, no re-push). Shadow mode must NOT
+    /// record — its renames happen off the watched tree, and a stale entry
+    /// could suppress a genuine user delete of the live file.
+    #[test]
+    fn soft_delete_records_delete_echo_in_live_mode_only() {
+        use crate::echo_guard::EchoGuard;
+        use std::sync::Arc;
+
+        // Live mode: file on the live vault tree, echo recorded.
+        let (v, _w, m) = mk(MaterializerMode::Live, default_cfg());
+        let guard = Arc::new(EchoGuard::new());
+        let m = m.with_echo_guard(guard.clone());
+        let rel = format!("{VAULT}/01_Inbox/live-del.md");
+        std::fs::create_dir_all(v.path().join(VAULT).join("01_Inbox")).unwrap();
+        std::fs::write(v.path().join(&rel), b"x").unwrap();
+        m.soft_delete(&rel).unwrap();
+        assert!(
+            guard.is_delete_echo(&rel),
+            "live-mode soft_delete must record a delete echo"
+        );
+
+        // Shadow mode: no echo recorded.
+        let (_v2, _w2, m2) = mk(MaterializerMode::Shadow, default_cfg());
+        let guard2 = Arc::new(EchoGuard::new());
+        let m2 = m2.with_echo_guard(guard2.clone());
+        m2.write(&payload("01_Inbox/shadow-del.md", "x")).unwrap();
+        m2.soft_delete("01_Inbox/shadow-del.md").unwrap();
+        assert!(
+            !guard2.is_delete_echo("01_Inbox/shadow-del.md"),
+            "shadow-mode soft_delete must NOT record a delete echo"
         );
     }
 
