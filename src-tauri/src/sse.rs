@@ -67,7 +67,23 @@ pub struct SseConsumer {
     /// down. Atomic write (tmp + rename) to avoid mid-write corruption.
     /// `None` => no persistence (back-compat for unit tests).
     last_event_id_path: Option<std::path::PathBuf>,
+    /// TKT-fc62ea8a: max silence tolerated on the stream before the session
+    /// is force-reconnected. See [`LIVENESS_WINDOW`].
+    liveness_window: std::time::Duration,
 }
+
+/// TKT-fc62ea8a: event-arrival liveness window. The server emits a
+/// `: keep-alive` SSE comment every 30s (sync_routes_p1 `heartbeat_interval`),
+/// so a healthy stream ALWAYS delivers a frame — event or comment — within
+/// that period. If NOTHING arrives for this window (3 missed keep-alives),
+/// the transport is dead even though the socket may still look ESTABLISHED:
+/// the 08-26/08-28 incident class was an origin restart behind the Cloudflare
+/// tunnel leaving the edge TCP half-open, so `stream.try_next()` blocked
+/// forever, the daemon never reconnected, and a host ran days on the ~30min
+/// reconcile pull alone. On expiry the session returns `SseError::TimedOut`,
+/// which the `run()` loop already handles: reconnect with backoff, resuming
+/// from the persisted `last_event_id` so the server replays the gap.
+const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
 
 impl SseConsumer {
     pub fn new(
@@ -87,7 +103,16 @@ impl SseConsumer {
             materializer,
             tray_state: None,
             last_event_id_path: None,
+            liveness_window: LIVENESS_WINDOW,
         })
+    }
+
+    /// TKT-fc62ea8a: override the liveness window (tests use sub-second
+    /// windows; production keeps [`LIVENESS_WINDOW`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_liveness_window(mut self, w: std::time::Duration) -> Self {
+        self.liveness_window = w;
+        self
     }
 
     pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
@@ -259,7 +284,34 @@ impl SseConsumer {
         }
         let client = builder.build();
         let mut stream = client.stream();
-        while let Some(event) = stream.try_next().await? {
+        loop {
+            // TKT-fc62ea8a event-arrival liveness watchdog: a healthy stream
+            // delivers a frame (event OR the server's 30s keep-alive comment)
+            // well inside the window. Total silence means a half-open
+            // transport (CF-tunnel edge kept ESTABLISHED across an origin
+            // restart) or a dead origin generator — either way the only
+            // recovery is a reconnect, which also triggers server-side
+            // catch-up from the persisted last_event_id.
+            let event = match tokio::time::timeout(self.liveness_window, stream.try_next()).await {
+                Ok(next) => match next? {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                Err(_elapsed) => {
+                    warn!(
+                        window_secs = self.liveness_window.as_secs(),
+                        "SSE liveness watchdog: no frames (events or keep-alives) within the window — stream is half-open or the origin stopped emitting; forcing reconnect"
+                    );
+                    self.ts_err(
+                        ConnectionStatus::Reconnecting,
+                        format!(
+                            "no SSE frames in {}s; forcing reconnect",
+                            self.liveness_window.as_secs()
+                        ),
+                    );
+                    return Err(SseError::TimedOut);
+                }
+            };
             match event {
                 SSE::Connected(_) => {
                     debug!("SSE connected");
@@ -365,5 +417,125 @@ impl SseConsumer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
+    use std::time::Duration;
+
+    /// Minimal SSE origin that sends valid headers + `frames`, then goes
+    /// SILENT while keeping the socket open — the client-visible shape of a
+    /// half-open transport (CF edge ESTABLISHED across an origin restart) or
+    /// a dead origin generator: no frames, no FIN, forever.
+    async fn spawn_silent_sse_server(
+        frames: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n{frames}"
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        (addr, handle)
+    }
+
+    fn test_consumer(
+        addr: std::net::SocketAddr,
+        window: Duration,
+    ) -> (tempfile::TempDir, tempfile::TempDir, SseConsumer) {
+        let vaults = tempfile::TempDir::new().unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        let mat = Materializer::new(
+            vaults.path().to_path_buf(),
+            Some("shadow/".to_string()),
+            MaterializerMode::Disabled,
+            ws.path().to_path_buf(),
+            "sse-test".to_string(),
+            MaterializerConfig {
+                device_id: "sse-test".into(),
+                ..Default::default()
+            },
+        );
+        let c = SseConsumer::new(
+            format!("http://{addr}"),
+            "test-token".to_string(),
+            vec![],
+            vec![],
+            mat,
+        )
+        .unwrap()
+        .with_liveness_window(window);
+        (vaults, ws, c)
+    }
+
+    /// TKT-fc62ea8a regression: a stream that goes totally silent (no events,
+    /// no keep-alives, socket held open) must be abandoned within the liveness
+    /// window with `SseError::TimedOut` so the run() loop reconnects. PRE-FIX
+    /// BEHAVIOR: `stream.try_next()` blocked forever — this test only fails
+    /// via its outer 10s timeout, which is exactly the daemon running days on
+    /// a half-open stream scaled down.
+    #[tokio::test]
+    async fn liveness_watchdog_abandons_a_silent_half_open_stream() {
+        let (addr, _srv) = spawn_silent_sse_server(": keep-alive\n\n").await;
+        let (_v, _w, c) = test_consumer(addr, Duration::from_millis(300));
+        let mut lei: Option<String> = None;
+        let out = tokio::time::timeout(Duration::from_secs(10), c.run_one_session(&mut lei))
+            .await
+            .expect(
+                "PRE-FIX failure mode: run_one_session hung forever on a silent half-open stream",
+            );
+        assert!(
+            matches!(out, Err(SseError::TimedOut)),
+            "expected liveness TimedOut, got {out:?}"
+        );
+    }
+
+    /// The watchdog measures per-frame gaps, not total session length: a
+    /// stream delivering keep-alive comments faster than the window must NOT
+    /// be killed by the watchdog even after many windows have elapsed.
+    #[tokio::test]
+    async fn keep_alives_inside_the_window_hold_the_session_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            // 8 keep-alives at 100ms — total 800ms, well past the 300ms
+            // window, but every GAP is inside it.
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if sock.write_all(b": keep-alive\n\n").await.is_err() {
+                    return;
+                }
+            }
+            // Then clean EOF: the session must end via stream end, not TimedOut.
+        });
+        let (_v, _w, c) = test_consumer(addr, Duration::from_millis(300));
+        let mut lei: Option<String> = None;
+        let out = tokio::time::timeout(Duration::from_secs(10), c.run_one_session(&mut lei))
+            .await
+            .expect("session should complete promptly");
+        assert!(
+            !matches!(out, Err(SseError::TimedOut)),
+            "keep-alives inside the window must not trip the watchdog, got {out:?}"
+        );
     }
 }
