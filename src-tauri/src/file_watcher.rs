@@ -1025,6 +1025,20 @@ impl FileWatcher {
         }
     }
 
+    /// TKT-c3605db8: true iff an Allow'd Deleted event for `path` is the echo
+    /// of a materializer soft-delete (an INBOUND server delete), consuming the
+    /// guard entry. Such an event must neither tick the DeleteBurstDetector —
+    /// the valve used to self-trip on every fleet-wide delete wave reaching a
+    /// peer — nor enqueue a delete push back to a server that already deleted
+    /// the note. Fail-open: no guard wired (or entry expired) means the delete
+    /// is treated as user-originated, the pre-existing behavior.
+    fn consume_delete_echo(&self, path: &str) -> bool {
+        self.echo_guard
+            .as_ref()
+            .map(|g| g.is_delete_echo(path))
+            .unwrap_or(false)
+    }
+
     async fn handle_fs_path(&self, abs: &Path) {
         let kind = if abs.exists() {
             // We keep the exists-based create-vs-modify heuristic: default to
@@ -1051,8 +1065,17 @@ impl FileWatcher {
         }
         match decision {
             FilterDecision::Allow(allowed) => {
-                // For deletes we also tick the burst detector after allow.
-                if matches!(&allowed, WatchEvent::Deleted { .. }) {
+                // For deletes we also tick the burst detector after allow —
+                // unless the delete is the materializer's own soft-delete echo
+                // (TKT-c3605db8), which must be invisible to the valve and
+                // never re-pushed.
+                if let WatchEvent::Deleted { path } = &allowed {
+                    if self.consume_delete_echo(path) {
+                        tracing::debug!(
+                            "file_watcher: skipping materializer soft-delete echo for {path} (not counted toward delete-burst, not re-pushed)"
+                        );
+                        return;
+                    }
                     if let Ok(mut b) = self.burst.lock() {
                         let _ = b.record_delete();
                     }
@@ -1450,6 +1473,104 @@ mod tests {
     /// A real edit (any byte change) MUST still enqueue. Red on pre-fix code:
     /// the watcher had no enqueue dedup, so every event was appended (the second
     /// identical event would make the journal len 2).
+    /// TKT-c3605db8 regression: a Deleted event whose path the materializer
+    /// just soft-deleted (an INBOUND server delete) must be invisible — no
+    /// DeleteBurstDetector tick, no delete push enqueued. Pre-fix behavior:
+    /// the echo both ticked the valve (trinity's valve self-tripped on the
+    /// 08-26 fleet delete wave, suppressing its real deletes for 2 days) and
+    /// re-pushed the delete. User deletes must still count and still trip.
+    #[tokio::test]
+    async fn materializer_soft_delete_echo_neither_ticks_valve_nor_enqueues() {
+        let dir = TempDir::new().unwrap();
+        let guard = Arc::new(crate::echo_guard::EchoGuard::new());
+        let burst = Arc::new(Mutex::new(DeleteBurstDetector::new(
+            3,
+            Duration::from_secs(30),
+        )));
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+        };
+        let w = FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(&dir),
+            burst.clone(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_echo_guard(guard.clone());
+
+        // Three inbound server deletes, materialized: guard records each path
+        // (exactly what Materializer::soft_delete does before its rename),
+        // then the watcher sees the file vanish.
+        for i in 0..3 {
+            let rel = format!("01_Notes/inbound-{i}.md");
+            let abs = dir.path().join(&rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, b"body").unwrap();
+            guard.record_delete(&rel);
+            std::fs::remove_file(&abs).unwrap();
+            w.handle_fs_path(&abs).await;
+        }
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            0,
+            "materializer soft-delete echoes must NOT enqueue delete pushes"
+        );
+        assert!(
+            !burst.lock().unwrap().is_paused(),
+            "materializer soft-delete echoes must NOT count toward the delete-burst valve"
+        );
+
+        // Three genuine user deletes (no guard entries) must still count —
+        // and at threshold 3 they must trip the valve.
+        for i in 0..3 {
+            let rel = format!("01_Notes/user-{i}.md");
+            let abs = dir.path().join(&rel);
+            std::fs::write(&abs, b"body").unwrap();
+            std::fs::remove_file(&abs).unwrap();
+            w.handle_fs_path(&abs).await;
+        }
+        assert!(
+            burst.lock().unwrap().is_paused(),
+            "user deletes must still tick the valve (threshold 3 reached)"
+        );
+    }
+
+    /// TKT-c3605db8: the echo entry is consumed — after one suppression, a
+    /// user delete of a RECREATED file at the same path counts normally.
+    #[tokio::test]
+    async fn delete_echo_consumed_recreated_file_user_delete_counts() {
+        let dir = TempDir::new().unwrap();
+        let guard = Arc::new(crate::echo_guard::EchoGuard::new());
+        let w = make_watcher(&dir, vec![], vec![]).with_echo_guard(guard.clone());
+
+        let rel = "01_Notes/note.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+
+        std::fs::write(&abs, b"body").unwrap();
+        guard.record_delete(rel);
+        std::fs::remove_file(&abs).unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.lock().unwrap().len(), 0, "echo suppressed");
+
+        // Recreate, then a genuine user delete: must enqueue (create + delete).
+        std::fs::write(&abs, b"body again").unwrap();
+        w.handle_fs_path(&abs).await;
+        std::fs::remove_file(&abs).unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            2,
+            "recreate + user delete must both enqueue (echo entry was consumed)"
+        );
+    }
+
     #[tokio::test]
     async fn redundant_identical_event_deduped_but_real_edit_enqueues() {
         let dir = TempDir::new().unwrap();
