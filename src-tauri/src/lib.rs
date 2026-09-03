@@ -603,11 +603,42 @@ fn spawn_sse_consumer(
                 return;
             }
         };
-        let snap = match api.health().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("api health failed: {e}");
-                return;
+        // STARTUP HEALTH IS RETRIED, NEVER FATAL (2026-09-03, trinity). This
+        // used to `return` on the first failure, which ended the whole sync
+        // task while the tray app stayed up looking healthy. A daemon launched
+        // at login runs BEFORE the tailnet/VPN is up, so the first health call
+        // failing is the NORMAL case on a workstation, not an exception:
+        // trinity logged "api health failed: network error" at 14:23:01Z,
+        // wrote nothing else for 30 minutes, held zero TCP connections, and
+        // its vault fell 370 KB behind link on a single file until an operator
+        // restarted it by hand. Exponential backoff capped at 60s, forever: a
+        // daemon with no server is a daemon that keeps asking, exactly as the
+        // SSE consumer below already does on disconnect.
+        let snap = {
+            let mut backoff = std::time::Duration::from_secs(1);
+            let mut attempt: u32 = 0;
+            loop {
+                match api.health().await {
+                    Ok(s) => {
+                        if attempt > 0 {
+                            tracing::info!(
+                                attempts = attempt + 1,
+                                "api health recovered; starting sync"
+                            );
+                        }
+                        break s;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        tracing::warn!(
+                            attempt,
+                            "api health failed: {e}; retrying in {:?} (startup health is never fatal)",
+                            backoff
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
             }
         };
 
