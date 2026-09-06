@@ -377,6 +377,26 @@ impl SseConsumer {
                                             "sse: CONFLICT, stashed local revision then materialized server winner"
                                         );
                                     }
+                                    // TKT-ddff1877: append-aware arms. Local
+                                    // superseded (or merged past) the server
+                                    // head without a fork; the compensating
+                                    // push carries the result up.
+                                    Ok(MaterializeOutcome::Skipped(
+                                        SkipReason::AppendPreservedPushUp { enqueued_push },
+                                    )) => {
+                                        warn!(
+                                            path = %env.path,
+                                            enqueued_push,
+                                            "sse: APPEND ARM A - server head is a line-prefix of local; local preserved (no fork), compensating push enqueued"
+                                        );
+                                    }
+                                    Ok(MaterializeOutcome::Merged { enqueued_push, .. }) => {
+                                        warn!(
+                                            path = %env.path,
+                                            enqueued_push,
+                                            "sse: APPEND ARM B - both sides appended after the verified base; merged locally (no fork), compensating push enqueued"
+                                        );
+                                    }
                                     Ok(MaterializeOutcome::Wrote { .. })
                                     | Ok(MaterializeOutcome::AlignedToCanonical { .. })
                                     | Ok(MaterializeOutcome::Skipped(_)) => {

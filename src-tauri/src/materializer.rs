@@ -128,6 +128,21 @@ pub enum SkipReason {
     /// fail-honest degrade: local is still preserved, but convergence then
     /// waits on the next reconcile pass).
     GuardPreserveLocalPushUp { enqueued_push: bool },
+    /// APPEND ARM A (TKT-ddff1877, regression of the 2026-05-25 append-
+    /// concatenation P0): this write resolved to an R4/R5 `Conflict`, but the
+    /// server head is a strict LINE-PREFIX of the local file — every server
+    /// byte sits at the front of local and local has appended lines after it
+    /// (`append_merge::is_strict_line_prefix`). Materializing the head would
+    /// move the file BACKWARD and sideline the newer appended lines into a
+    /// `conflict-from-<own device>` fork (the measured link/Trinity flight-
+    /// recorder forks; 78 appended lines left the live file that way). Local is
+    /// preserved untouched, NO conflict copy is minted, the head's change_seq
+    /// is recorded as OBSERVED lineage when its bytes verify, and a
+    /// compensating UP push is enqueued (CAS base = the head hash) so the
+    /// superset propagates. Still divergent until that push lands =>
+    /// `Deferred`. `enqueued_push` is false only when no push-journal handle
+    /// was wired (local still preserved; convergence waits on reconcile).
+    AppendPreservedPushUp { enqueued_push: bool },
     /// R1 (TKT-372e31b2): this write resolved to an R5 `Conflict` (shadow absent
     /// => "unknown provenance"), but the shadow store loaded in the
     /// `vault_scope_suspect` state - `vault_folders` resolved EMPTY while the
@@ -166,6 +181,15 @@ pub enum MaterializeOutcome {
     /// zero content difference by construction. This is the "alignment pull"
     /// that converges the fleet's CRLF corpus in one pull pass, zero pushes.
     AlignedToCanonical { path: PathBuf },
+    /// APPEND ARM B (TKT-ddff1877): both this host and the server appended
+    /// after the SAME verified base (the common line-boundary prefix whose
+    /// sha256 equals the shadow store's last-synced hash). The local file was
+    /// rewritten to `base + server_tail + local_tail` — a superset of both
+    /// byte-sets, every line exactly once — through the standard atomic
+    /// tmp+rename with the echo-guard recorded first, and a compensating UP
+    /// push was enqueued (CAS base = the head hash). NO conflict copy. The
+    /// path is still divergent from the server until that push lands.
+    Merged { path: PathBuf, enqueued_push: bool },
     /// Write completed but the post-write integrity check failed.  The file
     /// is intentionally NOT deleted — the owner can inspect both the bad
     /// write and the resulting ticket.
@@ -444,11 +468,18 @@ impl Materializer {
     /// `local_sha` is the sha of the bytes on disk we are pushing. A LAZY ref
     /// (`content_bytes: None`) — push_client reads the file at drain time.
     /// Returns true iff a journal handle was wired AND the append succeeded.
-    fn enqueue_compensating_push(&self, path: &str, local_sha: &str, server_hash: &str) -> bool {
+    fn enqueue_compensating_push(
+        &self,
+        tag: &str,
+        path: &str,
+        local_sha: &str,
+        server_hash: &str,
+    ) -> bool {
         let Some(journal) = &self.push_journal else {
             warn!(
                 path,
-                "ARM 1: no push-journal handle wired - local preserved but compensating push NOT enqueued (convergence waits on next reconcile pass)"
+                tag,
+                "no push-journal handle wired - local preserved but compensating push NOT enqueued (convergence waits on next reconcile pass)"
             );
             return false;
         };
@@ -470,14 +501,34 @@ impl Materializer {
             Ok(mut j) => match j.append(evt) {
                 Ok(()) => true,
                 Err(e) => {
-                    warn!(path, error = %e, "ARM 1: compensating push append failed");
+                    warn!(path, tag, error = %e, "compensating push append failed");
                     false
                 }
             },
             Err(e) => {
-                warn!(path, error = %e, "ARM 1: push-journal mutex poisoned; compensating push not enqueued");
+                warn!(path, tag, error = %e, "push-journal mutex poisoned; compensating push not enqueued");
                 false
             }
+        }
+    }
+
+    /// TKT-ddff1877: record the server head's `change_seq` as OBSERVED lineage
+    /// when — and only when — the payload's bytes verify against its declared
+    /// sha (the same rule as `push_client::record_verified_receipt`). Observed
+    /// provenance authorises the wire `base_seq` of the compensating push (so
+    /// it is accepted first time instead of 409-ing on a stale base) and NEVER
+    /// enables the causal-preserve arm (Finding 1, TKT-372e31b2). Live mode
+    /// only, like every other recording point. Returns whether it recorded.
+    fn record_observed_head(&self, payload: &NotePayload, actual_sha: &str) -> bool {
+        if !matches!(self.mode, MaterializerMode::Live) || actual_sha != payload.sha256 {
+            return false;
+        }
+        match (&self.base_seq_store, payload.change_seq) {
+            (Some(bs), Some(seq)) => {
+                bs.record_observed(&payload.path, seq);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -793,6 +844,7 @@ impl Materializer {
                         // what breaks the phantom-pull deadlock (RC-B1). The path
                         // stays divergent until the push lands (R2: Deferred/RED).
                         let enqueued_push = self.enqueue_compensating_push(
+                            "ANTI-STRIP ARM 1",
                             &payload.path,
                             &local_raw_sha,
                             &payload.sha256,
@@ -1071,50 +1123,160 @@ impl Materializer {
                             SkipReason::ConflictStormBreakerOpen,
                         ));
                     }
-                    // R4 (both moved) / R5 (shadow absent, unknown provenance):
-                    // ALWAYS-STASH-THEN-RESOLVE, regardless of Class or policy.
-                    // Stash the LOSER (local bytes) FIRST, atomically, BEFORE any
-                    // overwrite, so a crash mid-op never loses the loser; then the
-                    // server winner is materialized below. (I-83 NEVER-SILENT-
-                    // OVERWRITE.) The change_seq names the stash deterministically
-                    // so N fleet writers converge on one filename.
-                    let class = ConflictClassifier::classify(&payload.path);
-                    let stash_root = match self.mode {
-                        MaterializerMode::Live => self.vaults_root.clone(),
-                        _ => self.shadow_root(),
-                    };
-                    let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
-                    // Compute the stash path FIRST and record it in the echo_guard
-                    // BEFORE writing it, so the file_watcher recognizes the stash
-                    // write as an echo and never enqueues the conflict copy as a
-                    // push (D5). The conflict copy is also excluded by name in the
-                    // watcher, but recording here is belt-and-braces and keys the
-                    // exact (path, sha) the watcher will observe.
-                    let stash_target = stasher.compute_stash_path_public(
-                        &payload.path,
-                        &self.config.device_id,
-                        change_seq,
-                    );
-                    if let (Some(g), Some(rel)) =
-                        (&self.echo_guard, self.rel_for_stash(&stash_target))
-                    {
-                        g.record(&rel, &local_raw_sha);
+                    // TKT-ddff1877 (regression of the 2026-05-25 append-
+                    // concatenation P0): APPEND-AWARE ARMS, before the stash
+                    // floor. `decide()` cannot see that one side is a pure
+                    // APPEND of the other, so for an append-only file (a flight
+                    // recorder) it forks the WHOLE file on every append race and
+                    // overwrites local with the older head — the measured link
+                    // and Trinity fork storms (25 forks, 31+34 MB, 78 appended
+                    // lines dropped from the live file, 2026-09-01..05). The
+                    // arms are PURE and lossless w.r.t. server lines by
+                    // construction (`append_merge::resolve`):
+                    //
+                    //   ARM A  the head is a strict line-prefix of local (a peer
+                    //          re-pushed a STALE snapshot; every server line is
+                    //          already in local, in order) => PRESERVE local, no
+                    //          fork, compensating push carries the superset up.
+                    //   ARM B  both sides appended after the SAME verified base
+                    //          (the common line-boundary prefix whose sha256 ==
+                    //          the shadow's last-synced hash) => write
+                    //          base + server_tail + local_tail, no fork,
+                    //          compensating push carries the merge up. Refused
+                    //          when the shadow is absent or names another
+                    //          version: fail to the stash floor, never to a
+                    //          guessed merge.
+                    //   local is a prefix of the head => a clean pull (nothing
+                    //          local would be lost), so NO stash below.
+                    //
+                    // Anything else (an edit INSIDE the shared history, a
+                    // deleted line, unrelated content, a mid-line cut) is
+                    // `Unresolved` and the always-stash floor below stands. Live
+                    // mode only: the compensating push reads the live vault.
+                    let mut take_stash_floor = true;
+                    if matches!(self.mode, MaterializerMode::Live) {
+                        use crate::append_merge::{resolve, AppendResolution};
+                        match resolve(&local_bytes, content_bytes, shadow.as_deref()) {
+                            AppendResolution::LocalSupersedesServer => {
+                                let observed = self.record_observed_head(payload, &actual_sha);
+                                let enqueued_push = self.enqueue_compensating_push(
+                                    "APPEND ARM A",
+                                    &payload.path,
+                                    &local_raw_sha,
+                                    &payload.sha256,
+                                );
+                                warn!(
+                                    path = %payload.path,
+                                    change_seq,
+                                    incoming_seq = ?payload.change_seq,
+                                    observed_recorded = observed,
+                                    enqueued_push,
+                                    local_len = local_bytes.len(),
+                                    server_len = content_bytes.len(),
+                                    "materializer APPEND ARM A (TKT-ddff1877): server head is a strict line-prefix of local (stale head / local appended) - PRESERVING local, NO conflict copy; compensating push carries the superset up"
+                                );
+                                return Ok(MaterializeOutcome::Skipped(
+                                    SkipReason::AppendPreservedPushUp { enqueued_push },
+                                ));
+                            }
+                            AppendResolution::Merged { base_len, merged } => {
+                                let merged_sha = hex::encode(Sha256::digest(&merged));
+                                // Echo-guard the MERGED bytes before writing so
+                                // the file_watcher treats the rewrite as ours and
+                                // the compensating push (not a watcher push with a
+                                // stale base) is the single carrier.
+                                if let Some(g) = &self.echo_guard {
+                                    g.record(&payload.path, &merged_sha);
+                                }
+                                let parent = target.parent().ok_or_else(|| {
+                                    MaterializerError::PathTraversal(payload.path.clone())
+                                })?;
+                                fs::create_dir_all(parent)?;
+                                let mut tmp = NamedTempFile::new_in(parent)?;
+                                tmp.write_all(&merged)?;
+                                tmp.flush()?;
+                                atomic_persist(tmp, &target)?;
+                                let observed = self.record_observed_head(payload, &actual_sha);
+                                let enqueued_push = self.enqueue_compensating_push(
+                                    "APPEND ARM B",
+                                    &payload.path,
+                                    &merged_sha,
+                                    &payload.sha256,
+                                );
+                                warn!(
+                                    path = %payload.path,
+                                    change_seq,
+                                    incoming_seq = ?payload.change_seq,
+                                    base_len,
+                                    local_len = local_bytes.len(),
+                                    server_len = content_bytes.len(),
+                                    merged_len = merged.len(),
+                                    observed_recorded = observed,
+                                    enqueued_push,
+                                    "materializer APPEND ARM B (TKT-ddff1877): both sides appended after the verified base - MERGED base+server_tail+local_tail locally, NO conflict copy; compensating push carries the merge up"
+                                );
+                                return Ok(MaterializeOutcome::Merged {
+                                    path: target,
+                                    enqueued_push,
+                                });
+                            }
+                            AppendResolution::ServerSupersedesLocal => {
+                                info!(
+                                    path = %payload.path,
+                                    change_seq,
+                                    "materializer APPEND (TKT-ddff1877): local is a strict line-prefix of the server head - clean pull, nothing local would be lost, NO conflict copy"
+                                );
+                                take_stash_floor = false;
+                            }
+                            AppendResolution::Unresolved => {}
+                        }
                     }
-                    let written = stasher.write_stash(
-                        &payload.path,
-                        &local_bytes,
-                        &self.config.device_id,
-                        change_seq,
-                    )?;
-                    warn!(
-                        path = %payload.path,
-                        stash = %written.display(),
-                        class = ?class,
-                        change_seq,
-                        shadow_present = shadow.is_some(),
-                        "materializer CONFLICT (R4/R5): stashed local divergent revision BEFORE overwrite, both byte-sets preserved"
-                    );
-                    stash_path = Some(written);
+                    if take_stash_floor {
+                        // R4 (both moved) / R5 (shadow absent, unknown provenance):
+                        // ALWAYS-STASH-THEN-RESOLVE, regardless of Class or policy.
+                        // Stash the LOSER (local bytes) FIRST, atomically, BEFORE any
+                        // overwrite, so a crash mid-op never loses the loser; then the
+                        // server winner is materialized below. (I-83 NEVER-SILENT-
+                        // OVERWRITE.) The change_seq names the stash deterministically
+                        // so N fleet writers converge on one filename.
+                        let class = ConflictClassifier::classify(&payload.path);
+                        let stash_root = match self.mode {
+                            MaterializerMode::Live => self.vaults_root.clone(),
+                            _ => self.shadow_root(),
+                        };
+                        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
+                        // Compute the stash path FIRST and record it in the echo_guard
+                        // BEFORE writing it, so the file_watcher recognizes the stash
+                        // write as an echo and never enqueues the conflict copy as a
+                        // push (D5). The conflict copy is also excluded by name in the
+                        // watcher, but recording here is belt-and-braces and keys the
+                        // exact (path, sha) the watcher will observe.
+                        let stash_target = stasher.compute_stash_path_public(
+                            &payload.path,
+                            &self.config.device_id,
+                            change_seq,
+                        );
+                        if let (Some(g), Some(rel)) =
+                            (&self.echo_guard, self.rel_for_stash(&stash_target))
+                        {
+                            g.record(&rel, &local_raw_sha);
+                        }
+                        let written = stasher.write_stash(
+                            &payload.path,
+                            &local_bytes,
+                            &self.config.device_id,
+                            change_seq,
+                        )?;
+                        warn!(
+                            path = %payload.path,
+                            stash = %written.display(),
+                            class = ?class,
+                            change_seq,
+                            shadow_present = shadow.is_some(),
+                            "materializer CONFLICT (R4/R5): stashed local divergent revision BEFORE overwrite, both byte-sets preserved"
+                        );
+                        stash_path = Some(written);
+                    }
                 }
             }
         } else if let Some(sh_hash) = self
@@ -4331,5 +4493,669 @@ mod tests {
         // And the single stash holds the losing bytes verbatim.
         let forks = conflict_copies(&dir);
         assert_eq!(std::fs::read_to_string(dir.join(&forks[0])).unwrap(), local);
+    }
+
+    // ─── TKT-ddff1877: append-aware arms (regression of the 2026-05-25 P0) ────
+    //
+    // Replay of the measured link / Trinity flight-recorder fork storm on a
+    // SYNTHESIZED recorder-shaped fixture (the repo is public; no vault prose is
+    // ever committed). The real forked recorder replays through the `#[ignore]`
+    // test at the bottom, driven by `VAULT_SYNC_REPLAY_FIXTURE`.
+
+    /// Materializer wired like production for these arms: shadow + base_seq
+    /// stores (vault-folder aware) AND a push-journal handle so the compensating
+    /// push can be observed.
+    #[allow(clippy::type_complexity)]
+    fn mk_append(
+        mode: MaterializerMode,
+    ) -> (
+        TempDir,
+        TempDir,
+        Materializer,
+        Arc<ShadowStore>,
+        Arc<crate::base_seq_store::BaseSeqStore>,
+        Arc<Mutex<PushJournal>>,
+    ) {
+        let (v, w, m) = mk(mode, default_cfg());
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load_with_vault_folders(
+            sdir.path().join("shadow.json"),
+            vec![VAULT.to_string()],
+        );
+        let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
+            sdir.path().join("base_seq.json"),
+            vec![VAULT.to_string()],
+        );
+        let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let journal = Arc::new(Mutex::new(
+            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+        ));
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_base_seq_store(bs.clone())
+            .with_push_journal(journal.clone());
+        (v, w, m, shadow, bs, journal)
+    }
+
+    /// A recorder-SHAPED file: header + `## SESSION LOG` sections of
+    /// `- **HH:MM** ... Files: ...` entries. Deterministic, synthetic prose.
+    fn recorder_fixture(sessions: usize, entries_per_session: usize) -> Vec<u8> {
+        let mut s = String::from(
+            "# active-work.md — flight recorder (SYNTHESIZED fixture, TKT-ddff1877 replay)\n\n",
+        );
+        for si in 0..sessions {
+            s.push_str(&format!(
+                "## SESSION LOG 2026-09-0{} — seat-{si} (synthetic)\n",
+                (si % 5) + 1
+            ));
+            for ei in 0..entries_per_session {
+                s.push_str(&format!(
+                    "- **{:02}:{:02}** synthetic entry s{si}e{ei}: intent stated, outcome recorded. Files: this log\n",
+                    (8 + ei / 4) % 24,
+                    (ei * 7) % 60
+                ));
+            }
+            s.push('\n');
+        }
+        s.into_bytes()
+    }
+
+    /// Cut `bytes` at the last line boundary at or before `frac` of its length
+    /// (an OLDER snapshot of the same append-only file).
+    fn line_boundary_prefix(bytes: &[u8], frac: f64) -> &[u8] {
+        let cut = ((bytes.len() as f64) * frac) as usize;
+        let end = bytes[..cut]
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map_or(0, |i| i + 1);
+        &bytes[..end]
+    }
+
+    /// Non-blank lines of `from` that do NOT occur as a whole line in `within`.
+    fn lines_lost(from: &[u8], within: &[u8]) -> Vec<String> {
+        let have: std::collections::HashSet<&str> =
+            std::str::from_utf8(within).unwrap().lines().collect();
+        std::str::from_utf8(from)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !have.contains(l))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn count_line(within: &[u8], line: &str) -> usize {
+        std::str::from_utf8(within)
+            .unwrap()
+            .lines()
+            .filter(|l| *l == line)
+            .count()
+    }
+
+    fn payload_bytes(wire: &str, bytes: &[u8], seq: i64) -> NotePayload {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        NotePayload {
+            path: wire.to_string(),
+            frontmatter: serde_json::json!({}),
+            body: text.clone(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: Some(seq),
+            enriched_body: Some(text),
+        }
+    }
+
+    const APPENDED_LINK: &str = "- **20:24** link seat: appended after the last sync (would be DROPPED by the old code). Files: this log";
+    const APPENDED_LINK_2: &str = "- **20:25** link seat: second appended line. Files: this log";
+    const APPENDED_LINK_3: &str = "- **20:26** link seat: third appended line. Files: this log";
+    const APPENDED_TRINITY: &str = "- **20:24** trinity seat: appended concurrently on the other host. Files: active-work.trinity.md";
+
+    /// ARM A — THE 78-LINE-LOSS REPLAY. The head being materialized is an OLDER
+    /// snapshot of the recorder (a peer re-pushed a stale copy: every server
+    /// line is at the front of local, in order) while local has appended lines
+    /// after the last sync. `decide()` sees three distinct versions => Conflict.
+    ///
+    /// OLD CODE: stashed local as `conflict-from-<own device>-1001.md` and
+    /// overwrote the live file with the older head — the appended lines lived
+    /// only in the fork (the measured link forks; 78 lines salvaged by hand).
+    /// FIX: local preserved verbatim, ZERO lines lost from either side, NO
+    /// fork, the head's seq recorded as OBSERVED lineage, and a compensating
+    /// push (CAS base = head hash) enqueued to carry the superset up.
+    #[test]
+    fn append_arm_a_replay_stale_head_preserves_local_zero_lines_lost_no_fork() {
+        let (vaults, _ws, m, shadow, bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        // Last synced version V_k (shadow + adopted lineage), then local appends.
+        let v_k = recorder_fixture(3, 40);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&v_k)));
+        bs.record_adopted(&wire, 1000);
+        let local = [
+            &v_k[..],
+            format!("{APPENDED_LINK}\n{APPENDED_LINK_2}\n{APPENDED_LINK_3}\n").as_bytes(),
+        ]
+        .concat();
+        std::fs::write(&target, &local).unwrap();
+
+        // The head: a STALE snapshot (70% of V_k), with a NEWER seq than the
+        // adopted one (a peer's push minted it), so the causal gate stands down.
+        let stale_head = line_boundary_prefix(&v_k, 0.7).to_vec();
+        assert!(stale_head.len() < v_k.len());
+        let head = payload_bytes(&wire, &stale_head, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::AppendPreservedPushUp {
+                enqueued_push: true
+            }),
+            "ARM A must preserve local and enqueue a compensating push, got {out:?}"
+        );
+        let on_disk = std::fs::read(&target).unwrap();
+        assert_eq!(on_disk, local, "local preserved byte-for-byte");
+        assert_eq!(
+            lines_lost(&local, &on_disk),
+            Vec::<String>::new(),
+            "0 local lines lost"
+        );
+        assert_eq!(
+            lines_lost(&stale_head, &on_disk),
+            Vec::<String>::new(),
+            "0 server lines lost"
+        );
+        assert_eq!(count_line(&on_disk, APPENDED_LINK), 1);
+        assert_eq!(count_line(&on_disk, APPENDED_LINK_3), 1);
+        assert!(conflict_copies(&dir).is_empty(), "NO conflict-from fork");
+
+        // Lineage: the head's seq is OBSERVED (authorises the wire base_seq of
+        // the compensating push) but NOT adopted (never enables causal-preserve).
+        // The store holds ONE entry per path (`record_observed` replaces the
+        // Adopted 1000 with Observed 1001 — exactly what the existing 409
+        // read-receipt path does), so adopted lineage is now ABSENT until the
+        // compensating push is accepted and byte-verified.
+        assert_eq!(bs.get(rel), Some(1001), "observed head seq recorded");
+        assert_eq!(
+            bs.get_adopted(rel),
+            None,
+            "observed provenance never counts as adopted"
+        );
+        // Shadow untouched: the last-synced version is still V_k.
+        assert_eq!(
+            shadow.get(&wire).as_deref(),
+            Some(hex::encode(Sha256::digest(&v_k)).as_str())
+        );
+
+        // The compensating push: CAS base = the head hash, content = local.
+        let batch = journal.lock().unwrap().drain(10).unwrap();
+        assert_eq!(batch.len(), 1, "exactly one compensating push");
+        assert_eq!(batch[0].0.path, wire);
+        assert_eq!(batch[0].0.action, PushAction::Modify);
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase(head.sha256.clone())
+        );
+        assert_eq!(batch[0].0.content_sha, hex::encode(Sha256::digest(&local)));
+        assert_eq!(
+            batch[0].0.content_bytes, None,
+            "lazy ref: reads the live file at drain"
+        );
+    }
+
+    /// ARM B — TWO WRITERS APPENDING CONCURRENTLY. Both hosts appended after
+    /// the same last-synced base. OLD CODE: Conflict => fork + overwrite (the
+    /// local append lived only in the fork). FIX: ONE converged file holding
+    /// base + server_tail + local_tail, every line exactly once, no fork, a
+    /// compensating push enqueued; the merged bytes then materialize back from
+    /// the server as an R1 no-op.
+    #[test]
+    fn append_arm_b_replay_two_appenders_merge_to_one_file_no_dup_no_fork() {
+        let (vaults, _ws, m, shadow, bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let base = recorder_fixture(3, 40);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&base)));
+        bs.record_adopted(&wire, 1000);
+        let local = [
+            &base[..],
+            format!("{APPENDED_LINK}\n{APPENDED_LINK_2}\n").as_bytes(),
+        ]
+        .concat();
+        std::fs::write(&target, &local).unwrap();
+        let server_bytes = [&base[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        match &out {
+            MaterializeOutcome::Merged {
+                path,
+                enqueued_push: true,
+            } => assert_eq!(path, &target),
+            other => panic!("ARM B must merge + enqueue, got {other:?}"),
+        }
+        let on_disk = std::fs::read(&target).unwrap();
+        let expected = [
+            &base[..],
+            format!("{APPENDED_TRINITY}\n{APPENDED_LINK}\n{APPENDED_LINK_2}\n").as_bytes(),
+        ]
+        .concat();
+        assert_eq!(on_disk, expected, "base + server_tail + local_tail");
+        assert_eq!(
+            lines_lost(&local, &on_disk),
+            Vec::<String>::new(),
+            "0 local lines lost"
+        );
+        assert_eq!(
+            lines_lost(&server_bytes, &on_disk),
+            Vec::<String>::new(),
+            "0 server lines lost"
+        );
+        for l in [APPENDED_LINK, APPENDED_LINK_2, APPENDED_TRINITY] {
+            assert_eq!(count_line(&on_disk, l), 1, "{l} exactly once");
+        }
+        // No line of the base was duplicated either.
+        assert_eq!(
+            std::str::from_utf8(&on_disk).unwrap().lines().count(),
+            std::str::from_utf8(&base).unwrap().lines().count() + 3
+        );
+        assert!(conflict_copies(&dir).is_empty(), "NO conflict-from fork");
+        assert_eq!(bs.get(rel), Some(1001), "observed head seq recorded");
+        assert_eq!(
+            bs.get_adopted(rel),
+            None,
+            "observed replaces the single lineage entry"
+        );
+
+        let batch = journal.lock().unwrap().drain(10).unwrap();
+        assert_eq!(batch.len(), 1, "exactly one compensating push");
+        assert_eq!(
+            batch[0].0.base_hash,
+            PushBase::KnownBase(head.sha256.clone())
+        );
+        assert_eq!(
+            batch[0].0.content_sha,
+            hex::encode(Sha256::digest(&on_disk))
+        );
+
+        // Convergence: the server accepts the merge and it comes back as the
+        // new head. R1: identical, nothing written, still no fork.
+        let head2 = payload_bytes(&wire, &on_disk, 1002);
+        let out2 = m.write_with_change_seq(&head2, 1002).unwrap();
+        assert_eq!(
+            out2,
+            MaterializeOutcome::Skipped(SkipReason::IdenticalToLocal)
+        );
+        assert!(conflict_copies(&dir).is_empty());
+        assert_eq!(bs.get_adopted(rel), Some(1002), "converged version adopted");
+    }
+
+    /// Arranger requirement (3): ARM B must REFUSE when the shadow is ABSENT
+    /// (R5, unknown provenance) — fail to the stash floor, never to a guessed
+    /// merge. Both byte-sets preserved exactly as before the fix.
+    #[test]
+    fn append_arm_b_refuses_without_a_shadow_stash_floor_stands() {
+        let (vaults, _ws, m, _shadow, _bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let base = recorder_fixture(2, 20);
+        let local = [&base[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let server_bytes = [&base[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "got {out:?}"
+        );
+        let forks = conflict_copies(&dir);
+        assert_eq!(
+            forks.len(),
+            1,
+            "the stash floor still preserves local as a fork"
+        );
+        assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
+        assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
+        assert!(
+            journal.lock().unwrap().drain(10).unwrap().is_empty(),
+            "nothing enqueued"
+        );
+    }
+
+    /// Arranger requirement (3): ARM B must REFUSE when the shadow names a
+    /// version that is NOT a common ancestor of local and the head (stale /
+    /// foreign shadow) — stash floor, never a merge.
+    #[test]
+    fn append_arm_b_refuses_a_stale_foreign_shadow_stash_floor_stands() {
+        let (vaults, _ws, m, shadow, _bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let base = recorder_fixture(2, 20);
+        // The shadow names some unrelated version: no line cut of the common
+        // prefix can hash to it.
+        shadow.record(&wire, &sha256_hex("a version neither side descends from"));
+        let local = [&base[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let server_bytes = [&base[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "got {out:?}"
+        );
+        assert_eq!(conflict_copies(&dir).len(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
+        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+    }
+
+    /// An OLDER-but-genuine ancestor shadow (the daemon last synced an earlier
+    /// version, both sides then appended the SAME run before diverging): the
+    /// verified base is that older version, and the shared appended run must
+    /// appear ONCE — no duplication of the lines both sides already hold.
+    #[test]
+    fn append_arm_b_older_ancestor_shadow_merges_without_duplicating_the_shared_run() {
+        let (vaults, _ws, m, shadow, _bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let full = recorder_fixture(3, 30);
+        let ancestor = line_boundary_prefix(&full, 0.5).to_vec();
+        let shared_run = &full[ancestor.len()..]; // both sides hold this already
+        shadow.record(&wire, &hex::encode(Sha256::digest(&ancestor)));
+        let local = [&full[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let server_bytes = [&full[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Merged { .. }),
+            "got {out:?}"
+        );
+        let on_disk = std::fs::read(&target).unwrap();
+        let expected = [
+            &full[..],
+            format!("{APPENDED_TRINITY}\n{APPENDED_LINK}\n").as_bytes(),
+        ]
+        .concat();
+        assert_eq!(
+            on_disk, expected,
+            "shared run once, then server tail, then local tail"
+        );
+        let shared_first_line = std::str::from_utf8(shared_run)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        assert_eq!(
+            count_line(&on_disk, shared_first_line),
+            1,
+            "no duplicated history"
+        );
+        assert!(conflict_copies(&dir).is_empty());
+        assert_eq!(journal.lock().unwrap().drain(10).unwrap().len(), 1);
+    }
+
+    /// ARM A needs no shadow: a stale head is lossless to preserve against
+    /// regardless of provenance (R5 with a strict-prefix head).
+    #[test]
+    fn append_arm_a_fires_without_a_shadow() {
+        let (vaults, _ws, m, _shadow, _bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let v_k = recorder_fixture(2, 20);
+        let local = [&v_k[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let head = payload_bytes(&wire, line_boundary_prefix(&v_k, 0.6), 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::AppendPreservedPushUp {
+                enqueued_push: true
+            })
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), local);
+        assert!(conflict_copies(&dir).is_empty());
+        assert_eq!(journal.lock().unwrap().drain(10).unwrap().len(), 1);
+    }
+
+    /// Local is a strict line-prefix of the head (the server already holds
+    /// local's append plus more): a CLEAN pull converges without loss — no fork
+    /// where the old code minted a junk one, nothing enqueued.
+    #[test]
+    fn append_local_prefix_of_head_pulls_clean_without_a_fork() {
+        let (vaults, _ws, m, shadow, bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let base = recorder_fixture(2, 20);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&base)));
+        bs.record_adopted(&wire, 1000);
+        let local = [&base[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let server_bytes = [
+            &base[..],
+            format!("{APPENDED_LINK}\n{APPENDED_LINK_2}\n").as_bytes(),
+        ]
+        .concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Wrote { .. }),
+            "got {out:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
+        assert!(
+            conflict_copies(&dir).is_empty(),
+            "no junk fork for a contained local"
+        );
+        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        assert_eq!(bs.get_adopted(rel), Some(1001));
+    }
+
+    /// NEGATIVE: an edit INSIDE the shared history (a modified line) plus an
+    /// append on the server, against a local append — a TRUE divergence. No
+    /// line cut hashes to the shadow, so the arms stand down and the always-
+    /// stash floor is unchanged: fork minted, server materialized.
+    #[test]
+    fn append_arms_stand_down_when_the_shared_history_was_edited_stash_floor_stands() {
+        let (vaults, _ws, m, shadow, _bs, journal) = mk_append(MaterializerMode::Live);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let base = recorder_fixture(2, 20);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&base)));
+        let local = [&base[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        // The server rewrote one line in the middle of the history AND appended.
+        let edited = String::from_utf8(base.clone())
+            .unwrap()
+            .replacen(
+                "synthetic entry s1e3:",
+                "synthetic entry s1e3 (REWRITTEN on a peer):",
+                1,
+            )
+            .into_bytes();
+        assert_ne!(edited, base);
+        let server_bytes = [&edited[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+        let head = payload_bytes(&wire, &server_bytes, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "got {out:?}"
+        );
+        let forks = conflict_copies(&dir);
+        assert_eq!(
+            forks.len(),
+            1,
+            "true divergence keeps the always-stash floor"
+        );
+        assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
+        assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
+        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+    }
+
+    /// The arms are Live-only: in Shadow mode the pre-existing behavior stands
+    /// (the compensating push would read the live vault, which Shadow mode
+    /// never writes).
+    #[test]
+    fn append_arms_are_live_mode_only() {
+        let (vaults, ws, m, shadow, _bs, journal) = mk_append(MaterializerMode::Shadow);
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        // Shadow mode writes under the shadow root; seed the target there.
+        let target = m.target_path(&wire);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let v_k = recorder_fixture(1, 10);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&v_k)));
+        let local = [&v_k[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let head = payload_bytes(&wire, line_boundary_prefix(&v_k, 0.6), 1001);
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "got {out:?}"
+        );
+        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        drop((vaults, ws));
+    }
+
+    /// REAL-RECORDER REPLAY (arranger requirement 2). Runs ONLY when pointed at
+    /// a forked copy of a real flight recorder:
+    ///
+    /// ```text
+    /// VAULT_SYNC_REPLAY_FIXTURE=/tmp/active-work.forked.md \
+    ///   cargo test --lib append_replay_forked_recorder_fixture -- --ignored --nocapture
+    /// ```
+    ///
+    /// Replays both measured shapes on the real bytes (stale head = the fixture
+    /// cut at 80%; two appenders = fixture + one synthetic line each side) and
+    /// asserts ZERO lines lost, NO fork. The fixture is never committed.
+    #[test]
+    #[ignore]
+    fn append_replay_forked_recorder_fixture() {
+        let path = std::env::var("VAULT_SYNC_REPLAY_FIXTURE")
+            .expect("set VAULT_SYNC_REPLAY_FIXTURE to a forked copy of the recorder");
+        let fixture = std::fs::read(&path).expect("fixture readable");
+        let fixture_lines = std::str::from_utf8(&fixture).unwrap().lines().count();
+        println!(
+            "replay fixture: {path} ({} bytes, {fixture_lines} lines)",
+            fixture.len()
+        );
+
+        // Shape 1 — stale head (ARM A).
+        {
+            let (vaults, _ws, m, shadow, bs, journal) = mk_append(MaterializerMode::Live);
+            let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+            let wire = format!("{VAULT}/{rel}");
+            let target = vaults.path().join(VAULT).join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let dir = target.parent().unwrap().to_path_buf();
+            shadow.record(&wire, &hex::encode(Sha256::digest(&fixture)));
+            bs.record_adopted(&wire, 1003895045);
+            let local = [
+                &fixture[..],
+                format!("{APPENDED_LINK}\n{APPENDED_LINK_2}\n{APPENDED_LINK_3}\n").as_bytes(),
+            ]
+            .concat();
+            std::fs::write(&target, &local).unwrap();
+            let stale = line_boundary_prefix(&fixture, 0.8).to_vec();
+            let head = payload_bytes(&wire, &stale, 1003895046);
+            let t0 = std::time::Instant::now();
+            let out = m.write_with_change_seq(&head, 1003895046).unwrap();
+            let dt = t0.elapsed();
+            assert_eq!(
+                out,
+                MaterializeOutcome::Skipped(SkipReason::AppendPreservedPushUp {
+                    enqueued_push: true
+                })
+            );
+            let on_disk = std::fs::read(&target).unwrap();
+            assert_eq!(on_disk, local);
+            let lost_local = lines_lost(&local, &on_disk).len();
+            let lost_server = lines_lost(&stale, &on_disk).len();
+            let forks = conflict_copies(&dir).len();
+            let enqueued = journal.lock().unwrap().drain(10).unwrap().len();
+            println!(
+                "ARM A (stale head {} bytes vs local {} bytes): outcome={out:?} lines_lost_local={lost_local} lines_lost_server={lost_server} forks={forks} compensating_pushes={enqueued} elapsed={dt:?}",
+                stale.len(),
+                local.len()
+            );
+            assert_eq!((lost_local, lost_server, forks, enqueued), (0, 0, 0, 1));
+        }
+
+        // Shape 2 — two appenders (ARM B).
+        {
+            let (vaults, _ws, m, shadow, bs, journal) = mk_append(MaterializerMode::Live);
+            let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+            let wire = format!("{VAULT}/{rel}");
+            let target = vaults.path().join(VAULT).join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let dir = target.parent().unwrap().to_path_buf();
+            shadow.record(&wire, &hex::encode(Sha256::digest(&fixture)));
+            bs.record_adopted(&wire, 1003895045);
+            let local = [&fixture[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+            std::fs::write(&target, &local).unwrap();
+            let server_bytes = [&fixture[..], format!("{APPENDED_TRINITY}\n").as_bytes()].concat();
+            let head = payload_bytes(&wire, &server_bytes, 1003895046);
+            let t0 = std::time::Instant::now();
+            let out = m.write_with_change_seq(&head, 1003895046).unwrap();
+            let dt = t0.elapsed();
+            assert!(
+                matches!(
+                    out,
+                    MaterializeOutcome::Merged {
+                        enqueued_push: true,
+                        ..
+                    }
+                ),
+                "{out:?}"
+            );
+            let on_disk = std::fs::read(&target).unwrap();
+            let lost_local = lines_lost(&local, &on_disk).len();
+            let lost_server = lines_lost(&server_bytes, &on_disk).len();
+            let merged_lines = std::str::from_utf8(&on_disk).unwrap().lines().count();
+            let forks = conflict_copies(&dir).len();
+            let enqueued = journal.lock().unwrap().drain(10).unwrap().len();
+            println!(
+                "ARM B (two appenders): outcome=Merged merged_lines={merged_lines} (fixture {fixture_lines} + 2) lines_lost_local={lost_local} lines_lost_server={lost_server} forks={forks} compensating_pushes={enqueued} dup_check={} elapsed={dt:?}",
+                count_line(&on_disk, APPENDED_LINK) == 1 && count_line(&on_disk, APPENDED_TRINITY) == 1
+            );
+            assert_eq!(merged_lines, fixture_lines + 2);
+            assert_eq!((lost_local, lost_server, forks, enqueued), (0, 0, 0, 1));
+        }
     }
 }

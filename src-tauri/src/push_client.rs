@@ -991,6 +991,8 @@ impl PushClient {
     /// | `PullClean` (R3) | local == last-synced shadow, so the bytes were never a local edit |
     /// | `Noop` / `AlignedToCanonical` (R1/D1) | content-identical by definition |
     /// | `GuardPreserveLocalPushUp` (anti-strip ARM 1, TKT-989ad5f2) | local preserved + compensating push |
+    /// | `AppendPreservedPushUp` (append ARM A, TKT-ddff1877) | local preserved (head is a line-prefix of it) + compensating push |
+    /// | `Merged` (append ARM B, TKT-ddff1877) | local rewritten to base+server_tail+local_tail (superset of both) + compensating push |
     /// | `ShadowScopeSuspect` / `ConflictStormBreakerOpen` | whole write refused, local untouched |
     /// | terminal 409+404 (R5 F-B3.3, TKT-989ad5f2) | no local write; stores cleared + CREATE re-enqueued, bytes stay at the canonical path |
     /// | no materializer wired, or the refetch failed | returns before any write |
@@ -4193,6 +4195,230 @@ mod tests {
             fx.shadow.get(path),
             None,
             "terminal 404 must clear the stale shadow"
+        );
+    }
+
+    // ─── TKT-ddff1877: CAS-409 against a STALE head (append ARM A) end-to-end ──
+
+    /// Like [`make_receipt_client`] but the materializer also holds a SECOND
+    /// `PushJournal` handle on the SAME journal file (as `lib.rs` wires it), so
+    /// the append arms' compensating push lands where the next `drain_once`
+    /// reads it.
+    async fn make_append_client(
+        base_url: &str,
+        journal: Arc<Mutex<PushJournal>>,
+        journal_path: &std::path::Path,
+    ) -> (
+        PushClient,
+        TempDir,
+        Arc<crate::base_seq_store::BaseSeqStore>,
+        Arc<ShadowStore>,
+    ) {
+        let vault = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+        let rr = crate::read_receipt::ReadReceiptStore::load(sdir.path().join("read_receipt.json"));
+        let mat_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            PushJournal::open(journal_path).unwrap(),
+        ));
+        let mat = Materializer::new(
+            vault.path().to_path_buf(),
+            None,
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".into(),
+            MaterializerConfig {
+                device_id: "dev-test".into(),
+                ..Default::default()
+            },
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_push_journal(mat_journal)
+        .with_echo_guard(Arc::new(EchoGuard::new()));
+        let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
+        let client = PushClient::new(
+            api,
+            journal,
+            "dev-test".into(),
+            config_for_test(),
+            vault.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone())
+        .with_base_seq_store(bs.clone())
+        .with_read_receipt_store(rr)
+        .with_materializer(mat);
+        (client, vault, bs, shadow)
+    }
+
+    fn conflict_forks_under(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.to_string_lossy().contains(".conflict-from-") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// THE MEASURED LINK SHAPE, end-to-end through the push leg (journalctl
+    /// 2026-09-02 00:24Z / 2026-09-03 18:17Z): a local append pushes with its
+    /// last-adopted base_seq, the server 409s because a peer moved the head to
+    /// a STALE snapshot of the same file, the 409 handler refetches that head
+    /// and hands it to the materializer.
+    ///
+    /// OLD CODE: `Conflict` => stash local as `conflict-from-dev-test-1001.md`
+    /// + overwrite the live file with the older head; the acked journal entry
+    /// is gone, and 5 s later the pending push re-reads the file and pushes the
+    /// HEAD bytes back (hash == the 409's expected_hash) — the appended line
+    /// exists only in the fork. FIX: no fork, local intact, the head seq
+    /// recorded as the observed baseline, a compensating push enqueued with
+    /// CAS base = head hash, and the NEXT drain pushes the superset and is
+    /// ACCEPTED — the file converges to the local (complete) version.
+    #[tokio::test]
+    async fn cas_409_against_stale_head_prefix_preserves_local_no_fork_and_requeues() {
+        let mut srv = Server::new_async().await;
+        let stale_head = "line A\nline B\n";
+        let head_sha = sha256_hex(stale_head.as_bytes());
+        let local: &[u8] = b"line A\nline B\nline C appended after the last sync\n";
+        let local_sha = sha256_hex(local);
+
+        // Push #1 declares the last ADOPTED base (1000) => the server's head
+        // has moved => 409 naming the head hash. Exactly once (no blind retry).
+        let push_conflict = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::Regex(r#""base_seq":1000"#.into()))
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{head_sha}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+        // The refetch: the head is a STALE snapshot (strict line-prefix of local).
+        let note = serde_json::json!({
+            "path": "01_Notes/rec.md",
+            "frontmatter": {},
+            "body": stale_head,
+            "sha256": head_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 1001,
+            "enriched_body": stale_head,
+        })
+        .to_string();
+        let note_mock = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .expect(1)
+            .create_async()
+            .await;
+        // Push #2 = the compensating push: CAS base = the head hash AND the
+        // observed baseline (1001) on the wire; the server ACCEPTS the superset.
+        // The wire carries the body as base64 `content`; match the EXACT local
+        // bytes so an accepted push of anything else fails the test.
+        use base64::Engine as _;
+        let local_b64 = base64::engine::general_purpose::STANDARD.encode(local);
+        let push_accept = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""base_seq":1001"#.into()),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"base_hash":"{head_sha}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"content":"{local_b64}"}}"#)),
+            ]))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"accepted","seq":1,"content_hash":"{local_sha}","server_hash":"{local_sha}","server_seq":1002,"merged_content":null,"message":null}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (jdir, journal) = make_journal_with(vec![evt("01_Notes/rec.md", local)]);
+        let (client, vault, bs, shadow) = make_append_client(
+            &srv.url(),
+            journal.clone(),
+            &jdir.path().join("push_journal.jsonl"),
+        )
+        .await;
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join("01_Notes/rec.md"), local).unwrap();
+        // Lineage: we last adopted 1000 (our own earlier push); the shadow names
+        // some earlier synced version (NOT the stale head, else R2 would apply).
+        bs.record_adopted("01_Notes/rec.md", 1000);
+        shadow.record("01_Notes/rec.md", &sha256_hex(b"line A\n"));
+
+        // Round 1: the 409 + refetch. Surfaced as ConflictUnrecoverable for
+        // accounting (R6), but NOTHING is forked or overwritten.
+        let out1 = client.drain_once().await;
+        assert_eq!(out1.len(), 1);
+        assert!(
+            matches!(
+                out1[0].1,
+                PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+            ),
+            "the 409 is still surfaced, got {:?}",
+            out1[0].1
+        );
+        assert!(
+            conflict_forks_under(vault.path()).is_empty(),
+            "NO conflict-from fork may be minted for a stale-head 409"
+        );
+        assert_eq!(
+            std::fs::read(vault.path().join("01_Notes/rec.md")).unwrap(),
+            local,
+            "the live file keeps the appended line (old code overwrote it with the head)"
+        );
+        assert_eq!(
+            bs.get("01_Notes/rec.md"),
+            Some(1001),
+            "head seq observed for the retry"
+        );
+        assert_eq!(
+            bs.get_adopted("01_Notes/rec.md"),
+            None,
+            "observed head replaces the single lineage entry (same as the receipt path); adoption returns with the accepted retry"
+        );
+        assert_eq!(
+            journal.lock().await.len(),
+            1,
+            "the 409'd entry was acked and exactly one compensating push is pending"
+        );
+        push_conflict.assert_async().await;
+        note_mock.assert_async().await;
+
+        // Round 2: the compensating push carries the superset up and is ACCEPTED.
+        let out2 = client.drain_once().await;
+        assert_eq!(out2.len(), 1);
+        assert!(
+            matches!(out2[0].1, PushOutcome::Sent { .. }),
+            "the compensating push must be accepted, got {:?}",
+            out2[0].1
+        );
+        push_accept.assert_async().await;
+        assert_eq!(
+            bs.get_adopted("01_Notes/rec.md"),
+            Some(1002),
+            "converged version adopted"
+        );
+        assert_eq!(
+            shadow.get("01_Notes/rec.md").as_deref(),
+            Some(local_sha.as_str())
+        );
+        assert_eq!(journal.lock().await.len(), 0, "journal drained");
+        assert!(conflict_forks_under(vault.path()).is_empty());
+        assert_eq!(
+            std::fs::read(vault.path().join("01_Notes/rec.md")).unwrap(),
+            local
         );
     }
 }

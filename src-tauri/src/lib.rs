@@ -1,4 +1,5 @@
 pub mod api_client;
+pub mod append_merge;
 pub mod base_seq_store;
 pub mod canonical_form;
 pub mod commands;
