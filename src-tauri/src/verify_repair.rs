@@ -350,6 +350,9 @@ pub enum PullResultClass {
 ///   until the watcher-enqueued push lands.
 /// * `GuardPreserveLocalPushUp` — anti-strip ARM 1 preserved local + enqueued
 ///   a compensating push; still divergent until it lands.
+/// * `AppendPreservedPushUp` / `Merged` (TKT-ddff1877) — the append-aware
+///   arms preserved (or merged into) local and enqueued a compensating push;
+///   still divergent until it lands.
 /// * `ShadowScopeSuspect` (TKT-372e31b2) — the shadow store loaded scope-
 ///   suspect, the whole write was refused; still divergent until the operator
 ///   fixes `vault_name` and the daemon restarts.
@@ -367,6 +370,10 @@ pub fn classify_pull_outcome(
         Ok(O::Skipped(S::ConflictStormBreakerOpen)) => PullResultClass::Deferred,
         Ok(O::Skipped(S::LocalEditPreserved)) => PullResultClass::Deferred,
         Ok(O::Skipped(S::GuardPreserveLocalPushUp { .. })) => PullResultClass::Deferred,
+        // TKT-ddff1877 append-aware arms: local still differs from the server
+        // head until the compensating push lands => Deferred, never Succeeded.
+        Ok(O::Skipped(S::AppendPreservedPushUp { .. })) => PullResultClass::Deferred,
+        Ok(O::Merged { .. }) => PullResultClass::Deferred,
         Ok(O::Skipped(S::ShadowScopeSuspect)) => PullResultClass::Deferred,
         Ok(_) => PullResultClass::Succeeded,
     }
