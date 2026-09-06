@@ -637,9 +637,21 @@ fn spawn_sse_consumer(
         // path is now divergence-driven (always-stash) regardless of policy, but
         // we set NewerWins explicitly here so a stray ServerWins value can never
         // re-arm the old clobber, and the standalone ConflictStash API agrees.
+        // TKT-ddff1877 runtime kill-switch for the append-aware conflict arms:
+        // `VAULT_SYNC_APPEND_ARMS=off` (or 0/false/disabled/no) restores the
+        // pre-fix always-stash floor without a binary swap. Default ON.
+        let append_arms_enabled = materializer::append_arms_enabled_from_env_value(
+            std::env::var("VAULT_SYNC_APPEND_ARMS").ok().as_deref(),
+        );
+        if !append_arms_enabled {
+            tracing::warn!(
+                "VAULT_SYNC_APPEND_ARMS is set to an off-word: append-aware conflict arms DISABLED (pre-fix stash floor for every R4/R5 conflict)"
+            );
+        }
         let materializer_cfg = materializer::MaterializerConfig {
             device_id: cfg.subscriber_id.clone(),
             conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
+            append_arms_enabled,
             ..Default::default()
         };
         // S492 echo guard: shared between the materializer (records its writes)

@@ -304,6 +304,22 @@ pub struct MaterializerConfig {
     pub conflict_storm_threshold: u32,
     /// Sliding window (seconds) for `conflict_storm_threshold`.
     pub conflict_storm_window_secs: u64,
+    /// TKT-ddff1877 runtime kill-switch for the append-aware arms (ARM A /
+    /// ARM B / local-prefix clean pull). Default ON. Set from the environment
+    /// at daemon start (`VAULT_SYNC_APPEND_ARMS=off|0|false|disabled`, see
+    /// [`append_arms_enabled_from_env_value`]) so a deploy window can roll the
+    /// behaviour back to the pre-fix always-stash floor WITHOUT a binary swap.
+    /// When off, `Decision::Conflict` behaves exactly as before the fix.
+    pub append_arms_enabled: bool,
+}
+
+/// TKT-ddff1877: parse the `VAULT_SYNC_APPEND_ARMS` value. Anything other than
+/// an explicit off-word (`0`, `off`, `false`, `disabled`, `no`, case-insensitive,
+/// surrounding whitespace ignored) — including unset/empty — means ON. Pure so it
+/// is table-testable without touching the process environment.
+pub fn append_arms_enabled_from_env_value(raw: Option<&str>) -> bool {
+    !raw.map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| matches!(v.as_str(), "0" | "off" | "false" | "disabled" | "no"))
 }
 
 impl Default for MaterializerConfig {
@@ -315,6 +331,7 @@ impl Default for MaterializerConfig {
             device_id: "unknown-device".to_string(),
             conflict_storm_threshold: 50,
             conflict_storm_window_secs: 600,
+            append_arms_enabled: true,
         }
     }
 }
@@ -1154,7 +1171,18 @@ impl Materializer {
                     // `Unresolved` and the always-stash floor below stands. Live
                     // mode only: the compensating push reads the live vault.
                     let mut take_stash_floor = true;
-                    if matches!(self.mode, MaterializerMode::Live) {
+                    if matches!(self.mode, MaterializerMode::Live)
+                        && !self.config.append_arms_enabled
+                    {
+                        warn!(
+                            path = %payload.path,
+                            change_seq,
+                            "materializer APPEND ARMS DISABLED (VAULT_SYNC_APPEND_ARMS kill-switch, TKT-ddff1877): resolving this conflict with the pre-fix always-stash floor"
+                        );
+                    }
+                    if matches!(self.mode, MaterializerMode::Live)
+                        && self.config.append_arms_enabled
+                    {
                         use crate::append_merge::{resolve, AppendResolution};
                         match resolve(&local_bytes, content_bytes, shadow.as_deref()) {
                             AppendResolution::LocalSupersedesServer => {
@@ -5051,6 +5079,91 @@ mod tests {
         );
         assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
         drop((vaults, ws));
+    }
+
+    /// RUNTIME KILL-SWITCH (arranger ruling 2026-09-06 00:06): with
+    /// `append_arms_enabled = false` the arms never fire and the ARM A shape
+    /// resolves exactly as before the fix — stash floor, fork minted, head
+    /// materialized, nothing enqueued. Lets a deploy window roll the behaviour
+    /// back via `VAULT_SYNC_APPEND_ARMS=off` without a binary swap.
+    #[test]
+    fn append_arms_kill_switch_restores_the_pre_fix_stash_floor() {
+        let mut cfg = default_cfg();
+        cfg.append_arms_enabled = false;
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let shadow = ShadowStore::load_with_vault_folders(
+            sdir.path().join("shadow.json"),
+            vec![VAULT.to_string()],
+        );
+        let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
+        let journal = Arc::new(Mutex::new(
+            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+        ));
+        let m = m
+            .with_shadow_store(shadow.clone())
+            .with_push_journal(journal.clone());
+        let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+        let wire = format!("{VAULT}/{rel}");
+        let target = vaults.path().join(VAULT).join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let dir = target.parent().unwrap().to_path_buf();
+
+        let v_k = recorder_fixture(2, 20);
+        shadow.record(&wire, &hex::encode(Sha256::digest(&v_k)));
+        let local = [&v_k[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+        std::fs::write(&target, &local).unwrap();
+        let stale = line_boundary_prefix(&v_k, 0.6).to_vec();
+        let head = payload_bytes(&wire, &stale, 1001);
+
+        let out = m.write_with_change_seq(&head, 1001).unwrap();
+        assert!(
+            matches!(out, MaterializeOutcome::Stashed { .. }),
+            "got {out:?}"
+        );
+        let forks = conflict_copies(&dir);
+        assert_eq!(forks.len(), 1, "pre-fix behaviour: the fork is minted");
+        assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            stale,
+            "pre-fix behaviour: head materialized"
+        );
+        assert!(
+            journal.lock().unwrap().drain(10).unwrap().is_empty(),
+            "nothing enqueued"
+        );
+    }
+
+    #[test]
+    fn append_arms_env_value_parses_off_words_only() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some("yes"),
+            Some("banana"),
+        ] {
+            assert!(
+                append_arms_enabled_from_env_value(on),
+                "{on:?} must mean ON"
+            );
+        }
+        for off in [
+            Some("0"),
+            Some("off"),
+            Some("OFF"),
+            Some(" false "),
+            Some("Disabled"),
+            Some("no"),
+        ] {
+            assert!(
+                !append_arms_enabled_from_env_value(off),
+                "{off:?} must mean OFF"
+            );
+        }
     }
 
     /// REAL-RECORDER REPLAY (arranger requirement 2). Runs ONLY when pointed at
