@@ -1224,6 +1224,46 @@ impl Materializer {
                                 tmp.write_all(&merged)?;
                                 tmp.flush()?;
                                 atomic_persist(tmp, &target)?;
+                                // PR #14 review (findings 2 + 3): the merged write
+                                // rides the same tail as every other write — restore
+                                // the server-authoritative birthtime/mtime (the
+                                // 2026-06-05 ctime-clobber) and byte-verify what
+                                // landed BEFORE recording lineage or enqueuing a
+                                // push of it. Expected = the MERGED bytes (they
+                                // intentionally differ from the server sha).
+                                restore_server_times(&target, payload);
+                                if self.config.enable_integrity_check {
+                                    let expected = ExpectedIntegrity {
+                                        sha256_hex: merged_sha.clone(),
+                                        size_bytes: merged.len() as u64,
+                                    };
+                                    let result: IntegrityResult =
+                                        IntegrityChecker::new(false).verify(&target, &expected)?;
+                                    if !result.is_ok() {
+                                        let actual_hex = match &result.byte_level {
+                                            ByteLevelResult::ShaMismatch {
+                                                actual_prefix, ..
+                                            } => actual_prefix.clone(),
+                                            _ => String::new(),
+                                        };
+                                        warn!(
+                                            path = %payload.path,
+                                            expected = %merged_sha,
+                                            actual = %actual_hex,
+                                            "materializer APPEND ARM B: post-write integrity check FAILED on the merged bytes - file kept for inspection, NO lineage recorded, NO push enqueued"
+                                        );
+                                        if let Some(tray) = &self.tray_state {
+                                            if let Ok(mut w) = tray.write() {
+                                                w.inc_integrity_failures();
+                                            }
+                                        }
+                                        return Ok(MaterializeOutcome::IntegrityFailed {
+                                            path: target,
+                                            expected_sha: merged_sha,
+                                            actual_sha: actual_hex,
+                                        });
+                                    }
+                                }
                                 let observed = self.record_observed_head(payload, &actual_sha);
                                 let enqueued_push = self.enqueue_compensating_push(
                                     "APPEND ARM B",

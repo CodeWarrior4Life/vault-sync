@@ -35,12 +35,13 @@
 
 use sha2::{Digest, Sha256};
 
-/// How many candidate line-boundary cut points below the raw common-prefix end
-/// are hashed while searching for the verified base. Two appenders whose
-/// appended bytes happen to share a leading run (e.g. both start with "\n- **")
-/// push the raw common prefix a little PAST the true base; this bounds the walk
-/// back. Generous for any real recorder append (a handful of lines).
-pub const MAX_BASE_BACKTRACK_CANDIDATES: usize = 128;
+// Historical note (PR #14 review, finding 1): an earlier draft capped the
+// candidate walk at 128 line boundaries below the raw common-prefix end. The
+// hashing is a single incremental pass regardless of how many candidates are
+// checked (one `Sha256::clone().finalize()` per line boundary), so the cap
+// bought nothing and would have made two appenders that share a >128-line
+// identical run fall back to the fork it exists to prevent. Every line
+// boundary inside the common prefix is now a candidate.
 
 /// Outcome of [`resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +90,7 @@ fn decode_sha_hex(hex_sha: &str) -> Option<[u8; 32]> {
 /// base (those are the R2/R3 shapes, not a two-appender merge).
 ///
 /// Cost: one linear pass over the common prefix (an incremental hasher cloned
-/// at each candidate), bounded by [`MAX_BASE_BACKTRACK_CANDIDATES`].
+/// and finalized at each line boundary).
 pub fn verified_common_base(local: &[u8], server: &[u8], shadow_sha_hex: &str) -> Option<usize> {
     let want = decode_sha_hex(shadow_sha_hex)?;
     let n = common_prefix_len(local, server);
@@ -99,21 +100,17 @@ pub fn verified_common_base(local: &[u8], server: &[u8], shadow_sha_hex: &str) -
     // Candidate cut points, ascending: every position p <= n where the byte
     // before p is '\n' (the base ended with a newline) or the byte AT p is '\n'
     // in both inputs (the base's last line was unterminated and both appenders
-    // supplied the newline), plus n itself. Keep only the highest
-    // MAX_BASE_BACKTRACK_CANDIDATES.
-    let mut candidates: Vec<usize> = Vec::new();
-    for p in (1..=n).rev() {
+    // supplied the newline), plus n itself. Unbounded on purpose (module note
+    // above): the hashing below is one linear pass either way.
+    let mut candidates: Vec<usize> = Vec::with_capacity(64);
+    for p in 1..=n {
         let line_end_before = local[p - 1] == b'\n';
         let newline_at =
             p < local.len() && p < server.len() && local[p] == b'\n' && server[p] == b'\n';
         if p == n || line_end_before || newline_at {
             candidates.push(p);
-            if candidates.len() >= MAX_BASE_BACKTRACK_CANDIDATES {
-                break;
-            }
         }
     }
-    candidates.sort_unstable();
     candidates.dedup();
     let mut hasher = Sha256::new();
     let mut fed = 0usize;
@@ -269,6 +266,37 @@ mod tests {
             verified_common_base(&local, &server, &sha(BASE)),
             Some(BASE.len())
         );
+    }
+
+    /// PR #14 review finding 1: a shared identical run of MANY lines between the
+    /// true base and the divergence must not defeat the base search.
+    #[test]
+    fn verified_base_is_found_past_a_long_shared_run() {
+        let shared: Vec<u8> = (0..500)
+            .flat_map(|i| {
+                format!("- **10:{:02}** templated entry {i}. Files: log\n", i % 60).into_bytes()
+            })
+            .collect();
+        let local = [BASE, &shared[..], b"- **11:00** link\n"].concat();
+        let server = [BASE, &shared[..], b"- **11:01** trinity\n"].concat();
+        assert_eq!(
+            verified_common_base(&local, &server, &sha(BASE)),
+            Some(BASE.len())
+        );
+        match resolve(&local, &server, Some(&sha(BASE))) {
+            AppendResolution::Merged { merged, .. } => {
+                assert_eq!(
+                    merged,
+                    [
+                        BASE,
+                        &shared[..],
+                        b"- **11:01** trinity\n- **11:00** link\n"
+                    ]
+                    .concat()
+                );
+            }
+            other => panic!("expected Merged, got {other:?}"),
+        }
     }
 
     #[test]
