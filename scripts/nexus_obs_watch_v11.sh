@@ -117,7 +117,7 @@ PYS
 sizes() {
   { find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" -not -path '*/_archive/*' -print0 2>/dev/null
     find "$V/02_Projects" -maxdepth 3 -name 'active-work*.md' -print0 2>/dev/null
-  } | xargs -0 stat -f '%z %N' 2>/dev/null | sort -k2
+  } | xargs -0 stat -f '%z %i %N' 2>/dev/null | sort -k3
 }
 
 # R1 CORE. Emits: verified unverified mtime_total log_events newest_ev orphan_ev ev_gradeable
@@ -358,24 +358,32 @@ def load(f):
         for l in open(f, errors="replace"):
             l=l.rstrip("\n")
             if not l: continue
-            a,b=l.split(" ",1)
-            try: d[b]=int(a)
+            parts=l.split(" ",2)
+            if len(parts)!=3: continue
+            sz,ino,path=parts
+            try: d[path]=(int(sz),ino)
             except ValueError: pass
     except OSError: pass
     return d
 prev,cur=load(sys.argv[1]),load(sys.argv[2])
 out=[]
-for path,ps in prev.items():
+for path,(ps,pino) in prev.items():
     if path in cur:
-        cs=cur[path]
-        if cs<ps: out.append("SHRANK|%s|%d|%d"%(path,ps,cs))
+        cs=cur[path][0]
+        if cs<ps: out.append("SHRANK|%s|%d|%d|%s"%(path,ps,cs,pino))
     else:
-        out.append("ABSENT|%s|%d|0"%(path,ps))
+        out.append("ABSENT|%s|%d|0|%s"%(path,ps,pino))
 print("\n".join(out))
 PYL
 )
     if [ -n "$loss" ]; then
-      echo "$loss" | while IFS='|' read -r kind path was now; do
+      # SUBSHELL TRAP: this while loop is fed by a pipe, so it runs in a
+      # subshell -- a shell variable incremented inside it reads 0 again after
+      # `done`. The relocation tally therefore goes through a FILE, which
+      # survives the boundary. (Caught before shipping by asking where the
+      # counter lives, not by watching it read zero in production.)
+      RELF=/tmp/.obs_reloc.$$; : > "$RELF"
+      echo "$loss" | while IFS='|' read -r kind path was now ino; do
         [ -z "$kind" ] && continue
         if [ "$kind" = "ABSENT" ]; then
           # DISCRIMINATOR, and it is the whole point: absent-from-the-find is NOT
@@ -392,19 +400,51 @@ PYL
           # P0 loss page. A missing tool must never manufacture a loss claim.
           # basename -> shell builtin expansion; find -print -quit stops at hit 1;
           # and a find that FAILS is graded UNDETERMINED, never LOSS.
+          # RE-DERIVED 2026-09-13 after the basename version produced FALSE
+          # RELOCATED verdicts at scale during the nightly bulk archive move: it
+          # named a DIFFERENT project's file as the destination (a Nexus copy
+          # "relocated" into Pitboss's archive), because dozens of conflict
+          # copies share one basename -- which is the very defect class this
+          # observer exists to study. Worse than cosmetic: ANY absence matched
+          # SOME same-named file, so a GENUINE VANISH would have read RELOCATED
+          # and SUPPRESSED its own loss page. A false negative on the
+          # irreversible rung.
+          #
+          # INODE IS THE PROOF: a rename/move within a filesystem preserves it.
+          # Verdicts are now GRADED and each says what established it:
+          #   RELOCATED (inode)  - same inode found elsewhere. Proven same file.
+          #   RELOCATED (size)   - inode gone but exactly ONE conflict copy of
+          #                        that exact byte size exists. Probable copy+delete.
+          #   VANISHED           - neither. Candidate loss.
+          #   UNDETERMINED       - a probe failed; never graded as loss.
           bn=${path##*/}
-          elsewhere=$(find "$V" -name "$bn" -print -quit 2>/dev/null); fst=$?
+          elsewhere=$(find "$V" -inum "$ino" -print -quit 2>/dev/null); fst=$?
           if [ "$fst" -ne 0 ]; then
             echo "COND 4 UNDETERMINED $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B and is absent from its own path, but the relocation probe FAILED (find exit=$fst) — NOT graded as loss. Re-check by hand: find \"$V\" -name '$bn'"
           elif [ -n "$elsewhere" ]; then
-            echo "STASH RELOCATED $(date -u '+%H:%M:%SZ') ${path#$V/} -> ${elsewhere#$V/} (was ${was}B) — NOT loss: the bytes exist at a new path (archive move or rename)"
+            echo "inode|${path#$V/} -> ${elsewhere#$V/}" >> "$RELF"
           else
-            echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk AND from every path in the vault — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: find \"$V\" -name '$bn'"
+            # inode gone. Fall back to an EXACT-SIZE search among conflict
+            # copies, which is far stronger than a basename but still not proof.
+            szmatch=$(find "$V" -name "*$PAT*" -size "${was}c" -print 2>/dev/null | head -2)
+            szn=$(printf '%s' "$szmatch" | grep -c . 2>/dev/null); szn=${szn:-0}
+            if [ "$szn" = "1" ]; then
+              echo "size|${path#$V/} -> $(printf '%s' "$szmatch" | head -1 | sed "s#$V/##")" >> "$RELF"
+            else
+              echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk, its INODE is gone, and NO conflict copy of its exact byte size exists — GRADE: CANDIDATE (arranger ruling 2026-09-12) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: find \"$V\" -size ${was}c -name '*$PAT*'"
+            fi
           fi
         else
           echo "*** COND 4: FILE SHRANK — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} ${was}B -> ${now}B (delta=-$((was-now))B) — a recorder/stash only ever APPENDS, so a byte DECREASE is content displaced, not churn — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust"
         fi
       done
+      rn=$(grep -c . "$RELF" 2>/dev/null); rn=${rn:-0}
+      if [ "$rn" -gt 0 ] 2>/dev/null; then
+        ri=$(grep -c '^inode|' "$RELF" 2>/dev/null); ri=${ri:-0}
+        rs=$(grep -c '^size|' "$RELF" 2>/dev/null); rs=${rs:-0}
+        echo "STASHES RELOCATED $(date -u '+%H:%M:%SZ') n=$rn (inode-proven=$ri size-matched=$rs) — NOT loss, the bytes exist at new paths. Example: $(head -1 "$RELF" | cut -d'|' -f2). Verdict basis is the INODE (a move preserves it), NOT the basename: dozens of conflict copies share one basename, and a basename match reported a DIFFERENT project's file as the destination"
+      fi
+      rm -f "$RELF"
     fi
     mv -f "$SZCUR" "$SZPREV" 2>/dev/null || :
   fi
