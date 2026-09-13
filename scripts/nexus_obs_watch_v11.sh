@@ -563,7 +563,7 @@ PYL
       if [ -n "$c1why" ]; then
         c1_streak=$((c1_streak + 1))
         if [ "$c1_streak" -ge 2 ]; then
-          echo "*** COND 1: LOCKSTEP DIVERGENCE *** $(date -u '+%H:%M:%SZ') $c1why — CONFIRMED on $c1_streak consecutive reads (lag_max=$lag subs=$nsubs stalled=$stalled) — PAGE THE OPERATOR DIRECTLY"
+          echo "*** COND 1: LOCKSTEP DIVERGENCE *** $(date -u '+%H:%M:%SZ') $c1why — CONFIRMED on $c1_streak consecutive reads (lag_max=$lag subs=$nsubs stalled=$stalled) — ROUTE TO `pitboss` BY NAME, *NOT* THE OPERATOR. Arranger ruling 2026-09-13 07:30 EDT: the operator path on COND 1 is HELD because an IDLE ROUTE produces this exact shape (both 0.4.38 harness-memory instances behind by the IDENTICAL amount, all 0.4.41 peers at head, sse_served_age_s growing 1:1 = nothing to serve on that route; nexus proved 0 rows above the pair cursor server-side at 04:29). The ${COND1_FLOOR} floor measures served-JITTER and cannot bound an idle gap. COND 1 was only ever cleared to page the operator on DIVERGENCE, i.e. the pair lag values DIFFERING from each other. Measurement below is UNCHANGED and still emitted"
         else
           echo "COND 1 UNCONFIRMED $(date -u '+%H:%M:%SZ') $c1why on ONE read only (lag_max=$lag) — HELD, not paged, pending a second consecutive read. A catch-up instant leaves every cursor at a different LSN for one sample; that is what this hold exists for"
         fi
