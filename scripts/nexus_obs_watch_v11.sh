@@ -256,14 +256,28 @@ mx=max(lsns) if lsns else 0
 at_max=sum(1 for l in lsns if l==mx)
 off_max=len(recv)-at_max
 lag_max=(mx-min(lsns)) if lsns else 0
-print("%s %d %d %d %d %d"%(ovf,off_max,stalled,len(subs),lag_max,len(recv)))
+# GLOBAL-QUIET DISCRIMINATOR (nexus-obs-2, 2026-09-13 14:1xZ).
+# `last_event_age_s` is a SERVER-EMIT field, not a per-subscriber consume field:
+# it reads IDENTICALLY for every subscriber (measured 26s, then 46s, across all 5)
+# because it means "time since the server emitted anything to anyone". So when the
+# fleet is quiet, that one number crosses `stall` for EVERYONE AT ONCE and this rung
+# reported `stalled=5 of 5` -- a fleet-wide alarm caused by nothing happening.
+# MEASURED at 14:15:24Z, minutes after the operator's own FLEET QUIET order: all five
+# identical, head not advancing (delta 0 over 20s), server health 200. The order made
+# this false alarm the NEW NORMAL, so the rung would cry wolf indefinitely.
+# This is the SAME two-field lesson the predecessor applied to COND 1 (served-age vs
+# last_event_age) -- the `stalled` rung was simply never migrated with it.
+# A subscriber cannot be "not receiving" when there is NOTHING TO RECEIVE.
+ages=[s[2] for s in subs if s[2] is not None]
+gq=1 if (ages and len(ages)==len(subs) and len(set(ages))==1 and ages[0]>=stall) else 0
+print("%s %d %d %d %d %d %d"%(ovf,off_max,stalled,len(subs),lag_max,len(recv),gq))
 PY
   rm -f "$hf"
 }
 
 L=$(logf)
 prev_n=$(count); prev_cur=$(cat "$C" 2>/dev/null); prev_pid=$(pidof_)
-set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6
+set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6; prev_gq=${7:-0}
 # sentinel, NOT $3: seeding prev_stalled from the arm-time reading is what makes an
 # already-stalled peer invisible forever. -1 guarantees the first poll reports the level.
 prev_stalled=-1; arm_stalled=$3
@@ -517,7 +531,7 @@ PYL
 
   # R3b + trigger 4: one remote call per 5 ticks.
   if [ $((i % 5)) -eq 0 ]; then
-    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6
+    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6; gq=${7:-0}
     ss=$(served_state); headlsn=${ss%%|*}; rest=${ss#*|}; stale_list=${rest%%|*}; frozen_list=${rest#*|}
     if [ -n "$o" ] && [ "$o" != "?" ] && [ "$o" != "$prev_ovf" ]; then
       echo "*** TRIGGER 4: OVERFLOWS MOVED *** $(date -u '+%H:%M:%SZ') $prev_ovf -> $o — PAGE"; prev_ovf=$o
@@ -663,9 +677,22 @@ PYL
       elif [ "$stalled" != "$prev_stalled" ]; then swhy="TRANSITION from stalled=$prev_stalled"
       elif [ "$stalled" -gt 0 ] 2>/dev/null && [ $((now_s - st_last_emit)) -ge 1800 ]; then swhy="30-min heartbeat; condition PERSISTS"
       fi
+      # Under GLOBAL QUIET the per-subscriber claim is not merely noisy, it is FALSE:
+      # every age_s is the same server-emit number, so "N of M not receiving" asserts a
+      # per-subscriber fault that the data cannot support. Relabel, do not suppress --
+      # the measurement still surfaces, but as what it actually is.
+      if [ "${gq:-0}" = "1" ]; then
+        stalled_eff=0
+        if [ "$prev_gq_seen" != "1" ]; then
+          echo "SUBSCRIBER RECEIVE-STATE $(date -u '+%H:%M:%SZ') GLOBAL QUIET — all $nsubs subscribers report the IDENTICAL last_event_age_s (>= ${STALL}s), which is a SERVER-EMIT field, not per-subscriber: the server has emitted nothing to anyone, so nobody is starving. NOT a stall, NOT paged. (The old rung printed stalled=$stalled of $nsubs here; that claimed a per-subscriber fault the data cannot support. Same two-field lesson as COND 1: last_event_age_s hides a wedge AND invents a fleet-wide stall.)"
+          prev_gq_seen=1
+        fi
+      else
+      prev_gq_seen=0
       if [ -n "$swhy" ]; then
         echo "SUBSCRIBER RECEIVE-STATE $(date -u '+%H:%M:%SZ') stalled=$stalled of $nsubs (STALLED iff age_s >= ${STALL}s; label DERIVED from age_s, not asserted) — $swhy"
         st_last_emit=$now_s; prev_stalled=$stalled
+      fi
       fi
     fi
   fi
