@@ -12,7 +12,15 @@ decoration -- so the instrument gets extended first.
 Attribution is DERIVED from each line's own text, never asserted by position. An
 earlier version blanket-tagged every line with this observer's id, which
 LAUNDERED a sibling writer's output into apparently-attributable instrument
-output. Three verdicts:
+output. PREFIX LIST MAINTENANCE IS LOAD-BEARING: emits were added all session
+(COND 1 UNCONFIRMED/CLEARED, STASHES RELOCATED, PRE-BREACH WATCH, WINDOW VIEWS
+DIVERGE, COND 4 BASELINE RESEEDED) without updating this regex, so the
+observer's OWN alarm lines were tagged not-mine -- the laundering defect
+inverted, and actively misleading because the arranger reads these tags.
+Broadened to prefix families (COND 1 , COND 4 ) so a new emit in an existing
+family cannot be disowned again.
+
+Three verdicts:
   obs-v11              - matches a prefix this observer actually emits
   FOREIGN-IN-OBS-STREAM - it does not; another writer shares this fd
   SPLICED-MID-LINE     - begins as ours and does NOT end as ours, so a mid-line
@@ -26,8 +34,9 @@ and a mislabelled birth-vs-mtime pass.
 import sys, re, datetime
 
 OURS = re.compile(
-    r'^(WATCH-v11|HOURLY |NEW STASH |\*\*\* |SUBSCRIBER |COND 4 UNDETERMINED'
-    r'|STASH RELOCATED|FAILURE BURST |DAY BOUNDARY|CURSOR REGRESSED|CONFLICT DIVERGENCE)'
+    r'^(WATCH-v11|HOURLY |NEW STASH |\*\*\* |SUBSCRIBER |COND 1 |COND 4 '
+    r'|STASH RELOCATED|STASHES RELOCATED|FAILURE BURST |DAY BOUNDARY|CURSOR REGRESSED'
+    r'|CONFLICT DIVERGENCE|WINDOW VIEWS DIVERGE|PRE-BREACH WATCH|ARRANGER RUNG)'
 )
 
 def main():
