@@ -231,7 +231,7 @@ def w(o):
     if isinstance(o,dict):
         l=o.get('sse_served_lsn') or o.get('served_lsn')
         if l is not None:
-            subs.append((str(o.get('host') or '?'),int(l),o.get('last_event_age_s')))
+            subs.append((str(o.get('host') or '?'),int(l),o.get('last_event_age_s'),str(o.get('subscriber_id') or o.get('id') or '?')[:8]))
         for v in o.values(): w(v)
     elif isinstance(o,list):
         for v in o: w(v)
@@ -280,17 +280,22 @@ gq=1 if (ages and len(ages)==len(subs) and len(set(ages))==1 and ages[0]>=stall)
 # cursor). With nlag==1 the spread is trivially 0 — a single laggard cannot differ
 # from itself — and that is precisely the REAL single-subscriber wedge case. So a
 # suppression keyed on pdiff alone would silence the one condition that matters.
-lag_lsns=sorted(l for (_h,l,_a) in recv if l<mx) if recv else []
+lag_lsns=sorted(s[1] for s in recv if s[1]<mx) if recv else []  # index access, NOT unpacking: arity-safe
 nlag=len(lag_lsns)
 pdiff=(lag_lsns[-1]-lag_lsns[0]) if nlag>=2 else 0
-print("%s %d %d %d %d %d %d %d %d"%(ovf,off_max,stalled,len(subs),lag_max,len(recv),gq,nlag,pdiff))
+# LAGGARD-SET FINGERPRINT (arranger condition 1). nlag+pdiff cannot see a DIFFERENT
+# instance becoming the laggard while count and spread stay identical -- a fault
+# masquerading as the steady idle state. Index access, never unpacking.
+lag_ids=sorted(s[3] for s in recv if s[1]<mx) if recv else []
+lagsig="-".join(lag_ids) if lag_ids else "none"
+print("%s %d %d %d %d %d %d %d %d %s"%(ovf,off_max,stalled,len(subs),lag_max,len(recv),gq,nlag,pdiff,lagsig))
 PY
   rm -f "$hf"
 }
 
 L=$(logf)
 prev_n=$(count); prev_cur=$(cat "$C" 2>/dev/null); prev_pid=$(pidof_)
-set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6; prev_gq=${7:-0}; prev_nlag=${8:-0}; prev_pdiff=${9:-0}
+set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6; prev_gq=${7:-0}; prev_nlag=${8:-0}; prev_pdiff=${9:-0}; prev_lagsig=${10:-none}
 # sentinel, NOT $3: seeding prev_stalled from the arm-time reading is what makes an
 # already-stalled peer invisible forever. -1 guarantees the first poll reports the level.
 prev_stalled=-1; arm_stalled=$3
@@ -299,7 +304,7 @@ prev_push=$(grep -c 'ConflictUnrecoverable' "$L" 2>/dev/null)
 prev_orc=$(oracle "$L")
 i=0
 last_hour_reported=$(date -u '+%H')
-c1_streak=0; pb_streak=0; pb_last_emit=0; stale_last_emit=0; frozen_last_emit=0; cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
+c1_streak=0; c1_last_emit=0; c1_prev_sig=x; pb_streak=0; pb_last_emit=0; stale_last_emit=0; frozen_last_emit=0; cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
 # R4: LEVEL not EDGE for the size baseline too — seeded from a real read, and the
 # first diff happens on tick 1, so a shrink already in progress at arm time is
 # still caught on the next tick rather than being absorbed into the baseline.
@@ -544,7 +549,7 @@ PYL
 
   # R3b + trigger 4: one remote call per 5 ticks.
   if [ $((i % 5)) -eq 0 ]; then
-    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6; gq=${7:-0}; nlag=${8:-0}; pdiff=${9:-0}
+    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6; gq=${7:-0}; nlag=${8:-0}; pdiff=${9:-0}; lagsig=${10:-none}
     ss=$(served_state); headlsn=${ss%%|*}; rest=${ss#*|}; stale_list=${rest%%|*}; frozen_list=${rest#*|}
     if [ -n "$o" ] && [ "$o" != "?" ] && [ "$o" != "$prev_ovf" ]; then
       echo "*** TRIGGER 4: OVERFLOWS MOVED *** $(date -u '+%H:%M:%SZ') $prev_ovf -> $o — PAGE"; prev_ovf=$o
@@ -590,13 +595,46 @@ PYL
       if [ -n "$c1why" ]; then
         c1_streak=$((c1_streak + 1))
         if [ "$c1_streak" -ge 2 ]; then
-          echo "*** COND 1: LOCKSTEP DIVERGENCE *** $(date -u '+%H:%M:%SZ') $c1why — CONFIRMED on $c1_streak consecutive reads (lag_max=$lag subs=$nsubs stalled=$stalled) — ROUTE TO \`pitboss\` BY NAME, *NOT* THE OPERATOR. Arranger ruling 2026-09-13 07:30 EDT: the operator path on COND 1 is HELD because an IDLE ROUTE produces this exact shape (both 0.4.38 harness-memory instances behind by the IDENTICAL amount, all 0.4.41 peers at head, sse_served_age_s growing 1:1 = nothing to serve on that route; nexus proved 0 rows above the pair cursor server-side at 04:29). The ${COND1_FLOOR} floor measures served-JITTER and cannot bound an idle gap. COND 1 was only ever cleared to page the operator on DIVERGENCE, i.e. the pair lag values DIFFERING from each other. Measurement below is UNCHANGED and still emitted"
+          # DAMPENER (nexus-obs-2, 2026-09-13 16:3xZ). COND 1's CONFIRMED emit had NO
+          # dampener while SEVEN other rungs in this file throttle at 1800s -- there was
+          # no c1_last_emit anywhere. So on a PERSISTENT condition it re-fired on every
+          # health read: MEASURED 16:24:04 and 16:29:21, i.e. ~12 seat wakes/hour, each a
+          # full context read re-deriving an already-reported artifact. That is worse than
+          # the selfpark rate the operator issued a fleet order over (~2/hour).
+          #
+          # THE ARRANGER'S PROTECTION IS HONOURED, NOT TESTED: "silencing the operator
+          # path was authorized; silencing the measurement is not." Nothing is silenced --
+          # the FIRST confirmation always emits, COND 1 CLEARED always emits, detection is
+          # untouched, and every throttled repeat is written to the hourly log. What stops
+          # is redundant re-announcement of an alarm already delivered.
+          # This matches the instrument's own "transition + heartbeat" pattern used by the
+          # stalled, lag, oracle, divergence, stale and frozen rungs.
+          c1line="*** COND 1: LOCKSTEP DIVERGENCE *** $(date -u '+%H:%M:%SZ') $c1why — CONFIRMED on $c1_streak consecutive reads (lag_max=$lag subs=$nsubs stalled=$stalled) — ROUTE TO \`pitboss\` BY NAME, *NOT* THE OPERATOR. Arranger ruling 2026-09-13 07:30 EDT: the operator path on COND 1 is HELD because an IDLE ROUTE produces this exact shape (both 0.4.38 harness-memory instances behind by the IDENTICAL amount, all 0.4.41 peers at head, sse_served_age_s growing 1:1 = nothing to serve on that route; nexus proved 0 rows above the pair cursor server-side at 04:29). The ${COND1_FLOOR} floor measures served-JITTER and cannot bound an idle gap. COND 1 was only ever cleared to page the operator on DIVERGENCE, i.e. the pair lag values DIFFERING from each other. Measurement below is UNCHANGED and still emitted"
+          now_s=$(date +%s)
+          # ARRANGER CONDITION 1: a CHANGE inside a throttled hold emits AT ONCE, so the
+          # dampener cannot swallow a real fault that appears while an idle-route hold is
+          # throttled (pair splitting, a new instance joining, or a different instance
+          # becoming the laggard). Suppression must never hide the fault it sits on top of.
+          c1sig="$nlag:$pdiff:$lagsig"
+          if [ "$c1_streak" -eq 2 ] || [ "$c1sig" != "$c1_prev_sig" ] || [ $((now_s - c1_last_emit)) -ge 1800 ]; then
+            if [ "$c1_streak" -eq 2 ]; then c1tag="FIRST CONFIRMATION (nlag=$nlag pdiff=$pdiff laggards=$lagsig)"
+            elif [ "$c1sig" != "$c1_prev_sig" ]; then c1tag="*** CHANGE INSIDE A THROTTLED HOLD *** cohort moved [${c1_prev_sig}] -> [${c1sig}] (nlag:pdiff:laggards) — emitted IMMEDIATELY, not at the next heartbeat"
+            else c1tag="30-min heartbeat; condition PERSISTS unchanged (nlag=$nlag pdiff=$pdiff laggards=$lagsig)"; fi
+            c1_prev_sig="$c1sig"
+            echo "$c1line [$c1tag]"
+            c1_last_emit=$now_s
+          else
+            HLOG=${OBS_HLOG:-"$HOME/.claude/logs/nexus-obs-hourly.$(date -u '+%Y-%m-%d').log"}
+            printf '%s THROTTLED-COND1-REPEAT %s [streak=%s; already announced, next heartbeat at 1800s; no wake]\n' \
+              "$(date -u '+%H:%M:%SZ')" "$c1line" "$c1_streak" >> "$HLOG" 2>/dev/null
+          fi
         else
           echo "COND 1 UNCONFIRMED $(date -u '+%H:%M:%SZ') $c1why on ONE read only (lag_max=$lag) — HELD, not paged, pending a second consecutive read. A catch-up instant leaves every cursor at a different LSN for one sample; that is what this hold exists for"
         fi
       else
         if [ "${c1_streak:-0}" -gt 0 ]; then
           echo "COND 1 CLEARED $(date -u '+%H:%M:%SZ') condition no longer present after $c1_streak read(s) (at_max=$at_max of $nrecv, off_max=$off, lag_max=$lag) — the held condition was TRANSIENT, which is the outcome the hold is designed to find"
+          c1_last_emit=0; c1_prev_sig=x
         fi
         c1_streak=0
       fi
