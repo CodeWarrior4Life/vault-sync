@@ -66,6 +66,51 @@ count()    { find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" -n
 count_all(){ find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" 2>/dev/null | wc -l | tr -d ' '; }
 pidof_() { ps -axo pid=,args= | awk -v t="$T" 'index($0,t)>0 && index($0,t)==index($0,$2) {print $1; exit}'; }
 
+# R4a CORRECTED 2026-09-13 after the detector's FIRST live fire was a FALSE POSITIVE.
+# The old predicate counted CONFLICT EVENTS with no nearby copy. That conflated a
+# PUSH REJECTION with a conflict REQUIRING PRESERVATION. Measured: of three
+# ConflictUnrecoverable events, one was "enqueued CREATE (content preserved)",
+# one "409 refetch/merge ... outcome=Wrote" (a successful MERGE), and only one
+# actually stashed. So ~2/3 of push failures legitimately produce no copy -- the
+# benign shape the predecessor already characterised -- and the old predicate
+# would have paged CANDIDATE LOSS on most of them. A loss detector that fires on
+# the healthy path is a push-failure detector wearing a loss label.
+#
+# THE DAEMON NAMES THE STASH IT WROTE: "stashed losing local bytes before ack
+# (S511 D4) path=<doc> stash=<abs path>". So the ladder's exact wording -- "a
+# stash without its conflict copy" -- is a DIRECT EXISTENCE CHECK on a path the
+# daemon itself claims to have written. No correlation window, no tolerance
+# heuristic, and it CANNOT fire on enqueued-CREATE or merge-Wrote outcomes.
+STASH_GRACE=${OBS_STASH_GRACE:-30}   # seconds; only guards a write/fsync race,
+                                     # since the stash line is emitted after the write
+orphan_stashes() {
+  python3 - "$1" "$WIN" "$STASH_GRACE" <<'PYS'
+import sys, os, re, time, calendar, datetime
+log, win, grace = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+now = time.time(); out = []
+try:
+    for ln in open(log, errors="replace"):
+        if "stashed losing local bytes" not in ln or "stash=" not in ln:
+            continue
+        m = re.search(r"stash=(.*?)\s*$", ln)
+        if not m:
+            continue
+        sp = m.group(1)
+        try:
+            ep = calendar.timegm(datetime.datetime.strptime(ln[:19], "%Y-%m-%dT%H:%M:%S").timetuple())
+        except ValueError:
+            continue
+        age = now - ep
+        if age > win or age < grace:
+            continue
+        if not os.path.exists(sp):
+            out.append("%s|%s" % (ln[:19], sp))
+except OSError:
+    pass
+print("\n".join(out))
+PYS
+}
+
 # R4 (COND 4). Snapshot of path->size for every preserved conflict copy plus every
 # shared/partitioned recorder. Depth-bounded on the recorder leg (the brief's
 # observer-effect warning: never a vault-wide unbounded find in a contention probe).
@@ -269,13 +314,24 @@ while :; do
   # Every label below is DERIVED from its own numbers (trap 17: never hardcode a
   # state word beside live values).
   # =====================================================================
-  if [ -n "$orph" ] && [ "$orph" -gt 0 ] 2>/dev/null; then
+  # R4a: orphan STASHES (the daemon named a stash file that does not exist).
+  orphstash=$(orphan_stashes "$L")
+  if [ -n "$orphstash" ]; then
     now_s=$(date +%s)
     if [ $((now_s - orph_last_emit)) -ge 600 ]; then
-      echo "*** COND 4: ORPHAN CONFLICT EVENT(S) — CANDIDATE LOSS *** $(date -u '+%H:%M:%SZ') orphan_events=$orph of $evg gradeable in ${WIN}s (gradeable = log events older than ${TOL}s, so a copy still being written is NOT counted) verified=$ver total=$n — a conflict was LOGGED with NO preserving copy within ${TOL}s. GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: grep -E 'ConflictUnrecoverable|materializer CONFLICT' \"$L\" | tail -5   then   find \"$V\" -name '*$PAT*' -newermt '-${WIN} seconds'"
+      echo "$orphstash" | while IFS='|' read -r ots osp; do
+        [ -z "$osp" ] && continue
+        echo "*** COND 4: STASH NAMED BY THE DAEMON IS ABSENT — CANDIDATE LOSS *** $(date -u '+%H:%M:%SZ') event_ts=${ots}Z stash=[$osp] — the daemon logged \"stashed losing local bytes before ack\" and NAMED this file, and it is not on disk. GRADE: CANDIDATE (arranger ruling, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named stash path (use an ABSOLUTE -newermt; the relative form errors and still exits 0 on this host). THEN PAGE \`pitboss\` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust"
+      done
       orph_last_emit=$now_s
     fi
   fi
+  # Push failures that resolve via "enqueued CREATE (content preserved)" or
+  # "409 refetch/merge ... outcome=Wrote" are the HEALTHY paths and are counted
+  # for the hourly only -- never paged. This is the FALSE POSITIVE that the first
+  # live COND 4 fire taught: the flagged event was a successful MERGE.
+  orph=$(printf '%s' "$orphstash" | grep -c . 2>/dev/null || echo 0)
+  evg=$(grep -c 'stashed losing local bytes' "$L" 2>/dev/null || echo 0)
 
   sizes > "$SZCUR" 2>/dev/null || :
   # A MISSING BASELINE MUST NOT BE A SILENT SKIP. The baseline lives in /tmp, and
