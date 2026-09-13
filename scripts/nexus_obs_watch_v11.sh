@@ -457,7 +457,7 @@ PYL
     if [ -n "$lag" ] && [ "$lag" != "?" ] && [ "$lag" -ge "$LAGT" ] 2>/dev/null; then
       now_s=$(date +%s)
       if [ $((now_s - lag_last_emit)) -ge 1800 ]; then
-        echo "SUBSCRIBER LAG $(date -u '+%H:%M:%SZ') lag_max=$lag LSN behind the lockstep max (threshold ${LAGT}, measured healthy ceiling ~315 on 2026-09-12); off_max=$off of $nrecv — NOT COND 1 unless off_max>=2"
+        echo "SUBSCRIBER LAG $(date -u '+%H:%M:%SZ') lag_max=$lag LSN behind the lockstep max (threshold ${LAGT}, measured healthy ceiling ~315 on 2026-09-12); off_max=$off of $nrecv — NOT COND 1 unless off_max>=2. ARRANGER RULING 2026-09-13: crossing this threshold IS a declared break condition — PAGE `pitboss` BY NAME (arranger page, not the operator). Detection latency is ${POLL}s times 5 because lag is read on every 5th tick, and this line is dampened to 1 per 1800s, so a FIRST crossing surfaces within 300s and repeats are half-hourly"
         lag_last_emit=$now_s
       fi
     fi
