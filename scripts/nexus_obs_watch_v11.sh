@@ -621,6 +621,13 @@ PYL
       fi
     fi
     [ -n "$lag" ] && [ "$lag" != "?" ] && prev_lag=$lag
+    # The -1 seed is a SENTINEL meaning 'no health read yet', not a count. It
+    # leaked into the HOURLY as `stalled=-1/5` on 2026-09-13 09:00:42Z, 67 s
+    # after an arm and before the first health read (which runs every 5th
+    # tick). The hourly is the most-relayed line this instrument produces, so
+    # a sentinel printed there reads as a measurement. It now renders
+    # `not-yet-read`. Only surfaced because this seat swapped the monitor
+    # often enough for an hourly to land inside the 300 s window.
     # LEVEL DETECTOR, NOT AN EDGE — this is the TKT-92740334 lesson applied here:
     # THE TRIGGER IS AN EDGE WHILE THE CONDITION IS A LEVEL. A change-only check
     # seeded at arm time can NEVER report a peer that was ALREADY stalled when
@@ -647,7 +654,7 @@ PYL
     nu=$(find "$V" -name "*$PAT*" -newermt "$(date -v-1H '+%Y-%m-%d %H:00:00')" -not -path '*/_archive/*' 2>/dev/null -print0 \
           | xargs -0 stat -f '%m %N' 2>/dev/null | sort -n | tail -1 \
           | while read -r ep p; do echo "$(date -u -r "$ep" '+%H:%M:%SZ') ${p#$V/}"; done)
-    echo "HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$prev_stalled/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
+    echo "HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$(if [ "$prev_stalled" = "-1" ]; then echo "not-yet-read"; else echo "$prev_stalled"; fi)/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
     last_hour_reported="$hh"
   fi
 done
