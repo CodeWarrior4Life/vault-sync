@@ -201,7 +201,7 @@ sizes > "$SZPREV" 2>/dev/null || : ; loss_last_emit=0; orph_last_emit=0
 trap 'rm -f "$SZPREV" "$SZCUR"' EXIT INT TERM
 set -- $(window_state "$L"); ver=$1; unver=$2; mtot=$3; lev=$4; orph=$6; evg=$7
 arm_stalled_now=$arm_stalled
-echo "WATCH-v11 armed $(date -u '+%H:%M:%SZ') stash=$prev_n cursor=$prev_cur pid=$prev_pid overflows=$prev_ovf | win${WIN}s verified=$ver unverified=$unver mtime_total=$mtot log_events=$lev | oracle=$prev_orc | subs=$nsubs off_max=$prev_off lag_max=$prev_lag stalled=$arm_stalled | UNITS: age_s=last_event_age_s (seconds since that subscriber last RECEIVED an event); verified=mtime candidate correlated to a real log conflict event within ${TOL}s; unverified=mtime moved with NO nearby event (sync refresh) | LATENCY: stash/window/failure-burst/pid/oracle ${POLL}s, lsn+overflows $((POLL*5))s | trigger2 fires on VERIFIED>=${T2} only | R4/COND 4 WATCHED (v10 had NO loss predicate): orphan_ev=$orph of $evg gradeable, size-baseline seeded from $(wc -l < "$SZPREV" | tr -d ' ') tracked files; loss = a logged conflict with no copy, a copy absent from EVERY vault path, or any tracked file LOSING bytes"
+echo "WATCH-v11 armed $(date -u '+%H:%M:%SZ') stash=$prev_n cursor=$prev_cur pid=$prev_pid overflows=$prev_ovf | win${WIN}s verified=$ver unverified=$unver mtime_total=$mtot log_events=$lev | oracle=$prev_orc | subs=$nsubs off_max=$prev_off lag_max=$prev_lag stalled=$arm_stalled | UNITS: age_s=last_event_age_s (seconds since that subscriber last RECEIVED an event); verified=mtime candidate correlated to a real log conflict event within ${TOL}s; unverified=mtime moved with NO nearby event (sync refresh) | LATENCY: stash/window/failure-burst/pid/oracle ${POLL}s, lsn+overflows $((POLL*5))s | trigger2 fires on VERIFIED>=${T2} only | R4/COND 4 WATCHED (v10 had NO loss predicate): orphan_ev=$orph of $evg gradeable, size-baseline seeded from $(wc -l < "$SZPREV" | tr -d ' ') tracked files; loss = a logged conflict with no copy, a copy absent from EVERY vault path, or any tracked file LOSING bytes. COND 4 FIRES ARE GRADED CANDIDATE (arranger ruling, first week) and route to `pitboss` as an arranger page after oracle + direct-stat confirmation, NEVER to the operator from this lane"
 
 while :; do
   sleep "$POLL"; i=$((i+1))
@@ -272,7 +272,7 @@ while :; do
   if [ -n "$orph" ] && [ "$orph" -gt 0 ] 2>/dev/null; then
     now_s=$(date +%s)
     if [ $((now_s - orph_last_emit)) -ge 600 ]; then
-      echo "*** COND 4: ORPHAN CONFLICT EVENT(S) — CANDIDATE LOSS *** $(date -u '+%H:%M:%SZ') orphan_events=$orph of $evg gradeable in ${WIN}s (gradeable = log events older than ${TOL}s, so a copy still being written is NOT counted) verified=$ver total=$n — a conflict was LOGGED with NO preserving copy within ${TOL}s. PAGE THE OPERATOR DIRECTLY. Confirm: grep -E 'ConflictUnrecoverable|materializer CONFLICT' \"$L\" | tail -5   then   find \"$V\" -name '*$PAT*' -newermt '-${WIN} seconds'"
+      echo "*** COND 4: ORPHAN CONFLICT EVENT(S) — CANDIDATE LOSS *** $(date -u '+%H:%M:%SZ') orphan_events=$orph of $evg gradeable in ${WIN}s (gradeable = log events older than ${TOL}s, so a copy still being written is NOT counted) verified=$ver total=$n — a conflict was LOGGED with NO preserving copy within ${TOL}s. GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: grep -E 'ConflictUnrecoverable|materializer CONFLICT' \"$L\" | tail -5   then   find \"$V\" -name '*$PAT*' -newermt '-${WIN} seconds'"
       orph_last_emit=$now_s
     fi
   fi
@@ -328,10 +328,10 @@ PYL
           elif [ -n "$elsewhere" ]; then
             echo "STASH RELOCATED $(date -u '+%H:%M:%SZ') ${path#$V/} -> ${elsewhere#$V/} (was ${was}B) — NOT loss: the bytes exist at a new path (archive move or rename)"
           else
-            echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk AND from every path in the vault — PAGE THE OPERATOR DIRECTLY. Confirm: find \"$V\" -name '"'"'"'"'"'$bn'"'"'"'"'"'"
+            echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk AND from every path in the vault — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: find \"$V\" -name '"'"'"'"'"'$bn'"'"'"'"'"'"
           fi
         else
-          echo "*** COND 4: FILE SHRANK — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} ${was}B -> ${now}B (delta=-$((was-now))B) — a recorder/stash only ever APPENDS, so a byte DECREASE is content displaced, not churn — PAGE THE OPERATOR DIRECTLY"
+          echo "*** COND 4: FILE SHRANK — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} ${was}B -> ${now}B (delta=-$((was-now))B) — a recorder/stash only ever APPENDS, so a byte DECREASE is content displaced, not churn — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust"
         fi
       done
     fi
@@ -399,7 +399,8 @@ PYL
     # TRANSITION, and while stalled>0 persists, heartbeat every 30 min.
     if [ -n "$stalled" ] && [ "$stalled" != "?" ] 2>/dev/null; then
       now_s=$(date +%s); swhy=""
-      if [ "$stalled" != "$prev_stalled" ]; then swhy="TRANSITION from stalled=$prev_stalled"
+      if [ "$prev_stalled" = "-1" ]; then swhy="BASELINE — first health read after arm; -1 is the seed sentinel, NOT a prior state, so this is NOT a transition"
+      elif [ "$stalled" != "$prev_stalled" ]; then swhy="TRANSITION from stalled=$prev_stalled"
       elif [ "$stalled" -gt 0 ] 2>/dev/null && [ $((now_s - st_last_emit)) -ge 1800 ]; then swhy="30-min heartbeat; condition PERSISTS"
       fi
       if [ -n "$swhy" ]; then
