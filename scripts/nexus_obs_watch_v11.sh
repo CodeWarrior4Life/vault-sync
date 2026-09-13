@@ -58,6 +58,19 @@ T2=${OBS_T2:-6}              # stashes in WIN to trip trigger 2
 FB=${OBS_FB:-3}              # log events in WIN to surface a failure burst
 POLL=${OBS_POLL:-60}
 STALL=${OBS_STALL:-300}      # age_s at/above which a subscriber is NOT receiving
+STALE_SERVED=${OBS_STALE_SERVED:-600}   # s; sse_served_age_s above this = not being served
+FROZEN_SPAN=${OBS_FROZEN_SPAN:-300}     # s; min span for a stationary-cursor verdict
+SNAP=/tmp/.obs_snap.$$                  # per-subscriber lsn memory across samples
+COND1_FLOOR=${OBS_COND1_FLOOR:-500}   # MEASURED 2026-09-13: the two 0.4.38 memory instances
+                                     # skew 2-16 rows against the head (n=10, p99=16), so 10x p99
+                                     # = 160; floor set to 500 per the ruling's 'minimum a few
+                                     # hundred'. Interim pending the full 30-min sample.  # LSN gap below which a majority split is treated as
+                                     # catch-up jitter, not divergence. 500 sits above the
+                                     # measured healthy ceiling (~315, 2026-09-12) and far
+                                     # below LAGT. Calibrated against a REAL false positive:
+                                     # at 08:23:05Z COND 1 fired with lag_max=59361, and 31 s
+                                     # later both off-max peers were behind by THREE events.
+HURL=${OBS_HURL:-https://nexus.obsidian-inc.com/api/sync/health}
 LAGT=${OBS_LAGT:-5000}       # single-peer lag (LSN) worth surfacing; see calibration in health()      # age_s at/above which a subscriber is NOT receiving
 
 logf()  { f=$(ls -t "$LOGDIR"/daemon.log.* 2>/dev/null | grep -v '\.gz$' | head -1)
@@ -65,6 +78,20 @@ logf()  { f=$(ls -t "$LOGDIR"/daemon.log.* 2>/dev/null | grep -v '\.gz$' | head 
 count()    { find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" -not -path '*/_archive/*' 2>/dev/null | wc -l | tr -d ' '; }
 count_all(){ find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" 2>/dev/null | wc -l | tr -d ' '; }
 pidof_() { ps -axo pid=,args= | awk -v t="$T" 'index($0,t)>0 && index($0,t)==index($0,$2) {print $1; exit}'; }
+
+# ARRANGER-RUNG DETECTOR (ruling 2026-09-13). Emits: headlsn|stale_list|frozen_list
+# Keeps a per-subscriber lsn snapshot file so a STATIONARY cursor can be judged
+# across a real span rather than from one sample. Uses sse_served_age_s and
+# sse_served_lsn ONLY -- last_event_age_s and receiving_actual are deliberately
+# never consulted, because both read healthy throughout a 7h58m wedge.
+served_state() {
+  # Program passed BY PATH so stdin stays free for the piped payload. The first
+  # cut used `python3 - ARGS <<'PYX'` and the heredoc consumed stdin, discarding
+  # the curl output and returning "?" for every input -- trap #1 of this lane's
+  # brief, reproduced by the seat that had been briefed on it.
+  curl -sS -m 12 -A 'curl/8.7.1' "$HURL" 2>/dev/null \
+    | python3 /Users/cyril/.claude/scripts/obs_served_state.py "$SNAP" "$STALE_SERVED" "$FROZEN_SPAN"
+}
 
 # R4a CORRECTED 2026-09-13 after the detector's FIRST live fire was a FALSE POSITIVE.
 # The old predicate counted CONFLICT EVENTS with no nearby copy. That conflated a
@@ -237,13 +264,13 @@ prev_push=$(grep -c 'ConflictUnrecoverable' "$L" 2>/dev/null)
 prev_orc=$(oracle "$L")
 i=0
 last_hour_reported=$(date -u '+%H')
-cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
+c1_streak=0; stale_last_emit=0; frozen_last_emit=0; cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
 # R4: LEVEL not EDGE for the size baseline too — seeded from a real read, and the
 # first diff happens on tick 1, so a shrink already in progress at arm time is
 # still caught on the next tick rather than being absorbed into the baseline.
 SZPREV=/tmp/.obs_sz_prev.$$; SZCUR=/tmp/.obs_sz_cur.$$
 sizes > "$SZPREV" 2>/dev/null || : ; loss_last_emit=0; orph_last_emit=0
-trap 'rm -f "$SZPREV" "$SZCUR"' EXIT INT TERM
+trap 'rm -f "$SZPREV" "$SZCUR" "$SNAP"' EXIT INT TERM
 set -- $(window_state "$L"); ver=$1; unver=$2; mtot=$3; lev=$4; orph=$6; evg=$7
 arm_stalled_now=$arm_stalled
 echo "WATCH-v11 armed $(date -u '+%H:%M:%SZ') stash=$prev_n cursor=$prev_cur pid=$prev_pid overflows=$prev_ovf | win${WIN}s verified=$ver unverified=$unver mtime_total=$mtot log_events=$lev | oracle=$prev_orc | subs=$nsubs off_max=$prev_off lag_max=$prev_lag stalled=$arm_stalled | UNITS: age_s=last_event_age_s (seconds since that subscriber last RECEIVED an event); verified=mtime candidate correlated to a real log conflict event within ${TOL}s; unverified=mtime moved with NO nearby event (sync refresh) | LATENCY: stash/window/failure-burst/pid/oracle ${POLL}s, lsn+overflows $((POLL*5))s | trigger2 fires on VERIFIED>=${T2} only | R4/COND 4 WATCHED (v10 had NO loss predicate): orphan_ev=$orph of $evg gradeable, size-baseline seeded from $(wc -l < "$SZPREV" | tr -d ' ') tracked files; loss = a logged conflict with no copy, a copy absent from EVERY vault path, or any tracked file LOSING bytes. COND 4 FIRES ARE GRADED CANDIDATE (arranger ruling, first week) and route to `pitboss` as an arranger page after oracle + direct-stat confirmation, NEVER to the operator from this lane"
@@ -483,13 +510,103 @@ PYL
   # R3b + trigger 4: one remote call per 5 ticks.
   if [ $((i % 5)) -eq 0 ]; then
     set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6
+    ss=$(served_state); headlsn=${ss%%|*}; rest=${ss#*|}; stale_list=${rest%%|*}; frozen_list=${rest#*|}
     if [ -n "$o" ] && [ "$o" != "?" ] && [ "$o" != "$prev_ovf" ]; then
       echo "*** TRIGGER 4: OVERFLOWS MOVED *** $(date -u '+%H:%M:%SZ') $prev_ovf -> $o — PAGE"; prev_ovf=$o
     fi
     # COND 1: the LOCKSTEP MAJORITY split. One trailing peer is tolerated (today's
     # measured healthy shape is 3-at-max + 1 laggard) and surfaces as LAG below.
-    if [ -n "$off" ] && [ "$off" != "?" ] && [ "$off" -ge 2 ] 2>/dev/null; then
-      echo "*** COND 1: LOCKSTEP MAJORITY SPLIT *** $(date -u '+%H:%M:%SZ') off_max=$off of $nrecv receiving peers are NOT at the max LSN (lag_max=$lag subs=$nsubs stalled=$stalled) — PAGE THE OPERATOR DIRECTLY"
+    # RE-DERIVED 2026-09-13, TWICE. First after a REAL false positive paged the
+    # operator rung at 04:23 local on a THREE-EVENT skew; then again because my
+    # own first fix was WRONG in the worse direction.
+    #
+    # WHAT HAPPENED: the original encoding was off_max>=2, correct for the fleet
+    # it was measured on (FOUR subscribers, exactly ONE trailing memory instance,
+    # so off_max could never reach 2 healthily). A FIFTH subscriber appeared
+    # (fdb48e31, link harness-memory, same 0.4.38 / poll_since_lsn=None shape as
+    # 3a934c79) and TWO trailing memory instances make off_max=2 the STEADY
+    # STATE -- turning the operator rung constant-true via a fleet-shape change
+    # rather than a code change.
+    #
+    # MY FIRST FIX replaced it with "the majority must share the head", matching
+    # the previous seat's stated INTENT. It killed the false positive and ALSO
+    # went silent on n=5 with two peers genuinely 5000 behind -- a FALSE NEGATIVE
+    # on the rung that pages a sleeping operator. Trading a false page for a
+    # missed page is the worse trade, so that cut was discarded.
+    #
+    # WHAT ACTUALLY SHIPS: fire on EITHER a true majority split OR the original
+    # off_max>=2 with a magnitude floor, and require the condition to PERSIST
+    # across TWO consecutive health reads before paging. Persistence is the right
+    # instrument for a transient: the 59361 spike was real AT THAT INSTANT and 31
+    # seconds later the gap was 3, so no magnitude threshold could have
+    # distinguished it -- only a second look could.
+    if [ -n "$off" ] && [ "$off" != "?" ] && [ -n "$nrecv" ] && [ "$nrecv" != "?" ] 2>/dev/null; then
+      at_max=$((nrecv - off)); c1why=""
+      # ARRANGER RULING 2026-09-13: COND 1 = off_max>=2 AND lag_max above a floor
+      # clear of normal memory-instance skew. A majority-split clause was
+      # considered and DROPPED: for n>=4 a majority split always implies off>=2,
+      # so it only added "majority split with a sub-floor gap" -- jitter, which
+      # is exactly what the floor is for. Build-based exclusion was explicitly
+      # refused by the ruling: a WEDGED memory instance must stay visible, just
+      # not to the operator.
+      if [ "$off" -ge 2 ] && [ -n "$lag" ] && [ "$lag" != "?" ] && [ "$lag" -ge "$COND1_FLOOR" ] 2>/dev/null; then
+        c1why="off_max=$off of $nrecv with lag_max=$lag at/above the measured floor ${COND1_FLOOR} (at_max=$at_max)"
+      fi
+      if [ -n "$c1why" ]; then
+        c1_streak=$((c1_streak + 1))
+        if [ "$c1_streak" -ge 2 ]; then
+          echo "*** COND 1: LOCKSTEP DIVERGENCE *** $(date -u '+%H:%M:%SZ') $c1why — CONFIRMED on $c1_streak consecutive reads (lag_max=$lag subs=$nsubs stalled=$stalled) — PAGE THE OPERATOR DIRECTLY"
+        else
+          echo "COND 1 UNCONFIRMED $(date -u '+%H:%M:%SZ') $c1why on ONE read only (lag_max=$lag) — HELD, not paged, pending a second consecutive read. A catch-up instant leaves every cursor at a different LSN for one sample; that is what this hold exists for"
+        fi
+      else
+        if [ "${c1_streak:-0}" -gt 0 ]; then
+          echo "COND 1 CLEARED $(date -u '+%H:%M:%SZ') condition no longer present after $c1_streak read(s) (at_max=$at_max of $nrecv, off_max=$off, lag_max=$lag) — the held condition was TRANSIENT, which is the outcome the hold is designed to find"
+        fi
+        c1_streak=0
+      fi
+    fi
+    # ===================================================================
+    # ARRANGER RUNG (ruling 2026-09-13). Pages the ARRANGER BY NAME, NEVER the
+    # operator. Fires on the two signals that tonight's wedge proved actually
+    # discriminate, and DELIBERATELY uses neither last_event_age_s nor
+    # receiving_actual -- both read healthy for all five subscribers while one
+    # had been served nothing for 7 h 58 m, which is how the wedge hid.
+    #   (a) sse_served_age_s > STALE_SERVED while the head is advancing
+    #   (b) a stationary sse_served_lsn across two samples >= 5 min apart
+    # ===================================================================
+    # ================= HELD, NOT LIVE (arranger ruling 2026-09-13 04:28) =========
+    # Both rungs below are gated OFF. The ruling held the sse_served_age_s rung
+    # because it would page on every QUIET ROUTE: a named-route subscriber gets
+    # nothing for cross-route events, and catch-up never records sse_served, so
+    # served-age grows on an idle route EXACTLY as on a wedge. Measured
+    # server-side 08:16-08:19Z: zero rows above 3a934c79's cursor on its own
+    # route, and that cursor WAS the route max -- it was idle, not wedged.
+    #
+    # EXTENDED BEYOND THE RULING, deliberately: the ruling named only the
+    # served-age rung, but the STATIONARY-CURSOR rung has the IDENTICAL defect
+    # for the identical reason -- an idle route's cursor sits at its route head
+    # and is stationary BY DEFINITION. Shipping it would page on every quiet
+    # route too. Holding both is the ruling's intent; holding only the named one
+    # would have reproduced the same false pager under a different name.
+    #
+    # The correct rung is per-subscriber "behind its ROUTE head by N rows", which
+    # nexus is adding to /api/sync/health. This code stays, unexecuted, until
+    # that figure exists.
+    ARRANGER_RUNG=${OBS_ARRANGER_RUNG:-0}
+    if [ "$ARRANGER_RUNG" = "1" ] && [ -n "$stale_list" ]; then
+      now_s=$(date +%s)
+      if [ $((now_s - stale_last_emit)) -ge 1800 ]; then
+        echo "*** ARRANGER RUNG: SUBSCRIBER NOT BEING SERVED *** $(date -u '+%H:%M:%SZ') $stale_list (head=$headlsn advancing; threshold sse_served_age_s>${STALE_SERVED}s) — PAGE \`pitboss\` BY NAME, NOT the operator. NOTE: last_event_age_s and receiving_actual will look HEALTHY here; they read 0 and 5/5 during a 7h58m wedge on 2026-09-13. Confirm with: sse_served_age_s and a second sse_served_lsn sample >=5 min later"
+        stale_last_emit=$now_s
+      fi
+    fi
+    if [ "$ARRANGER_RUNG" = "1" ] && [ -n "$frozen_list" ]; then
+      now_s=$(date +%s)
+      if [ $((now_s - frozen_last_emit)) -ge 1800 ]; then
+        echo "*** ARRANGER RUNG: STATIONARY CURSOR *** $(date -u '+%H:%M:%SZ') $frozen_list — sse_served_lsn UNCHANGED across samples >=${FROZEN_SPAN}s apart while the head advanced. A client restart is MEASURED not to clear this (2026-09-13, pid 12557->58043, cursor unmoved) — PAGE \`pitboss\` BY NAME, NOT the operator"
+        frozen_last_emit=$now_s
+      fi
     fi
     # LAG is a separate, dampened condition: a single peer trailing. Threshold
     # ${LAGT} is ~16x the measured healthy ceiling (315 on 2026-09-12), chosen to
