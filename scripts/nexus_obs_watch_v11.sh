@@ -278,7 +278,16 @@ while :; do
   fi
 
   sizes > "$SZCUR" 2>/dev/null || :
-  if [ -s "$SZPREV" ] && [ -s "$SZCUR" ]; then
+  # A MISSING BASELINE MUST NOT BE A SILENT SKIP. The baseline lives in /tmp, and
+  # /tmp aging is a MEASURED fleet condition (link: 2d override via
+  # /etc/tmpfiles.d/tmp.conf, broadcast 2026-09-12). If it is swept, the guard
+  # below would quietly stop detecting loss forever -- the loss detector itself
+  # going dark with no output, which is the phantom-coverage shape this whole
+  # instrument exists to avoid. So: re-seed, and SAY that a window was skipped.
+  if [ ! -s "$SZPREV" ] && [ -s "$SZCUR" ]; then
+    echo "COND 4 BASELINE RESEEDED $(date -u '+%H:%M:%SZ') the size baseline at $SZPREV was missing or empty (likely /tmp aging) — re-seeded from $(wc -l < "$SZCUR" | tr -d ' ') tracked files. ONE comparison window was skipped, so a shrink/vanish in that window is NOT observable; orphan-event detection was unaffected"
+    mv -f "$SZCUR" "$SZPREV" 2>/dev/null || :
+  elif [ -s "$SZPREV" ] && [ -s "$SZCUR" ]; then
     loss=$(python3 - "$SZPREV" "$SZCUR" <<'PYL'
 import sys
 def load(f):
