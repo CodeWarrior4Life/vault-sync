@@ -61,10 +61,12 @@ STALL=${OBS_STALL:-300}      # age_s at/above which a subscriber is NOT receivin
 STALE_SERVED=${OBS_STALE_SERVED:-600}   # s; sse_served_age_s above this = not being served
 FROZEN_SPAN=${OBS_FROZEN_SPAN:-300}     # s; min span for a stationary-cursor verdict
 SNAP=/tmp/.obs_snap.$$                  # per-subscriber lsn memory across samples
-COND1_FLOOR=${OBS_COND1_FLOOR:-500}   # MEASURED 2026-09-13: the two 0.4.38 memory instances
-                                     # skew 2-16 rows against the head (n=10, p99=16), so 10x p99
-                                     # = 160; floor set to 500 per the ruling's 'minimum a few
-                                     # hundred'. Interim pending the full 30-min sample.  # LSN gap below which a majority split is treated as
+COND1_FLOOR=${OBS_COND1_FLOOR:-580}   # MEASURED 2026-09-13 08:26:41-08:57:26Z, 31 min, both 0.4.38
+                                     # harness-memory instances: skew 0-58 rows, p99=58, so 10x p99
+                                     # = 580. FINAL, superseding the interim 500 taken from n=10
+                                     # (p99=16) -- that thin sample under-read the skew by ~3.6x.
+                                     # NOTE the two instances track each other exactly, so the 124
+                                     # rows are 62 PAIRED observations, not 124 independent ones.  # LSN gap below which a majority split is treated as
                                      # catch-up jitter, not divergence. 500 sits above the
                                      # measured healthy ceiling (~315, 2026-09-12) and far
                                      # below LAGT. Calibrated against a REAL false positive:
