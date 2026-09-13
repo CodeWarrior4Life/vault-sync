@@ -270,14 +270,27 @@ lag_max=(mx-min(lsns)) if lsns else 0
 # A subscriber cannot be "not receiving" when there is NOTHING TO RECEIVE.
 ages=[s[2] for s in subs if s[2] is not None]
 gq=1 if (ages and len(ages)==len(subs) and len(set(ages))==1 and ages[0]>=stall) else 0
-print("%s %d %d %d %d %d %d"%(ovf,off_max,stalled,len(subs),lag_max,len(recv),gq))
+# LAGGARD-COHORT SHAPE (nexus-obs-2, 2026-09-13 15:3xZ) — two more fields so the
+# WATCH rung can apply the arranger's RATIFIED discriminator instead of magnitude:
+# idle moves every subscriber on a route TOGETHER, a real fault hits ONE.
+#   nlag  = how many receiving peers trail the max
+#   pdiff = spread WITHIN that trailing cohort
+# THE TRAP THIS AVOIDS, stated because getting it wrong would blind a real wedge:
+# pdiff==0 is an idle-route signal ONLY when nlag>=2 (two or more sharing one
+# cursor). With nlag==1 the spread is trivially 0 — a single laggard cannot differ
+# from itself — and that is precisely the REAL single-subscriber wedge case. So a
+# suppression keyed on pdiff alone would silence the one condition that matters.
+lag_lsns=sorted(l for (_h,l,_a) in recv if l<mx) if recv else []
+nlag=len(lag_lsns)
+pdiff=(lag_lsns[-1]-lag_lsns[0]) if nlag>=2 else 0
+print("%s %d %d %d %d %d %d %d %d"%(ovf,off_max,stalled,len(subs),lag_max,len(recv),gq,nlag,pdiff))
 PY
   rm -f "$hf"
 }
 
 L=$(logf)
 prev_n=$(count); prev_cur=$(cat "$C" 2>/dev/null); prev_pid=$(pidof_)
-set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6; prev_gq=${7:-0}
+set -- $(health); prev_ovf=$1; prev_off=$2; nsubs=$4; prev_lag=$5; nrecv=$6; prev_gq=${7:-0}; prev_nlag=${8:-0}; prev_pdiff=${9:-0}
 # sentinel, NOT $3: seeding prev_stalled from the arm-time reading is what makes an
 # already-stalled peer invisible forever. -1 guarantees the first poll reports the level.
 prev_stalled=-1; arm_stalled=$3
@@ -531,7 +544,7 @@ PYL
 
   # R3b + trigger 4: one remote call per 5 ticks.
   if [ $((i % 5)) -eq 0 ]; then
-    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6; gq=${7:-0}
+    set -- $(health); o=$1; off=$2; stalled=$3; nsubs=$4; lag=$5; nrecv=$6; gq=${7:-0}; nlag=${8:-0}; pdiff=${9:-0}
     ss=$(served_state); headlsn=${ss%%|*}; rest=${ss#*|}; stale_list=${rest%%|*}; frozen_list=${rest#*|}
     if [ -n "$o" ] && [ "$o" != "?" ] && [ "$o" != "$prev_ovf" ]; then
       echo "*** TRIGGER 4: OVERFLOWS MOVED *** $(date -u '+%H:%M:%SZ') $prev_ovf -> $o — PAGE"; prev_ovf=$o
@@ -640,7 +653,27 @@ PYL
       if [ "$pb_streak" -ge 2 ]; then
         now_s=$(date +%s)
         if [ $((now_s - pb_last_emit)) -ge 1800 ]; then
-          echo "PRE-BREACH WATCH $(date -u '+%H:%M:%SZ') lag_max=$lag has held at/above ${PREBREACH} (about 70 pct of the ${COND1_FLOOR} floor) across $pb_streak consecutive reads; off_max=$off of $nrecv, still UNDER the floor so COND 1 is correctly silent — TELL \`pitboss\` BY NAME WITH THIS READING. This is a WATCH, NOT a page: it means the floor's basis is STALE and wants re-deriving from a LONG (multi-hour) baseline, not from another short window"
+          # IDLE-ROUTE SUPPRESSION (arranger's ratified discriminator, applied here).
+          # This rung is dampened to 1/1800s, so on an idle route it re-fires FOREVER
+          # -- MEASURED 2026-09-13: three fires (470, 404, 452) held across 8
+          # consecutive reads, each waking the seat for a full context read to
+          # re-derive the identical pair_diff=0. Same burn class as the selfpark
+          # order and the unconditional hourly. The WATCH's message ("the floor's
+          # basis is stale, re-derive from a LONG baseline") was delivered and RULED
+          # ON hours ago -- nexus owns that baseline -- so repeating it changes
+          # nothing and costs a context read every half hour indefinitely.
+          # SUPPRESS ONLY when nlag>=2 AND pdiff==0: two or more laggards sharing ONE
+          # cursor is the idle-route signature. nlag==1 is NEVER suppressed -- a lone
+          # laggard has a trivially-zero spread and is the real-wedge case.
+          # Still written to the hourly log, so the measurement is never lost.
+          pbline="PRE-BREACH WATCH $(date -u '+%H:%M:%SZ') lag_max=$lag has held at/above ${PREBREACH} (about 70 pct of the ${COND1_FLOOR} floor) across $pb_streak consecutive reads; off_max=$off of $nrecv, still UNDER the floor so COND 1 is correctly silent — TELL \`pitboss\` BY NAME WITH THIS READING. This is a WATCH, NOT a page: it means the floor's basis is STALE and wants re-deriving from a LONG (multi-hour) baseline, not from another short window"
+          if [ "${nlag:-0}" -ge 2 ] 2>/dev/null && [ "${pdiff:-0}" -eq 0 ] 2>/dev/null; then
+            HLOG=${OBS_HLOG:-"$HOME/.claude/logs/nexus-obs-hourly.$(date -u '+%Y-%m-%d').log"}
+            printf '%s SUPPRESSED-IDLE-ROUTE %s [nlag=%s pdiff=%s: %s laggards share ONE cursor => idle route, not divergence; no wake]\n' \
+              "$(date -u '+%H:%M:%SZ')" "$pbline" "$nlag" "$pdiff" "$nlag" >> "$HLOG" 2>/dev/null
+          else
+            echo "$pbline [DISCRIMINATOR: nlag=$nlag pdiff=$pdiff -- NOT the idle-route signature (that needs nlag>=2 AND pdiff==0), so this reading is surfaced]"
+          fi
           pb_last_emit=$now_s
         fi
       fi
