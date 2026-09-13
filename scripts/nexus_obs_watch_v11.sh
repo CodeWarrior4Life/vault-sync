@@ -279,7 +279,7 @@ while :; do
 
   sizes > "$SZCUR" 2>/dev/null || :
   if [ -s "$SZPREV" ] && [ -s "$SZCUR" ]; then
-    loss=$(python3 - "$SZPREV" "$SZCUR" <<'"'"'PYL'"'"'
+    loss=$(python3 - "$SZPREV" "$SZCUR" <<'PYL'
 import sys
 def load(f):
     d={}
@@ -304,7 +304,7 @@ print("\n".join(out))
 PYL
 )
     if [ -n "$loss" ]; then
-      echo "$loss" | while IFS='"'"'|'"'"' read -r kind path was now; do
+      echo "$loss" | while IFS='|' read -r kind path was now; do
         [ -z "$kind" ] && continue
         if [ "$kind" = "ABSENT" ]; then
           # DISCRIMINATOR, and it is the whole point: absent-from-the-find is NOT
@@ -324,11 +324,11 @@ PYL
           bn=${path##*/}
           elsewhere=$(find "$V" -name "$bn" -print -quit 2>/dev/null); fst=$?
           if [ "$fst" -ne 0 ]; then
-            echo "COND 4 UNDETERMINED $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B and is absent from its own path, but the relocation probe FAILED (find exit=$fst) — NOT graded as loss. Re-check by hand: find \"$V\" -name '"'"'$bn'"'"'"
+            echo "COND 4 UNDETERMINED $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B and is absent from its own path, but the relocation probe FAILED (find exit=$fst) — NOT graded as loss. Re-check by hand: find \"$V\" -name '$bn'"
           elif [ -n "$elsewhere" ]; then
             echo "STASH RELOCATED $(date -u '+%H:%M:%SZ') ${path#$V/} -> ${elsewhere#$V/} (was ${was}B) — NOT loss: the bytes exist at a new path (archive move or rename)"
           else
-            echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk AND from every path in the vault — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: find \"$V\" -name '"'"'"'"'"'$bn'"'"'"'"'"'"
+            echo "*** COND 4: STASH VANISHED — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} was ${was}B, now absent from disk AND from every path in the vault — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust. Confirm: find \"$V\" -name '$bn'"
           fi
         else
           echo "*** COND 4: FILE SHRANK — LOSS *** $(date -u '+%H:%M:%SZ') ${path#$V/} ${was}B -> ${now}B (delta=-$((was-now))B) — a recorder/stash only ever APPENDS, so a byte DECREASE is content displaced, not churn — GRADE: CANDIDATE (arranger ruling 2026-09-12, detector's first week) — NOT a confirmed loss. CONFIRM BEFORE ESCALATING, two independent checks: (1) the reconcile oracle's still_divergent, (2) a direct stat of the named path. THEN PAGE `pitboss` AS AN ARRANGER PAGE — NOT the operator from this lane: loss is exactly where a false positive costs trust"
@@ -417,7 +417,7 @@ PYL
     nu=$(find "$V" -name "*$PAT*" -newermt "$(date -v-1H '+%Y-%m-%d %H:00:00')" -not -path '*/_archive/*' 2>/dev/null -print0 \
           | xargs -0 stat -f '%m %N' 2>/dev/null | sort -n | tail -1 \
           | while read -r ep p; do echo "$(date -u -r "$ep" '+%H:%M:%SZ') ${p#$V/}"; done)
-    echo "HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$prev_stalled/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d '"'"' '"'"') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
+    echo "HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$prev_stalled/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
     last_hour_reported="$hh"
   fi
 done
