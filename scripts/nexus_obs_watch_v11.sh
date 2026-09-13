@@ -677,7 +677,41 @@ PYL
     nu=$(find "$V" -name "*$PAT*" -newermt "$(date -v-1H '+%Y-%m-%d %H:00:00')" -not -path '*/_archive/*' 2>/dev/null -print0 \
           | xargs -0 stat -f '%m %N' 2>/dev/null | sort -n | tail -1 \
           | while read -r ep p; do echo "$(date -u -r "$ep" '+%H:%M:%SZ') ${p#$V/}"; done)
-    echo "HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$(if [ "$prev_stalled" = "-1" ]; then echo "not-yet-read"; else echo "$prev_stalled"; fi)/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
+    # ---- HOURLY EMIT GATE (nexus-obs-2, 2026-09-13) --------------------------
+    # WHY: this hourly printed UNCONDITIONALLY, and a printed line re-invokes the
+    # Monitor-hosted seat for a FULL CONTEXT READ. Under FLEET QUIET an unchanged
+    # hourly is not relayed to the arranger either, so the wake existed only to
+    # write one recorder line -- 24x/day of exactly the "wake to say nothing" the
+    # operator is paying for (same class as the selfpark burn measured 09:15 EDT).
+    #
+    # SAFE NOW, AND WAS NOT BEFORE: the hourly used to be this instrument's ONLY
+    # unconditional output, so gating it would have made a dead observer invisible
+    # for an hour. obs_liveness_guard.py now owns that role and speaks on
+    # ABSENT/STALE/NO-STATE, so death is detected without this heartbeat.
+    #
+    # THE AUDIT TRAIL IS NOT LOST: the line is ALWAYS appended to $HLOG. Only the
+    # WAKE is conditional. Writing a file costs nothing; waking the model does.
+    #
+    # lag_max is BANDED, not compared raw: it legitimately swings 10 -> 652 -> 13
+    # on an idle route, so a raw compare would call almost every hour "changed"
+    # and defeat the gate. Bands match the ladder that actually triggers action.
+    hline="HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$(if [ "$prev_stalled" = "-1" ]; then echo "not-yet-read"; else echo "$prev_stalled"; fi)/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
+    case "${prev_lag:-0}" in ''|*[!0-9]*) lagband=unknown ;; *)
+      if [ "$prev_lag" -ge 580 ]; then lagband=at-or-above-floor
+      elif [ "$prev_lag" -ge 400 ]; then lagband=watch-band
+      else lagband=below-watch; fi ;;
+    esac
+    hsig="$n|$hr|$ver|$prev_orc|$prev_off|$lagband|$prev_stalled|${orph:-0}|$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN)"
+    HLOG=${OBS_HLOG:-"$HOME/.claude/logs/nexus-obs-hourly.$(date -u '+%Y-%m-%d').log"}
+    printf '%s %s\n' "$(date -u '+%H:%M:%SZ')" "$hline" >> "$HLOG" 2>/dev/null
+    if [ "$hsig" != "$prev_hsig" ]; then
+      echo "$hline [EMITTED: material state CHANGED vs last hourly; sig=$hsig prev=${prev_hsig:-none}]"
+      prev_hsig="$hsig"
+    else
+      # Silent by design. Full line is in $HLOG; the liveness guard covers death.
+      :
+    fi
+    # ---- end hourly emit gate ------------------------------------------------
     last_hour_reported="$hh"
   fi
 done
