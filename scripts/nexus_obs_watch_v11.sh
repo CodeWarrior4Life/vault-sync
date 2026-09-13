@@ -61,6 +61,12 @@ STALL=${OBS_STALL:-300}      # age_s at/above which a subscriber is NOT receivin
 STALE_SERVED=${OBS_STALE_SERVED:-600}   # s; sse_served_age_s above this = not being served
 FROZEN_SPAN=${OBS_FROZEN_SPAN:-300}     # s; min span for a stationary-cursor verdict
 SNAP=/tmp/.obs_snap.$$                  # per-subscriber lsn memory across samples
+PREBREACH=${OBS_PREBREACH:-400}       # ~70 pct of COND1_FLOOR. A WATCH line, NEVER a page:
+                                     # arranger ruling 2026-09-13 06:04 EDT. Sustained skew here
+                                     # means the floor's basis is stale and wants re-deriving
+                                     # from a LONG baseline, not from another short window --
+                                     # the 31-min sample that set 580 had max=58 while live skew
+                                     # later read 189, so the 10x margin was really 3.1x.
 COND1_FLOOR=${OBS_COND1_FLOOR:-580}   # MEASURED 2026-09-13 08:26:41-08:57:26Z, 31 min, both 0.4.38
                                      # harness-memory instances: skew 0-58 rows, p99=58, so 10x p99
                                      # = 580. FINAL, superseding the interim 500 taken from n=10
@@ -266,7 +272,7 @@ prev_push=$(grep -c 'ConflictUnrecoverable' "$L" 2>/dev/null)
 prev_orc=$(oracle "$L")
 i=0
 last_hour_reported=$(date -u '+%H')
-c1_streak=0; stale_last_emit=0; frozen_last_emit=0; cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
+c1_streak=0; pb_streak=0; pb_last_emit=0; stale_last_emit=0; frozen_last_emit=0; cur_max_delta=0; cur_last_emit=0; fb_last_emit=0; dv_last_emit=0; prev_unver=-1; orc_last_emit=0; st_last_emit=0; lag_last_emit=0
 # R4: LEVEL not EDGE for the size baseline too — seeded from a real read, and the
 # first diff happens on tick 1, so a shrink already in progress at arm time is
 # still caught on the next tick rather than being absorbed into the baseline.
@@ -609,6 +615,23 @@ PYL
         echo "*** ARRANGER RUNG: STATIONARY CURSOR *** $(date -u '+%H:%M:%SZ') $frozen_list — sse_served_lsn UNCHANGED across samples >=${FROZEN_SPAN}s apart while the head advanced. A client restart is MEASURED not to clear this (2026-09-13, pid 12557->58043, cursor unmoved) — PAGE \`pitboss\` BY NAME, NOT the operator"
         frozen_last_emit=$now_s
       fi
+    fi
+    # PRE-BREACH WATCH (ruling 2026-09-13 06:04 EDT). NOT a page, and not COND 1.
+    # Says "the floor's basis is stale, re-derive from a long baseline". Requires
+    # two consecutive reads so a single catch-up spike cannot trip it -- the same
+    # reason COND 1 carries persistence.
+    if [ -n "$lag" ] && [ "$lag" != "?" ] && [ "$lag" -ge "$PREBREACH" ] 2>/dev/null \
+       && [ -n "$lag" ] && [ "$lag" -lt "$COND1_FLOOR" ] 2>/dev/null; then
+      pb_streak=$((pb_streak + 1))
+      if [ "$pb_streak" -ge 2 ]; then
+        now_s=$(date +%s)
+        if [ $((now_s - pb_last_emit)) -ge 1800 ]; then
+          echo "PRE-BREACH WATCH $(date -u '+%H:%M:%SZ') lag_max=$lag has held at/above ${PREBREACH} (about 70 pct of the ${COND1_FLOOR} floor) across $pb_streak consecutive reads; off_max=$off of $nrecv, still UNDER the floor so COND 1 is correctly silent — TELL \`pitboss\` BY NAME WITH THIS READING. This is a WATCH, NOT a page: it means the floor's basis is STALE and wants re-deriving from a LONG (multi-hour) baseline, not from another short window"
+          pb_last_emit=$now_s
+        fi
+      fi
+    else
+      pb_streak=0
     fi
     # LAG is a separate, dampened condition: a single peer trailing. Threshold
     # ${LAGT} is ~16x the measured healthy ceiling (315 on 2026-09-12), chosen to
