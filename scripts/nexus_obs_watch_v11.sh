@@ -330,8 +330,14 @@ while :; do
   # "409 refetch/merge ... outcome=Wrote" are the HEALTHY paths and are counted
   # for the hourly only -- never paged. This is the FALSE POSITIVE that the first
   # live COND 4 fire taught: the flagged event was a successful MERGE.
-  orph=$(printf '%s' "$orphstash" | grep -c . 2>/dev/null || echo 0)
-  evg=$(grep -c 'stashed losing local bytes' "$L" 2>/dev/null || echo 0)
+  # `grep -c` PRINTS a count AND EXITS 1 when the count is zero, so a trailing
+  # `|| echo 0` appends a SECOND zero: the capture becomes "0\n0", every integer
+  # test on it errors out, and the derived COND4 label flips to NOT-GREEN while
+  # orphan_ev is genuinely 0. It also splits the hourly line mid-field. Measured
+  # live at the 02:00Z hourly. grep -c needs no fallback; guard only an EMPTY
+  # capture, and never fall back on a NON-ZERO EXIT that carries a valid value.
+  orph=$(printf '%s' "$orphstash" | grep -c . 2>/dev/null); orph=${orph:-0}
+  evg=$(grep -c 'stashed losing local bytes' "$L" 2>/dev/null); evg=${evg:-0}
 
   sizes > "$SZCUR" 2>/dev/null || :
   # A MISSING BASELINE MUST NOT BE A SILENT SKIP. The baseline lives in /tmp, and
