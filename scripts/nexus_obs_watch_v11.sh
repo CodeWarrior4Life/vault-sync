@@ -35,6 +35,19 @@
 #      PHANTOM COVERAGE on its two most severe rungs, and the two weakest
 #      conditions were the two guarding IRREVERSIBLE outcomes.
 #
+#  LABEL RULE COROLLARY (nexus-obs-2, 2026-09-14 00:0xZ): A LABEL DERIVED FROM AN
+#  EMPTY SET IS NOT A FINDING. MEASURED at the 00:00Z rotation: logf() picks the
+#  newest daemon.log.* by mtime, so the instant daemon.log.<newday> is created it
+#  outranks the 9 MB current-day log. push dropped 22 -> 0, orphan_ev went 0/10 ->
+#  0/0, and COND 4 -- THE BYTE-LOSS RUNG, the most severe one here -- reported
+#  GREEN on ZERO gradeable events. That is "green because nothing to grade", not
+#  "green because verified safe", and a real loss inside that window would be
+#  ungradeable and silently reported GREEN. Now renders NOT-GRADEABLE so the gap
+#  is VISIBLE. A visible gap gets fixed; a vacuous GREEN never does. NOTE this is
+#  an HONEST-LABEL fix, not a coverage fix: the rung is still blind until the new
+#  log accumulates events. Closing the coverage gap (reading the previous log
+#  across the rotation boundary) is a design change, raised with the arranger
+#  rather than made unilaterally on the loss rung.
 #  LABEL RULE (earned the hard way): the 20:00Z and 21:00Z hourlies reported
 #  "FROZEN 4TH DAEMON" beside age=5s and age=9s because the LABEL was a string
 #  constant while only the VALUES were computed. EVERY LABEL HERE IS DERIVED FROM
@@ -793,7 +806,7 @@ PYL
     # lag_max is BANDED, not compared raw: it legitimately swings 10 -> 652 -> 13
     # on an idle route, so a raw compare would call almost every hour "changed"
     # and defeat the gate. Bands match the ladder that actually triggers action.
-    hline="HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$(if [ "$prev_stalled" = "-1" ]; then echo "not-yet-read"; else echo "$prev_stalled"; fi)/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$([ "${orph:-0}" -eq 0 ] 2>/dev/null && echo GREEN || echo NOT-GREEN) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
+    hline="HOURLY ${hh}:00Z | live=$n | incl_archive=$(count_all) | last_hour=$hr | verified_win=$ver | unverified_win=$unver | log_events_win=$lev | materializer=$mz | push=$pushn | pid=[$pid] | overflows=$prev_ovf | oracle=$prev_orc | off_max=$prev_off lag_max=$prev_lag | stalled=$(if [ "$prev_stalled" = "-1" ]; then echo "not-yet-read"; else echo "$prev_stalled"; fi)/$nsubs | cursor=$cur | newest_mtime=[${nu:--}] (newest_mtime is an MTIME, not an event time) | orphan_ev=$orph/$evg gradeable | tracked_files=$(wc -l < "$SZPREV" 2>/dev/null | tr -d ' ') | COND4=$(if [ "${evg:-0}" -eq 0 ] 2>/dev/null; then echo "NOT-GRADEABLE(0 gradeable events in the current daemon log — typically the post-rotation window; this is NOT a safety finding)"; elif [ "${orph:-0}" -eq 0 ] 2>/dev/null; then echo GREEN; else echo NOT-GREEN; fi) (COND4 label DERIVED from orphan_ev this window; shrink/vanish emit on transition, so silence here means no byte-loss seen since the last tick)"
     case "${prev_lag:-0}" in ''|*[!0-9]*) lagband=unknown ;; *)
       if [ "$prev_lag" -ge 580 ]; then lagband=at-or-above-floor
       elif [ "$prev_lag" -ge 400 ]; then lagband=watch-band
