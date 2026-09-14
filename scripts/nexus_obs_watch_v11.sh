@@ -94,8 +94,56 @@ COND1_FLOOR=${OBS_COND1_FLOOR:-580}   # MEASURED 2026-09-13 08:26:41-08:57:26Z, 
 HURL=${OBS_HURL:-https://nexus.obsidian-inc.com/api/sync/health}
 LAGT=${OBS_LAGT:-5000}       # single-peer lag (LSN) worth surfacing; see calibration in health()      # age_s at/above which a subscriber is NOT receiving
 
-logf()  { f=$(ls -t "$LOGDIR"/daemon.log.* 2>/dev/null | grep -v '\.gz$' | head -1)
-          [ -n "$f" ] && echo "$f" || echo "$LOGDIR/daemon.log.$(date '+%Y-%m-%d')"; }
+# TIMEZONE, MEASURED NOT ASSUMED -- and the first cut of this fix got it WRONG in a
+# way that would have been worse than the bug. The daemon names and stamps by UTC:
+# measured 2026-09-14 00:06Z, daemon.log.2026-09-14 was growing 7709 -> 8149 bytes in
+# 12s with stamps matching `date -u`, while daemon.log.2026-09-13 sat FROZEN at
+# 23:59:45Z. Resolving by LOCAL date (AST, still 09-13) would have pinned the observer
+# to the frozen file -- it would stop seeing new events ENTIRELY, a total blackout of
+# the loss rung rather than a first-hour gap. Caught only by checking the live
+# resolution before deploying.
+#
+# Footnote in fairness to the code being replaced: mtime ordering was CONVENTION-
+# AGNOSTIC -- it followed whichever file the daemon actually wrote, without needing to
+# know the timezone. That is a real virtue this date-based version gives up, which is
+# why the convention is recorded here as MEASURED with its evidence, so a future change
+# to it is detectable rather than silent.
+# logf: resolve the daemon log BY DATE, and UNION across the rotation boundary.
+#
+# WHAT WAS WRONG (MEASURED 2026-09-14 00:00Z): this picked the newest daemon.log.*
+# by MTIME. The instant daemon.log.<newday> was created at 1980 bytes it outranked
+# the day's 9 MB log, so push went 22 -> 0, orphan_ev 0/10 -> 0/0, and COND 4 --
+# the BYTE-LOSS rung -- reported GREEN on an empty set. Arranger ruling 20:04 EDT:
+# keep NOT-GRADEABLE as the permanent floor AND close the coverage gap, because a
+# rung blind for the first stretch of every day is a measurable tail, and an
+# aggregate may not hide a tail.
+#
+# CONSTRAINT 1, verbatim: the union must be BY CONTENT (both files, explicit),
+# NEVER by mtime ordering -- mtime ordering is precisely what broke it. So both
+# paths are derived from the DATE, deterministically, and existence is checked.
+#
+# WHY THE THRESHOLD IS AS SMALL AS IT CAN BE (EVG_MIN=1): the union exists solely
+# to prevent BLINDNESS, and one gradeable event ends blindness. Holding the
+# previous day's log open LONGER is not free -- it is its own risk, because
+# correlating today's mtime candidates against yesterday's events invites
+# cross-day false matches. (The +/-TOL correlation window is 180s, so yesterday's
+# events sit hours away and cannot match, but the principle stands: read the
+# smallest window that answers the question.)
+#
+# Only the TAIL of the previous log is unioned: during the rotation window the
+# current log is small BY DEFINITION, and the graders look at recent windows, so
+# a bounded tail covers the boundary without re-reading 9 MB every poll.
+logf()  { _cur="$LOGDIR/daemon.log.$(date -u '+%Y-%m-%d')"
+          _prv="$LOGDIR/daemon.log.$(date -u -v-1d '+%Y-%m-%d')"
+          _n=0; [ -f "$_cur" ] && _n=$(grep -c 'stashed losing local bytes' "$_cur" 2>/dev/null)
+          _n=${_n:-0}
+          if [ "$_n" -lt "${EVG_MIN:-1}" ] 2>/dev/null && [ -f "$_prv" ]; then
+            _u="/tmp/.obs_union.$$"
+            { tail -n "${UNION_TAIL:-20000}" "$_prv" 2>/dev/null; [ -f "$_cur" ] && cat "$_cur" 2>/dev/null; } > "$_u" 2>/dev/null
+            echo "$_u"
+          else
+            echo "$_cur"
+          fi; }
 count()    { find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" -not -path '*/_archive/*' 2>/dev/null | wc -l | tr -d ' '; }
 count_all(){ find "$V" -name "*$PAT*" -newermt "$(date '+%Y-%m-%d') 00:00:00" 2>/dev/null | wc -l | tr -d ' '; }
 pidof_() { ps -axo pid=,args= | awk -v t="$T" 'index($0,t)>0 && index($0,t)==index($0,$2) {print $1; exit}'; }
