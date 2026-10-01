@@ -897,25 +897,7 @@ impl FileWatcher {
                             None => break, // channel closed → debouncer dropped
                             Some(Ok(events)) => {
                                 for de in events {
-                                    // v0.4.9 ROOT-CAUSE FIX: drop non-mutating
-                                    // events. notify 7.0 watches IN_OPEN + IN_ATTRIB,
-                                    // so reads emit `Access(*)` and atime/perm touches
-                                    // emit `Modify(Metadata)`. Neither is a content
-                                    // change. Forwarding reads as Modified pushes was
-                                    // the backstop storm; dropping them here also
-                                    // breaks the read→event→read feedback loop (the
-                                    // handler below re-reads each file to hash it,
-                                    // which would otherwise re-fire `Access(Open)`).
-                                    if !is_mutating_kind(&de.event.kind) {
-                                        tracing::trace!(
-                                            kind = ?de.event.kind,
-                                            "file_watcher: dropping non-mutating event"
-                                        );
-                                        continue;
-                                    }
-                                    for path in &de.event.paths {
-                                        me.handle_fs_path(path).await;
-                                    }
+                                    me.handle_debounced_event(&de.event).await;
                                 }
                                 // Storm circuit-breaker: if a wedged-at-capacity
                                 // journal tripped the breaker, halt the loop
@@ -1037,6 +1019,79 @@ impl FileWatcher {
             .as_ref()
             .map(|g| g.is_delete_echo(path))
             .unwrap_or(false)
+    }
+
+    /// Dispatch one debounced notify event (extracted from the `start` loop so
+    /// tests can drive the real dispatch without a live inotify watch).
+    async fn handle_debounced_event(&self, event: &notify::Event) {
+        // v0.4.9 ROOT-CAUSE FIX: drop non-mutating
+        // events. notify 7.0 watches IN_OPEN + IN_ATTRIB,
+        // so reads emit `Access(*)` and atime/perm touches
+        // emit `Modify(Metadata)`. Neither is a content
+        // change. Forwarding reads as Modified pushes was
+        // the backstop storm; dropping them here also
+        // breaks the read→event→read feedback loop (the
+        // handler below re-reads each file to hash it,
+        // which would otherwise re-fire `Access(Open)`).
+        if !is_mutating_kind(&event.kind) {
+            tracing::trace!(
+                kind = ?event.kind,
+                "file_watcher: dropping non-mutating event"
+            );
+            return;
+        }
+        for path in &event.paths {
+            self.handle_fs_path(path).await;
+        }
+        // TKT-054f1710: notify-debouncer-full "emits only one Remove event when
+        // deleting a directory (inotify)" -- it DISCARDS the queued child-file
+        // removes under the removed dir. The lone `Deleted{<dir>}` above is then
+        // dropped by the extension gate, so without this expansion a "rm files;
+        // rmdir dir" never propagated. Only `Remove` kinds expand: a directory
+        // RENAME must never be split into child deletes (see module doc).
+        if matches!(event.kind, notify::EventKind::Remove(_)) {
+            for path in &event.paths {
+                self.expand_removed_dir(path).await;
+            }
+        }
+    }
+
+    /// TKT-054f1710: turn a removed directory into per-file deletes for every
+    /// SERVER-KNOWN path under it (the shadow store's last-accepted keys).
+    /// Safety: no-op unless the dir is absent on disk; each child is skipped if
+    /// it exists locally; each expanded delete runs the full `handle_fs_path`
+    /// pipeline, so scope/exclude, RASP fence, echo guard and the delete-burst
+    /// valve all still apply. A duplicate (the debouncer DID deliver a child
+    /// remove too) costs one redundant delete push, never a wrong one.
+    async fn expand_removed_dir(&self, abs: &Path) {
+        if abs.exists() {
+            return;
+        }
+        let Some(store) = &self.shadow_store else {
+            return;
+        };
+        let Some(rel) = self.normalize_path(abs) else {
+            return;
+        };
+        let children = store.keys_under(&rel);
+        if children.is_empty() {
+            return;
+        }
+        let mut expanded = 0usize;
+        for child in &children {
+            let child_abs = self.vault_root.join(child);
+            if child_abs.exists() {
+                continue;
+            }
+            self.handle_fs_path(&child_abs).await;
+            expanded += 1;
+        }
+        tracing::info!(
+            dir = %rel,
+            known_children = children.len(),
+            expanded,
+            "file_watcher: directory Remove expanded into per-file deletes (TKT-054f1710: debouncer swallowed the child removes)"
+        );
     }
 
     async fn handle_fs_path(&self, abs: &Path) {
@@ -1872,6 +1927,240 @@ mod tests {
             w.journal.lock().unwrap().len(),
             3,
             "recreate after delete must enqueue even with pre-delete-identical bytes"
+        );
+    }
+
+    // ---------- TKT-054f1710: rm children + immediate rmdir ----------
+    //
+    // notify-debouncer-full "emits only one Remove event when deleting a
+    // directory (inotify)": it discards the queued child-file removes under the
+    // removed dir. Pre-fix, that lone `Remove(<dir>)` became `Deleted{<dir>}`,
+    // which the extension gate dropped (a dir has no `.md`), so NO delete was
+    // ever pushed and the files lived on on every other host (MEASURED on link
+    // and icarus 2026-10-01).
+
+    /// Watcher with a shadow store holding `known` (server-accepted paths) and
+    /// a delete-burst valve of `burst_threshold`.
+    fn make_watcher_with_shadow(
+        dir: &TempDir,
+        sdir: &TempDir,
+        known: &[&str],
+        burst_threshold: usize,
+    ) -> FileWatcher {
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        for k in known {
+            shadow.record(k, "server-hash");
+        }
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+        };
+        FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(dir),
+            Arc::new(Mutex::new(DeleteBurstDetector::new(
+                burst_threshold,
+                Duration::from_secs(30),
+            ))),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_shadow_store(shadow)
+    }
+
+    /// Drain the journal into sorted `(path, action)` pairs.
+    fn journal_entries(w: &FileWatcher) -> Vec<(String, String)> {
+        let mut j = w.journal.lock().unwrap();
+        let n = j.len();
+        let mut v: Vec<(String, String)> = j
+            .drain(n)
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| (e.path, format!("{:?}", e.action)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn remove_dir_event(abs: &Path) -> notify::Event {
+        notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+            .add_path(abs.to_path_buf())
+    }
+
+    /// The incident shape: files deleted, parent rmdir'd inside one debounce
+    /// window, debouncer delivers ONLY `Remove(dir)`. Every server-known child
+    /// must get a Delete push. Red pre-fix (journal empty).
+    #[tokio::test]
+    async fn dir_remove_expands_to_deletes_for_known_children() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let w = make_watcher_with_shadow(
+            &dir,
+            &sdir,
+            &[
+                "_synctest/gonedir/a.md",
+                "_synctest/gonedir/sub/b.md",
+                "_synctest/keep.md",
+            ],
+            20,
+        );
+        let d = dir.path().join("_synctest/gonedir");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(dir.path().join("_synctest/keep.md"), b"k").unwrap();
+        // (files were never on disk in this fixture beyond the dir; the
+        // shadow is the authority for what the server holds)
+        std::fs::remove_dir_all(&d).unwrap();
+
+        w.handle_debounced_event(&remove_dir_event(&d)).await;
+
+        assert_eq!(
+            journal_entries(&w),
+            vec![
+                ("_synctest/gonedir/a.md".to_string(), "Delete".to_string()),
+                ("_synctest/gonedir/sub/b.md".to_string(), "Delete".to_string()),
+            ],
+            "a dir Remove must push a Delete for each server-known child, and nothing outside the dir"
+        );
+    }
+
+    /// A child that is still on disk (or a dir that was recreated before the
+    /// event was handled) must NEVER be deleted: expansion is gated on the
+    /// path being absent locally.
+    #[tokio::test]
+    async fn dir_remove_never_deletes_paths_present_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let w = make_watcher_with_shadow(&dir, &sdir, &["d/a.md", "d/b.md"], 20);
+        let d = dir.path().join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.md"), b"still here").unwrap();
+
+        // dir exists (recreated) -> no expansion at all
+        w.handle_debounced_event(&remove_dir_event(&d)).await;
+        assert!(
+            journal_entries(&w).iter().all(|(_, a)| a != "Delete"),
+            "a dir that exists on disk must not be expanded into deletes"
+        );
+    }
+
+    /// A directory RENAME must not be split into child deletes (module doc:
+    /// "we never split a rename into delete+create"). Only `Remove` kinds expand.
+    #[tokio::test]
+    async fn dir_rename_does_not_expand_into_child_deletes() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let w = make_watcher_with_shadow(&dir, &sdir, &["old/a.md"], 20);
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("a.md"), b"moved").unwrap();
+        let ev = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(old.clone())
+        .add_path(new.clone());
+
+        w.handle_debounced_event(&ev).await;
+        assert!(
+            !journal_entries(&w)
+                .iter()
+                .any(|(p, a)| p == "old/a.md" && a == "Delete"),
+            "a dir rename must not be turned into deletes of the old children"
+        );
+    }
+
+    /// Children the server does NOT know (absent from the shadow) are never
+    /// invented: expansion only covers server-accepted paths.
+    #[tokio::test]
+    async fn dir_remove_ignores_paths_unknown_to_shadow() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let w = make_watcher_with_shadow(&dir, &sdir, &["other/x.md"], 20);
+        let d = dir.path().join("d");
+        w.handle_debounced_event(&remove_dir_event(&d)).await;
+        assert!(journal_entries(&w).is_empty());
+    }
+
+    /// Expanded deletes still pass the delete-burst valve: a big folder delete
+    /// trips it exactly like N individual deletes would (the valve is the
+    /// safety net against an accidental mass delete).
+    #[tokio::test]
+    async fn dir_remove_expansion_is_subject_to_delete_burst_valve() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let known: Vec<String> = (0..10).map(|i| format!("big/n{i}.md")).collect();
+        let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+        let w = make_watcher_with_shadow(&dir, &sdir, &known_refs, 3);
+        let d = dir.path().join("big");
+        w.handle_debounced_event(&remove_dir_event(&d)).await;
+        let deletes = journal_entries(&w)
+            .iter()
+            .filter(|(_, a)| a == "Delete")
+            .count();
+        assert!(
+            deletes > 0,
+            "the first deletes below the threshold must still push"
+        );
+        assert!(
+            deletes < 10,
+            "the burst valve must pause expansion of a 10-file folder at threshold 3 (got {deletes})"
+        );
+    }
+
+    /// Catastrophe guard: a Remove of the VAULT ROOT itself (unmount, a wiped
+    /// sync root) must NEVER expand into a delete of every known note.
+    #[tokio::test]
+    async fn vault_root_remove_never_expands_to_mass_delete() {
+        let parent = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let root = parent.path().join("Mainframe");
+        std::fs::create_dir_all(&root).unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("a.md", "h");
+        shadow.record("d/b.md", "h");
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+        };
+        let jdir = TempDir::new().unwrap();
+        let w = FileWatcher::new(
+            root.clone(),
+            make_journal(&jdir),
+            make_burst(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_shadow_store(shadow);
+        std::fs::remove_dir_all(&root).unwrap();
+        w.handle_debounced_event(&remove_dir_event(&root)).await;
+        assert!(
+            journal_entries(&w).is_empty(),
+            "removing the vault root must not enqueue a single delete"
+        );
+    }
+
+    /// Expanded deletes still pass the scope/exclude gates: a dir under an
+    /// excluded prefix must not push deletes for its children.
+    #[tokio::test]
+    async fn dir_remove_expansion_respects_scope_excludes() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        shadow.record("private/a.md", "h");
+        let w = make_watcher(&dir, vec![], vec!["private"]).with_shadow_store(shadow);
+        let d = dir.path().join("private");
+        w.handle_debounced_event(&remove_dir_event(&d)).await;
+        assert!(
+            journal_entries(&w).is_empty(),
+            "an excluded dir's children must not be deleted"
         );
     }
 
