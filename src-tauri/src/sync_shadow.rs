@@ -283,6 +283,29 @@ impl ShadowStore {
         self.inner.lock().ok().and_then(|m| m.get(&key).cloned())
     }
 
+    /// TKT-054f1710: every recorded key strictly UNDER directory `dir` (keys
+    /// that start with `<dir>/`), in canonical sync-root-relative form. The
+    /// prefix is canonicalized like `record`/`get`, and the `/` boundary means
+    /// `d` never matches `dd/x.md`. Used by the file_watcher to expand a
+    /// directory `Remove` (notify-debouncer-full swallows the child removes)
+    /// into per-file deletes for the paths the server is known to hold.
+    pub fn keys_under(&self, dir: &str) -> Vec<String> {
+        let mut prefix = self.canon_key(dir.trim_end_matches('/'));
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        prefix.push('/');
+        self.inner
+            .lock()
+            .map(|m| {
+                m.keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Number of recorded entries. D9 (S511): the startup shadow-wipe fast-path
     /// uses this to detect an empty/wiped shadow (fresh install, corrupt-load
     /// reset, manual delete) so it can seed shadow=server BEFORE the first
@@ -462,6 +485,37 @@ mod tests {
     #[test]
     fn canonical_sync_path_folds_backslashes() {
         assert_eq!(canonical_sync_path("Notes\\sub\\x.md"), "Notes/sub/x.md");
+    }
+
+    /// TKT-054f1710: keys_under returns only keys strictly under `<dir>/`,
+    /// honors the `/` boundary (`d` must not match `dd/`), canonicalizes the
+    /// prefix (vault-folder strip + trailing slash), and refuses an empty dir
+    /// (which would otherwise match the whole vault).
+    #[test]
+    fn keys_under_respects_directory_boundary() {
+        let dir = TempDir::new().unwrap();
+        let store = ShadowStore::load_with_vault_folders(
+            dir.path().join("shadow.json"),
+            vec!["Mainframe".to_string()],
+        );
+        store.record("d/a.md", "h1");
+        store.record("d/sub/b.md", "h2");
+        store.record("dd/c.md", "h3");
+        store.record("d.md", "h4");
+        let mut got = store.keys_under("d");
+        got.sort();
+        assert_eq!(got, vec!["d/a.md".to_string(), "d/sub/b.md".to_string()]);
+        let mut got2 = store.keys_under("Mainframe/d/");
+        got2.sort();
+        assert_eq!(
+            got2, got,
+            "vault-prefixed + trailing-slash dir must canonicalize"
+        );
+        assert!(
+            store.keys_under("").is_empty(),
+            "empty dir must never match the vault"
+        );
+        assert!(store.keys_under("x").is_empty());
     }
 
     /// record(NFD key) then get(NFC key) must hit: the store is
