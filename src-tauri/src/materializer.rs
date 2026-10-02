@@ -1771,18 +1771,34 @@ impl Materializer {
         let now = chrono::Utc::now();
         let ts = now.format("%Y%m%dT%H%M%SZ");
         let nanos = now.timestamp_subsec_nanos();
-        let mut renamed = target.with_file_name(format!(
-            "{}.deleted-{ts}-{nanos:09}",
-            target.file_name().unwrap().to_string_lossy()
-        ));
+        // TKT-559e5f0d: preserve OUT of the active tree. Pre-fix the copy was
+        // a SIBLING `<name>.deleted-*` in the same folder; the suffix is
+        // non-.md so it never synced and accreted per host inside live scan
+        // paths (5,071 across the fleet, MEASURED 2026-10-02). It now goes to
+        // `<root>/_archive/nexus-sync-deleted/<same relative dir>/`, where
+        // <root> is the same root the target lives under (vaults_root live,
+        // the shadow tree otherwise), so a shadow-mode delete never touches
+        // the live vault. Same filesystem as the target, so the rename stays
+        // atomic. The parent is created on demand.
+        let archive_root = match self.mode {
+            MaterializerMode::Live => self.vaults_root.clone(),
+            _ => self.shadow_root(),
+        }
+        .join("_archive")
+        .join("nexus-sync-deleted");
+        let archive_dir = match Path::new(path).parent() {
+            Some(p) if !p.as_os_str().is_empty() => archive_root.join(p),
+            _ => archive_root,
+        };
+        fs::create_dir_all(&archive_dir)?;
+        let file_name = target.file_name().unwrap().to_string_lossy().into_owned();
+        let mut renamed = archive_dir.join(format!("{file_name}.deleted-{ts}-{nanos:09}"));
         // Defensive: if that exact name somehow already exists, append a small
         // counter so we never clobber an earlier preserved deletion.
         if renamed.exists() {
             for n in 2u32..u32::MAX {
-                let candidate = target.with_file_name(format!(
-                    "{}.deleted-{ts}-{nanos:09}-{n}",
-                    target.file_name().unwrap().to_string_lossy()
-                ));
+                let candidate =
+                    archive_dir.join(format!("{file_name}.deleted-{ts}-{nanos:09}-{n}"));
                 if !candidate.exists() {
                     renamed = candidate;
                     break;
@@ -3004,15 +3020,12 @@ mod tests {
         m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
         // S477: soft_delete takes vaults-root-relative paths, same as write().
         m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md")).unwrap();
-        let shadow_dir = ws
-            .path()
-            .join(".lattice-runtime")
-            .join(SLUG)
-            .join("shadow")
-            .join(VAULT)
-            .join("01_Inbox");
+        let shadow_root = ws.path().join(".lattice-runtime").join(SLUG).join("shadow");
+        let shadow_dir = shadow_root.join(VAULT).join("01_Inbox");
+        // TKT-559e5f0d: preserved copies live in the archive mirror, not beside the file.
+        let archive_dir = archive_dir_for(&shadow_root, &format!("{VAULT}/01_Inbox"));
         assert!(!shadow_dir.join("foo.md").exists());
-        let entries: Vec<_> = std::fs::read_dir(&shadow_dir)
+        let entries: Vec<_> = std::fs::read_dir(&archive_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -3071,6 +3084,65 @@ mod tests {
             .count()
     }
 
+    /// TKT-559e5f0d: where a soft_delete preserves the file: the
+    /// `_archive/nexus-sync-deleted/` mirror of the wire path's directory,
+    /// anchored at the same root the target lives under.
+    fn archive_dir_for(root: &Path, wire_dir: &str) -> PathBuf {
+        root.join("_archive")
+            .join("nexus-sync-deleted")
+            .join(wire_dir)
+    }
+
+    /// TKT-559e5f0d regression (live mode = production): the preserved copy
+    /// lands in the archive mirror with the original bytes, and NO
+    /// `<name>.deleted-*` sibling is left in the active folder (pre-fix the
+    /// sibling accreted in place: 5,071 across the fleet on 2026-10-02).
+    #[test]
+    fn soft_delete_preserves_into_archive_not_sibling_live() {
+        let (vaults, _ws, _sdir, m, _shadow, wire, target) = mk_delete_leg();
+        std::fs::write(&target, b"original bytes").unwrap();
+        m.soft_delete(&wire).unwrap();
+        let active_dir = target.parent().unwrap();
+        assert!(!target.exists(), "the live file must be gone");
+        assert_eq!(
+            count_by_prefix(active_dir, "foo.md.deleted-"),
+            0,
+            "no .deleted-* sibling may remain in the active folder"
+        );
+        let arch = archive_dir_for(vaults.path(), &format!("{VAULT}/01_Inbox"));
+        let kept: Vec<PathBuf> = std::fs::read_dir(&arch)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("foo.md.deleted-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "exactly one preserved copy in the archive");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"original bytes");
+    }
+
+    /// TKT-559e5f0d: shadow mode archives under the shadow root, never the
+    /// live vault.
+    #[test]
+    fn soft_delete_preserves_into_archive_not_sibling_shadow() {
+        let (vaults, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
+        m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
+        m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md")).unwrap();
+        let shadow_root = ws.path().join(".lattice-runtime").join(SLUG).join("shadow");
+        let active_dir = shadow_root.join(VAULT).join("01_Inbox");
+        assert_eq!(count_by_prefix(&active_dir, "foo.md.deleted-"), 0);
+        let arch = archive_dir_for(&shadow_root, &format!("{VAULT}/01_Inbox"));
+        assert_eq!(count_by_prefix(&arch, "foo.md.deleted-"), 1);
+        assert!(
+            !vaults.path().join("_archive").exists(),
+            "shadow mode must never write into the live vault"
+        );
+    }
+
     /// Shadow present + local raw sha differs => the local bytes survive as a
     /// `.conflict-from-<device>-0.md` sibling (seq 0: no base_seq known, same
     /// as the push leg's bare-409 stash) AND the delete still wins.
@@ -3084,7 +3156,13 @@ mod tests {
 
         let dir = vaults.path().join(VAULT).join("01_Inbox");
         assert!(!target.exists(), "delete must still win");
-        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        assert_eq!(
+            count_by_prefix(
+                &archive_dir_for(vaults.path(), &format!("{VAULT}/01_Inbox")),
+                "foo.md.deleted-"
+            ),
+            1
+        );
         let stash = dir.join("foo.conflict-from-morpheus-0.md");
         assert!(stash.exists(), "divergent local edit must be forked");
         assert_eq!(
@@ -3106,7 +3184,13 @@ mod tests {
 
         let dir = vaults.path().join(VAULT).join("01_Inbox");
         assert!(!target.exists());
-        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        assert_eq!(
+            count_by_prefix(
+                &archive_dir_for(vaults.path(), &format!("{VAULT}/01_Inbox")),
+                "foo.md.deleted-"
+            ),
+            1
+        );
         assert_eq!(
             count_by_prefix(&dir, "foo.conflict-from-"),
             0,
@@ -3126,7 +3210,13 @@ mod tests {
 
         let dir = vaults.path().join(VAULT).join("01_Inbox");
         assert!(!target.exists());
-        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 1);
+        assert_eq!(
+            count_by_prefix(
+                &archive_dir_for(vaults.path(), &format!("{VAULT}/01_Inbox")),
+                "foo.md.deleted-"
+            ),
+            1
+        );
         assert_eq!(
             count_by_prefix(&dir, "foo.conflict-from-"),
             0,
@@ -3152,7 +3242,13 @@ mod tests {
             1,
             "identical divergent bytes must converge on ONE stash"
         );
-        assert_eq!(count_by_prefix(&dir, "foo.md.deleted-"), 2);
+        assert_eq!(
+            count_by_prefix(
+                &archive_dir_for(vaults.path(), &format!("{VAULT}/01_Inbox")),
+                "foo.md.deleted-"
+            ),
+            2
+        );
     }
 
     /// A known base_seq names the stash (`-<seq>`), mirroring the push leg's
@@ -3914,20 +4010,16 @@ mod tests {
     #[test]
     fn d13_soft_delete_suffix_is_nanosecond_unique() {
         let (_v, ws, m) = mk(MaterializerMode::Shadow, default_cfg());
-        let shadow_dir = ws
-            .path()
-            .join(".lattice-runtime")
-            .join(SLUG)
-            .join("shadow")
-            .join(VAULT)
-            .join("01_Inbox");
+        let shadow_root = ws.path().join(".lattice-runtime").join(SLUG).join("shadow");
+        // TKT-559e5f0d: preserved copies live in the archive mirror, not beside the file.
+        let archive_dir = archive_dir_for(&shadow_root, &format!("{VAULT}/01_Inbox"));
         // Two write+delete cycles on the SAME path, back to back (same second).
         m.write(&payload("01_Inbox/d.md", "v1")).unwrap();
         m.soft_delete(&format!("{VAULT}/01_Inbox/d.md")).unwrap();
         m.write(&payload("01_Inbox/d.md", "v2")).unwrap();
         m.soft_delete(&format!("{VAULT}/01_Inbox/d.md")).unwrap();
 
-        let deleted: Vec<String> = std::fs::read_dir(&shadow_dir)
+        let deleted: Vec<String> = std::fs::read_dir(&archive_dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
