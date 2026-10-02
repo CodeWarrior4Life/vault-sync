@@ -153,7 +153,13 @@ fn delete_renames_to_deleted_ts() {
         .join(SLUG)
         .join("shadow/01_Inbox/");
     assert!(!shadow_dir.join("foo.md").exists());
-    let entries: Vec<_> = std::fs::read_dir(&shadow_dir)
+    // TKT-559e5f0d: the preserved copy lives in the archive mirror, not beside the file.
+    let archive_dir = w
+        .path()
+        .join(".lattice-runtime")
+        .join(SLUG)
+        .join("shadow/_archive/nexus-sync-deleted/01_Inbox/");
+    let entries: Vec<_> = std::fs::read_dir(&archive_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -176,8 +182,8 @@ fn delete_nothing_to_delete_is_not_error() {
 #[test]
 fn delete_former_substrate_path_now_soft_deletes() {
     // "substrate must sync": soft_delete no longer refuses substrate. After a
-    // write, the substrate path soft-deletes to a `.deleted-*` sibling like
-    // any content note.
+    // write, the substrate path soft-deletes into the `_archive/nexus-sync-deleted/`
+    // mirror (TKT-559e5f0d) like any content note.
     let v = TempDir::new().unwrap();
     let w = TempDir::new().unwrap();
     let m = mk(&v, &w, MaterializerMode::Shadow);
@@ -185,7 +191,9 @@ fn delete_former_substrate_path_now_soft_deletes() {
     m.soft_delete("00_VAULT.md").unwrap();
     let shadow_dir = w.path().join(".lattice-runtime").join(SLUG).join("shadow/");
     assert!(!shadow_dir.join("00_VAULT.md").exists());
-    let deleted: Vec<_> = std::fs::read_dir(&shadow_dir)
+    // TKT-559e5f0d: a top-level path is preserved at the archive root.
+    let archive_dir = shadow_dir.join("_archive/nexus-sync-deleted/");
+    let deleted: Vec<_> = std::fs::read_dir(&archive_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
