@@ -987,6 +987,14 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
         scope_excludes: ctx.scope_excludes.clone(),
         debounce_ms: 500,
         managed_payload_excludes: managed,
+        // TKT-35f75318: scope_roots/excludes from the server are STORAGE-key
+        // prefixes (`<route>/...`); give the watcher the route so its scope
+        // gate matches the same key form. Empty route (vault) = None.
+        storage_prefix: if spec.route.is_empty() {
+            None
+        } else {
+            Some(spec.route.clone())
+        },
     };
     let watcher = match file_watcher::FileWatcher::new(
         vault_root.clone(),
