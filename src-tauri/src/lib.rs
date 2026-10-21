@@ -490,6 +490,9 @@ fn spawn_sse_consumer(
         // Future: extend to all roots (deferred — multi-root redflag is a
         // follow-up task).
         let primary_root = watch_roots[0].0.clone();
+        // TKT-35f75318: the SSE consumer materializes into the primary root, so
+        // its defensive scope check must use the primary root's route.
+        let primary_route = watch_roots[0].1.clone();
         let gate = redflag::RedflagGate::new(primary_root.clone());
         match gate.check() {
             redflag::RedflagStatus::Tripped { path, .. } => {
@@ -920,6 +923,7 @@ fn spawn_sse_consumer(
             materializer,
         ) {
             Ok(c) => c
+                .with_route(&primary_route)
                 .with_tray_state(tray_state)
                 .with_last_event_id_path(last_event_id_path),
             Err(e) => {
