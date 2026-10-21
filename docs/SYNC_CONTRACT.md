@@ -405,6 +405,22 @@ matching. — *daemon `scope.rs:1-23`*
 watcher and push; delete events bypass the existence-dependent part of the check.
 — *daemon `push_client.rs:40-43, 466-480`, `file_watcher.rs:70-71`*
 
+> **[I55 scope note, 2026-08-08 audit]** This gate is a **daemon-layer
+> implementation boundary, not a server or contract property**. The **v2
+> subscriber server lane has NO extension allowlist** — `scope_filter.py`
+> `V9_BASELINE_EXCLUDES` is a denylist of noise, and v2 `POST /push` accepts
+> UTF-8, NUL-free content of any extension **for an otherwise admissible path**
+> (V9 exclusions and request validation still apply; binary/NUL bytes are
+> 422-rejected). The one server-side extension allowlist that DOES exist,
+> `TRACKED_EXTENSIONS` in `sync_admin_routes.py`, belongs to the legacy
+> Sprint-0 manifest lane and does not govern v2. This daemon gate is the
+> identified cause of every "a `*.sh` never propagated" observation. Do NOT
+> widen it to allow-all: v2 server storage is UTF-8-text-only, so binary files
+> would become permanent push rejections. Also note the asymmetry: `.canvas`
+> passes this gate but the server's durable change feed stamps `%.md` only
+> (change_seq trigger), so `.canvas` edits are live-fanout-only and invisible
+> to catchup.
+
 **[I56] Daemon hardcoded excludes (defense-in-depth, regardless of config):**
 directories `.obsidian/`, `.lattice-sync/`, `.trash/`, `._/`; basename prefix `.%`
 (machine-local convention, S477). — *daemon `file_watcher.rs:54-68`*
