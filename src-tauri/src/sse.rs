@@ -52,11 +52,31 @@ struct Envelope {
     lsn: Option<serde_json::Value>,
 }
 
+/// TKT-35f75318: the SSE consumer's defensive scope decision, factored out as
+/// a pure fn so it is unit-testable. `wire_path` is the route-RELATIVE path the
+/// server sends (it strips `<route>/` in `_map_event_to_wire`), while
+/// `scope_roots` / `scope_excludes` are STORAGE-key prefixes (the server
+/// matches them on the canonical key before `to_wire`). `route` `None`/empty =
+/// the bare vault route. Returns `true` only when the event may be applied;
+/// the caller DROPS on `false`.
+pub fn sse_event_in_scope(
+    wire_path: &str,
+    route: Option<&str>,
+    scope_roots: &[String],
+    scope_excludes: &[String],
+) -> bool {
+    let key = crate::file_watcher::storage_key_for(route, wire_path);
+    path_in_scope(&key, scope_roots, scope_excludes)
+}
+
 pub struct SseConsumer {
     nexus_url: String,
     token: String,
     scope_roots: Vec<String>,
     scope_excludes: Vec<String>,
+    /// TKT-35f75318: the materialized root's route (`None` = bare vault),
+    /// used only to build the storage key for the defensive scope check.
+    route: Option<String>,
     api: ApiClient,
     materializer: Materializer,
     tray_state: Option<SharedTrayState>,
@@ -114,6 +134,7 @@ impl SseConsumer {
             token,
             scope_roots,
             scope_excludes,
+            route: None,
             api,
             materializer,
             tray_state: None,
@@ -134,6 +155,17 @@ impl SseConsumer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_liveness_window(mut self, w: std::time::Duration) -> Self {
         self.liveness_window = w;
+        self
+    }
+
+    /// TKT-35f75318: set the route of the root this consumer materializes into
+    /// (the primary sync_root). Empty string = bare vault = `None`.
+    pub fn with_route(mut self, route: &str) -> Self {
+        self.route = if route.is_empty() {
+            None
+        } else {
+            Some(route.to_string())
+        };
         self
     }
 
@@ -348,7 +380,12 @@ impl SseConsumer {
                         error!("path traversal rejected at SSE: {}", env.path);
                         continue;
                     }
-                    if !path_in_scope(&env.path, &self.scope_roots, &self.scope_excludes) {
+                    if !sse_event_in_scope(
+                        &env.path,
+                        self.route.as_deref(),
+                        &self.scope_roots,
+                        &self.scope_excludes,
+                    ) {
                         debug!("defensive scope drop: {}", env.path);
                         continue;
                     }
@@ -483,6 +520,95 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         (addr, handle)
+    }
+
+    // ---------- TKT-35f75318: defensive scope check on the storage key ----------
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// (a) routed, in scope: wire `t4-canary.md` on route harness-memory/Nexus is
+    /// storage key `harness-memory/Nexus/t4-canary.md` -> applied. Red pre-fix.
+    #[test]
+    fn sse_routed_in_scope_is_applied() {
+        assert!(sse_event_in_scope(
+            "t4-canary.md",
+            Some("harness-memory/Nexus"),
+            &v(&["harness-memory/"]),
+            &[],
+        ));
+    }
+
+    /// (b) routed, out of scope -> dropped (unrelated root and a sibling route).
+    #[test]
+    fn sse_routed_out_of_scope_is_dropped() {
+        for roots in [&["other/"][..], &["harness-memory/Cutlist/"][..]] {
+            assert!(!sse_event_in_scope(
+                "t4-canary.md",
+                Some("harness-memory/Nexus"),
+                &v(roots),
+                &[],
+            ));
+        }
+        // Storage-form exclude still drops on a routed root.
+        assert!(!sse_event_in_scope(
+            "private/x.md",
+            Some("harness-memory/Nexus"),
+            &v(&["harness-memory/"]),
+            &v(&["harness-memory/Nexus/private/"]),
+        ));
+    }
+
+    /// (c) bare/empty route: unchanged (wire path == storage key).
+    #[test]
+    fn sse_bare_route_unchanged() {
+        for route in [None, Some("")] {
+            let roots = v(&["02_Projects/"]);
+            assert!(sse_event_in_scope("02_Projects/x.md", route, &roots, &[]));
+            assert!(!sse_event_in_scope("05_Personal/y.md", route, &roots, &[]));
+            assert!(!sse_event_in_scope(
+                "harness-memory/Nexus/a.md",
+                route,
+                &[],
+                &v(&["harness-memory/"]),
+            ));
+        }
+    }
+
+    /// The builder maps empty route to None (bare) and keeps a named route.
+    #[test]
+    fn sse_with_route_maps_empty_to_bare() {
+        let mat = || {
+            Materializer::new(
+                std::env::temp_dir(),
+                None,
+                MaterializerMode::Disabled,
+                std::env::temp_dir(),
+                "sse-test".to_string(),
+                MaterializerConfig::default(),
+            )
+        };
+        let c = SseConsumer::new(
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+            vec![],
+            vec![],
+            mat(),
+        )
+        .unwrap()
+        .with_route("");
+        assert_eq!(c.route, None);
+        let c = SseConsumer::new(
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+            vec![],
+            vec![],
+            mat(),
+        )
+        .unwrap()
+        .with_route("harness-memory/Nexus");
+        assert_eq!(c.route.as_deref(), Some("harness-memory/Nexus"));
     }
 
     fn test_consumer(

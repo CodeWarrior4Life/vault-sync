@@ -382,6 +382,9 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     // ---- B1 --------------------------------------------------------------
     // Redflag gate: checked against the first sync root (primary vault).
     let primary_root = roots[0].path.clone();
+    // TKT-35f75318: the SSE consumer materializes into the primary root, so
+    // its defensive scope check must use the primary root's route.
+    let primary_route = roots[0].route.clone();
     let gate = redflag::RedflagGate::new(primary_root.clone());
     match gate.check() {
         redflag::RedflagStatus::Tripped { path, .. } => {
@@ -649,7 +652,8 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     ) {
         Ok(c) => {
             let h = Arc::clone(&handles);
-            c.with_tray_state(tray)
+            c.with_route(&primary_route)
+                .with_tray_state(tray)
                 .with_state_dir(&state_dir)
                 .with_on_connected(Arc::new(move || h.mark_sse_connected()))
         }
