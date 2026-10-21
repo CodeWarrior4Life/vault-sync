@@ -874,6 +874,7 @@ fn spawn_sse_consumer(
                     &cfg,
                     eff_sub,
                     root.path.clone(),
+                    root.route.clone(),
                     workspace_root_for_journal.clone(),
                     watch_scope_roots.clone(),
                     watch_scope_excludes.clone(),
@@ -991,6 +992,7 @@ fn spawn_push_pipeline(
     cfg: &config::Config,
     subscriber_id: String,
     watch_root: std::path::PathBuf,
+    route: String,
     workspace_root: std::path::PathBuf,
     scope_roots: Vec<String>,
     scope_excludes: Vec<String>,
@@ -1355,6 +1357,10 @@ fn spawn_push_pipeline(
         scope_excludes,
         debounce_ms: 500,
         managed_payload_excludes: managed,
+        // TKT-35f75318: scope_roots/excludes from the server are STORAGE-key
+        // prefixes (`<route>/...`); give the watcher the route so its scope
+        // gate matches the same key form. Empty route (vault) = None.
+        storage_prefix: if route.is_empty() { None } else { Some(route) },
     };
     let watcher = match file_watcher::FileWatcher::new(
         vault_root,
