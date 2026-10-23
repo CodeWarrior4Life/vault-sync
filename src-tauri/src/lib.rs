@@ -213,7 +213,18 @@ pub fn run() {
                 )))
             };
 
-            tray::build_tray(app.handle(), shared_state.clone())?;
+            // TKT-31dc4efa: a managed instance is a second copy of the same
+            // app — building its tray put a second, identical Nexus Sync icon
+            // in the macOS menu bar. Skip ONLY the icon UI; `shared_state` is
+            // still created above and handed to every pipeline below. Every
+            // tray-UI path (2s refresher, icon animation, menu handlers with
+            // their `tray_by_id` lookups, TrayMenuHandles) lives inside
+            // build_tray, so none of it exists without the icon.
+            if policy.tray {
+                tray::build_tray(app.handle(), shared_state.clone())?;
+            } else {
+                tracing::info!("managed-instance mode: tray icon suppressed (TKT-31dc4efa)");
+            }
 
             // S484: silent auto-update — checks on startup AND every 6h, using
             // the pubkey + endpoints in tauri.conf.json. Runs detached so a slow
@@ -1505,6 +1516,48 @@ mod tests {
 
         // Suppress unused-import warning when no other test consumes it.
         let _ = PathBuf::new();
+    }
+
+    /// TKT-31dc4efa: in managed-instance mode NO tray icon is built, so every
+    /// tray-STATE writer the headless pipelines drive (updater indicator,
+    /// conflict counter, redflag monitor, recon backstop, verify flag,
+    /// delete-burst valve) must work against a bare SharedTrayState with no
+    /// TrayIcon / TrayMenuHandles anywhere — no panic, state still updates,
+    /// and the tooltip text still renders (for logs) without a tray.
+    #[test]
+    fn tray_state_writers_are_safe_with_no_tray_icon_built() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault_path = dir.path().to_path_buf();
+        let policy = managed_instance::plugin_policy(true);
+        assert!(!policy.tray, "precondition: managed mode builds no tray");
+
+        let tray_state: tray_state::SharedTrayState =
+            Arc::new(RwLock::new(tray_state::TrayState::new(
+                "sub-managed".to_string(),
+                "https://example".to_string(),
+                vault_path.clone(),
+            )));
+        {
+            let mut s = tray_state.write().unwrap();
+            s.set_update_available(Some("9.9.9".to_string()));
+            s.set_conflict_unresolved(2);
+            s.set_verify_in_progress(true);
+            s.set_verify_in_progress(false);
+            s.set_recon_in_progress(true);
+            s.note_recon_pass(3, 4);
+            s.set_delete_burst_paused(true);
+            s.set_delete_burst_paused(false);
+            s.set_redflag_tripped(true);
+        }
+        // redflag monitor tick: file absent → clears the flag, no tray needed.
+        let gate = redflag::RedflagGate::new(vault_path);
+        redflag_tick(&gate, &tray_state);
+
+        let s = tray_state.read().unwrap();
+        assert_eq!(s.update_available.as_deref(), Some("9.9.9"));
+        assert_eq!(s.conflict_unresolved, 2);
+        assert!(!s.redflag_tripped);
+        assert!(!tray::build_tooltip(&s).is_empty());
     }
 
     /// The push pipeline (spawn_push_pipeline) and verify_repair
