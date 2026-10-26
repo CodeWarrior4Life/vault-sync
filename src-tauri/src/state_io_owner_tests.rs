@@ -639,3 +639,369 @@ fn t_cs2_11_run_time_belt() {
     assert!(r.is_ok(), "shadow-mode write must pass the belt: {r:?}");
     assert!(shadow.join("Mainframe/ok.md").exists());
 }
+
+/// T-CS2-18 (T-D2 for the StateDir): the recorder shows the temp `sync_all`
+/// (F_FULLFSYNC on Apple, VENDOR-DOC) and the held-dirfd sync for
+/// `replace_atomic`, and `sync_data` on the file for `append`; with the
+/// dirfd sync forced to "unsupported", Apple falls back to `fsync(dirfd)` and
+/// reports `CommittedDurabilityUncertain` (CS-1 §4b) while Linux keeps the
+/// tolerated `Durable` rule.
+#[cfg(unix)]
+#[test]
+fn t_cs2_18_statedir_durability_contract() {
+    use crate::durable_file::seams as dseams;
+    let fx = fixture();
+    dseams::reset();
+    fx.sd.seams.recorder.lock().unwrap().clear();
+    let c = fx.sd.replace_atomic(StateFile::Shadow, b"{}").unwrap();
+    let rec = fx.sd.seams.recorder.lock().unwrap().clone();
+    let ev = dseams::events();
+    assert!(
+        rec.iter()
+            .any(|r| r.starts_with("openat:shadow_hashes.json.tmp-")),
+        "{rec:?}"
+    );
+    assert!(
+        rec.contains(&"renameat:shadow_hashes.json".to_string()),
+        "{rec:?}"
+    );
+    assert!(rec.contains(&"sync_dir:".to_string()), "{rec:?}");
+    assert!(ev.contains(&"sync_all:temp".to_string()), "{ev:?}");
+    let apple = cfg!(target_vendor = "apple");
+    let want = if apple { "AppleFullFsync" } else { "Synced" };
+    assert!(
+        ev.iter().any(|e| e == &format!("dir_sync_branch:{want}")),
+        "{ev:?}"
+    );
+    assert_eq!(c, Commit::Durable);
+
+    // append: sync_data on the file.
+    fx.sd.seams.recorder.lock().unwrap().clear();
+    let _c = fx.sd.append(StateFile::DeleteLedger, b"a\n").unwrap();
+    assert!(fx
+        .sd
+        .seams
+        .recorder
+        .lock()
+        .unwrap()
+        .contains(&"sync_data:delete-burst-SUPPRESSED".to_string()));
+
+    // Forced "F_FULLFSYNC unsupported" on the dirfd.
+    dseams::reset();
+    let enotsup = if apple { 45 } else { 95 };
+    dseams::fail_dir_fsync(None, enotsup);
+    let c = fx
+        .sd
+        .replace_atomic(StateFile::Shadow, b"{\"x\":1}")
+        .unwrap();
+    let ev = dseams::events();
+    if apple {
+        assert!(
+            ev.contains(&"dir_sync_branch:AppleFallbackFsync".to_string()),
+            "{ev:?}"
+        );
+        assert_eq!(c, Commit::CommittedDurabilityUncertain);
+    } else {
+        assert!(
+            ev.contains(&"dir_sync_branch:ToleratedUnsupported".to_string()),
+            "{ev:?}"
+        );
+        assert_eq!(c, Commit::Durable);
+    }
+}
+
+/// T-CS2-23 (no behaviour change while custody holds; modes stated per C10):
+/// v1 names and raw formats are unchanged (raw stores reload; no framing),
+/// and the file modes are exactly: 0600 for files written through
+/// `replace_atomic` or created by `openat(O_CREAT, 0600)` (journal on first
+/// create and after every rewrite, pause marker, last_event_id, retry
+/// ledger, a newly created ledger), and unchanged 0600 for the three stores
+/// and the lock file. An EXISTING ledger keeps its mode (appends do not
+/// chmod).
+#[cfg(unix)]
+#[test]
+fn t_cs2_23_formats_and_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let fx = fixture();
+    let mut j = PushJournal::open(&fx.sd).unwrap();
+    assert_eq!(
+        mode(&fx.d.join("push_journal.jsonl")),
+        0o600,
+        "journal create"
+    );
+    j.append(evt("a.md")).unwrap();
+    j.append(evt("a.md")).unwrap();
+    j.compact().unwrap();
+    assert_eq!(
+        mode(&fx.d.join("push_journal.jsonl")),
+        0o600,
+        "journal rewrite"
+    );
+    assert_eq!(mode(&fx.d.join("push_journal.lock")), 0o600, "lock");
+    let line = std::fs::read_to_string(fx.d.join("push_journal.jsonl")).unwrap();
+    assert!(
+        line.starts_with('{') && line.ends_with('\n'),
+        "raw jsonl: {line:?}"
+    );
+
+    let shadow = crate::sync_shadow::ShadowStore::load(&fx.sd);
+    shadow.record("n.md", "h");
+    let _c = shadow.flush().unwrap();
+    let bs = crate::base_seq_store::BaseSeqStore::load(&fx.sd);
+    bs.record_adopted("n.md", 4);
+    let _c = bs.flush().unwrap();
+    let rr = crate::read_receipt::ReadReceiptStore::load(&fx.sd);
+    rr.record_verified(
+        "n.md",
+        crate::read_receipt::Receipt {
+            revision_seq: 4,
+            body_sha: "s".into(),
+        },
+    );
+    let _c = rr.flush().unwrap();
+    for n in ["shadow_hashes.json", "base_seq.json", "read_receipt.json"] {
+        assert_eq!(mode(&fx.d.join(n)), 0o600, "{n}");
+        let raw = std::fs::read(fx.d.join(n)).unwrap();
+        assert_eq!(raw.first(), Some(&b'{'), "{n}: raw JSON, never framed");
+    }
+    // The raw stores reload (a framed file would load EMPTY).
+    assert_eq!(
+        crate::sync_shadow::ShadowStore::load(&fx.sd)
+            .get("n.md")
+            .as_deref(),
+        Some("h")
+    );
+    assert_eq!(
+        crate::base_seq_store::BaseSeqStore::load(&fx.sd).get("n.md"),
+        Some(4)
+    );
+
+    let mut det =
+        DeleteBurstDetector::new(1, std::time::Duration::from_secs(30)).with_pause_marker(&fx.sd);
+    det.record_delete();
+    assert_eq!(mode(&fx.d.join("delete-burst-PAUSED")), 0o600, "marker");
+    sse_consumer()
+        .with_state_dir(&fx.sd)
+        .persist_last_event_id("7-1");
+    assert_eq!(mode(&fx.d.join("last_event_id")), 0o600, "last_event_id");
+    assert_eq!(
+        std::fs::read(fx.d.join("last_event_id")).unwrap(),
+        b"7-1",
+        "last_event_id stays raw"
+    );
+    assert!(DeleteLedger::new(&fx.sd).record("x.md"));
+    assert_eq!(
+        mode(&fx.d.join("delete-burst-SUPPRESSED")),
+        0o600,
+        "new ledger"
+    );
+
+    // An existing ledger keeps its mode.
+    let fx2 = fixture();
+    std::fs::write(fx2.d.join("delete-burst-SUPPRESSED"), b"").unwrap();
+    std::fs::set_permissions(
+        fx2.d.join("delete-burst-SUPPRESSED"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(DeleteLedger::new(&fx2.sd).record("y.md"));
+    assert_eq!(mode(&fx2.d.join("delete-burst-SUPPRESSED")), 0o644);
+
+    let cfg = TempDir::new().unwrap();
+    let cd = StateDir::for_test_scoped(cfg.path(), Scope::ConfigDir);
+    crate::retry_ledger::RetryLedger::load(&cd).record_failure("z.md", "e");
+    assert_eq!(mode(&cfg.path().join("reconcile-retry-ledger.json")), 0o600);
+    // Exactly the v1 file names, nothing else.
+    let mut got = names(&fx.d);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "base_seq.json",
+            "delete-burst-PAUSED",
+            "delete-burst-SUPPRESSED",
+            "last_event_id",
+            "push_journal.jsonl",
+            "push_journal.lock",
+            "read_receipt.json",
+            "shadow_hashes.json",
+        ]
+    );
+}
+
+/// Run `test` (an ignored child test of this module) inside
+/// `unshare -rm`; `None` (SKIPPED-LOUD) when unshare is unavailable.
+#[cfg(target_os = "linux")]
+fn run_in_unshare(test: &str) -> Option<std::process::Output> {
+    let probe = std::process::Command::new("unshare")
+        .args([
+            "-rm",
+            "sh",
+            "-c",
+            "d=$(mktemp -d) && e=$(mktemp -d) && mount --bind \"$d\" \"$e\" && umount \"$e\"",
+        ])
+        .output();
+    match probe {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "SKIPPED-LOUD {test}: `unshare -rm` + bind mount not permitted here ({}). REQUIRED on link and icarus at rollout (CS-2 §7).",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!(
+                "SKIPPED-LOUD {test}: unshare unavailable ({e}). REQUIRED on link and icarus at rollout (CS-2 §7)."
+            );
+            return None;
+        }
+    }
+    Some(
+        std::process::Command::new("unshare")
+            .arg("-rm")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("state_io::owner_tests::{test}"),
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("CS2_UNSHARE_CHILD", "1")
+            .output()
+            .unwrap(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn bind(src: &Path, dst: &Path) {
+    let o = std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "mount --bind: {o:?}");
+}
+
+/// T-CS2-6 child (runs inside `unshare -rm`).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "T-CS2-6 child; spawned by t_cs2_6_bind_alias_no_false_positive"]
+fn t_cs2_6_child() {
+    if std::env::var_os("CS2_UNSHARE_CHILD").is_none() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("A");
+    let b = tmp.path().join("B");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    bind(&a, &b);
+    let (reg, latch) = {
+        let latch = Arc::new(Latch::new());
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        (
+            bootstrap_with_latch(&a, &["s6".into()], &cfg, latch.clone()).unwrap(),
+            latch,
+        )
+    };
+    let sd = reg.get("s6").unwrap();
+    for _ in 0..1000 {
+        assert!(sd.custody().is_ok(), "bind alias must not false-positive");
+    }
+    assert!(DeleteLedger::new(&sd).record("seen-at-b.md"));
+    let at_b = b
+        .join(layout::RUNTIME_DIR_NAME)
+        .join("s6")
+        .join("sync-state")
+        .join("delete-burst-SUPPRESSED");
+    assert!(at_b.exists(), "the StateDir write is visible at B");
+    assert!(latch.exits.lock().unwrap().is_empty(), "no exit");
+    println!("T6_OK");
+}
+
+/// T-CS2-6 (T-S7 control, bind alias): in `unshare -rm`, bind A at B,
+/// bootstrap via A: custody stays Ok across 1000 checks, a StateDir write is
+/// visible at B, and no exit happens. SKIPPED-LOUD where unshare is
+/// unavailable (required on link and icarus at rollout).
+#[cfg(target_os = "linux")]
+#[test]
+fn t_cs2_6_bind_alias_no_false_positive() {
+    let Some(out) = run_in_unshare("t_cs2_6_child") else {
+        return;
+    };
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("T6_OK"),
+        "{out:?}"
+    );
+}
+
+/// T-CS2-7 child (runs inside `unshare -rm`).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "T-CS2-7 child; spawned by t_cs2_7_over_mount_exits_74"]
+fn t_cs2_7_child() {
+    if std::env::var_os("CS2_UNSHARE_CHILD").is_none() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    let e = tmp.path().join("E");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&e).unwrap();
+    let latch = Arc::new(Latch::new());
+    let cfg = tmp.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let reg = bootstrap_with_latch(&ws, &["s7".into()], &cfg, latch.clone()).unwrap();
+    let sd = reg.get("s7").unwrap();
+    let leaf = super::tests::leaf(&ws, "s7");
+    bind(&e, &leaf);
+    // Seam-bypassed write lands in the held inode, not in E.
+    sd.seams.custody_disabled.store(true, Ordering::SeqCst);
+    assert!(DeleteLedger::new(&sd).record("held.md"));
+    sd.seams.custody_disabled.store(false, Ordering::SeqCst);
+    assert!(names(&e).is_empty(), "nothing in E");
+    // Custody: Replaced, exit 74.
+    assert!(matches!(
+        sd.custody(),
+        Err(OwnershipLost {
+            reason: LossReason::Replaced { .. }
+        })
+    ));
+    let e2 = sd.append(StateFile::DeleteLedger, b"x\n").unwrap_err();
+    assert!(is_ownership_lost(&e2.0));
+    assert!(matches!(
+        latch.exits.lock().unwrap().as_slice(),
+        [(74, LossReason::Replaced { .. })]
+    ));
+    // Unmount: the held inode has the seam-bypassed write.
+    let o = std::process::Command::new("umount")
+        .arg(&leaf)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    assert!(leaf.join("delete-burst-SUPPRESSED").exists());
+    println!("T7_OK");
+}
+
+/// T-CS2-7 (T-S8, over-mount): bind an empty E over the held canonical
+/// path: custody returns Replaced, the process exits 74, and a seam-bypassed
+/// write lands in the held inode and not in E. SKIPPED-LOUD where unshare is
+/// unavailable (required on link and icarus at rollout).
+#[cfg(target_os = "linux")]
+#[test]
+fn t_cs2_7_over_mount_exits_74() {
+    let Some(out) = run_in_unshare("t_cs2_7_child") else {
+        return;
+    };
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("T7_OK"),
+        "{out:?}"
+    );
+}

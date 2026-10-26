@@ -364,6 +364,9 @@ fn sync_temp(f: &File) -> io::Result<()> {
     if let Some(e) = seams::take_sync_all_failure() {
         return Err(e);
     }
+    // std `sync_all` issues F_FULLFSYNC on Apple (CS-2 T-CS2-18 records it).
+    #[cfg(test)]
+    seams::record_event("sync_all:temp".to_string());
     f.sync_all()
 }
 
