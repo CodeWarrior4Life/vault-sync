@@ -73,6 +73,8 @@ rstest = "0.23"
 tokio = { version = "1", features = ["test-util"] }
 # Piece 1 (S535): property test for canonicalize() idempotency / fixpoint.
 proptest = "1"
+# CS-2 T-CS2-21: compile-time "no path accessor" assertions.
+static_assertions = "1"
 
 [features]
 default = []

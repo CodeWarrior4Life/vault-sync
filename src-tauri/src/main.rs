@@ -68,10 +68,10 @@ fn init_logging() {
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "daemon.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    // Leak the guard — non-blocking writer needs it alive for the whole
-    // process lifetime, and main() has no natural place to hand it off.
-    // Leaking on a process-singleton is fine; daemon never re-enters main().
-    Box::leak(Box::new(guard));
+    // The guard keeps the non-blocking writer alive for the process lifetime.
+    // CS-2 §3.3: it is handed to state_io, whose exit-74 path drops it (a
+    // bounded 250 ms flush) before `process::exit`, which runs no destructors.
+    vault_sync_daemon::state_io::register_log_flush(Box::new(move || drop(guard)));
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)

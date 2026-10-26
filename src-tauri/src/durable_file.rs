@@ -73,7 +73,6 @@ pub(crate) enum MutexKey {
     /// A canonicalized directory path ([`PathAnchor`]).
     Path(PathBuf),
     /// The `(st_dev, st_ino)` of a held directory (`state_io::StateAnchor`).
-    #[allow(dead_code)] // constructed by state_io (CS-2 commit b)
     DevIno(u64, u64),
 }
 

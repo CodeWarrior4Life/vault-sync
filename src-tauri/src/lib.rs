@@ -28,6 +28,7 @@ pub mod redflag;
 pub mod retry_ledger;
 pub mod scope;
 pub mod sse;
+pub mod state_io;
 pub mod sync_health;
 pub mod sync_shadow;
 pub mod token_store;
