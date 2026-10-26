@@ -38,7 +38,7 @@ jobs:
       - name: nexus-vault-sync-supervisor tests (O5-2a)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/supervisor/test-supervisor.sh
-      # #29 gate C2: the Trinity install script's competing-route removal and one-supervised-pid receipt (shims, ~5 s).
+      # #29 gate C2 + follow-up P1-P5: the Trinity install script (exact-path matching, reversible parking, never kills, receipt; shims).
       - name: install-trinity-agent tests (#29 C2)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/launchd/test-install-trinity-agent.sh
