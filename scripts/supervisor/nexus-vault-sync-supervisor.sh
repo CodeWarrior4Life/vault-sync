@@ -15,6 +15,114 @@ COOLDOWN_SECS="${NVS_COOLDOWN_SECS:-1200}" # >= 20 min between restarts
 ST="$HOME/.local/state/nexus-vault-sync-supervisor"; mkdir -p "$ST"
 NOW=$(date +%s)
 log(){ logger -t nexus-vault-sync-supervisor -- "$*"; echo "$(date -u +%FT%TZ) $*" >> "$ST/log"; }
+# ---- O5-2a (LSEC-9325-B6D8-O5-ONFAILURE-RULING, O5-2 "No Silent Holds"): alert on an INACTIVE vault-sync unit.
+# The not_receiving logic below cannot see a STOPPED unit (the server then reports nothing for it, which reads
+# "inconclusive"). So, first and independently: for each watched unit that exists on this host, track how long it
+# has been not-active; at >= NVS_INACTIVE_SECS raise ONE alert (lnotify notice on the infra rail + a conductor page
+# to the arranger), re-alert at most every NVS_REALERT_SECS while still inactive, and emit one "recovered" when it
+# is active again. ALERT ONLY: this block never starts, stops or restarts anything. It never exits the script.
+WATCH_UNITS="${NVS_WATCH_UNITS:-nexus-vault-sync.service nexus-vault-sync-memory.service}"
+INACTIVE_SECS="${NVS_INACTIVE_SECS:-900}"     # 15 min (O5-2)
+REALERT_SECS="${NVS_REALERT_SECS:-3600}"      # at most one re-alert per 60 min per unit
+HOST_SHORT="$(hostname -s 2>/dev/null || echo unknown-host)"
+LNOTIFY="${NVS_LNOTIFY:-$(command -v lnotify 2>/dev/null || echo "$HOME/.local/bin/lnotify")}"
+PAGE_CSID="${NVS_PAGE_CSID:-}"                # the arranger's FULL conductor session id; no default
+PAGE_URL="${NVS_PAGE_URL:-https://nexus.obsidian-inc.com/api/conductor/coord/emit}"
+PAGE_KEY_NAME="${NVS_PAGE_KEY_NAME:-CONDUCTOR_SERVICE_KEY_NVS_SUPERVISOR}"
+PAGE_KEY_FILE="${NVS_PAGE_KEY_FILE:-$HOME/whetstone/.env}"
+unit_alert(){  # $1 unit  $2 raised|recovered  $3 one-line detail
+  local u="$1" kind="$2" detail="$3" ev claim=notice
+  [ "$kind" = recovered ] && ev=unit.recovered || ev=unit.stopped
+  local ikey="nexus-vault-sync.unit-inactive:${HOST_SHORT}:${u}"
+  local msg="[nexus-vault-sync-supervisor@${HOST_SHORT}] ${u}: ${detail}"
+  # (1) lnotify, claim notice: the vault-note route + the ledger, never the interruptive nexus_nudge surface.
+  if [ -x "$LNOTIFY" ] && printf '%s' "$msg" | "$LNOTIFY" legacy --principal "${HOST_SHORT}.nexus-vault-sync-supervisor@lattice" \
+       --app nexus-vault-sync --venture lattice --event-type "$ev" --claim "$claim" --identity-key "$ikey" \
+       --subject "$u" --sender nexus-vault-sync-supervisor --caused-by "$u" >/dev/null 2>>"$ST/lnotify.err"; then
+    log "ALERT-NOTIFY-OK kind=$kind unit=$u ikey=$ikey"
+  else
+    log "ALERT-NOTIFY-FAILED kind=$kind unit=$u ikey=$ikey (lnotify=$LNOTIFY; see $ST/lnotify.err)"
+  fi
+  # (2) conductor page to the arranger, by FULL csid only. The service key is read by NAME inside python and
+  # reaches curl on STDIN (-K -), never argv, env or stdout.
+  case "$PAGE_CSID" in
+    "") log "PAGE SKIPPED (LOUD): NVS_PAGE_CSID is unset — no arranger page for kind=$kind unit=$u"; return 0 ;;
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) log "PAGE SKIPPED (LOUD): NVS_PAGE_CSID is not a full session uuid (len=${#PAGE_CSID}) — refusing to page"; return 0 ;;
+  esac
+  local out
+  out=$(python3 - "$PAGE_KEY_FILE" "$PAGE_KEY_NAME" "$PAGE_URL" "$PAGE_CSID" "$HOST_SHORT" "$u" "$kind" "$msg" <<'PY' 2>&1
+import json, re, subprocess, sys
+kf, kn, url, csid, host, unit, kind, msg = sys.argv[1:9]
+if not re.fullmatch(r"CONDUCTOR_SERVICE_KEY_[A-Z0-9_]+", kn):
+    print("PAGE SKIPPED: key NAME is not a CONDUCTOR_SERVICE_KEY_* name"); sys.exit(0)
+key = None
+try:
+    for line in open(kf, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if line.startswith("export "): line = line[7:].lstrip()
+        if line.startswith(kn + "="):
+            key = line[len(kn) + 1:].strip().strip('"').strip("'")
+except OSError:
+    pass
+if not key:
+    print("PAGE SKIPPED (PROVISIONING GAP): key %s not found in %s" % (kn, kf)); sys.exit(0)
+if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", key):
+    print("PAGE SKIPPED: key value has a disallowed character (not echoed)"); sys.exit(0)
+payload = {"kind": "talk", "session_id": csid, "body": {
+    "from": "nexus-vault-sync-supervisor@%s (automated)" % host,
+    "topic": "vault-sync unit %s on %s: %s" % (unit, host, "RECOVERED" if kind == "recovered" else "INACTIVE"),
+    "detail": msg}}
+r = subprocess.run(["curl", "-sS", "-m", "25", "-X", "POST", url, "-H", "Content-Type: application/json",
+                    "-A", "curl/8.7.1", "-K", "-", "-w", "\n%{http_code}", "-d", json.dumps(payload)],
+                   input='header = "Authorization: Bearer %s"\n' % key, capture_output=True, text=True,
+                   errors="replace")
+body, _, code = r.stdout.rpartition("\n")
+if r.returncode == 0 and code.strip().startswith("2"):
+    print("PAGE-OK http=%s" % code.strip())
+else:
+    print("PAGE-FAILED rc=%s http=%s" % (r.returncode, code.strip() or "?"))
+PY
+)
+  log "$out kind=$kind unit=$u csid=$PAGE_CSID"
+}
+check_inactive_units(){
+  local u load act f_since f_alert since dur last
+  for u in $WATCH_UNITS; do
+    f_since="$ST/unit.$u.inactive_since"; f_alert="$ST/unit.$u.last_alert"
+    load=$(systemctl --user show -p LoadState --value "$u" 2>/dev/null)
+    case "$load" in
+      not-found) rm -f "$f_since" "$f_alert"; continue ;;   # not on this host (e.g. icarus has no -memory): skipped
+      "") log "unit $u: systemctl unreadable — inconclusive, no change"; continue ;;
+    esac
+    act=$(systemctl --user is-active "$u" 2>/dev/null)
+    case "$act" in
+      "") log "unit $u: is-active unreadable — inconclusive, no change"; continue ;;
+      active)
+        if [ -f "$f_since" ]; then
+          since=$(cat "$f_since"); dur=$((NOW-since))
+          if [ -f "$f_alert" ]; then
+            log "unit $u RECOVERED: active again after ${dur}s not-active"
+            unit_alert "$u" recovered "active again after ${dur}s not-active (since $(date -u -d "@$since" +%FT%TZ))"
+          else
+            log "unit $u active again after ${dur}s (< ${INACTIVE_SECS}s, never alerted)"
+          fi
+          rm -f "$f_since" "$f_alert"
+        fi ;;
+      *)
+        [ -f "$f_since" ] || { echo "$NOW" > "$f_since"; log "unit $u not active ($act, LoadState=$load) — inactive window opened"; }
+        since=$(cat "$f_since"); dur=$((NOW-since))
+        [ "$dur" -ge "$INACTIVE_SECS" ] || continue
+        last=$(cat "$f_alert" 2>/dev/null || echo 0)
+        [ $((NOW-last)) -ge "$REALERT_SECS" ] || continue
+        echo "$NOW" > "$f_alert"
+        log "unit $u INACTIVE ${dur}s (>= ${INACTIVE_SECS}s; state=$act) — alerting"
+        unit_alert "$u" raised "NOT ACTIVE ($act) for ${dur}s since $(date -u -d "@$since" +%FT%TZ) (threshold ${INACTIVE_SECS}s). Alert only: nothing was restarted. Re-alert at most every ${REALERT_SECS}s." ;;
+    esac
+  done
+}
+check_inactive_units || log "inactive-unit check errored — continuing to the not_receiving check"
+# ---- end O5-2a
 STATE=$(curl -fsS -m 10 -A curl/8.7.1 "$URL" 2>/dev/null | python3 -c '
 import sys,json
 try: d=json.load(sys.stdin)
