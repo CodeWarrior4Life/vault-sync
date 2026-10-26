@@ -233,6 +233,10 @@ pub(crate) struct Latch {
     /// exit (0 = nobody; 74, 70, or [`CLAIM_RESTART`]). One CAS per process,
     /// shared by `ownership_lost` and every CS-3 leaver.
     exit_claim: AtomicI32,
+    /// CS-3 gate K1: the non-74 claimant has COMMITTED to leaving (it is
+    /// past the point where it re-checks custody). From then on a custody
+    /// loss must exit 74 itself, because no later re-check will see it.
+    exit_committed: AtomicBool,
     #[cfg(test)]
     pub(crate) exits: Mutex<Vec<(i32, LossReason)>>,
 }
@@ -243,6 +247,7 @@ impl Latch {
             set: AtomicBool::new(false),
             errors_logged: AtomicUsize::new(0),
             exit_claim: AtomicI32::new(0),
+            exit_committed: AtomicBool::new(false),
             #[cfg(test)]
             exits: Mutex::new(Vec::new()),
         }
@@ -309,6 +314,16 @@ impl ExitGate {
             0 => None,
             c => Some(c),
         }
+    }
+
+    /// Gate K1: the claimant commits to leaving (CAS false -> true) BEFORE
+    /// its custody re-check. A custody loss after this point is no longer
+    /// seen by the claimant, so `ownership_lost` exits 74 itself.
+    pub fn commit(&self) {
+        let _ =
+            self.0
+                .exit_committed
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// The CS-2 mutation latch: set by `ownership_lost`; every mutating
@@ -381,10 +396,24 @@ fn ownership_lost(latch: &Latch, shown: &DisplayPath, id: (u64, u64), reason: &L
         .compare_exchange(0, EXIT_OWNERSHIP_LOST, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        // Another leaver holds `exit_once`. The latch is set, so nothing more
-        // is written; that leaver's pre-exit re-check (C9) exits 74.
+        let claimed_by = latch.exit_claim.load(Ordering::SeqCst);
+        // Gate K1: the latch store above and this load are SeqCst, as are the
+        // claimant's commit and its latch re-check, so at least one side sees
+        // the other. If the claimant already committed, its re-check is
+        // behind it: custody loss must still win, so exit 74 here.
+        if latch.exit_committed.load(Ordering::SeqCst) {
+            tracing::error!(
+                claimed_by,
+                "state_io: OWNERSHIP LOST after the {claimed_by} claimant committed to leaving; exiting 74 (custody loss wins, CS-3 gate K1)"
+            );
+            flush_logs_bounded();
+            exit_74(latch, reason);
+            return;
+        }
+        // The claimant has not committed: the latch is set, so nothing more
+        // is written, and its pre-exit re-check (C9) exits 74.
         tracing::error!(
-            claimed_by = latch.exit_claim.load(Ordering::SeqCst),
+            claimed_by,
             "state_io: OWNERSHIP LOST while another exit was already claimed; mutation latch set, the claimant exits 74"
         );
         return;

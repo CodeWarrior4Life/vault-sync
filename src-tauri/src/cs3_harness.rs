@@ -493,6 +493,17 @@ async fn child_main(scenario: String) {
                     })));
                     crate::faults::arm("drain_loop.panic");
                 }
+                "D" => {
+                    // K1: custody is lost INSIDE leave(), after the 70
+                    // claimant committed and passed its re-check; the custody
+                    // tick (fast ticks) observes it.
+                    c.sup.set_in_leave(Some(Box::new(move || {
+                        lose_custody(&ws, &sub);
+                        std::thread::sleep(Duration::from_secs(3));
+                        println!("LEAVE_WINDOW_SURVIVED");
+                    })));
+                    crate::faults::arm("drain_loop.panic");
+                }
                 "C" => {
                     c.sup.set_before_recheck(Some(Box::new(move |who| {
                         if who == "stall_watchdog" {
@@ -1701,6 +1712,29 @@ fn exit_order_run(order: &str, extra: &[(&str, &str)]) -> (Out, Env, Mock) {
     (out, env, m)
 }
 
+/// The 74 came from one of the two custody-wins paths, each with the
+/// mutation latch set: the leaver's C9 re-check line (`mutation_latch=true`,
+/// naming the leaver), or, once the leaver has committed (gate K1),
+/// `ownership_lost` itself (which sets the latch first), naming the claim.
+#[cfg(unix)]
+fn assert_74_with_latch(out: &Out, order: &str, leaver: &str, claim: &str) {
+    if let Some(l) = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("exiting 74 instead"))
+    {
+        assert!(l.contains("mutation_latch=true"), "{order}: {l}");
+        assert!(l.contains(leaver), "{order}: {l}");
+        return;
+    }
+    let l = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("custody loss wins"))
+        .unwrap_or_else(|| panic!("{order}: no custody-wins line\n{}", out.dump()));
+    assert!(l.contains(claim), "{order}: {l}");
+}
+
 /// T-CS3-19 (gates C1 and C9, three orders): A, 74 first (custody lost at
 /// the push gate while a drain is mid-commit); B, 70 first (a drain-loop
 /// panic; custody lost inside its pre-exit store flush); C, watchdog first
@@ -1724,26 +1758,39 @@ fn t_cs3_19_exit_precedence() {
     let (out, env, _m) = exit_order_run("B", &[]);
     assert_eq!(out.code, Some(74), "B\n{}", out.dump());
     assert!(!out.has("RESTART_CALLED"), "B\n{}", out.dump());
-    let line = out
-        .stderr
-        .lines()
-        .find(|l| l.contains("exiting 74 instead"))
-        .unwrap_or_else(|| panic!("B: no C9 line\n{}", out.dump()));
-    assert!(line.contains("mutation_latch=true"), "B: {line}");
-    assert!(line.contains("drain_loop:0"), "B: {line}");
+    assert_74_with_latch(&out, "B", "drain_loop:0", "claimed_by=70");
     assert_untouched_since_loss(&env, "sub-a", &out);
 
     let (out, env, _m) =
         exit_order_run("C", &[("CS3_STALL_ZERO", "1"), ("CS3_WATCHDOG_MS", "100")]);
     assert_eq!(out.code, Some(74), "C\n{}", out.dump());
     assert!(!out.has("RESTART_CALLED"), "C relaunched\n{}", out.dump());
-    let line = out
-        .stderr
-        .lines()
-        .find(|l| l.contains("exiting 74 instead"))
-        .unwrap_or_else(|| panic!("C: no C9 line\n{}", out.dump()));
-    assert!(line.contains("mutation_latch=true"), "C: {line}");
-    assert!(line.contains("stall_watchdog"), "C: {line}");
+    assert_74_with_latch(&out, "C", "stall_watchdog", "claimed_by=-1");
+    assert_untouched_since_loss(&env, "sub-a", &out);
+}
+
+/// T-CS3-19 order D (gate K1): a custody loss arrives AFTER the non-74
+/// claimant committed and passed its re-check, inside the `leave()` /
+/// log-flush window. `ownership_lost` finds the claim committed and exits
+/// 74 itself: no 70, no relaunch, no state byte written after the loss.
+/// Mutation: `ownership_lost` returns on any claimed exit (the pre-K1 code).
+#[cfg(unix)]
+#[test]
+fn t_cs3_19_order_d_loss_in_leave_window() {
+    let (out, env, _m) = exit_order_run("D", &[("CS3_FAST_TICK_MS", "50")]);
+    assert_eq!(out.code, Some(74), "D\n{}", out.dump());
+    assert!(!out.has("RESTART_CALLED"), "D\n{}", out.dump());
+    assert!(
+        !out.has("LEAVE_WINDOW_SURVIVED"),
+        "D: the loss was missed\n{}",
+        out.dump()
+    );
+    assert!(!out.has("HOST_EXIT=70"), "D\n{}", out.dump());
+    assert!(
+        out.stderr.lines().any(|l| l.contains("custody loss wins")),
+        "D: ownership_lost did not exit 74 itself\n{}",
+        out.dump()
+    );
     assert_untouched_since_loss(&env, "sub-a", &out);
 }
 

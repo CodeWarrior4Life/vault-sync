@@ -455,6 +455,10 @@ impl Supervisor {
     fn custody_lost_before_leaving(&self, who: &str, intended: Leave) -> bool {
         #[cfg(test)]
         self.hooks.run_before_recheck(who);
+        // Gate K1: commit BEFORE the re-check. A custody loss after this
+        // point is handled by `ownership_lost` itself (it exits 74), so no
+        // window remains in which the loss is missed by both sides.
+        self.gate.commit();
         let latched_before = self.gate.mutation_latched();
         let custody = crate::state_io::custody_all();
         let mutation_latch = self.gate.mutation_latched();
@@ -474,6 +478,8 @@ impl Supervisor {
     }
 
     fn leave(&self, how: Leave) {
+        #[cfg(test)]
+        self.hooks.run_in_leave();
         crate::state_io::flush_logs_bounded();
         match how {
             Leave::Exit(code) => self.host.exit(code),
@@ -524,6 +530,7 @@ pub(crate) mod test_hooks {
     pub(crate) struct Hooks {
         before_recheck: Mutex<Option<Hook>>,
         in_pre_exit_flush: Mutex<Option<FlushHook>>,
+        in_leave: Mutex<Option<FlushHook>>,
     }
 
     impl Hooks {
@@ -535,6 +542,16 @@ pub(crate) mod test_hooks {
                 .as_mut()
             {
                 h(who);
+            }
+        }
+        pub(super) fn run_in_leave(&self) {
+            let h = self
+                .in_leave
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(mut h) = h {
+                h();
             }
         }
         pub(super) fn take_in_pre_exit_flush(&self) -> Option<FlushHook> {
@@ -551,6 +568,15 @@ pub(crate) mod test_hooks {
             *self
                 .hooks
                 .before_recheck
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = h;
+        }
+        /// K1 order D: runs once inside `leave()`, after the re-check and
+        /// before the log flush and the exit or restart.
+        pub(crate) fn set_in_leave(&self, h: Option<FlushHook>) {
+            *self
+                .hooks
+                .in_leave
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = h;
         }
