@@ -43,18 +43,15 @@
 //! `base_seq: null` and takes the refetch/merge path on the server's 409).
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use tracing::warn;
 
-use crate::sync_shadow::canonical_sync_path;
+use crate::sync_shadow::{canonical_sync_path, FlushGen};
 
 /// Periodic flush cadence, matching the shadow / base_seq stores.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
@@ -105,7 +102,8 @@ pub fn verify_receipt(
 pub struct ReadReceiptStore {
     inner: Mutex<HashMap<String, Receipt>>,
     path: PathBuf,
-    dirty: AtomicBool,
+    /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
+    gen: FlushGen,
     /// Sync-root basenames whose leading `<vault_folder>/` prefix is stripped
     /// off keys, identical to `ShadowStore`/`BaseSeqStore` so all stores key in
     /// lockstep.
@@ -189,7 +187,7 @@ impl ReadReceiptStore {
         Arc::new(ReadReceiptStore {
             inner: Mutex::new(map),
             path,
-            dirty: AtomicBool::new(migrated),
+            gen: FlushGen::new(migrated),
             vault_folders,
         })
     }
@@ -203,7 +201,7 @@ impl ReadReceiptStore {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             m.insert(key, receipt);
-            self.dirty.store(true, Ordering::Relaxed);
+            self.gen.bump();
         }
     }
 
@@ -218,7 +216,7 @@ impl ReadReceiptStore {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             if m.remove(&key).is_some() {
-                self.dirty.store(true, Ordering::Relaxed);
+                self.gen.bump();
             }
         }
     }
@@ -233,33 +231,18 @@ impl ReadReceiptStore {
         self.len() == 0
     }
 
-    /// Persist the full map via atomic tmp+rename. No-op (and `Ok`) when not
-    /// dirty. Clears the dirty flag only after a successful persist.
+    /// Persist the full map durably (tmp in the destination dir, `sync_all`,
+    /// rename, dir fsync). No-op (and `Ok`) when nothing changed since the
+    /// last durable flush. A mutation that lands after the snapshot stays
+    /// unflushed and is written by the next flush (Unit 1a S2).
     pub fn flush(&self) -> std::io::Result<()> {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let snapshot: HashMap<String, Receipt> = match self.inner.lock() {
-            Ok(m) => m.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let parent = self
-            .path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut tmp = NamedTempFile::new_in(&parent)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.persist(&self.path).map_err(|e| e.error)?;
-
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(())
+        self.gen.flush_durable(&self.path, || {
+            let m = match self.inner.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (self.gen.current(), m.clone())
+        })
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
@@ -369,5 +352,50 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.get("anything.md"), None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Unit 1a (TKT-b25fce06) §3: T-S1..T-S3 for ReadReceiptStore ----
+
+    impl crate::sync_shadow::flush_gen_checks::GenStore for ReadReceiptStore {
+        fn load_at(path: PathBuf) -> Arc<Self> {
+            ReadReceiptStore::load(path)
+        }
+        fn put(&self, i: u32) {
+            self.record_verified(
+                &format!("n/{i}.md"),
+                Receipt {
+                    revision_seq: i64::from(i),
+                    body_sha: sha_of(&format!("b{i}")),
+                },
+            );
+        }
+        fn has(&self, i: u32) -> bool {
+            self.get(&format!("n/{i}.md"))
+                == Some(Receipt {
+                    revision_seq: i64::from(i),
+                    body_sha: sha_of(&format!("b{i}")),
+                })
+        }
+        fn flush_now(&self) -> std::io::Result<()> {
+            self.flush()
+        }
+        fn gen(&self) -> &FlushGen {
+            &self.gen
+        }
+    }
+
+    #[test]
+    fn ts1_receipt_mutation_after_snapshot_is_persisted_by_next_flush() {
+        crate::sync_shadow::flush_gen_checks::t_s1::<ReadReceiptStore>();
+    }
+
+    #[test]
+    fn ts2_receipt_sync_error_propagates_and_stays_unflushed() {
+        crate::sync_shadow::flush_gen_checks::t_s2::<ReadReceiptStore>();
+    }
+
+    #[test]
+    fn ts3_receipt_concurrent_flushes_leave_newer_snapshot() {
+        crate::sync_shadow::flush_gen_checks::t_s3::<ReadReceiptStore>();
     }
 }

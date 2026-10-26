@@ -67,16 +67,13 @@
 //! re-earns Adopted on its next byte-verified materialize / accepted push.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tempfile::NamedTempFile;
 use tracing::warn;
 
-use crate::sync_shadow::canonical_sync_path;
+use crate::sync_shadow::{canonical_sync_path, FlushGen};
 
 /// Periodic flush cadence, matching the shadow store.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
@@ -118,7 +115,8 @@ enum RawSeqEntry {
 pub struct BaseSeqStore {
     inner: Mutex<HashMap<String, SeqEntry>>,
     path: PathBuf,
-    dirty: AtomicBool,
+    /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
+    gen: FlushGen,
     /// Sync-root basenames whose leading `<vault_folder>/` prefix is stripped
     /// off keys, identical to `ShadowStore` so the two stores key in lockstep.
     vault_folders: Vec<String>,
@@ -234,13 +232,13 @@ impl BaseSeqStore {
         Arc::new(BaseSeqStore {
             inner: Mutex::new(map),
             path,
-            dirty: AtomicBool::new(migrated || value_migrated),
+            gen: FlushGen::new(migrated || value_migrated),
             vault_folders,
         })
     }
 
-    /// Upsert `path -> seq` with ADOPTED provenance. No I/O; sets the dirty
-    /// flag. The seq MUST come from a server response (push `server_seq` /
+    /// Upsert `path -> seq` with ADOPTED provenance. No I/O; bumps the
+    /// mutation generation. The seq MUST come from a server response (push `server_seq` /
     /// note `change_seq`), NEVER a local assumption, and MUST be recorded only
     /// AFTER the corresponding bytes are byte-verified on the local FS (R3).
     /// Callers enforce both — this is what makes Adopted a proof of descent.
@@ -268,7 +266,7 @@ impl BaseSeqStore {
                     prov: SeqProvenance::Observed,
                 },
             );
-            self.dirty.store(true, Ordering::Relaxed);
+            self.gen.bump();
         }
     }
 
@@ -276,7 +274,7 @@ impl BaseSeqStore {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             m.insert(key, SeqEntry { seq, prov });
-            self.dirty.store(true, Ordering::Relaxed);
+            self.gen.bump();
         }
     }
 
@@ -312,7 +310,7 @@ impl BaseSeqStore {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             if m.remove(&key).is_some() {
-                self.dirty.store(true, Ordering::Relaxed);
+                self.gen.bump();
             }
         }
     }
@@ -327,33 +325,18 @@ impl BaseSeqStore {
         self.len() == 0
     }
 
-    /// Persist the full map via atomic tmp+rename. No-op (and `Ok`) when not
-    /// dirty. Clears the dirty flag only after a successful persist.
+    /// Persist the full map durably (tmp in the destination dir, `sync_all`,
+    /// rename, dir fsync). No-op (and `Ok`) when nothing changed since the
+    /// last durable flush. A mutation that lands after the snapshot stays
+    /// unflushed and is written by the next flush (Unit 1a S2).
     pub fn flush(&self) -> std::io::Result<()> {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let snapshot: HashMap<String, SeqEntry> = match self.inner.lock() {
-            Ok(m) => m.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let parent = self
-            .path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut tmp = NamedTempFile::new_in(&parent)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.persist(&self.path).map_err(|e| e.error)?;
-
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(())
+        self.gen.flush_durable(&self.path, || {
+            let m = match self.inner.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (self.gen.current(), m.clone())
+        })
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
@@ -513,5 +496,40 @@ mod tests {
         assert_eq!(s.get("a.md"), Some(9));
         s.remove("a.md");
         assert_eq!(s.get("a.md"), None);
+    }
+
+    // ---- Unit 1a (TKT-b25fce06) §3: T-S1..T-S3 for BaseSeqStore ----
+
+    impl crate::sync_shadow::flush_gen_checks::GenStore for BaseSeqStore {
+        fn load_at(path: PathBuf) -> Arc<Self> {
+            BaseSeqStore::load(path)
+        }
+        fn put(&self, i: u32) {
+            self.record_adopted(&format!("n/{i}.md"), i64::from(i) + 1000);
+        }
+        fn has(&self, i: u32) -> bool {
+            self.get_adopted(&format!("n/{i}.md")) == Some(i64::from(i) + 1000)
+        }
+        fn flush_now(&self) -> std::io::Result<()> {
+            self.flush()
+        }
+        fn gen(&self) -> &FlushGen {
+            &self.gen
+        }
+    }
+
+    #[test]
+    fn ts1_base_seq_mutation_after_snapshot_is_persisted_by_next_flush() {
+        crate::sync_shadow::flush_gen_checks::t_s1::<BaseSeqStore>();
+    }
+
+    #[test]
+    fn ts2_base_seq_sync_error_propagates_and_stays_unflushed() {
+        crate::sync_shadow::flush_gen_checks::t_s2::<BaseSeqStore>();
+    }
+
+    #[test]
+    fn ts3_base_seq_concurrent_flushes_leave_newer_snapshot() {
+        crate::sync_shadow::flush_gen_checks::t_s3::<BaseSeqStore>();
     }
 }
