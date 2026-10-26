@@ -3,8 +3,9 @@
 `gate-lp-adv/` is a copy of the lsec gate's adversarial fixture set
 (`~/.cache/lsec-9325/lp-adv-1793004436` on link, row
 LSEC-9325-B6D8-CS3-PR24-PASS-W-C on TKT-b6d8c4ba). The originals are left in
-place. `@FIX@` replaces the absolute fixture path in the x2/x3 plists; the test
-substitutes the temp copy's path.
+place. `@FIX@` replaces the fixture-set root
+(`~/.cache/lsec-9325/lp-adv-1793004436`) in the x2/x3 plists; the test stages
+each fixture under a temp root and substitutes that root.
 
 `verify-launcher-policy.sh` reads systemd's EFFECTIVE values from
 `systemctl --user show`, not from unit files. Each systemd fixture therefore

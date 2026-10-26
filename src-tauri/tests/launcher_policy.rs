@@ -28,8 +28,9 @@ fn gate_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/launcher_policy/gate-lp-adv")
 }
 
-/// Copy one gate fixture into a temp dir, substituting `@FIX@` with the
-/// copy's own path (x2/x3 plists name their start.sh by absolute path).
+/// Copy one gate fixture into a temp dir laid out like the gate's set
+/// (`<root>/<fixture>/...`), substituting `@FIX@` with that root (x2/x3
+/// plists name their start.sh by absolute path).
 fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
     let t = tempfile::TempDir::new().unwrap();
     let dst = t.path().join(fixture);
@@ -37,7 +38,7 @@ fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
     for f in walk(&dst) {
         if let Ok(s) = std::fs::read_to_string(&f) {
             if s.contains("@FIX@") {
-                std::fs::write(&f, s.replace("@FIX@", &dst.display().to_string())).unwrap();
+                std::fs::write(&f, s.replace("@FIX@", &t.path().display().to_string())).unwrap();
             }
         }
     }
@@ -112,7 +113,7 @@ fn expect(what: &str, got: (i32, String), want: i32) {
 
 /// Run one gate fixture: systemd (its `systemctl-show.txt`) when it has
 /// one, launchd (its `a/` agent dir) otherwise.
-fn gate(fixture: &str, want: i32) {
+fn gate(fixture: &str, want: i32) -> String {
     let (_t, dir) = stage(fixture);
     let show = dir.join("systemctl-show.txt");
     let got = if show.exists() {
@@ -120,7 +121,9 @@ fn gate(fixture: &str, want: i32) {
     } else {
         run(Mode::Launchd(&dir.join("a")), Some(GATE_DAEMON))
     };
+    let out = got.1.clone();
     expect(fixture, got, want);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -132,21 +135,27 @@ fn gate(fixture: &str, want: i32) {
 /// Mutation: drop the masked check.
 #[test]
 fn t_cs3_24_k2_x1_masked_unit() {
-    gate("x1", 10);
+    let _ = gate("x1", 10);
 }
 
 /// x2: a bash wrapper whose script runs `open` (no exec): 13.
 /// Mutation: accept any interpreter script.
 #[test]
 fn t_cs3_24_k2_x2_bash_wrapper_open() {
-    gate("x2", 13);
+    let out = gate("x2", 13);
+    // The script was resolved and read: the failure is its own reason.
+    assert!(out.contains("does not end by exec'ing the daemon"), "{out}");
 }
 
 /// x3: a script whose last line is `exec /usr/bin/open`: 13.
 /// Mutation: accept any script whose last line is an `exec`.
 #[test]
 fn t_cs3_24_k2_x3_exec_open() {
-    gate("x3", 13);
+    let out = gate("x3", 13);
+    assert!(
+        out.contains("execs /usr/bin/open, not the daemon binary"),
+        "{out}"
+    );
 }
 
 /// x4: `Restart=on-failure` + `SuccessExitStatus=SOFTWARE IOERR`: 70 and 74
@@ -154,7 +163,7 @@ fn t_cs3_24_k2_x3_exec_open() {
 /// Mutations: drop the SuccessExitStatus check; drop the name mapping.
 #[test]
 fn t_cs3_24_k2_x4_success_exit_status_names() {
-    gate("x4", 11);
+    let _ = gate("x4", 11);
 }
 
 /// x5: `RestartPreventExitStatus=CONFIG`. CONFIG is EX_CONFIG = 78, which
@@ -162,21 +171,21 @@ fn t_cs3_24_k2_x4_success_exit_status_names() {
 /// Mutation: drop the name mapping (12).
 #[test]
 fn t_cs3_24_k2_x5_prevent_config_is_78() {
-    gate("x5", 0);
+    let _ = gate("x5", 0);
 }
 
 /// x6: `/usr/bin/env open -a X`: 13.
 /// Mutation: drop the launchd program allowlist.
 #[test]
 fn t_cs3_24_k2_x6_env_open() {
-    gate("x6", 13);
+    let _ = gate("x6", 13);
 }
 
 /// x7: launchd `Disabled=true`: launchd neither runs nor supervises it: 10.
 /// Mutation: drop the Disabled check.
 #[test]
 fn t_cs3_24_k2_x7_launchd_disabled() {
-    gate("x7", 10);
+    let _ = gate("x7", 10);
 }
 
 /// The gate's spec fixtures keep their spec codes.
@@ -191,7 +200,7 @@ fn t_cs3_24_gate_spec_fixtures() {
         ("s12", 12),
         ("s13", 13),
     ] {
-        gate(f, want);
+        let _ = gate(f, want);
     }
     // s10 on launchd too: no agent at all.
     let (_t, dir) = stage("s10");
