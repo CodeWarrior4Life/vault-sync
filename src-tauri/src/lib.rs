@@ -109,6 +109,22 @@ fn list_vault_folders(vaults_root: String) -> Vec<commands_vaults::VaultFolderIn
     commands_vaults::list_vault_folders_impl(std::path::Path::new(&vaults_root))
 }
 
+/// TKT-31dc4efa wiring: build the tray ICON only when the plugin policy says
+/// so (vault mode). `run()` routes its single `tray::build_tray` call through
+/// here, so the wiring test covers the real gate. Returns whether `build` ran.
+fn build_tray_if_enabled<E>(
+    policy: &managed_instance::PluginPolicy,
+    build: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E> {
+    if policy.tray {
+        build()?;
+        Ok(true)
+    } else {
+        tracing::info!("managed-instance mode: tray icon suppressed (TKT-31dc4efa)");
+        Ok(false)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Managed-instance mode (spec §5, 2026-08-08): resolve ONCE, up front.
@@ -230,11 +246,9 @@ pub fn run() {
             // tray-UI path (2s refresher, icon animation, menu handlers with
             // their `tray_by_id` lookups, TrayMenuHandles) lives inside
             // build_tray, so none of it exists without the icon.
-            if policy.tray {
-                tray::build_tray(app.handle(), shared_state.clone())?;
-            } else {
-                tracing::info!("managed-instance mode: tray icon suppressed (TKT-31dc4efa)");
-            }
+            build_tray_if_enabled(&policy, || {
+                tray::build_tray(app.handle(), shared_state.clone())
+            })?;
 
             // CS-3 D6: the handles slot is managed ALWAYS (even unpaired), so
             // V&R can refuse with NotPublished instead of failing to resolve.
@@ -577,6 +591,34 @@ mod tests {
     /// delete-burst valve) must work against a bare SharedTrayState with no
     /// TrayIcon / TrayMenuHandles anywhere — no panic, state still updates,
     /// and the tooltip text still renders (for logs) without a tray.
+    /// Wiring test (TKT-31dc4efa): the gate `run()` uses around
+    /// `tray::build_tray`. Managed policy must NOT invoke the builder; vault
+    /// policy must invoke it exactly once and propagate its error.
+    #[test]
+    fn wiring_tray_gate_skips_builder_in_managed_mode() {
+        let calls = std::cell::Cell::new(0u32);
+        let managed = managed_instance::plugin_policy(true);
+        let built = build_tray_if_enabled(&managed, || {
+            calls.set(calls.get() + 1);
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert!(!built, "managed mode must not build the tray icon");
+        assert_eq!(calls.get(), 0, "managed mode must not call build_tray");
+
+        let vault = managed_instance::plugin_policy(false);
+        let built = build_tray_if_enabled(&vault, || {
+            calls.set(calls.get() + 1);
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert!(built, "vault mode must build the tray icon");
+        assert_eq!(calls.get(), 1, "vault mode calls build_tray exactly once");
+
+        let err = build_tray_if_enabled(&vault, || Err::<(), String>("boom".into()));
+        assert_eq!(err, Err("boom".to_string()), "builder error must propagate");
+    }
+
     #[test]
     fn tray_state_writers_are_safe_with_no_tray_icon_built() {
         let dir = tempfile::TempDir::new().unwrap();

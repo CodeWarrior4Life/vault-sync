@@ -382,9 +382,6 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     // ---- B1 --------------------------------------------------------------
     // Redflag gate: checked against the first sync root (primary vault).
     let primary_root = roots[0].path.clone();
-    // TKT-35f75318: the SSE consumer materializes into the primary root, so
-    // its defensive scope check must use the primary root's route.
-    let primary_route = roots[0].route.clone();
     let gate = redflag::RedflagGate::new(primary_root.clone());
     match gate.check() {
         redflag::RedflagStatus::Tripped { path, .. } => {
@@ -643,17 +640,17 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         );
     }
     let sse_spec = TaskSpec::new("sse_consumer", TaskClass::Required);
-    let consumer = match sse::SseConsumer::new(
+    let consumer = match primary_sse_consumer(
         cfg.nexus_url.clone(),
         token,
         health_snap.scope_roots,
         health_snap.scope_excludes,
         materializer,
+        &roots,
     ) {
         Ok(c) => {
             let h = Arc::clone(&handles);
-            c.with_route(&primary_route)
-                .with_tray_state(tray)
+            c.with_tray_state(tray)
                 .with_state_dir(&state_dir)
                 .with_on_connected(Arc::new(move || h.mark_sse_connected()))
         }
@@ -792,6 +789,50 @@ struct PipelineCtx {
     read_receipt: Arc<read_receipt::ReadReceiptStore>,
     sync_health: Arc<SyncHealth>,
     knobs: BootKnobs,
+}
+
+/// TKT-35f75318 wiring (B10): build the SSE consumer. It materializes into
+/// the PRIMARY root (`roots[0]`), so its defensive scope check must use that
+/// root's route to match the route-prefixed STORAGE key. `run_boot` calls
+/// this to make its consumer, so the wiring test in `cs3_tests::boot_wiring` covers
+/// the real path. Empty `roots` = the bare vault route.
+pub(crate) fn primary_sse_consumer(
+    nexus_url: String,
+    token: String,
+    scope_roots: Vec<String>,
+    scope_excludes: Vec<String>,
+    materializer: crate::materializer::Materializer,
+    roots: &[RootSpec],
+) -> anyhow::Result<sse::SseConsumer> {
+    let primary_route = roots.first().map(|r| r.route.as_str()).unwrap_or("");
+    sse::SseConsumer::new(nexus_url, token, scope_roots, scope_excludes, materializer)
+        .map(|c| c.with_route(primary_route))
+}
+
+/// TKT-35f75318 wiring (push pipeline): the file watcher's config for one
+/// root. `scope_roots`/`scope_excludes` from the server are STORAGE-key
+/// prefixes (`<route>/...`); the watcher gets the root's route so its scope
+/// gate matches the same key form. Empty route (vault) = `None`.
+/// `spawn_push_pipeline` calls this to build its watcher config, so the
+/// wiring test in `cs3_tests::boot_wiring` covers the real path.
+pub(crate) fn push_watcher_config(
+    spec: &RootSpec,
+    scope_roots: Vec<String>,
+    scope_excludes: Vec<String>,
+    managed: bool,
+) -> file_watcher::FileWatcherConfig {
+    file_watcher::FileWatcherConfig {
+        allowed_extensions: vec!["md".into(), "canvas".into()],
+        scope_roots,
+        scope_excludes,
+        debounce_ms: 500,
+        managed_payload_excludes: managed,
+        storage_prefix: if spec.route.is_empty() {
+            None
+        } else {
+            Some(spec.route.clone())
+        },
+    }
 }
 
 /// One root's push pipeline (B8): the drain loop (Required), the stall
@@ -985,21 +1026,12 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
         redflag::DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&sd),
     ));
     redflag::register_delete_burst_handle(Arc::clone(&burst));
-    let watcher_cfg = file_watcher::FileWatcherConfig {
-        allowed_extensions: vec!["md".into(), "canvas".into()],
-        scope_roots: ctx.scope_roots.clone(),
-        scope_excludes: ctx.scope_excludes.clone(),
-        debounce_ms: 500,
-        managed_payload_excludes: managed,
-        // TKT-35f75318: scope_roots/excludes from the server are STORAGE-key
-        // prefixes (`<route>/...`); give the watcher the route so its scope
-        // gate matches the same key form. Empty route (vault) = None.
-        storage_prefix: if spec.route.is_empty() {
-            None
-        } else {
-            Some(spec.route.clone())
-        },
-    };
+    let watcher_cfg = push_watcher_config(
+        &spec,
+        ctx.scope_roots.clone(),
+        ctx.scope_excludes.clone(),
+        managed,
+    );
     let watcher = match file_watcher::FileWatcher::new(
         vault_root.clone(),
         Arc::clone(&journal),

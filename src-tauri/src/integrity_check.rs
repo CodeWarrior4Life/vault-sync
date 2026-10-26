@@ -605,17 +605,109 @@ mod tests {
     }
 
     // ─── subprocess language checks ──────────────────────────────────────
+    //
+    // TKT-55d2b645: on windows-latest the python/node interpreter cases hit the
+    // 5 s SUBPROCESS_TIMEOUT (SubprocessFailed { code: -1 }) in 3 of 4 runs
+    // (MEASURED). On Windows ONLY, such a timeout takes the existing "not
+    // actually invokable -> accept skip" path with a loud SKIP-ON-TIMEOUT line;
+    // everywhere else a timeout still fails. Product code (and its 5 s bound) is
+    // unchanged; `subprocess_timeout_returns_error` still proves a timeout errors.
+    //
+    // PB-ADEB-WINFLAKE: a skip must not mask a real hang, so the four cases run
+    // in ONE test and at least one case that was attempted must complete. One
+    // test (not four tests plus a shared counter) because cargo runs tests in
+    // parallel in an unspecified order: a "final" assertion test could run before
+    // the others finish and read a partial count. Inside one test the order and
+    // the count are deterministic.
 
-    #[test]
-    fn python_syntax_ok() {
-        if skip_if_missing("python") && skip_if_missing("python3") {
+    /// What one interpreter case did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaseOutcome {
+        /// The interpreter is not on PATH (or VAULT_SYNC_SKIP_SUBPROCESS_TESTS):
+        /// the pre-existing skip; the case was never attempted.
+        Missing,
+        /// The case ran to completion and its assertion passed.
+        Completed,
+        /// The interpreter hit the 5 s timeout and the Windows-only skip applied.
+        SkippedOnTimeout,
+    }
+
+    /// The timeout skip is Windows-only; local and CI runs on Linux and macOS
+    /// stay strict.
+    fn timeout_skip_allowed() -> bool {
+        cfg!(windows)
+    }
+
+    /// Write a line that libtest does NOT capture (it captures only the print
+    /// macros), so it shows in every run's log, passing or not.
+    fn loud(line: &str) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+
+    /// Run one verify; `None` = a timeout that the Windows gate let skip.
+    /// A timeout off Windows, or any other error, fails the test.
+    /// The skip is TKT-55d2b645 (CI flake on windows-latest); whether the 5 s
+    /// SUBPROCESS_TIMEOUT bound itself is right is a product question:
+    /// product question: TKT-a819e558 (is the 5 s interpreter bound right on Windows?)
+    fn verify_or_timeout_skip(
+        case: &str,
+        p: &Path,
+        exp: &ExpectedIntegrity,
+    ) -> Option<IntegrityResult> {
+        classify(case, IntegrityChecker::new(true).verify(p, exp))
+    }
+
+    /// The decision on one verify result (separated so the gate is testable
+    /// with a synthetic timeout: `py_compile` of a sleeping script does not
+    /// sleep, so a real timeout cannot be provoked through `verify`).
+    fn classify(case: &str, r: Result<IntegrityResult, IntegrityError>) -> Option<IntegrityResult> {
+        match r {
+            Ok(r) => Some(r),
+            Err(IntegrityError::SubprocessFailed { code: -1, language })
+                if timeout_skip_allowed() =>
+            {
+                loud(&format!(
+                    "SKIP-ON-TIMEOUT: {case}: the {language} interpreter hit the {}s subprocess timeout \
+                     (TKT-55d2b645, Windows only); counted against the all-skipped guard",
+                    SUBPROCESS_TIMEOUT.as_secs()
+                ));
+                None
+            }
+            Err(e) => panic!("{case}: verify failed: {e:?}"),
+        }
+    }
+
+    /// The guard: when at least one case was attempted, at least one must have
+    /// completed. Every attempted case skipping on a timeout fails.
+    fn assert_not_all_timed_out(outcomes: &[(&str, CaseOutcome)]) {
+        let attempted = outcomes
+            .iter()
+            .filter(|(_, o)| *o != CaseOutcome::Missing)
+            .count();
+        let skipped = outcomes
+            .iter()
+            .filter(|(_, o)| *o == CaseOutcome::SkippedOnTimeout)
+            .count();
+        if attempted == 0 {
             return;
+        }
+        assert!(
+            skipped < attempted,
+            "every attempted interpreter case ({attempted}) skipped on a timeout: a skip must not mask a real \
+             hang (PB-ADEB-WINFLAKE): {outcomes:?}"
+        );
+    }
+
+    fn python_syntax_ok_case() -> CaseOutcome {
+        if skip_if_missing("python") && skip_if_missing("python3") {
+            return CaseOutcome::Missing;
         }
         let tmp = TempDir::new().unwrap();
         let (p, sha, size) = fixture(&tmp, "ok.py", b"print(\"hi\")\n");
-        let r = IntegrityChecker::new(true)
-            .verify(&p, &expected(&sha, size))
-            .unwrap();
+        let Some(r) = verify_or_timeout_skip("python_syntax_ok", &p, &expected(&sha, size)) else {
+            return CaseOutcome::SkippedOnTimeout;
+        };
         // Either Ok (subprocess ran) or Skipped (subprocess not found on
         // this exact program-name probe but present under the other) — both
         // are acceptable for the green path.
@@ -626,18 +718,19 @@ mod tests {
             }) => {}
             other => panic!("expected Ok or SubprocessNotFound, got {other:?}"),
         }
+        CaseOutcome::Completed
     }
 
-    #[test]
-    fn python_syntax_error() {
+    fn python_syntax_error_case() -> CaseOutcome {
         if skip_if_missing("python") && skip_if_missing("python3") {
-            return;
+            return CaseOutcome::Missing;
         }
         let tmp = TempDir::new().unwrap();
         let (p, sha, size) = fixture(&tmp, "bad.py", b"def x(\n");
-        let r = IntegrityChecker::new(true)
-            .verify(&p, &expected(&sha, size))
-            .unwrap();
+        let Some(r) = verify_or_timeout_skip("python_syntax_error", &p, &expected(&sha, size))
+        else {
+            return CaseOutcome::SkippedOnTimeout;
+        };
         match r.language_level {
             Some(LanguageLevelResult::ParseError {
                 language: "python", ..
@@ -649,31 +742,31 @@ mod tests {
             }
             other => panic!("expected ParseError or Skipped, got {other:?}"),
         }
+        CaseOutcome::Completed
     }
 
-    #[test]
-    fn node_syntax_ok() {
+    fn node_syntax_ok_case() -> CaseOutcome {
         if skip_if_missing("node") {
-            return;
+            return CaseOutcome::Missing;
         }
         let tmp = TempDir::new().unwrap();
         let (p, sha, size) = fixture(&tmp, "ok.js", b"const x = 1; console.log(x);\n");
-        let r = IntegrityChecker::new(true)
-            .verify(&p, &expected(&sha, size))
-            .unwrap();
+        let Some(r) = verify_or_timeout_skip("node_syntax_ok", &p, &expected(&sha, size)) else {
+            return CaseOutcome::SkippedOnTimeout;
+        };
         assert_eq!(r.language_level, Some(LanguageLevelResult::Ok));
+        CaseOutcome::Completed
     }
 
-    #[test]
-    fn node_syntax_error() {
+    fn node_syntax_error_case() -> CaseOutcome {
         if skip_if_missing("node") {
-            return;
+            return CaseOutcome::Missing;
         }
         let tmp = TempDir::new().unwrap();
         let (p, sha, size) = fixture(&tmp, "bad.js", b"function (\n");
-        let r = IntegrityChecker::new(true)
-            .verify(&p, &expected(&sha, size))
-            .unwrap();
+        let Some(r) = verify_or_timeout_skip("node_syntax_error", &p, &expected(&sha, size)) else {
+            return CaseOutcome::SkippedOnTimeout;
+        };
         assert!(matches!(
             r.language_level,
             Some(LanguageLevelResult::ParseError {
@@ -681,6 +774,94 @@ mod tests {
                 ..
             })
         ));
+        CaseOutcome::Completed
+    }
+
+    /// The four interpreter cases (formerly four tests: python_syntax_ok,
+    /// python_syntax_error, node_syntax_ok, node_syntax_error), run in one test
+    /// so the all-skipped guard sees every outcome.
+    #[test]
+    fn interpreter_syntax_checks() {
+        let outcomes = [
+            ("python_syntax_ok", python_syntax_ok_case()),
+            ("python_syntax_error", python_syntax_error_case()),
+            ("node_syntax_ok", node_syntax_ok_case()),
+            ("node_syntax_error", node_syntax_error_case()),
+        ];
+        // PB-ADEB-PR30-SEQ: the skip count, every run (uncaptured stderr).
+        let skipped = outcomes
+            .iter()
+            .filter(|(_, o)| *o == CaseOutcome::SkippedOnTimeout)
+            .count();
+        loud(&format!(
+            "integrity_check interpreter tests: {skipped} of {} skipped on timeout {outcomes:?}",
+            outcomes.len()
+        ));
+        assert_not_all_timed_out(&outcomes);
+    }
+
+    /// The gate: off Windows a timeout is never skipped. Negative control: make
+    /// `timeout_skip_allowed` true everywhere (red here).
+    #[cfg(not(windows))]
+    #[test]
+    fn timeout_skip_is_windows_only() {
+        assert!(
+            !timeout_skip_allowed(),
+            "a timeout must stay a failure off Windows"
+        );
+    }
+
+    /// Off Windows, a timeout result fails the case: no SKIP-ON-TIMEOUT.
+    /// Negative control: make `timeout_skip_allowed` true everywhere (red).
+    #[cfg(not(windows))]
+    #[test]
+    #[should_panic(expected = "verify failed: SubprocessFailed")]
+    fn timeout_off_windows_still_fails_the_case() {
+        let _ = classify(
+            "synthetic",
+            Err(IntegrityError::SubprocessFailed {
+                language: "python",
+                code: -1,
+            }),
+        );
+    }
+
+    /// On Windows, the same timeout result is skipped (None).
+    #[cfg(windows)]
+    #[test]
+    fn timeout_on_windows_is_skipped() {
+        let r = classify(
+            "synthetic",
+            Err(IntegrityError::SubprocessFailed {
+                language: "python",
+                code: -1,
+            }),
+        );
+        assert!(r.is_none());
+    }
+
+    /// The guard fails when every attempted case skipped on a timeout (the
+    /// forced all-timeout run), and passes when one completed or none ran.
+    #[test]
+    #[should_panic(expected = "a skip must not mask a real hang")]
+    fn guard_fails_when_every_case_timed_out() {
+        assert_not_all_timed_out(&[
+            ("python_syntax_ok", CaseOutcome::SkippedOnTimeout),
+            ("python_syntax_error", CaseOutcome::SkippedOnTimeout),
+            ("node_syntax_ok", CaseOutcome::SkippedOnTimeout),
+            ("node_syntax_error", CaseOutcome::SkippedOnTimeout),
+        ]);
+    }
+
+    #[test]
+    fn guard_passes_with_one_completion_or_nothing_attempted() {
+        assert_not_all_timed_out(&[
+            ("python_syntax_ok", CaseOutcome::SkippedOnTimeout),
+            ("python_syntax_error", CaseOutcome::SkippedOnTimeout),
+            ("node_syntax_ok", CaseOutcome::Completed),
+            ("node_syntax_error", CaseOutcome::SkippedOnTimeout),
+        ]);
+        assert_not_all_timed_out(&[("python_syntax_ok", CaseOutcome::Missing)]);
     }
 
     #[test]

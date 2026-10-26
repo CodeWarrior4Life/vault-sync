@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the icarus vault-sync deaf supervisor every minute (port of TKT-978e7918)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=60s
+OnCalendar=*:*:00
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

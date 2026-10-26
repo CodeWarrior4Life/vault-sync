@@ -1,0 +1,9 @@
+[Unit]
+Description=Interim restart-on-deaf supervisor for nexus-vault-sync on icarus (port of link TKT-978e7918 supervisor, operator P0 2026-09-25)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nexus-vault-sync-supervisor.sh
+TimeoutStopFailureMode=abort
+Environment=NVS_SUBSCRIBER_ID=c7702ee9-efcb-43df-b69e-c28fd992ff90
+Environment=NVS_DEAF_SECS=1800
