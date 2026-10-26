@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PROPOSED Trinity LaunchAgent for the vault-sync daemon (TKT-a6e5c227).
+  A documented artifact only: nothing installs it. Release-time install and
+  canary are per the PR body. The path assumes the bundle installed by
+  install.sh (/Applications/Nexus Vault Sync.app, executable vault-sync-daemon).
+
+  - ProgramArguments: the daemon binary directly (never `open`, never a
+    wrapper; verify-launcher-policy.sh code 13), plus the silent flag.
+  - KeepAlive SuccessfulExit=false: relaunch on any non-zero exit
+    (70 a Required task ended or a supervised restart, 74 custody lost);
+    exit 0 (tray quit, lock held by another live instance) is not relaunched.
+  - VAULT_SYNC_SUPERVISED=1: a daemon restart (tray update click, updater,
+    stall watchdog) exits 70 for launchd to relaunch instead of self-spawning.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.lattice.vaultsync-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/Nexus Vault Sync.app/Contents/MacOS/vault-sync-daemon</string>
+		<string>--silent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>VAULT_SYNC_SUPERVISED</key>
+		<string>1</string>
+	</dict>
+</dict>
+</plist>

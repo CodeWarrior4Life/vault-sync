@@ -1521,3 +1521,124 @@ mod boot_wiring {
         assert!(!c.event_in_scope("05_Personal/y.md"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// TKT-a6e5c227 ruling (b): a restart under a supervisor exits 70
+// ---------------------------------------------------------------------------
+
+/// Supervised (`with_gate_supervised(.., true)`): `restart_once` leaves by
+/// exit 70 and never calls `restart()` (no self-spawned successor).
+/// Mutation: `restart_via_host` ignores `supervised` (red: a restart).
+#[test]
+fn a6_supervised_restart_once_exits_70_no_restart() {
+    let host = Arc::new(RecordingHost::default());
+    let sup = Supervisor::with_gate_supervised(host.clone(), ExitGate::detached(), true);
+    assert!(sup.restart_once("a6_supervised"));
+    assert_eq!(host.exits(), vec![crate::supervise::EXIT_TASK_ENDED]);
+    assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
+}
+
+/// Unsupervised: `restart_once` still calls `restart()` once, no exit.
+/// Mutation: always exit 70 (red).
+#[test]
+fn a6_unsupervised_restart_once_unchanged() {
+    let host = Arc::new(RecordingHost::default());
+    let sup = Supervisor::with_gate(host.clone(), ExitGate::detached());
+    assert!(sup.restart_once("a6_unsupervised"));
+    assert!(host.exits().is_empty(), "{:?}", host.exits());
+    assert_eq!(host.restarts.load(Ordering::SeqCst), 1);
+}
+
+/// Only an exact `1` means supervised; absent, empty and garbage do not.
+/// Mutation: accept any non-empty value (red on `0`, `true`, ...).
+#[test]
+fn a6_supervised_env_value_parsing() {
+    use crate::supervise::supervised_from_env_value as sup_from;
+    use std::ffi::OsStr;
+    assert!(sup_from(Some(OsStr::new("1"))));
+    assert!(!sup_from(None));
+    for v in ["", "0", "true", "yes", " 1", "1 ", "01", "2", "on"] {
+        assert!(!sup_from(Some(OsStr::new(v))), "{v:?} must be unsupervised");
+    }
+}
+
+const A6_MARKER_ENV: &str = "CS3_A6_SUCCESSOR_MARKER";
+/// `tray`: the helper runs the tray's click-to-update restart instead.
+const A6_MODE_ENV: &str = "CS3_A6_MODE";
+
+/// A host that leaves for real: `exit` is `std::process::exit`; `restart`
+/// stands in for `app.restart()` by writing the successor marker (the
+/// self-spawn) and exiting 0, as tauri's restart does.
+struct ExitingHost {
+    marker: PathBuf,
+}
+
+impl Host for ExitingHost {
+    fn notify(&self, _: &str, _: &str) {}
+    fn emit(&self, _: &str, _: serde_json::Value) {}
+    fn exit(&self, code: i32) {
+        std::process::exit(code);
+    }
+    fn restart(&self) {
+        std::fs::write(&self.marker, b"successor").unwrap();
+        std::process::exit(0);
+    }
+}
+
+/// Helper, NOT a test on its own: the process supervisor built the
+/// production way (`Supervisor::process`, which reads
+/// `VAULT_SYNC_SUPERVISED`), then a `restart_once`; or, with
+/// `CS3_A6_MODE=tray`, the tray's click-to-update restart.
+#[test]
+#[ignore = "TKT-a6e5c227 helper; spawned by a6_process_restart_honours_supervised_env"]
+fn a6_child_process_restart() {
+    let Ok(marker) = std::env::var(A6_MARKER_ENV) else {
+        return;
+    };
+    let host = Arc::new(ExitingHost {
+        marker: PathBuf::from(marker),
+    });
+    if std::env::var(A6_MODE_ENV).as_deref() == Ok("tray") {
+        crate::tray::update_click_restart(&*host);
+    } else {
+        Supervisor::process(host).restart_once("a6_child");
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    std::process::exit(99);
+}
+
+/// The real process paths (the supervisor's `restart_once` and the tray's
+/// click-to-update): `VAULT_SYNC_SUPERVISED=1` -> exit 70 and no
+/// successor; absent or garbage -> the self-spawn (marker, exit 0).
+/// Mutations: `Supervisor::process` ignores the env; the tray click calls
+/// `restart()` directly (each red on its `1` case).
+#[test]
+fn a6_process_restart_honours_supervised_env() {
+    for mode in ["supervisor", "tray"] {
+        let run = |env: Option<&str>| {
+            let d = TempDir::new().unwrap();
+            let marker = d.path().join("successor");
+            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+            c.args([
+                "--exact",
+                "cs3_tests::a6_child_process_restart",
+                "--ignored",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .env(A6_MARKER_ENV, &marker)
+            .env(A6_MODE_ENV, mode)
+            .env_remove(crate::supervise::ENV_SUPERVISED)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            if let Some(v) = env {
+                c.env(crate::supervise::ENV_SUPERVISED, v);
+            }
+            let st = c.status().unwrap();
+            (st.code(), marker.exists())
+        };
+        assert_eq!(run(Some("1")), (Some(70), false), "{mode}: supervised");
+        assert_eq!(run(None), (Some(0), true), "{mode}: env absent");
+        assert_eq!(run(Some("yes")), (Some(0), true), "{mode}: env garbage");
+    }
+}

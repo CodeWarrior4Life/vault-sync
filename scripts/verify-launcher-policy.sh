@@ -47,6 +47,11 @@
 #   With no --systemd-show and no --agent-dir, live mode: systemd (via
 #   systemctl) everywhere except macOS, launchd on macOS.
 #
+# Informational (TKT-a6e5c227; never changes the exit code): one line names
+# the supervisor's VAULT_SYNC_SUPERVISED value (systemd Environment=, launchd
+# EnvironmentVariables). Only `1` makes a daemon restart exit 70 for the
+# supervisor to relaunch instead of self-spawning through app.restart().
+#
 # Exit codes (spec section 4.3 item 11; unchanged by K2):
 #   0   pass: a supervisor exists, restarts on both 70 and 74, prevents at
 #       most 78, and runs the daemon binary directly (or, on launchd, through
@@ -151,6 +156,17 @@ is_via() {
   return 1
 }
 
+# TKT-a6e5c227, informational only: report the supervisor's
+# VAULT_SYNC_SUPERVISED (only `1` means supervised). Never affects the exit.
+supervised_note() {
+  local who="$1" v="$2"
+  if [ "$v" = "1" ]; then
+    echo "$who: VAULT_SYNC_SUPERVISED=1 (a daemon restart exits 70 for the supervisor to relaunch)"
+  else
+    echo "$who: VAULT_SYNC_SUPERVISED=${v:-<unset>} (informational, TKT-a6e5c227: without =1 a daemon restart self-spawns through app.restart() and exits 0)"
+  fi
+}
+
 # The unit's effective Environment (systemd), for `exec "$VAR"` targets.
 unit_env=""
 env_value() {
@@ -224,6 +240,7 @@ check_systemd() {
   restart=$(prop Restart); prevent=$(prop RestartPreventExitStatus)
   success=$(prop SuccessExitStatus); exec=$(prop ExecStart)
   echo "systemd $name: LoadState=${load:-?} UnitFileState=${ufs:-?} ActiveState=${active:-?} MainPID=${mainpid:-?} Restart=${restart:-?} RestartPreventExitStatus=[$prevent] SuccessExitStatus=[$success]"
+  supervised_note "systemd $name" "$(env_value VAULT_SYNC_SUPERVISED)"
   case "$load" in
     loaded) ;;
     masked)
@@ -382,15 +399,17 @@ check_launchd() {
   plist=$(find_agent) || return 10
   local parsed
   parsed=$(plist_tags "$plist") || return 2
-  # Emits KEEPALIVE=, DISABLED=, PROG0= and PROG1=.
+  # Emits KEEPALIVE=, DISABLED=, PROG0=, PROG1= and SUPERVISED=.
   local out
   out=$(printf '%s\n' "$parsed" | awk '
     function text(t) { sub(/^<string>/, "", t); sub(/<\/string>$/, "", t); return t }
-    BEGIN { ka = "none"; dis = "false"; p0 = ""; p1 = ""; nargs = 0; depth = 0; kadepth = -1; pending = "" }
+    BEGIN { ka = "none"; dis = "false"; p0 = ""; p1 = ""; nargs = 0; depth = 0; kadepth = -1; envdepth = -1; sup = ""; pending = "" }
     {
       t = $0
       if (t ~ /^<dict>$/) { depth++ }
-      if (t ~ /^<\/dict>$/) { if (depth == kadepth) { kadepth = -1 } ; depth--; next }
+      if (t ~ /^<\/dict>$/) { if (depth == kadepth) { kadepth = -1 } ; if (depth == envdepth) { envdepth = -1 } ; depth--; next }
+      if (pending == "Env") { pending = ""; if (t == "<dict>") envdepth = depth; next }
+      if (pending == "Supervised") { pending = ""; if (t ~ /^<string>/) sup = text(t); next }
       if (pending == "KeepAlive") {
         pending = ""
         if (t == "<true/>") ka = "true"
@@ -416,20 +435,24 @@ check_launchd() {
         pending = ""
         next
       }
+      if (t == "<key>EnvironmentVariables</key>" && depth == 1) { pending = "Env"; next }
+      if (t == "<key>VAULT_SYNC_SUPERVISED</key>" && envdepth >= 0 && depth == envdepth) { pending = "Supervised"; next }
       if (t == "<key>KeepAlive</key>" && depth == 1) { pending = "KeepAlive"; next }
       if (t == "<key>Disabled</key>" && depth == 1) { pending = "Disabled"; next }
       if (t == "<key>SuccessfulExit</key>" && kadepth >= 0 && depth == kadepth) { pending = "SuccessfulExit"; next }
       if (t == "<key>Program</key>" && depth == 1) { pending = "Program"; p0 = ""; next }
       if (t == "<key>ProgramArguments</key>" && depth == 1) { pending = "ProgramArguments"; next }
     }
-    END { print "KEEPALIVE=" ka; print "DISABLED=" dis; print "PROG0=" p0; print "PROG1=" p1 }
+    END { print "KEEPALIVE=" ka; print "DISABLED=" dis; print "PROG0=" p0; print "PROG1=" p1; print "SUPERVISED=" sup }
   ')
-  local ka dis p0 p1
+  local ka dis p0 p1 sup
   ka=$(printf '%s\n' "$out" | sed -n 's/^KEEPALIVE=//p')
   dis=$(printf '%s\n' "$out" | sed -n 's/^DISABLED=//p')
   p0=$(printf '%s\n' "$out" | sed -n 's/^PROG0=//p')
   p1=$(printf '%s\n' "$out" | sed -n 's/^PROG1=//p')
+  sup=$(printf '%s\n' "$out" | sed -n 's/^SUPERVISED=//p')
   echo "launchd $name: plist=$plist Disabled=$dis KeepAlive=$ka program=${p0:-<none>} arg1=${p1:-<none>}"
+  supervised_note "launchd $name" "$sup"
   if [ "$dis" = "true" ]; then
     echo "launchd $name: Disabled=true; launchd does not run or supervise the agent" >&2
     return 10

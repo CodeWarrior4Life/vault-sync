@@ -632,3 +632,125 @@ fn t_cs3_24_l2_via_no_daemon_after() {
         13,
     );
 }
+
+// ---------------------------------------------------------------------------
+// TKT-a6e5c227: VAULT_SYNC_SUPERVISED (informational; never the exit code)
+// ---------------------------------------------------------------------------
+
+const SUP_ENV: &str =
+    "<key>EnvironmentVariables</key><dict><key>OTHER</key><string>x</string><key>VAULT_SYNC_SUPERVISED</key><string>1</string></dict>";
+
+/// launchd: the plist's EnvironmentVariables value is reported, `1` as
+/// supervised, absent or anything else as not; the exit code stays 0 in
+/// every case, and a nested env dict does not disturb the KeepAlive parse.
+/// Mutation: drop the EnvironmentVariables parse (red: `=1` never shown).
+#[test]
+fn a6_launchd_supervised_env_reported_not_gated() {
+    let t = tempfile::TempDir::new().unwrap();
+    let a = t.path().join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    plist(&a, SUP_ENV, &[DAEMON, "--silent"]);
+    let got = run(Mode::Launchd(&a), None);
+    assert!(
+        got.1
+            .contains("VAULT_SYNC_SUPERVISED=1 (a daemon restart exits 70"),
+        "{}",
+        got.1
+    );
+    expect("supervised plist", got, 0);
+
+    plist(&a, "", &[DAEMON, "--silent"]);
+    let got = run(Mode::Launchd(&a), None);
+    assert!(
+        got.1
+            .contains("VAULT_SYNC_SUPERVISED=<unset> (informational"),
+        "{}",
+        got.1
+    );
+    expect("no env", got, 0);
+
+    plist(
+        &a,
+        "<key>EnvironmentVariables</key><dict><key>VAULT_SYNC_SUPERVISED</key><string>yes</string></dict>",
+        &[DAEMON, "--silent"],
+    );
+    let got = run(Mode::Launchd(&a), None);
+    assert!(
+        got.1.contains("VAULT_SYNC_SUPERVISED=yes (informational"),
+        "{}",
+        got.1
+    );
+    expect("garbage env", got, 0);
+
+    // A top-level key named like the env var (outside EnvironmentVariables)
+    // is not the env.
+    plist(
+        &a,
+        "<key>VAULT_SYNC_SUPERVISED</key><string>1</string>",
+        &[DAEMON, "--silent"],
+    );
+    let got = run(Mode::Launchd(&a), None);
+    assert!(got.1.contains("VAULT_SYNC_SUPERVISED=<unset>"), "{}", got.1);
+    expect("top-level key", got, 0);
+}
+
+/// systemd: the effective Environment= value is reported; exit unchanged.
+#[test]
+fn a6_systemd_supervised_env_reported_not_gated() {
+    let t = tempfile::TempDir::new().unwrap();
+    let f = show_live(
+        t.path(),
+        "s.txt",
+        "active",
+        "4242",
+        &exec_of(DAEMON),
+        "HOME=/h VAULT_SYNC_SUPERVISED=1",
+    );
+    let got = run(Mode::Systemd(&f), None);
+    assert!(
+        got.1.contains("VAULT_SYNC_SUPERVISED=1 (a daemon"),
+        "{}",
+        got.1
+    );
+    expect("supervised unit", got, 0);
+    let f = show_live(t.path(), "s2.txt", "active", "4242", &exec_of(DAEMON), "");
+    let got = run(Mode::Systemd(&f), None);
+    assert!(got.1.contains("VAULT_SYNC_SUPERVISED=<unset>"), "{}", got.1);
+    expect("unsupervised unit", got, 0);
+}
+
+/// The proposed Trinity agent shipped as a document
+/// (`scripts/launchd/com.lattice.vaultsync-daemon.plist`) passes the
+/// launcher-policy check as-is (direct binary, KeepAlive on failure, a
+/// running agent stub) and carries VAULT_SYNC_SUPERVISED=1.
+#[test]
+fn a6_proposed_trinity_plist_passes_policy() {
+    let label = "com.lattice.vaultsync-daemon";
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts/launchd")
+        .join(format!("{label}.plist"));
+    let t = tempfile::TempDir::new().unwrap();
+    let a = t.path().join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::copy(&src, a.join(format!("{label}.plist"))).unwrap();
+    let stub = t.path().join("lc.txt");
+    std::fs::write(&stub, LC_RUNNING.replace("vs-fx", label)).unwrap();
+    let out = Command::new("bash")
+        .arg(script())
+        .args(["--name", label, "--agent-dir"])
+        .arg(&a)
+        .arg("--launchctl-print")
+        .arg(&stub)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("KeepAlive=failure"), "{text}");
+    assert!(text.contains("VAULT_SYNC_SUPERVISED=1 "), "{text}");
+    assert!(text.contains("program=/Applications/Nexus Vault Sync.app/Contents/MacOS/vault-sync-daemon arg1=--silent"), "{text}");
+}

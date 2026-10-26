@@ -22,8 +22,11 @@
 //!   enforced by an exclusive lock on `<dir>/daemon.lock` held for the
 //!   process lifetime. A held lock is retried for a bounded window (10 s,
 //!   Unit 1d) so a self-restart's successor outlives the predecessor's
-//!   teardown; after the window a second process exits non-zero with a
-//!   distinct error message.
+//!   teardown; after the window a second process exits 0 with a distinct
+//!   "lock held" line (TKT-a6e5c227: another live instance owns the dir, so
+//!   a supervisor's `SuccessfulExit:false` must not relaunch a duplicate).
+//!   The lock is an OS lock (flock(2) on Unix) on an open handle: process
+//!   death releases it, and a leftover `daemon.lock` FILE is never "held".
 //! - **Plugin policy**: managed instances register NO single-instance plugin
 //!   (R12 — the lock above replaces it, keyed by config dir instead of
 //!   app identity), NO updater (the vault instance is the sole update leader
@@ -190,6 +193,62 @@ where
                 std::thread::sleep(poll.min(window - elapsed));
             }
             Err(std::fs::TryLockError::Error(source)) => return Err(RetryFail::Io(source)),
+        }
+    }
+}
+
+/// Exit status of a managed instance whose config-dir lock is still held by
+/// another LIVE process after [`LOCK_RETRY_WINDOW`] (TKT-a6e5c227 ruling
+/// (a)). 0, so a supervisor with `KeepAlive {SuccessfulExit:false}` (launchd)
+/// or `Restart=on-failure` (systemd) does not relaunch a duplicate. "Held"
+/// can only mean a live holder: the lock is flock(2) on an open handle,
+/// released by the OS when the holder dies (even by SIGKILL).
+pub const EXIT_LOCK_HELD: i32 = 0;
+
+/// Exit status when the lock cannot be taken for an I/O reason (the lock
+/// path cannot be opened or locked). Unchanged: a failure, so a supervisor
+/// relaunches.
+pub const EXIT_LOCK_IO: i32 = 1;
+
+/// The distinct log line of the lock-held exit (stderr and the log).
+pub const LOCK_HELD_EXIT_LINE: &str =
+    "managed-instance lock held by another live process; exiting 0 (not a failure: that process owns this config dir, so no duplicate is relaunched)";
+
+/// The exit status `run()` uses for a lock refusal.
+pub fn lock_refusal_exit_code(e: &LockError) -> i32 {
+    match e {
+        LockError::Held { .. } => EXIT_LOCK_HELD,
+        LockError::Io { .. } => EXIT_LOCK_IO,
+    }
+}
+
+/// `run()`'s startup lock: [`acquire_daemon_lock`], or log and EXIT the
+/// process with [`lock_refusal_exit_code`] (0 for held, 1 for an I/O error).
+pub fn acquire_daemon_lock_or_exit(canonical_config_dir: &Path) -> DaemonLock {
+    acquire_daemon_lock_or_exit_with(canonical_config_dir, LOCK_RETRY_WINDOW, LOCK_RETRY_POLL)
+}
+
+/// [`acquire_daemon_lock_or_exit`] with an explicit retry window (tests).
+pub fn acquire_daemon_lock_or_exit_with(
+    canonical_config_dir: &Path,
+    window: Duration,
+    poll: Duration,
+) -> DaemonLock {
+    match acquire_daemon_lock_with(canonical_config_dir, window, poll) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let code = lock_refusal_exit_code(&e);
+            match &e {
+                LockError::Held { dir } => {
+                    tracing::warn!(config_dir = %dir.display(), "{LOCK_HELD_EXIT_LINE}");
+                    eprintln!("{LOCK_HELD_EXIT_LINE}: {}", dir.display());
+                }
+                LockError::Io { .. } => {
+                    tracing::error!("{e}");
+                    eprintln!("error: {e}");
+                }
+            }
+            std::process::exit(code);
         }
     }
 }
@@ -662,5 +721,154 @@ mod tests {
             plugin_policy(false).tray,
             "vault (non-managed) mode must keep building its tray icon"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // TKT-a6e5c227 ruling (a): lock held -> exit 0; a SIGKILLed holder
+    // leaves no "held" lock behind.
+    // ---------------------------------------------------------------------
+
+    const A6_DIR_ENV: &str = "MI_A6_CHILD_DIR";
+    const A6_READY_ENV: &str = "MI_A6_CHILD_READY";
+    /// The second-instance helper's exit status when it DID take the lock
+    /// (a clean relaunch); never a status `run()` uses.
+    const A6_ACQUIRED: i32 = 42;
+
+    /// Helper, NOT a test on its own: a second daemon instance running
+    /// `run()`'s real startup lock path (`acquire_daemon_lock_or_exit_with`,
+    /// short window). Refused -> that function exits the process itself.
+    #[test]
+    #[ignore = "TKT-a6e5c227 second-instance helper; spawned by the a6 tests"]
+    fn a6_child_second_instance() {
+        let Ok(dir) = std::env::var(A6_DIR_ENV) else {
+            return;
+        };
+        let lock = acquire_daemon_lock_or_exit_with(Path::new(&dir), SHORT_WINDOW, SHORT_POLL);
+        std::mem::forget(lock);
+        std::process::exit(A6_ACQUIRED);
+    }
+
+    /// Helper, NOT a test on its own: a holder that takes the lock, signals
+    /// ready and then waits to be killed.
+    #[test]
+    #[ignore = "TKT-a6e5c227 holder helper; spawned by a6_sigkilled_holder_leaves_no_held_lock"]
+    fn a6_child_holder_until_killed() {
+        let Ok(dir) = std::env::var(A6_DIR_ENV) else {
+            return;
+        };
+        let ready = std::env::var(A6_READY_ENV).unwrap();
+        let lock = acquire_daemon_lock_with(Path::new(&dir), Duration::ZERO, SHORT_POLL)
+            .expect("holder must take the free lock");
+        std::fs::write(&ready, b"held").unwrap();
+        std::thread::sleep(Duration::from_secs(120));
+        drop(lock);
+    }
+
+    fn a6_spawn(helper: &str, dir: &Path, ready: Option<&Path>) -> std::process::Child {
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args([
+            "--exact",
+            &format!("managed_instance::tests::{helper}"),
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env(A6_DIR_ENV, dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+        if let Some(r) = ready {
+            c.env(A6_READY_ENV, r);
+        }
+        c.spawn().expect("spawn helper process")
+    }
+
+    /// TKT-a6e5c227 (a): a LIVE holder makes a second instance exit 0, not
+    /// exit 1, with the distinct lock-held line; a lock I/O error still
+    /// exits 1. Mutation: `EXIT_LOCK_HELD = 1` (red: status 1).
+    #[test]
+    fn a6_live_holder_second_instance_exits_0() {
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        let _held = hold_lock_directly(&canon);
+        let out = a6_spawn("a6_child_second_instance", &canon, None)
+            .wait_with_output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "lock held by a live process must exit 0, got {:?}; stderr: {err}",
+            out.status
+        );
+        assert!(
+            err.contains(LOCK_HELD_EXIT_LINE),
+            "distinct line missing: {err}"
+        );
+
+        // An I/O error is still a failure (exit 1): the lock path is a dir.
+        let bad = TempDir::new().unwrap();
+        let bad = resolve_config_dir(bad.path()).unwrap();
+        std::fs::create_dir(bad.join(LOCK_FILENAME)).unwrap();
+        let out = a6_spawn("a6_child_second_instance", &bad, None)
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(EXIT_LOCK_IO), "{:?}", out.status);
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(LOCK_HELD_EXIT_LINE));
+    }
+
+    /// TKT-a6e5c227 (a): the holder is killed with SIGKILL (no destructor,
+    /// no cleanup). The `daemon.lock` FILE stays behind, yet it does not
+    /// count as held: a direct acquire succeeds at once, and a relaunched
+    /// second instance takes the lock (exit 42), it does not exit 0.
+    /// Mutation: treat an existing lock file as held (red).
+    #[cfg(unix)]
+    #[test]
+    fn a6_sigkilled_holder_leaves_no_held_lock() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        let ready = dir.path().join("holder-ready");
+        let mut holder = a6_spawn("a6_child_holder_until_killed", &canon, Some(&ready));
+        let t0 = Instant::now();
+        while !ready.exists() {
+            if t0.elapsed() > Duration::from_secs(30) {
+                let _ = holder.kill();
+                panic!("holder never signalled that it holds the lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Positive control: the live holder really holds it.
+        match acquire_daemon_lock_with(&canon, Duration::ZERO, SHORT_POLL) {
+            Err(LockError::Held { .. }) => {}
+            other => panic!("holder must hold the lock, got {other:?}"),
+        }
+        // kill -9 (std's Child::kill is SIGKILL on Unix; asserted below).
+        let rc = unsafe { libc::kill(holder.id() as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(rc, 0, "kill -9 failed");
+        let status = holder.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert!(
+            canon.join(LOCK_FILENAME).exists(),
+            "precondition: the lock FILE is left behind by the killed holder"
+        );
+
+        // A single relaunch takes the lock cleanly.
+        let out = a6_spawn("a6_child_second_instance", &canon, None)
+            .wait_with_output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(A6_ACQUIRED),
+            "relaunch after kill -9 must acquire, got {:?}; stderr: {err}",
+            out.status
+        );
+        assert!(
+            !err.contains(LOCK_HELD_EXIT_LINE),
+            "stale file read as held: {err}"
+        );
+        acquire_daemon_lock_with(&canon, Duration::ZERO, SHORT_POLL)
+            .expect("stale lock file must not count as held");
     }
 }
