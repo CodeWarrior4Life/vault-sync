@@ -408,6 +408,8 @@ pub enum StateHealthEvent {
     StateFsUnsupported { fs_type: String },
     /// A state replace committed but its directory sync failed (§3.4 W5-W7).
     DurableWriteUncertain { file: String },
+    /// The configured sync-state leaf is a symlink (TKT-98d5f42d F2).
+    StateDirSymlinked { sub: String },
 }
 
 impl StateHealthEvent {
@@ -417,6 +419,7 @@ impl StateHealthEvent {
             StateHealthEvent::StateDirCreated { .. } => "state_dir_created",
             StateHealthEvent::StateFsUnsupported { .. } => "state_fs_unsupported",
             StateHealthEvent::DurableWriteUncertain { .. } => "durable_write_uncertain",
+            StateHealthEvent::StateDirSymlinked { .. } => "state_dir_symlinked",
         }
     }
 }
@@ -464,6 +467,9 @@ pub fn raise_state_event(e: StateHealthEvent) -> bool {
         }
         StateHealthEvent::StateFsUnsupported { fs_type } => {
             tracing::warn!(sync_health_event = e.name(), fs_type = %fs_type, "sync_health: state_fs_unsupported")
+        }
+        StateHealthEvent::StateDirSymlinked { sub } => {
+            tracing::warn!(sync_health_event = e.name(), sub = %sub, "sync_health: state_dir_symlinked")
         }
         StateHealthEvent::DurableWriteUncertain { file } => {
             tracing::warn!(sync_health_event = e.name(), file = %file, "sync_health: durable_write_uncertain")

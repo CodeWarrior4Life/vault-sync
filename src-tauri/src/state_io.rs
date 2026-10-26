@@ -651,6 +651,11 @@ pub struct StateDir {
     /// `(st_dev, st_ino)` from `fstat` at bootstrap.
     id: (u64, u64),
     canon: CanonPath,
+    /// The name under which the held directory's REAL parent lists it
+    /// (TKT-98d5f42d F2): the leaf of the resolved canonical path. Equals
+    /// the canonical leaf unless the configured leaf is a symlink.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    real_leaf: String,
     scope: Scope,
     /// This boot created the leaf directory.
     created: bool,
@@ -832,15 +837,7 @@ impl StateDir {
             if self.dir.metadata()?.nlink() == 0 {
                 return Ok(false);
             }
-            let leaf = self
-                .canon
-                .0
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "held dir has no leaf name")
-                })?;
-            sys::parent_holds_leaf(self.dir.as_raw_fd(), leaf, self.id)
+            sys::parent_holds_leaf(self.dir.as_raw_fd(), &self.real_leaf, self.id)
         }
         #[cfg(not(unix))]
         {
@@ -1194,9 +1191,18 @@ impl StateDir {
         created: bool,
         latch: Arc<Latch>,
     ) -> StateDir {
+        // F2: the leaf the held dir's real parent lists, from the resolved
+        // canonical path (a symlinked configured leaf resolves to its
+        // target's name). Falls back to the canonical leaf.
+        let real_leaf = dunce::canonicalize(&canon)
+            .ok()
+            .and_then(|r| r.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .or_else(|| canon.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
         StateDir {
             #[cfg(unix)]
             dir: held,
+            real_leaf,
             #[cfg(not(unix))]
             path: held,
             id,
@@ -1590,6 +1596,15 @@ fn open_sync_state(ws: &Path, sub: &str, latch: &Arc<Latch>) -> io::Result<State
             if (cm.dev(), cm.ino()) == id {
                 let sd =
                     StateDir::new_held(cur, id, canon, Scope::SyncState, created, latch.clone());
+                // F2: a symlinked configured leaf is tolerated (custody
+                // follows it, D1) but surfaced: the held dir lives elsewhere.
+                if std::fs::symlink_metadata(&sd.canon.0).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    tracing::warn!(state_dir = %sd.display(None), real_leaf = %sd.real_leaf, "state_io: the configured sync-state leaf is a symlink");
+                    raise_state_event(StateHealthEvent::StateDirSymlinked {
+                        sub: sub.to_string(),
+                    });
+                }
                 if let Err(fs_type) = observe_fs(&sd.dir) {
                     tracing::warn!(state_dir = %sd.display(None), fs_type = %fs_type, "state_io: state dir is on an unsupported filesystem (observe-only in CS-2; CS-4 enforces)");
                     raise_state_event(StateHealthEvent::StateFsUnsupported { fs_type });
