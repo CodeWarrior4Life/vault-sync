@@ -11,6 +11,11 @@ jobs:
         os: [windows-latest, macos-latest, macos-14, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    # TKT-55d2b645 (PB-ADEB-TCS310): every leg here is a HOSTED runner. T-CS3-10 then judges its 100 ms sibling-stall
+    # bound on the median of 3 samples instead of one (hosted macos-latest measured 132.8 / 127.06 ms single samples).
+    # Local and self-hosted runs never set this and stay strict.
+    env:
+      VAULT_SYNC_CI_TIMING_SLACK: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

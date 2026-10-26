@@ -622,6 +622,44 @@ fn with_sibling_ticker<R>(rt: &tokio::runtime::Runtime, work: impl FnOnce() -> R
     (r, w)
 }
 
+/// T-CS3-10's sibling-stall bound: 100 ms, STRICT.
+const T_CS3_10_STALL_BOUND: Duration = Duration::from_millis(100);
+
+/// TKT-55d2b645 (PB-ADEB-TCS310): hosted CI only, and only when the job sets
+/// the EXPLICIT `VAULT_SYNC_CI_TIMING_SLACK=1` (never inferred from the OS or
+/// from GITHUB_ACTIONS): the bound applies to the MEDIAN of 3 measurements
+/// instead of a single one. Same 100 ms. Hosted macos-latest measured single
+/// samples of 132.8 ms and 127.06 ms (runs 40334613959, 40354604022): one
+/// scheduler hiccup in a 300 ms window. A real offload regression stalls the
+/// sibling for the whole 150 ms lock hold in EVERY sample, so the median still
+/// fails it. Local and self-hosted runs keep the strict single sample.
+fn t_cs3_10_ci_slack() -> bool {
+    std::env::var("VAULT_SYNC_CI_TIMING_SLACK").as_deref() == Ok("1")
+}
+
+/// Measure the sibling stall for `ctx` (1 sample strict, or 3 samples and the
+/// median under the CI allowance), print every sample uncaptured, and assert
+/// the bound. `measure` runs one context and returns its worst sibling gap.
+fn assert_sibling_bound(ctx: &str, mut measure: impl FnMut() -> Duration) {
+    let slack = t_cs3_10_ci_slack();
+    let mut samples: Vec<Duration> = (0..if slack { 3 } else { 1 }).map(|_| measure()).collect();
+    samples.sort();
+    let judged = samples[samples.len() / 2];
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "T-CS3-10 {ctx}: sibling worst-gap samples {samples:?} -> {} {judged:?} (bound {T_CS3_10_STALL_BOUND:?}, {})",
+            if slack { "median" } else { "value" },
+            if slack { "VAULT_SYNC_CI_TIMING_SLACK=1: median of 3" } else { "strict: one sample" }
+        );
+    }
+    assert!(
+        judged < T_CS3_10_STALL_BOUND,
+        "{ctx}: sibling stalled {judged:?} (samples {samples:?})"
+    );
+}
+
 /// T-CS3-10 (T-J3, gate C3 matrix): `append` + `drain` from each of the five
 /// contexts completes without panic within 2 s; on the multi-thread contexts
 /// a sibling task on the same runtime keeps ticking every 10 ms with no
@@ -643,44 +681,41 @@ fn t_cs3_10_offload_matrix() {
     owner.inner().set_hold_ms(150);
 
     // 1. A multi-thread runtime worker (the drain loop, the watcher task).
-    let o = owner.clone();
-    let started = Instant::now();
-    let (path, worst) = with_sibling_ticker(&rt, || {
-        rt.block_on(rt.spawn(async move { journal_ops(&o) }))
-            .unwrap()
+    assert_sibling_bound("worker", || {
+        let o = owner.clone();
+        let started = Instant::now();
+        let (path, worst) = with_sibling_ticker(&rt, || {
+            rt.block_on(rt.spawn(async move { journal_ops(&o) }))
+                .unwrap()
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(path, Some(OffloadPath::BlockInPlace), "worker");
+        worst
     });
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert_eq!(path, Some(OffloadPath::BlockInPlace), "worker");
-    assert!(
-        worst < Duration::from_millis(100),
-        "worker: sibling stalled {worst:?}"
-    );
 
     // 2. A spawn_blocking thread (V&R's hashing pool).
-    let o = owner.clone();
-    let (path, worst) = with_sibling_ticker(&rt, || {
-        rt.block_on(rt.spawn_blocking(move || journal_ops(&o)))
-            .unwrap()
+    assert_sibling_bound("spawn_blocking", || {
+        let o = owner.clone();
+        let (path, worst) = with_sibling_ticker(&rt, || {
+            rt.block_on(rt.spawn_blocking(move || journal_ops(&o)))
+                .unwrap()
+        });
+        assert_eq!(path, Some(OffloadPath::BlockInPlace), "spawn_blocking");
+        worst
     });
-    assert_eq!(path, Some(OffloadPath::BlockInPlace), "spawn_blocking");
-    assert!(
-        worst < Duration::from_millis(100),
-        "spawn_blocking: sibling stalled {worst:?}"
-    );
 
     // 3. A thread inside a multi-thread runtime's block_on (the CLI).
-    let o = owner.clone();
-    let h = rt.handle().clone();
-    let (path, worst) = with_sibling_ticker(&rt, || {
-        std::thread::spawn(move || h.block_on(async move { journal_ops(&o) }))
-            .join()
-            .unwrap()
+    assert_sibling_bound("block_on", || {
+        let o = owner.clone();
+        let h = rt.handle().clone();
+        let (path, worst) = with_sibling_ticker(&rt, || {
+            std::thread::spawn(move || h.block_on(async move { journal_ops(&o) }))
+                .join()
+                .unwrap()
+        });
+        assert_eq!(path, Some(OffloadPath::BlockInPlace), "block_on thread");
+        worst
     });
-    assert_eq!(path, Some(OffloadPath::BlockInPlace), "block_on thread");
-    assert!(
-        worst < Duration::from_millis(100),
-        "block_on: sibling stalled {worst:?}"
-    );
 
     // 4. A plain std::thread: inline.
     let o = owner.clone();
