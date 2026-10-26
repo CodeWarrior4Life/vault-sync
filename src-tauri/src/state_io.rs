@@ -216,6 +216,7 @@ impl Latch {
         self.set.load(Ordering::SeqCst)
     }
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
     pub(crate) fn errors_logged(&self) -> usize {
         self.errors_logged.load(Ordering::SeqCst)
     }
@@ -323,6 +324,7 @@ impl DirSeams {
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
+#[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
 pub(crate) mod seams {
     use std::cell::RefCell;
     use std::path::Path;
@@ -535,7 +537,7 @@ mod sys {
 
 /// Classify a Linux `statfs.f_type` magic. `Ok(name)` for the supported set
 /// (btrfs, ext4, xfs; tmpfs under `cfg(test)`), `Err(label)` otherwise.
-#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn classify_fs_magic(magic: u64) -> Result<&'static str, String> {
     match magic {
         0x9123_683E => Ok("btrfs"),
@@ -553,7 +555,9 @@ pub(crate) fn classify_fs_magic(magic: u64) -> Result<&'static str, String> {
 }
 
 /// Classify an Apple `statfs.f_fstypename`.
+// Read by observe_fs on Apple only; tests use it everywhere.
 #[cfg_attr(not(any(target_vendor = "apple", test)), allow(dead_code))]
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
 pub(crate) fn classify_fs_name(name: &str) -> Result<&'static str, String> {
     match name {
         "apfs" => Ok("apfs"),
@@ -1112,12 +1116,14 @@ impl StateDir {
 
     /// Test access to this dir's identity.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
     pub(crate) fn test_id(&self) -> (u64, u64) {
         self.id
     }
 
     /// Test access to this dir's latch.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
     pub(crate) fn test_latch(&self) -> &Latch {
         &self.latch
     }

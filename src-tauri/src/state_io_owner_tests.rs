@@ -2,6 +2,8 @@
 //! reader, driven through its real owner (journal, stores, ledger, marker,
 //! SSE cursor, retry ledger) against a held `StateDir`.
 #![allow(clippy::disallowed_methods)]
+// Most of these tests are unix-only; their helpers are unused on Windows.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::*;
 use crate::delete_ledger::DeleteLedger;

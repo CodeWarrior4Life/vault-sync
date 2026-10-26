@@ -581,6 +581,7 @@ impl ShadowStore {
 
     /// Test access to the flush generations (T-CS2-19).
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
     pub(crate) fn test_gen(&self) -> &FlushGen {
         &self.gen
     }

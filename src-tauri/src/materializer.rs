@@ -2293,6 +2293,7 @@ fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerE
 
 /// CS-2 T-CS2-11: a well-formed payload for `path` (as the server sends it).
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
 pub(crate) fn test_payload(path: &str, body: &str) -> NotePayload {
     use sha2::{Digest, Sha256};
     let fm = serde_json::json!({"title": "Test"});

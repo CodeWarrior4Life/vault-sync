@@ -2,6 +2,8 @@
 //! (journal, stores, ledger, marker, SSE, retry ledger) live beside their
 //! owners and in `state_io_owner_tests.rs`.
 #![allow(clippy::disallowed_methods)]
+// Most of these tests are unix-only; their helpers are unused on Windows.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::*;
 use std::sync::atomic::Ordering;
