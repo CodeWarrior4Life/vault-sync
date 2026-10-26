@@ -174,18 +174,39 @@ fn file_hashes(dir: &Path) -> BTreeMap<String, String> {
     m
 }
 
+/// Write `bytes` to `p` atomically: a temp file in the same dir, then a
+/// rename. A reader sees no file or the whole file, never a truncated one.
+fn write_atomic(p: &Path, bytes: &[u8]) {
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, bytes).unwrap();
+    std::fs::rename(&tmp, p).unwrap();
+}
+
 /// Move the held sync-state dir of `sub` away (custody lost) and record the
 /// moved dir's file hashes in `<ws>/moved-hashes.json`.
+///
+/// TKT-10da65a6: the daemon's (correct) exit(74) runs on another thread the
+/// moment the dir is gone. The old order (rename, then a truncate-and-write of
+/// the record) let that exit land between the truncate and the write, leaving
+/// an EMPTY record (`EOF while parsing a value`, ubuntu run 40350285736). So
+/// the record is written, whole and atomically, BEFORE the rename: a rename
+/// preserves contents, so the hashes of `d` are the moved dir's hashes. If a
+/// legitimate state write landed in the window between that hash and the
+/// rename (custody was still held), the record is replaced, again atomically,
+/// with the moved dir's hashes; any exit in between leaves the first, whole
+/// record. The assertion is unchanged: the moved dir stays byte-identical to
+/// the hashes at the loss.
 fn lose_custody(ws: &Path, sub: &str) {
     let d = state_dir_of(ws, sub);
     let moved = d.with_file_name("sync-state.moved");
+    let record = ws.join("moved-hashes.json");
+    let before = file_hashes(&d);
+    write_atomic(&record, serde_json::to_string(&before).unwrap().as_bytes());
     std::fs::rename(&d, &moved).unwrap();
-    let hashes = file_hashes(&moved);
-    std::fs::write(
-        ws.join("moved-hashes.json"),
-        serde_json::to_string(&hashes).unwrap(),
-    )
-    .unwrap();
+    let at_loss = file_hashes(&moved);
+    if at_loss != before {
+        write_atomic(&record, serde_json::to_string(&at_loss).unwrap().as_bytes());
+    }
     println!("CUSTODY_LOST");
 }
 
