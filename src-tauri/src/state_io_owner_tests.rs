@@ -97,7 +97,7 @@ fn fire_writers(fx: &Fixture, f: StateFile, custody_on: bool) {
     // until it gets a trigger here (T-CS2-1).
     match f {
         StateFile::PushJournal => {
-            let mut j = PushJournal::open(&fx.sd).unwrap();
+            let j = PushJournal::open(&fx.sd).unwrap();
             j.append(evt("a.md")).unwrap();
             j.append(evt("a.md")).unwrap();
             let cur = j.drain(1).unwrap().remove(0).1;
@@ -749,7 +749,7 @@ fn t_cs2_23_formats_and_modes() {
     use std::os::unix::fs::PermissionsExt;
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     let fx = fixture();
-    let mut j = PushJournal::open(&fx.sd).unwrap();
+    let j = PushJournal::open(&fx.sd).unwrap();
     assert_eq!(
         mode(&fx.d.join("push_journal.jsonl")),
         0o600,

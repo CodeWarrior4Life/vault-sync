@@ -169,15 +169,23 @@ pub async fn run_once(
 /// tick's failure is handled inside [`run_once`]. The `unsupported_ticks`
 /// counter lives for the loop's lifetime so the 405 streak is tracked across
 /// beats (log-once, quiet window, then periodic escalation).
-pub fn spawn(api: Arc<ApiClient>, health: Arc<SyncHealth>) {
+/// CS-3: returns its `JoinHandle` for the supervisor (class Optional).
+pub fn spawn(
+    api: Arc<ApiClient>,
+    health: Arc<SyncHealth>,
+) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
         let unsupported_ticks = AtomicU32::new(0);
-        let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        let mut tick = tokio::time::interval(crate::supervise::tick(Duration::from_secs(
+            HEARTBEAT_INTERVAL_SECS,
+        )));
         loop {
             tick.tick().await;
+            #[cfg(test)]
+            crate::faults::point("heartbeat");
             let _ = run_once(&api, &health, Utc::now(), &unsupported_ticks).await;
         }
-    });
+    })
 }
 
 #[cfg(test)]

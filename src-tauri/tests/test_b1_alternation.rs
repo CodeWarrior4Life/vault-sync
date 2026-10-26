@@ -28,13 +28,12 @@
 use mockito::Server;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 use vault_sync_daemon::api_client::{ApiClient, NotePayload};
 use vault_sync_daemon::echo_guard::EchoGuard;
+use vault_sync_daemon::journal_owner::JournalOwner;
 use vault_sync_daemon::materializer::{
     MaterializeOutcome, Materializer, MaterializerConfig, MaterializerMode, SkipReason,
 };
-use vault_sync_daemon::push_journal::PushJournal;
 use vault_sync_daemon::sync_shadow::ShadowStore;
 use vault_sync_daemon::verify_repair::{
     decide_direction, Direction, VerifyRepair, VerifyRepairConfig,
@@ -230,7 +229,8 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
     )
     .unwrap();
     let sd = reg.get("sub-b1-vr").unwrap();
-    let journal = Arc::new(Mutex::new(PushJournal::open(&sd).unwrap()));
+    // CS-3: the journal is the sub's one owner (claims the StateDir).
+    let journal = JournalOwner::open(&sd, "sub-b1-vr").unwrap();
     let mat = Materializer::new(
         vault.path().to_path_buf(),
         Some("shadow/".into()),
@@ -255,7 +255,7 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
 
     assert_eq!(report.modify_count, 0, "drift-but-Pull must NOT push");
     assert_eq!(report.add_count, 1, "the drift must resolve as one pull");
-    let j = journal.lock().await;
+    let j = journal.clone();
     assert_eq!(
         j.len(),
         0,

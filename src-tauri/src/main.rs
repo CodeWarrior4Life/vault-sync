@@ -1,6 +1,8 @@
 // CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
 // `cargo clippy` without `-D warnings` also fails (see clippy.toml).
 #![deny(clippy::disallowed_methods)]
+// CS-3 T-CS3-11: no std MutexGuard may be held across an `.await`.
+#![deny(clippy::await_holding_lock)]
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

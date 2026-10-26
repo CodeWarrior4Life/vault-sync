@@ -113,6 +113,13 @@ pub struct TrayState {
     /// indicator + the click-to-restart-and-apply menu item. Reset to None on
     /// the freshly-restarted (already-updated) binary.
     pub update_available: Option<String>,
+    /// CS-3 §3.1 (AR-1C-005): `config.toml` on disk no longer matches the
+    /// snapshot this daemon runs on. A notice, not a hold: nothing reloads
+    /// and nothing stops; a restart applies the new config.
+    pub config_pending_restart: bool,
+    /// CS-3 §3.1: the sha8 of the config snapshot this process runs on
+    /// (empty when unpaired).
+    pub config_sha8: String,
 }
 
 impl TrayState {
@@ -143,7 +150,14 @@ impl TrayState {
             last_recon_at: None,
             recon_in_progress: false,
             update_available: None,
+            config_pending_restart: false,
+            config_sha8: String::new(),
         }
+    }
+
+    /// CS-3 §3.1: set/clear the config-pending-restart notice flag.
+    pub fn set_config_pending_restart(&mut self, pending: bool) {
+        self.config_pending_restart = pending;
     }
 
     /// v0.4.12: record that a newer release is available/staged (Some(version))

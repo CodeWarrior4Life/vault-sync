@@ -25,7 +25,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -182,6 +182,36 @@ pub struct NotBootstrapped {
     pub why: String,
 }
 
+/// CS-3 D2 (I-OWN-4): the member is already claimed by an owner in this
+/// process. The claim is never released while the process runs (gate C8).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("state file {} is already owned in this process: {why}", file.name())]
+pub struct AlreadyOwned {
+    pub file: StateFile,
+    pub why: &'static str,
+}
+
+/// CS-3 D2: proof that the caller holds the one owner claim on a
+/// [`StateDir`]'s member. Not `Clone`; only [`StateDir::claim`] builds it,
+/// and [`crate::push_journal::PushJournal::open_claimed`] consumes it.
+#[derive(Debug)]
+pub struct OwnerClaim {
+    dir: usize,
+    file: StateFile,
+}
+
+impl OwnerClaim {
+    /// The claimed member.
+    pub fn file(&self) -> StateFile {
+        self.file
+    }
+    /// True iff this claim was taken on `sd` (pointer identity: one
+    /// registered `StateDir` per sub per process).
+    pub fn is_for(&self, sd: &Arc<StateDir>) -> bool {
+        self.dir == Arc::as_ptr(sd) as usize
+    }
+}
+
 /// Bootstrap failure for the whole registry (per-sub failures are recorded
 /// in the registry instead, so valid subs still bootstrap).
 #[derive(Debug, thiserror::Error)]
@@ -199,6 +229,10 @@ pub enum BootstrapError {
 pub(crate) struct Latch {
     set: AtomicBool,
     errors_logged: AtomicUsize,
+    /// CS-3 `exit_once` (gate C1): who claimed the process's own-initiative
+    /// exit (0 = nobody; 74, 70, or [`CLAIM_RESTART`]). One CAS per process,
+    /// shared by `ownership_lost` and every CS-3 leaver.
+    exit_claim: AtomicI32,
     #[cfg(test)]
     pub(crate) exits: Mutex<Vec<(i32, LossReason)>>,
 }
@@ -208,6 +242,7 @@ impl Latch {
         Latch {
             set: AtomicBool::new(false),
             errors_logged: AtomicUsize::new(0),
+            exit_claim: AtomicI32::new(0),
             #[cfg(test)]
             exits: Mutex::new(Vec::new()),
         }
@@ -227,6 +262,61 @@ fn process_latch() -> Arc<Latch> {
     L.get_or_init(|| Arc::new(Latch::new())).clone()
 }
 
+/// The `exit_once` claim value of an `app.restart()` leaver (the stall
+/// watchdog's PushStall/WatcherStale restart and the updater's staged-update
+/// restart). Not an exit status.
+pub const CLAIM_RESTART: i32 = -1;
+
+/// CS-3 `exit_once` (§3.5, gates C1 and C9): the one crate-level CAS latch
+/// that every way the process leaves on its own initiative claims. It lives
+/// on the CS-2 [`Latch`], so the mutation latch and the exit claim are one
+/// object: `ownership_lost` (74), the supervisor (70) and the two restart
+/// paths all go through it.
+#[derive(Clone)]
+pub struct ExitGate(Arc<Latch>);
+
+impl ExitGate {
+    /// The process gate (production).
+    pub fn process() -> Self {
+        ExitGate(process_latch())
+    }
+
+    /// Test gate bound to a test `StateDir`'s own latch.
+    #[cfg(test)]
+    pub(crate) fn for_dir(sd: &StateDir) -> Self {
+        ExitGate(sd.latch.clone())
+    }
+
+    /// A fresh, unshared gate (in-process unit tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        ExitGate(Arc::new(Latch::new()))
+    }
+
+    /// Claim the process exit for `code`. Exactly one caller per process
+    /// gets `true`; every later claimant gets `false` and must not leave.
+    pub fn try_claim(&self, code: i32) -> bool {
+        self.0
+            .exit_claim
+            .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Who claimed the exit, if anyone.
+    pub fn claimed(&self) -> Option<i32> {
+        match self.0.exit_claim.load(Ordering::SeqCst) {
+            0 => None,
+            c => Some(c),
+        }
+    }
+
+    /// The CS-2 mutation latch: set by `ownership_lost`; every mutating
+    /// state op then fails in `guard_mutation` without a syscall.
+    pub fn mutation_latched(&self) -> bool {
+        self.0.is_set()
+    }
+}
+
 type LogFlush = Box<dyn FnOnce() + Send>;
 
 fn log_flush_slot() -> &'static Mutex<Option<LogFlush>> {
@@ -241,7 +331,7 @@ pub fn register_log_flush(f: Box<dyn FnOnce() + Send>) {
 }
 
 /// Flush logs, waiting at most 250 ms (§3.3 step 4).
-fn flush_logs_bounded() {
+pub(crate) fn flush_logs_bounded() {
     let f = log_flush_slot()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -258,6 +348,10 @@ fn flush_logs_bounded() {
 
 /// §3.3: latch, log once, raise SyncHealth, flush logs, `exit(74)`. Only the
 /// first caller proceeds; the others return at once.
+///
+/// CS-3 gate C1 rule 1: the mutation latch is set FIRST and ALWAYS, even
+/// when `exit_once` was already claimed by a 70 or a restart; that claimant
+/// re-checks the latch right before it leaves and exits 74 instead (C9).
 fn ownership_lost(latch: &Latch, shown: &DisplayPath, id: (u64, u64), reason: &LossReason) {
     if latch
         .set
@@ -266,6 +360,9 @@ fn ownership_lost(latch: &Latch, shown: &DisplayPath, id: (u64, u64), reason: &L
     {
         return;
     }
+    // CS-3 §3.3: liveness goes Stopped before the exit, so a borrowed V&R
+    // stops before its next append.
+    crate::supervise::stop_process_liveness("ownership_lost");
     latch.errors_logged.fetch_add(1, Ordering::SeqCst);
     tracing::error!(
         state_dir = %shown,
@@ -278,6 +375,19 @@ fn ownership_lost(latch: &Latch, shown: &DisplayPath, id: (u64, u64), reason: &L
     raise_state_event(StateHealthEvent::OwnershipLost {
         reason: reason.as_str().to_string(),
     });
+    if latch
+        .exit_claim
+        .compare_exchange(0, EXIT_OWNERSHIP_LOST, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        // Another leaver holds `exit_once`. The latch is set, so nothing more
+        // is written; that leaver's pre-exit re-check (C9) exits 74.
+        tracing::error!(
+            claimed_by = latch.exit_claim.load(Ordering::SeqCst),
+            "state_io: OWNERSHIP LOST while another exit was already claimed; mutation latch set, the claimant exits 74"
+        );
+        return;
+    }
     flush_logs_bounded();
     exit_74(latch, reason);
 }
@@ -313,6 +423,8 @@ pub(crate) struct DirSeams {
     pub(crate) custody_disabled: AtomicBool,
     /// Every syscall-level operation, as `"<op>:<name>"`.
     pub(crate) recorder: Mutex<Vec<String>>,
+    /// CS-3 T-CS3-6/-7: `PushJournal` handles constructed on this dir.
+    pub(crate) journal_constructs: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -660,6 +772,9 @@ pub struct StateDir {
     /// This boot created the leaf directory.
     created: bool,
     dir_sync_pending: AtomicBool,
+    /// CS-3 D2: the `PushJournal` owner bit. Set once by [`StateDir::claim`];
+    /// no code path clears it while the process runs (gate C8).
+    journal_claimed: AtomicBool,
     latch: Arc<Latch>,
     #[cfg(test)]
     pub(crate) seams: DirSeams,
@@ -718,6 +833,43 @@ impl StateAppender<'_> {
 }
 
 impl StateDir {
+    /// CS-3 D2 (I-OWN-4): take the one owner claim on a claimable member
+    /// (only `PushJournal` in CS-3). A second claim on the same `StateDir`
+    /// returns [`AlreadyOwned`]; the bit is never cleared (gate C8), so a
+    /// re-claim after every owner was dropped is refused too.
+    pub fn claim(&self, f: StateFile) -> Result<OwnerClaim, AlreadyOwned> {
+        let bit = match f {
+            StateFile::PushJournal => &self.journal_claimed,
+            _ => {
+                return Err(AlreadyOwned {
+                    file: f,
+                    why: "not a claimable member",
+                })
+            }
+        };
+        if bit
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(AlreadyOwned {
+                file: f,
+                why: "the owner claim was already taken (never released while the process runs)",
+            });
+        }
+        Ok(OwnerClaim {
+            dir: self as *const StateDir as usize,
+            file: f,
+        })
+    }
+
+    /// True iff the member's owner claim has been taken in this process.
+    pub fn is_claimed(&self, f: StateFile) -> bool {
+        match f {
+            StateFile::PushJournal => self.journal_claimed.load(Ordering::SeqCst),
+            _ => false,
+        }
+    }
+
     fn check_scope(&self, f: StateFile) -> Result<(), NotCommitted> {
         if f.scope() != self.scope {
             // A programming error. The debug assert is compiled out of test
@@ -1052,6 +1204,10 @@ impl StateDir {
     fn open_or_create(&self, name: &str, rdwr: bool) -> Result<(File, bool), NotCommitted> {
         #[cfg(test)]
         self.seams.rec("openat", name);
+        // CS-3 T-CS3-9: tag the write-capable opens, so a read-only diagnosis
+        // can be told apart from a write open of the same name.
+        #[cfg(test)]
+        self.seams.rec("open_w", name);
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -1210,6 +1366,7 @@ impl StateDir {
             scope,
             created,
             dir_sync_pending: AtomicBool::new(false),
+            journal_claimed: AtomicBool::new(false),
             latch,
             #[cfg(test)]
             seams: DirSeams::default(),
@@ -1754,15 +1911,18 @@ pub fn custody_tick(dirs: &[Arc<StateDir>]) {
     }
 }
 
-/// Spawn the 5 s custody tick over the process registry.
-pub fn spawn_custody_tick() {
+/// Spawn the 5 s custody tick over the process registry. CS-3: returns its
+/// `JoinHandle` for the supervisor (class Required); it never ends by design.
+pub fn spawn_custody_tick() -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut tick = tokio::time::interval(crate::supervise::tick(Duration::from_secs(5)));
         loop {
             tick.tick().await;
+            #[cfg(test)]
+            crate::faults::point("custody_tick");
             custody_tick(&registry().all());
         }
-    });
+    })
 }
 
 /// Test hooks reachable from other modules' tests (T-CS2-3).

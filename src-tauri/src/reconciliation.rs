@@ -54,10 +54,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-
 use crate::api_client::ApiClient;
 use crate::config::SyncRoot;
+use crate::journal_owner::JournalOwner;
 use crate::push_journal::PushJournal;
 use crate::tray_state::SharedTrayState;
 use crate::verify_repair::{
@@ -139,7 +138,7 @@ impl EnvReader for MapEnv {
 pub async fn run_reconciliation_pass(
     vault_root: PathBuf,
     api: Arc<ApiClient>,
-    journal: Arc<Mutex<PushJournal>>,
+    journal: Arc<JournalOwner>,
     device_id: String,
     tray_state: SharedTrayState,
     materializer: crate::materializer::Materializer,
@@ -295,7 +294,16 @@ pub async fn seed_shadow_from_server_if_empty(
     // (RASP fence + excludes + extension gate applied identically). VerifyRepair
     // requires a journal handle but seeding NEVER enqueues a push, so it gets
     // the in-memory scratch sink (CS-2 D5, W16): no temp dir, no file.
-    let scratch_journal = Arc::new(Mutex::new(PushJournal::scratch()));
+    // CS-3 J8 (D12): the scratch sink wrapped as an owner; gate C10 keeps
+    // exactly this one `PushJournal::scratch()` call and this one
+    // `JournalOwner::wrap_scratch` call.
+    let scratch_journal = match JournalOwner::wrap_scratch(PushJournal::scratch()) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "reconciliation: D9 seed scratch journal refused; skipping seed");
+            return 0;
+        }
+    };
     #[cfg(test)]
     let _rec = seed_test::Recorder(Arc::clone(&scratch_journal));
     let vr = VerifyRepair::new(
@@ -413,69 +421,32 @@ pub fn recon_pairs_from_sync_roots(
         .collect()
 }
 
-/// B4 (Nexus Sync): spawn one reconciliation backstop task per sync_root.
+/// Spawn the long-running recon task. Returns the JoinHandle for the
+/// supervisor (CS-3 class RootDegrading). On kill switch the task logs once
+/// and returns [`TaskEnd::Disabled`](crate::supervise::TaskEnd::Disabled).
 ///
-/// Each task is fully independent: it has its own `vault_root`
-/// (= `sync_root.path`), its own `device_id` (= effective subscriber_id for
-/// that root), and shares the API client + push_journal + tray_state with the
-/// rest of the pipeline.
-///
-/// Returns the `JoinHandle`s so the caller can keep them alive (the inner
-/// loops run for the daemon's lifetime). An empty `sync_roots` slice yields
-/// an empty Vec — no tasks spawned, no reconciliation runs.
-///
-/// On the kill switch being set, each individual task logs once and returns
-/// immediately (the kill switch is global across all roots, per env var).
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_reconciliation_tasks_for_roots(
-    sync_roots: &[SyncRoot],
-    fallback_subscriber_id: &str,
-    api: Arc<ApiClient>,
-    journal: Arc<Mutex<PushJournal>>,
-    tray_state: SharedTrayState,
-    materializer: crate::materializer::Materializer,
-    shadow: Arc<crate::sync_shadow::ShadowStore>,
-) -> Vec<tauri::async_runtime::JoinHandle<()>> {
-    recon_pairs_from_sync_roots(sync_roots, fallback_subscriber_id)
-        .into_iter()
-        .map(|(root_path, subscriber_id)| {
-            spawn_reconciliation_task(
-                root_path,
-                Arc::clone(&api),
-                Arc::clone(&journal),
-                subscriber_id,
-                tray_state.clone(),
-                materializer.clone(),
-                shadow.clone(),
-            )
-        })
-        .collect()
-}
-
-/// Spawn the long-running recon task. Returns the JoinHandle so the
-/// caller can keep it alive (the inner loop runs for the daemon's
-/// lifetime). On kill switch the task logs once and returns immediately.
-///
-/// Called from `lib::spawn_push_pipeline`'s success path after the
-/// push_journal handle is open.
+/// Called from the boot task's per-root pipeline with the root's journal
+/// owner.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reconciliation_task(
     vault_root: PathBuf,
     api: Arc<ApiClient>,
-    journal: Arc<Mutex<PushJournal>>,
+    journal: Arc<JournalOwner>,
     device_id: String,
     tray_state: SharedTrayState,
     materializer: crate::materializer::Materializer,
     shadow: Arc<crate::sync_shadow::ShadowStore>,
-) -> tauri::async_runtime::JoinHandle<()> {
+) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
+        #[cfg(test)]
+        crate::faults::point("reconcile_backstop");
         let env = ProcessEnv;
         if is_disabled(&env) {
             tracing::info!(
                 "reconciliation: disabled via {} env var; backstop task exiting",
                 ENV_DISABLE
             );
-            return;
+            return crate::supervise::TaskEnd::Disabled;
         }
         let interval = read_interval(&env);
         tracing::info!(
@@ -519,17 +490,16 @@ pub fn spawn_reconciliation_task(
 pub(crate) mod seed_test {
     use std::cell::Cell;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     thread_local! {
         pub(crate) static LAST_SCRATCH_APPENDS: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
-    pub(crate) struct Recorder(pub(crate) Arc<Mutex<crate::push_journal::PushJournal>>);
+    pub(crate) struct Recorder(pub(crate) Arc<crate::journal_owner::JournalOwner>);
 
     impl Drop for Recorder {
         fn drop(&mut self) {
-            let n = self.0.try_lock().map(|j| j.scratch_appends()).ok();
+            let n = Some(self.0.inner().scratch_appends());
             LAST_SCRATCH_APPENDS.with(|c| c.set(n));
         }
     }

@@ -1,24 +1,23 @@
 //! Tauri command surface invoked from the JS front-end + the tray menu.
 //!
-//! Currently only hosts `verify_repair_run`, the owner-invokable "Verify and
-//! repair all files…" sweep wired to `tray.rs`. The command resolves config +
-//! token + workspace + journal exactly the way `lib.rs::spawn_sse_consumer`
-//! does, then delegates to `verify_repair::VerifyRepair::run`.
+//! Hosts `verify_repair_run`, the owner-invokable "Verify and repair all
+//! files…" sweep wired to `tray.rs`. CS-3 §3.4: it borrows the daemon's own
+//! handles (journal owner, shadow, per-root API client) from the published
+//! `SyncHandles` and delegates to `verify_repair::VerifyRepair::run`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tauri::Manager;
 
-use crate::api_client::ApiClient;
 use crate::config;
 use crate::conflict_stash::parse_conflict_filename;
-use crate::push_journal::PushJournal;
-use crate::state_io::StateDir;
-use crate::token_store;
-use crate::verify_repair::{VerifyRepair, VerifyRepairConfig, VerifyRepairReport};
+use crate::ownership::{hash_config_file, DiskConfig};
+use crate::sync_handles::{BorrowRefused, LiveBorrow, SyncHandlesSlot};
+use crate::verify_repair::{
+    VerifyRepair, VerifyRepairConfig, VerifyRepairError, VerifyRepairReport,
+};
 
 /// v0.3 mandate §3 — `<workspace_root>/.lattice-runtime/<subscriber_slug>/`
 /// is the canonical "daemon state OUT of vault" anchor. Mirrors the resolver
@@ -33,119 +32,78 @@ pub(crate) fn resolve_workspace_root() -> PathBuf {
         .join("Nexus")
 }
 
-/// Build a `VerifyRepair` from explicit inputs (config + token + workspace +
-/// vault_root). Pulled out of the `#[tauri::command]` for unit-testability
-/// — the command itself does the env-driven I/O (config load + keyring read)
-/// and delegates here. Mirrors the `pair` / `pair_inner` split in `pairing.rs`.
-///
-/// B4 (Nexus Sync): `vault_root` is now a separate parameter so callers can
-/// pass each `sync_root.path` independently, running one VerifyRepair per
-/// root instead of a single global `cfg.vaults_root` sweep.
-///
-/// `subscriber_id` is also separated from `cfg.subscriber_id` so the caller
-/// can supply the *effective* per-root subscriber (resolved via
-/// `effective_subscriber_id(&root, &cfg)` in `lib.rs`).
-pub(crate) fn build_verify_repair(
-    cfg: &config::Config,
-    token: &str,
-    sd: &Arc<StateDir>,
-    vault_root: PathBuf,
-    subscriber_id: &str,
-) -> Result<(VerifyRepair, Arc<Mutex<PushJournal>>), String> {
-    let api = ApiClient::new(&cfg.nexus_url, token).map_err(|e| e.to_string())?;
-    let api_arc = Arc::new(api);
-
-    // W15 (CS-2): no create_dir_all; the journal lives in the held dir.
-    let journal = PushJournal::open(sd).map_err(|e| e.to_string())?;
-    let journal_arc = Arc::new(Mutex::new(journal));
-
-    // fix/reconcile-server-wins-shadow: wire the (read-only) shadow store so the
-    // owner-invoked "Verify and repair" makes the SAME push-vs-pull direction
-    // call the periodic backstop does. Loads the SAME on-disk shadow file the
-    // daemon maintains (path → last-synced server hash); reads the persisted
-    // (last-flushed, ≤30s old) state. With shadow but no materializer, the manual
-    // button correctly PUSHES genuine local edits (shadow == server) and DETECTS
-    // (counts) stale locals — their server-wins PULL is executed by the periodic
-    // backstop (which is wired with a materializer). This avoids constructing a
-    // materializer here without the server health snapshot (mode/shadow_path),
-    // which could write to the wrong place.
-    let shadow = crate::sync_shadow::ShadowStore::load(sd);
-
-    let vr = VerifyRepair::new(
-        vault_root,
-        api_arc,
-        journal_arc.clone(),
-        subscriber_id.to_string(),
-        VerifyRepairConfig::default(),
-    )
-    .with_shadow(shadow);
-    Ok((vr, journal_arc))
-}
-
-/// CS-2 (W15): the held state dir of a bootstrapped subscriber. Any other
-/// subscriber gets an error string; nothing is created (the registry never
-/// creates).
-pub(crate) fn verify_repair_state_dir(subscriber_id: &str) -> Result<Arc<StateDir>, String> {
-    crate::state_io::registry()
-        .get(subscriber_id)
-        .map_err(|e| format!("verify and repair: {e}"))
-}
-
-/// Owner-invokable Tauri command. Loads the daemon config, pulls the token
-/// from the keyring (or file fallback), then runs `VerifyRepair::run`
-/// end-to-end for EACH sync_root (B4 per-root semantics).
-///
-/// Reports from individual roots are merged into a single aggregate
-/// `VerifyRepairReport` so the tray click handler can render a combined
-/// summary dialog. On any failure the `String` body is logged + surfaced to
-/// the dialog ("Verify and repair failed: …"); the daemon does NOT crash.
-///
-/// B4 (Nexus Sync): iterates `cfg.sync_roots` so every configured root gets
-/// its own manifest walk + reconcile call. Each root uses its effective
-/// subscriber_id (root's own when set, else top-level fallback) as the
-/// `device_id` passed to the server reconcile endpoint, ensuring the server
-/// maps the manifest to the correct subscriber namespace.
+/// Owner-invokable Tauri command, also called directly by the tray
+/// (`tray.rs`). CS-3 §3.4 (D6, P10): reads the managed
+/// [`SyncHandlesSlot`] and borrows; it never loads config, loads a token,
+/// opens a journal or loads a shadow.
 #[tauri::command]
-pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
-    let cfg_path = config::default_config_path();
-    let cfg = config::Config::load_from(&cfg_path).map_err(|e| e.to_string())?;
+pub async fn verify_repair_run(app: tauri::AppHandle) -> Result<VerifyRepairReport, String> {
+    let slot = app
+        .try_state::<SyncHandlesSlot>()
+        .map(|s| s.inner().clone());
+    verify_repair_with(slot.as_ref()).await
+}
 
-    let token = match token_store::load(&cfg.subscriber_id).map_err(|e| e.to_string())? {
-        Some(t) => t,
-        None => {
-            return Err(format!(
-                "no token in keyring or file fallback for subscriber_id={}; re-pair required",
-                cfg.subscriber_id
-            ));
+fn refused(r: BorrowRefused) -> String {
+    format!("Verify and repair refused: {r}")
+}
+
+/// CS-3 §3.4 preflight, all or nothing (D9, D10): a fresh hash of the
+/// config file compared with the snapshot's, then a borrow of EVERY root in
+/// snapshot order. Any refusal returns before any manifest walk or server
+/// request.
+pub fn verify_repair_preflight(
+    slot: Option<&SyncHandlesSlot>,
+) -> Result<Vec<LiveBorrow>, BorrowRefused> {
+    let Some(handles) = slot.and_then(|s| s.get()) else {
+        return Err(BorrowRefused::NotPublished {
+            why: "unpaired, booting, or boot aborted".to_string(),
+        });
+    };
+    let snap = handles.snapshot();
+    match hash_config_file(snap.cfg_path()) {
+        DiskConfig::Hash(h) if &h == snap.config_sha256() => {}
+        DiskConfig::Unreadable(why) => return Err(BorrowRefused::ConfigUnreadable { why }),
+        other => {
+            return Err(BorrowRefused::ConfigChanged {
+                snapshot_sha8: snap.sha8(),
+                disk_sha8: other.sha8(),
+            })
         }
-    };
+    }
+    snap.roots().iter().map(|r| handles.borrow(r.key)).collect()
+}
 
-    // B4: iterate sync_roots, running one VerifyRepair per root.
-    // Derive the per-root (vault_root, subscriber_id) pairs using the
-    // same priority logic as lib::effective_subscriber_id.
-    let pairs = crate::verify_repair::roots_to_reconcile_pairs(&cfg.sync_roots, &cfg.subscriber_id);
-
-    // If sync_roots is empty (should not happen post-B1 back-compat, but
-    // handle gracefully), fall back to the legacy single-root path using
-    // cfg.vaults_root + cfg.subscriber_id.
-    let pairs = if pairs.is_empty() {
-        vec![(cfg.vaults_root.clone(), cfg.subscriber_id.clone())]
-    } else {
-        pairs
-    };
-
-    // Aggregate all per-root reports into one combined report.
+/// The V&R body: preflight, then one `VerifyRepair` per root with the
+/// root's borrowed journal owner, the daemon's own top-level shadow (the
+/// real `vault_folders` keying) and the root pipeline's own `ApiClient`
+/// (closes TKT-b6d8c4ba facets 1-3). Reports merge into one.
+pub async fn verify_repair_with(
+    slot: Option<&SyncHandlesSlot>,
+) -> Result<VerifyRepairReport, String> {
+    let borrows = verify_repair_preflight(slot).map_err(refused)?;
     let mut combined = VerifyRepairReport::default();
-    for (vault_root, subscriber_id) in &pairs {
-        // CS-2 (W15): only a bootstrapped subscriber has a state dir; any
-        // other returns an error string and writes nothing.
-        let sd = verify_repair_state_dir(subscriber_id)?;
-        let (vr, _journal) =
-            build_verify_repair(&cfg, &token, &sd, vault_root.clone(), subscriber_id)?;
-        let report = vr.run().await.map_err(|e| e.to_string())?;
+    let roots = borrows.len();
+    for (done, b) in borrows.into_iter().enumerate() {
+        let vr = VerifyRepair::new(
+            b.root.path.clone(),
+            b.api,
+            b.journal,
+            b.root.eff_sub.clone(),
+            VerifyRepairConfig::default(),
+        )
+        .with_shadow(b.shadow)
+        .with_liveness(b.live);
+        let report = match vr.run().await {
+            Ok(r) => r,
+            Err(VerifyRepairError::Stopped(_)) => {
+                return Err(format!("daemon stopping: no changes after {done} roots"));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         tracing::info!(
-            root = %vault_root.display(),
-            subscriber_id = %subscriber_id,
+            root = %b.root.path.display(),
+            subscriber_id = %b.root.eff_sub,
             files_scanned = report.files_scanned,
             modify_count = report.modify_count,
             add_count = report.add_count,
@@ -153,7 +111,6 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
             elapsed_ms = report.elapsed_ms,
             "verify_repair_run: per-root complete"
         );
-        // Accumulate into combined report.
         combined.files_scanned += report.files_scanned;
         combined.files_in_sync += report.files_in_sync;
         combined.modify_count += report.modify_count;
@@ -172,7 +129,7 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
         combined.elapsed_ms += report.elapsed_ms;
     }
     tracing::info!(
-        roots_scanned = pairs.len(),
+        roots_scanned = roots,
         files_scanned = combined.files_scanned,
         modify_count = combined.modify_count,
         add_count = combined.add_count,
@@ -333,18 +290,54 @@ mod tests {
         }
     }
 
-    /// T-CS2-12 (Verify-and-repair half): a subscriber that was not
-    /// bootstrapped gets an error string and nothing is created.
-    #[test]
-    fn t_cs2_12_verify_repair_unbootstrapped_sub_errors() {
-        let e = verify_repair_state_dir("sub-never-bootstrapped").unwrap_err();
-        assert!(e.contains("not bootstrapped"), "{e}");
+    /// T-CS2-12 (Verify-and-repair half), CS-3 form: with no published
+    /// handles V&R refuses `NotPublished` and touches no state dir (it never
+    /// resolves a sub's dir itself any more).
+    #[tokio::test]
+    async fn t_cs2_12_verify_repair_unpublished_refuses() {
+        let e = verify_repair_with(None).await.unwrap_err();
+        assert!(e.contains("Verify and repair refused"), "{e}");
+        assert!(e.contains("sync is not running"), "{e}");
+        let empty = SyncHandlesSlot::default();
+        let e = verify_repair_with(Some(&empty)).await.unwrap_err();
+        assert!(e.contains("sync is not running"), "{e}");
     }
 
-    fn sd_for(ws: &TempDir, sub: &str) -> Arc<StateDir> {
+    fn sd_for(ws: &TempDir, sub: &str) -> std::sync::Arc<crate::state_io::StateDir> {
         let d = ws.path().join(sub);
         fs::create_dir_all(&d).unwrap();
-        StateDir::for_test(&d)
+        crate::state_io::StateDir::for_test(&d)
+    }
+
+    /// The pre-CS-3 per-root V&R construction, kept as a test helper so the
+    /// per-root walk and aggregate tests keep exercising `VerifyRepair`.
+    fn build_verify_repair(
+        cfg: &Config,
+        token: &str,
+        sd: &std::sync::Arc<crate::state_io::StateDir>,
+        vault_root: PathBuf,
+        subscriber_id: &str,
+    ) -> Result<
+        (
+            VerifyRepair,
+            std::sync::Arc<crate::journal_owner::JournalOwner>,
+        ),
+        String,
+    > {
+        let api = std::sync::Arc::new(
+            crate::api_client::ApiClient::new(&cfg.nexus_url, token).map_err(|e| e.to_string())?,
+        );
+        let journal = crate::journal_owner::test_owner(sd);
+        let shadow = crate::sync_shadow::ShadowStore::load(sd);
+        let vr = VerifyRepair::new(
+            vault_root,
+            api,
+            journal.clone(),
+            subscriber_id.to_string(),
+            VerifyRepairConfig::default(),
+        )
+        .with_shadow(shadow);
+        Ok((vr, journal))
     }
 
     #[test]

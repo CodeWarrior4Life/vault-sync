@@ -78,12 +78,12 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::api_client::{ApiClient, ApiError, ReconcileBatchItem, ReconcileBatchRequest};
+use crate::journal_owner::JournalOwner;
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 
@@ -245,6 +245,10 @@ pub enum VerifyRepairError {
     Api(#[from] ApiError),
     #[error("journal: {0}")]
     Journal(#[from] JournalError),
+    /// CS-3 §3.4: the daemon's liveness went `Stopped` mid-run; nothing more
+    /// is appended (appends already committed stay: at-least-once).
+    #[error("daemon stopping: {0}")]
+    Stopped(String),
 }
 
 /// Direction the reconcile backstop should take for one drift/match/missing
@@ -382,7 +386,8 @@ pub fn classify_pull_outcome(
 pub struct VerifyRepair {
     vault_root: PathBuf,
     api: Arc<ApiClient>,
-    journal: Arc<Mutex<PushJournal>>,
+    /// CS-3 (J3, J7): the root's one journal owner, borrowed.
+    journal: Arc<JournalOwner>,
     device_id: String,
     config: VerifyRepairConfig,
     /// Optional materializer used to EXECUTE server-wins PULLs in the drift
@@ -398,13 +403,23 @@ pub struct VerifyRepair {
     /// state across daemon restarts (not just implicit next-scan retry). `None`
     /// in unit tests that don't exercise persistence.
     retry_ledger: Option<Arc<crate::retry_ledger::RetryLedger>>,
+    /// CS-3 §3.4: the borrowed process liveness. Checked after the manifest
+    /// walk, before the reconcile request and immediately before the single
+    /// `append_batch`. `None` (the backstop, tests): never stops.
+    live: Option<tokio::sync::watch::Receiver<crate::supervise::Liveness>>,
 }
+
+/// CS-3 T-CS3-16: V&R reached its park seam (between the manifest walk and
+/// the reconcile request).
+#[cfg(test)]
+pub(crate) static VR_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl VerifyRepair {
     pub fn new(
         vault_root: PathBuf,
         api: Arc<ApiClient>,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
         device_id: String,
         config: VerifyRepairConfig,
     ) -> Self {
@@ -417,7 +432,28 @@ impl VerifyRepair {
             materializer: None,
             shadow: None,
             retry_ledger: None,
+            live: None,
         }
+    }
+
+    /// CS-3 §3.4: watch the daemon's liveness (the V&R borrow).
+    pub fn with_liveness(
+        mut self,
+        live: tokio::sync::watch::Receiver<crate::supervise::Liveness>,
+    ) -> Self {
+        self.live = Some(live);
+        self
+    }
+
+    /// `Err(Stopped)` once liveness reads `Stopped`.
+    fn check_live(&self, at: &'static str) -> Result<(), VerifyRepairError> {
+        if let Some(rx) = &self.live {
+            if let crate::supervise::Liveness::Stopped { reason } = &*rx.borrow() {
+                tracing::warn!(at, reason = %reason, "verify_repair: daemon stopping; no further changes");
+                return Err(VerifyRepairError::Stopped(reason.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Builder: attach the durable retry ledger (AR-003).
@@ -449,6 +485,19 @@ impl VerifyRepair {
 
         let manifest = self.build_local_manifest_parallel(&mut report).await?;
         report.files_scanned = manifest.len();
+        self.check_live("after_manifest_walk")?;
+        #[cfg(test)]
+        if crate::faults::armed("vr.park_until_stopped") {
+            if let Some(rx) = &self.live {
+                let mut rx = rx.clone();
+                VR_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    rx.wait_for(|l| *l != crate::supervise::Liveness::Live),
+                )
+                .await;
+            }
+        }
 
         // v0.4.10: send the manifest as the reconcile-batch payload —
         // `{paths:[{path, fs_hash}]}`, where fs_hash is the raw-file SHA-256 we
@@ -463,6 +512,7 @@ impl VerifyRepair {
 
         let req = ReconcileBatchRequest { paths: api_paths };
 
+        self.check_live("before_reconcile_request")?;
         let deltas = match self.api.reconcile_batch(&req).await {
             Ok(r) => r.deltas,
             Err(e) => {
@@ -583,8 +633,8 @@ impl VerifyRepair {
         // sees that not everything queued.
         if !pending_pushes.is_empty() {
             let queued = pending_pushes.len();
-            let mut j = self.journal.lock().await;
-            match j.append_batch(pending_pushes) {
+            self.check_live("before_append_batch")?;
+            match self.journal.append_batch(pending_pushes) {
                 Ok(written) if written < queued => {
                     tracing::warn!(
                         written,
@@ -1178,10 +1228,10 @@ mod tests {
         p
     }
 
-    async fn make_journal() -> (TempDir, Arc<Mutex<PushJournal>>) {
+    async fn make_journal() -> (TempDir, Arc<JournalOwner>) {
         let dir = TempDir::new().unwrap();
-        let j = PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap();
-        (dir, Arc::new(Mutex::new(j)))
+        let j = crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(dir.path()));
+        (dir, j)
     }
 
     fn make_api(url: &str) -> Arc<ApiClient> {
@@ -1192,7 +1242,7 @@ mod tests {
         vault_root: PathBuf,
         url: &str,
         config: VerifyRepairConfig,
-    ) -> (VerifyRepair, Arc<Mutex<PushJournal>>, TempDir) {
+    ) -> (VerifyRepair, Arc<JournalOwner>, TempDir) {
         let (jdir, journal) = make_journal().await;
         let api = make_api(url);
         let vr = VerifyRepair::new(vault_root, api, journal.clone(), "dev-test".into(), config);
@@ -1586,12 +1636,12 @@ mod tests {
         assert_eq!(report.modify_count, 1);
         assert_eq!(report.modify_paths_sample, vec!["notes/a.md"]);
 
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 1);
         let batch = {
             // We hold the mutex via `j`; downgrade by dropping.
             drop(j);
-            let mut j2 = journal.lock().await;
+            let j2 = journal.clone();
             j2.drain(10).unwrap()
         };
         assert_eq!(batch.len(), 1);
@@ -1635,7 +1685,7 @@ mod tests {
         assert!(local_path.exists());
         // The local-only file is pushed up.
         let batch = {
-            let mut j = journal.lock().await;
+            let j = journal.clone();
             assert_eq!(j.len(), 1);
             j.drain(10).unwrap()
         };
@@ -1671,7 +1721,7 @@ mod tests {
         assert_eq!(report.modify_count, 0);
         assert_eq!(report.add_count, 0);
         assert_eq!(report.files_in_sync, 1);
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 0);
     }
 
@@ -1942,7 +1992,7 @@ mod tests {
         assert_eq!(report.modify_count, 0, "stale local must NOT push");
         assert_eq!(report.add_count, 1, "stale local must pull (server-wins)");
         assert_eq!(report.add_paths_sample, vec!["notes/a.md"]);
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 0, "no push journaled for a pull");
         drop(j);
         // Local file now holds the server canonical bytes.

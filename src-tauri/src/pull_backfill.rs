@@ -289,11 +289,11 @@ pub async fn run_pull_backfill_guarded(
 /// Spawn the long-lived pull-backfill task: wait a short settle window, run an
 /// immediate pass to close the existing gap, then re-run every interval. Honors
 /// the kill switch. One task per `(api, materializer)` pair — the caller spawns
-/// one per sync_root, mirroring `spawn_reconciliation_tasks_for_roots`.
+/// one per sync_root. CS-3: returns its `JoinHandle` (class Optional).
 pub fn spawn_pull_backfill_task(
     api: Arc<ApiClient>,
     materializer: Materializer,
-) -> tauri::async_runtime::JoinHandle<()> {
+) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     spawn_pull_backfill_task_guarded(api, materializer, None)
 }
 
@@ -303,12 +303,12 @@ pub fn spawn_pull_backfill_task_guarded(
     api: Arc<ApiClient>,
     materializer: Materializer,
     ledger: Option<crate::delete_ledger::DeleteLedger>,
-) -> tauri::async_runtime::JoinHandle<()> {
+) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
         let env = ProcessEnv;
         if is_backfill_disabled(&env) {
             tracing::info!("pull_backfill: disabled via {ENV_DISABLE_BACKFILL}; not arming");
-            return;
+            return crate::supervise::TaskEnd::Disabled;
         }
         let interval = read_backfill_interval(&env);
         tracing::info!(

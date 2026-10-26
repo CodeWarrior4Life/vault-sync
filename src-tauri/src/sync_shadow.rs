@@ -589,17 +589,22 @@ impl ShadowStore {
     /// Spawn a background loop that flushes every 30s for the process lifetime.
     /// The immediate first `interval` tick is consumed so we don't flush at t=0
     /// (nothing recorded yet). A flush error is logged and the loop continues.
-    pub fn spawn_periodic_flush(self: Arc<Self>) {
+    /// CS-3: returns its `JoinHandle` for the supervisor (class Required).
+    pub fn spawn_periodic_flush(
+        self: Arc<Self>,
+    ) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
         tauri::async_runtime::spawn(async move {
-            let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+            let mut tick = tokio::time::interval(crate::supervise::tick(FLUSH_INTERVAL));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
+                #[cfg(test)]
+                crate::faults::point("flush_shadow");
                 if let Err(e) = self.flush() {
                     warn!(error = %e, "shadow store: periodic flush failed (will retry)");
                 }
             }
-        });
+        })
     }
 }
 
