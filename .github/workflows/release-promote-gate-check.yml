@@ -1,0 +1,60 @@
+name: release-promote-gate-check
+
+# Proves the release.yml placement gate (PR #39, 2026-10-26) on every PR/push:
+# 1. statically: release.yml's "Promote on Nexus" step carries EXACTLY the
+#    opt-in `if:` expression (a removed or edited gate fails this job);
+# 2. at runtime: a step guarded by the IDENTICAL expression shows as "skipped"
+#    while the repo variable VAULT_SYNC_AUTOPROMOTE is not 'true', and the final
+#    step prints that outcome.
+# release.yml itself only runs on v* tags, so this is the pre-tag proof.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-promote-gate-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-promote-gate-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  promote-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static - release.yml promote step carries the exact opt-in gate
+        run: |
+          python3 - <<'EOF'
+          import sys, yaml
+          wf = yaml.safe_load(open(".github/workflows/release.yml"))
+          steps = [s for job in wf["jobs"].values() for s in job.get("steps", [])
+                   if s.get("name", "").startswith("Promote on Nexus")]
+          # Built from two halves: a literal dollar-brace-brace inside run: is
+          # evaluated by Actions BEFORE python sees it (the first run read 'false').
+          want = "$" + "{{ vars.VAULT_SYNC_AUTOPROMOTE == 'true' }}"
+          print(f"promote steps found: {len(steps)}")
+          for s in steps:
+              print(f"if: {s.get('if')!r}")
+          if len(steps) != 1 or steps[0].get("if") != want:
+              sys.exit(f"FAIL: expected exactly one promote step with if: {want!r}")
+          print("OK: promote step is gated on the opt-in variable")
+          EOF
+      - name: Runtime - identical expression (must be SKIPPED unless opted in)
+        id: gate
+        if: ${{ vars.VAULT_SYNC_AUTOPROMOTE == 'true' }}
+        run: echo "VAULT_SYNC_AUTOPROMOTE is 'true' - a tag run WOULD promote"
+      - name: Report gate outcome
+        if: ${{ always() }}
+        run: |
+          echo "runtime gate step outcome: '${{ steps.gate.outcome }}'"
+          echo "VAULT_SYNC_AUTOPROMOTE seen as: '${{ vars.VAULT_SYNC_AUTOPROMOTE }}'"
+          if [ "${{ steps.gate.outcome }}" = "skipped" ]; then
+            echo "PROOF: promote would be SKIPPED on a tag run with this variable state"
+          else
+            echo "NOTE: promote WOULD RUN on a tag run (opt-in is set)"
+          fi
