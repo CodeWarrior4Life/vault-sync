@@ -694,6 +694,7 @@ impl PushJournal {
 
     /// CS-3 T-CS3-17: make every `append` fail with `CapacityExceeded`.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // the Linux storm tests
     pub(crate) fn set_force_capacity(&self, on: bool) {
         self.faults.force_capacity.store(on, Ordering::SeqCst);
     }
