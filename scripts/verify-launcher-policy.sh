@@ -47,6 +47,9 @@
 #   With no --systemd-show and no --agent-dir, live mode: systemd (via
 #   systemctl) everywhere except macOS, launchd on macOS.
 #
+# Warning (gate C3 on #29; never changes the exit code): Restart=always passes the 70/74 contract but is flagged,
+# because it also restarts after a clean exit 0; the O5 target is on-failure + RestartPreventExitStatus=78.
+#
 # Informational (TKT-a6e5c227; never changes the exit code): one line names
 # the supervisor's VAULT_SYNC_SUPERVISED value (systemd Environment=, launchd
 # EnvironmentVariables). Only `1` makes a daemon restart exit 70 for the
@@ -272,6 +275,14 @@ check_systemd() {
       echo "systemd $name: Restart=${restart:-<unset>} does not restart on exit 70 and 74" >&2
       return 11 ;;
   esac
+  # Gate C3 on #29 (O5): Restart=always is a WARNING, not a failure. It does restart on 70 and 74 (the contract
+  # this script grades), but it ALSO restarts after a clean exit 0 (a tray quit, a lock-held duplicate), which the
+  # exit-0 semantics rely on NOT happening. The O5 target is Restart=on-failure + RestartPreventExitStatus=78.
+  # No new exit code (gate C10 keeps the table); link runs Restart=always today, so failing it would block that
+  # host's check before the O5 switch is placed.
+  if [ "$restart" = always ]; then
+    echo "systemd $name: WARNING Restart=always also restarts after a clean exit 0 (tray quit, lock-held duplicate); the O5 target is Restart=on-failure with RestartPreventExitStatus=78" >&2
+  fi
   local s n
   for s in $success; do
     if n=$(status_number "$s"); then

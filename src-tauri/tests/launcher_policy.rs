@@ -754,3 +754,36 @@ fn a6_proposed_trinity_plist_passes_policy() {
     assert!(text.contains("VAULT_SYNC_SUPERVISED=1 "), "{text}");
     assert!(text.contains("program=/Applications/Nexus Vault Sync.app/Contents/MacOS/vault-sync-daemon arg1=--silent"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// #29 gate C3: Restart=always is warned (exit code unchanged); on-failure is not
+// ---------------------------------------------------------------------------
+
+/// `Restart=always` restarts on 70 and 74, so it still passes (0), but it also
+/// restarts after a clean exit 0, so the check prints a WARNING naming the O5
+/// target. `Restart=on-failure` prints no warning. Mutation: drop the warning
+/// (red on the `always` leg).
+#[test]
+fn c3_restart_always_is_warned_not_failed() {
+    let t = tempfile::TempDir::new().unwrap();
+    let got = run(
+        Mode::Systemd(&show(t.path(), "always", "78", "", DAEMON)),
+        None,
+    );
+    assert!(
+        got.1
+            .contains("WARNING Restart=always also restarts after a clean exit 0")
+            && got
+                .1
+                .contains("Restart=on-failure with RestartPreventExitStatus=78"),
+        "{}",
+        got.1
+    );
+    expect("Restart=always", got, 0);
+    let got = run(
+        Mode::Systemd(&show(t.path(), "on-failure", "78", "", DAEMON)),
+        None,
+    );
+    assert!(!got.1.contains("WARNING Restart=always"), "{}", got.1);
+    expect("Restart=on-failure", got, 0);
+}
