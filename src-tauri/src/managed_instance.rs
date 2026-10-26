@@ -149,22 +149,43 @@ pub fn acquire_daemon_lock_with(
             path: path.clone(),
             source,
         })?;
+    match retry_try_lock(|| file.try_lock(), window, poll) {
+        Ok(()) => Ok(DaemonLock { _file: file, path }),
+        Err(RetryFail::Held) => Err(LockError::Held {
+            dir: canonical_config_dir.to_path_buf(),
+        }),
+        Err(RetryFail::Io(source)) => Err(LockError::Io { path, source }),
+    }
+}
+
+/// Why [`retry_try_lock`] gave up.
+#[derive(Debug)]
+enum RetryFail {
+    /// Still `WouldBlock` when the window elapsed.
+    Held,
+    /// A real lock error: returned on the FIRST occurrence, never retried.
+    Io(io::Error),
+}
+
+/// The bounded retry, separated from the file so a test can inject a real
+/// `TryLockError::Error` (which cannot be provoked reliably on a real file).
+/// Retries ONLY on `WouldBlock`, for at most `window` (monotonic clock).
+fn retry_try_lock<F>(mut try_lock: F, window: Duration, poll: Duration) -> Result<(), RetryFail>
+where
+    F: FnMut() -> Result<(), std::fs::TryLockError>,
+{
     let started = Instant::now();
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(DaemonLock { _file: file, path }),
+        match try_lock() {
+            Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
                 if elapsed >= window {
-                    return Err(LockError::Held {
-                        dir: canonical_config_dir.to_path_buf(),
-                    });
+                    return Err(RetryFail::Held);
                 }
                 std::thread::sleep(poll.min(window - elapsed));
             }
-            Err(std::fs::TryLockError::Error(source)) => {
-                return Err(LockError::Io { path, source });
-            }
+            Err(std::fs::TryLockError::Error(source)) => return Err(RetryFail::Io(source)),
         }
     }
 }
@@ -257,6 +278,53 @@ pub(crate) mod test_env {
 
 #[cfg(test)]
 mod tests {
+
+    /// T-1d-3b (gate C1, kills M3): a genuine `TryLockError::Error` is returned on
+    /// the FIRST call and never retried, even with a long window.
+    #[test]
+    fn t_1d_3b_try_lock_error_is_never_retried() {
+        let mut calls = 0u32;
+        let started = Instant::now();
+        let r = retry_try_lock(
+            || {
+                calls += 1;
+                Err(std::fs::TryLockError::Error(io::Error::other(
+                    "injected lock error",
+                )))
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(r, Err(RetryFail::Io(_))),
+            "a real lock error must surface as Io"
+        );
+        assert_eq!(calls, 1, "a real lock error must not be retried");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "no sleep on a real lock error"
+        );
+    }
+
+    /// The same seam still retries WouldBlock and then succeeds.
+    #[test]
+    fn t_1d_3c_wouldblock_then_ok_via_seam() {
+        let mut calls = 0u32;
+        let r = retry_try_lock(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(std::fs::TryLockError::WouldBlock)
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        );
+        assert!(r.is_ok());
+        assert_eq!(calls, 3);
+    }
     use super::*;
     use std::sync::mpsc;
     use tempfile::TempDir;
