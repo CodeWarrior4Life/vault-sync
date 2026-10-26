@@ -40,7 +40,7 @@ use std::io::{self, BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::state_io::{NotCommitted, StateDir, StateFile};
+use crate::state_io::{DisplayPath, NotCommitted, StateDir, StateFile};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -476,6 +476,12 @@ impl PushJournal {
         #[cfg(not(test))]
         debug_assert!(false, "append to the scratch journal (CS-2 C10)");
         true
+    }
+
+    /// Operator text naming the journal file (CS-2: the journal's
+    /// `DisplayPath`; `None` for the scratch sink).
+    pub fn display(&self) -> Option<DisplayPath> {
+        self.sd().map(|sd| sd.display(Some(StateFile::PushJournal)))
     }
 
     fn sd(&self) -> Option<&Arc<StateDir>> {

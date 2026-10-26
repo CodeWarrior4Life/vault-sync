@@ -1200,11 +1200,15 @@ impl FileWatcher {
                                 tracing::warn!("file_watcher: journal append failed: {e}");
                             }
                             if self.record_append_capacity(is_capacity) {
+                                let journal_dir = j
+                                    .display()
+                                    .map(|d| d.to_string())
+                                    .unwrap_or_else(|| "<scratch>".to_string());
                                 tracing::error!(
                                     target: "vault_sync_daemon::file_watcher",
                                     threshold = STORM_BREAKER_THRESHOLD,
                                     error = %e,
-                                    "STORM CIRCUIT-BREAKER TRIPPED: {STORM_BREAKER_THRESHOLD} consecutive journal CapacityExceeded failures — the push journal is wedged at its 100MB cap and the file_watcher would hot-spin (the S489/S490 storm: 85% CPU, 290MB logs, all new events dropped). HALTING the file_watcher to prevent CPU/log runaway. Likely cause: a reconciliation/materializer backlog filled the journal faster than push_client could drain it. Investigate sync-state/push_journal.jsonl (at cap?) and push_client drain health (server reachable? reconciliation HTTP errors?). The watcher will NOT auto-resume — restart the daemon after the backlog clears."
+                                    "STORM CIRCUIT-BREAKER TRIPPED: {STORM_BREAKER_THRESHOLD} consecutive journal CapacityExceeded failures — the push journal is wedged at its 100MB cap and the file_watcher would hot-spin (the S489/S490 storm: 85% CPU, 290MB logs, all new events dropped). HALTING the file_watcher to prevent CPU/log runaway. Likely cause: a reconciliation/materializer backlog filled the journal faster than push_client could drain it. Investigate the push journal (state dir: {journal_dir}; at cap?) and push_client drain health (server reachable? reconciliation HTTP errors?). The watcher will NOT auto-resume — restart the daemon after the backlog clears."
                                 );
                             }
                         }
@@ -1237,7 +1241,7 @@ impl FileWatcher {
                 let (n, marker) = match self.burst.lock() {
                     Ok(mut b) => (
                         b.note_suppressed(),
-                        b.pause_marker_path().map(|p| p.display().to_string()),
+                        b.pause_marker_display().map(|p| p.to_string()),
                     ),
                     Err(_) => (1, None),
                 };

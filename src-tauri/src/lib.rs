@@ -1105,12 +1105,6 @@ fn spawn_push_pipeline(
             return None;
         }
     };
-    // TEMPORARY within the CS-2 commit series: the ledger and marker owners
-    // move onto the StateDir in the next commit.
-    let journal_path = std::path::PathBuf::from(
-        sd.display(Some(state_io::StateFile::PushJournal))
-            .to_string(),
-    );
     // P0 2026-08-26 second pass: the suppressed-delete ledger lives beside the
     // journal in sync-state. It stops pull_backfill resurrecting a suppressed
     // delete (MEASURED: created=275 at 2026-08-26T00:05:37, which silently
@@ -1118,12 +1112,7 @@ fn spawn_push_pipeline(
     // clears the pause marker, so an intentional bulk delete can complete.
     // Constructed here because both the backfill task and the file watcher
     // need the same ledger.
-    let delete_ledger = crate::delete_ledger::DeleteLedger::new(
-        journal_path
-            .parent()
-            .map(|d| d.join("delete-burst-SUPPRESSED"))
-            .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-SUPPRESSED")),
-    );
+    let delete_ledger = crate::delete_ledger::DeleteLedger::new(&sd);
     let delete_ledger_for_backfill = delete_ledger.clone();
     let journal = match push_journal::PushJournal::open(&sd) {
         Ok(mut j) => {
@@ -1394,13 +1383,9 @@ fn spawn_push_pipeline(
     // action, which is unreachable on the headless `cage` daemon — so the valve
     // was a one-way trapdoor that silently discarded every delete for 13.5h
     // after it tripped. Removing this file is now the headless resume.
-    let burst_marker = journal_path
-        .parent()
-        .map(|d| d.join("delete-burst-PAUSED"))
-        .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-PAUSED"));
     let burst = Arc::new(std::sync::Mutex::new(
         redflag::DeleteBurstDetector::new(20, std::time::Duration::from_secs(30))
-            .with_pause_marker(burst_marker),
+            .with_pause_marker(&sd),
     ));
     // S484: expose the valve so the tray "Resume delete propagation" action
     // can reset it in place (no daemon restart). Register before `burst` is

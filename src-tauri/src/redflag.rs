@@ -24,6 +24,8 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::state_io::{DisplayPath, StateDir, StateFile};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Sentinel filename, matched case-sensitively at the vault root.
@@ -105,7 +107,8 @@ pub struct DeleteBurstDetector {
     /// not retire notes, left no tombstone, and never reached peers. A valve
     /// whose only reset is unreachable in the real deployment is a one-way
     /// trapdoor, not a safety valve.
-    pause_marker: Option<PathBuf>,
+    /// CS-2: the held state dir; the marker is `StateFile::PauseMarker`.
+    pause_marker: Option<Arc<StateDir>>,
     /// Deletes suppressed since the valve latched. Drives throttled WARN
     /// logging at the call site so a latched valve can never again be silent.
     suppressed: u64,
@@ -160,26 +163,27 @@ impl DeleteBurstDetector {
 
     /// Attach the filesystem pause marker (P0 2026-08-26). The production
     /// wire-up always sets this; `new()` alone keeps the marker-less behavior.
-    pub fn with_pause_marker(mut self, marker: impl Into<PathBuf>) -> Self {
-        self.pause_marker = Some(marker.into());
+    pub fn with_pause_marker(mut self, sd: &Arc<StateDir>) -> Self {
+        self.pause_marker = Some(Arc::clone(sd));
         self
     }
 
-    /// Path of the pause marker, if one is configured.
-    pub fn pause_marker_path(&self) -> Option<&PathBuf> {
-        self.pause_marker.as_ref()
+    /// Operator text naming the pause marker, if one is configured
+    /// (replaces `pause_marker_path`; CS-2 gate C7).
+    pub fn pause_marker_display(&self) -> Option<DisplayPath> {
+        self.pause_marker
+            .as_ref()
+            .map(|sd| sd.display(Some(StateFile::PauseMarker)))
     }
 
     /// Write the pause marker, explaining in the file itself how to resume.
     /// The marker is advisory: a write failure must never block the valve from
     /// latching, so errors are logged and swallowed.
     fn write_pause_marker(&self) {
-        let Some(path) = &self.pause_marker else {
+        let Some(sd) = &self.pause_marker else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let shown = sd.display(Some(StateFile::PauseMarker));
         let body = format!(
             "vault-sync: OUTBOUND DELETE PROPAGATION IS PAUSED\n\
              \n\
@@ -199,11 +203,12 @@ impl DeleteBurstDetector {
              valve were intentional.\n",
             self.threshold,
             self.window.as_secs(),
-            path.display(),
+            shown,
         );
-        if let Err(e) = std::fs::write(path, body) {
+        // W10 (CS-2): atomic replace through the held dir; no create_dir_all.
+        if let Err(e) = sd.replace_atomic(StateFile::PauseMarker, body.as_bytes()) {
             tracing::warn!(
-                path = %path.display(),
+                marker = %shown,
                 error = %e,
                 "redflag: could not write delete-burst pause marker; headless resume unavailable — use the tray action or restart the daemon"
             );
@@ -212,8 +217,9 @@ impl DeleteBurstDetector {
 
     /// Remove the pause marker (best-effort; absence is the desired state).
     fn clear_pause_marker(&self) {
-        if let Some(path) = &self.pause_marker {
-            let _ = std::fs::remove_file(path);
+        // W11 (CS-2): unlinkat through the held dir.
+        if let Some(sd) = &self.pause_marker {
+            let _ = sd.remove(StateFile::PauseMarker);
         }
     }
 
@@ -227,10 +233,12 @@ impl DeleteBurstDetector {
         if !self.paused {
             return false;
         }
-        let Some(path) = self.pause_marker.clone() else {
+        let Some(sd) = self.pause_marker.clone() else {
             return false;
         };
-        if path.exists() {
+        // Through the held dir fd (fstatat, NOFOLLOW). Any Err keeps the
+        // valve latched.
+        if sd.exists(StateFile::PauseMarker).unwrap_or(true) {
             return false;
         }
         self.events.clear();
@@ -399,6 +407,7 @@ pub fn resume_delete_propagation() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::fs;
@@ -673,9 +682,9 @@ mod tests {
     // and the daemon runs headless under `cage`.
 
     fn tripped_with_marker(dir: &TempDir) -> (DeleteBurstDetector, PathBuf) {
-        let marker = dir.path().join("sync-state").join("delete-burst-PAUSED");
-        let mut det =
-            DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&marker);
+        let marker = dir.path().join("delete-burst-PAUSED");
+        let mut det = DeleteBurstDetector::new(20, Duration::from_secs(30))
+            .with_pause_marker(&crate::state_io::StateDir::for_test(dir.path()));
         let now = Instant::now();
         for i in 0..20 {
             det.record_delete_at(now + Duration::from_millis(i));
@@ -804,9 +813,8 @@ mod tests {
         // valve protects again, so an accidental mass delete inside a grace
         // period is still capped.
         let dir = TempDir::new().unwrap();
-        let marker = dir.path().join("m");
-        let mut det =
-            DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&marker);
+        let mut det = DeleteBurstDetector::new(20, Duration::from_secs(30))
+            .with_pause_marker(&crate::state_io::StateDir::for_test(dir.path()));
         let t = Instant::now();
         det.grant_grace_at(t);
         assert_eq!(det.grace_remaining(), GRACE_DELETES);
@@ -835,7 +843,7 @@ mod tests {
         // Consent is time-bounded: an unused grace window must not sit open.
         let dir = TempDir::new().unwrap();
         let mut det = DeleteBurstDetector::new(20, Duration::from_secs(30))
-            .with_pause_marker(dir.path().join("m"));
+            .with_pause_marker(&crate::state_io::StateDir::for_test(dir.path()));
         let t = Instant::now();
         det.grant_grace_at(t);
         // One delete AFTER the window closes must not consume grace; it goes

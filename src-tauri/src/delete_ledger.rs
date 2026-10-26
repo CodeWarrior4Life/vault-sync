@@ -46,8 +46,9 @@
 //! rather than corrupting the set.
 
 use std::collections::BTreeSet;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::state_io::{DisplayPath, StateDir, StateFile};
 
 /// Hard cap on ledger size so a runaway suppression cannot grow a file without
 /// bound. Well above any plausible intentional bulk delete (the incident that
@@ -55,64 +56,68 @@ use std::path::{Path, PathBuf};
 pub const LEDGER_MAX_PATHS: usize = 100_000;
 
 /// Append-only record of deletes the burst valve suppressed.
+///
+/// CS-2 (TKT-23091e72): holds `(Arc<StateDir>, StateFile::DeleteLedger)`,
+/// never a path; every read and write goes through the held directory fd.
 #[derive(Debug, Clone)]
 pub struct DeleteLedger {
-    path: PathBuf,
+    sd: Arc<StateDir>,
 }
 
 impl DeleteLedger {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+    pub fn new(sd: &Arc<StateDir>) -> Self {
+        Self { sd: Arc::clone(sd) }
     }
 
-    pub fn file_path(&self) -> &Path {
-        &self.path
+    /// Operator text naming the ledger file (replaces `file_path`).
+    pub fn display(&self) -> DisplayPath {
+        self.sd.display(Some(StateFile::DeleteLedger))
     }
 
     /// Record one suppressed delete. Best-effort: a write failure is logged by
     /// the caller's context and must never block the valve from suppressing.
-    /// Returns true iff the line was written.
+    /// Returns true iff the line was written (W8: ONE `write_all` of a
+    /// pre-built buffer through the held dir, which narrows torn lines).
     pub fn record(&self, rel: &str) -> bool {
         if rel.is_empty() || rel.contains('\n') {
             return false;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         // Cheap bound check: only pay the read when the file is already large.
-        if let Ok(md) = std::fs::metadata(&self.path) {
-            // ~4 KiB average path budget is generous; this is a runaway guard,
-            // not an exact count.
-            if md.len() > (LEDGER_MAX_PATHS as u64) * 512 {
+        // ~4 KiB average path budget is generous; this is a runaway guard,
+        // not an exact count.
+        if let Ok(Some(len)) = self.sd.len(StateFile::DeleteLedger) {
+            if len > (LEDGER_MAX_PATHS as u64) * 512 {
                 return false;
             }
         }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            Ok(mut f) => writeln!(f, "{rel}").is_ok(),
-            Err(_) => false,
-        }
+        let mut line = String::with_capacity(rel.len() + 1);
+        line.push_str(rel);
+        line.push('\n');
+        self.sd
+            .append(StateFile::DeleteLedger, line.as_bytes())
+            .is_ok()
     }
 
     /// The distinct suppressed paths. Order-independent and de-duplicated, so
-    /// repeated suppression of one path replays once.
+    /// repeated suppression of one path replays once. Read through the held
+    /// dir fd, so a moved-and-recreated tree cannot present an empty guard
+    /// set (CS-2 §2.2).
     pub fn paths(&self) -> BTreeSet<String> {
-        let Ok(body) = std::fs::read_to_string(&self.path) else {
-            return BTreeSet::new();
-        };
-        parse_ledger(&body)
+        match self.sd.read(StateFile::DeleteLedger) {
+            Ok(Some(bytes)) => parse_ledger(&String::from_utf8_lossy(&bytes)),
+            _ => BTreeSet::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.paths().is_empty()
     }
 
-    /// Drop the ledger entirely (after a successful replay).
+    /// Drop the ledger entirely (after a successful replay). W9.
     pub fn clear(&self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(e) = self.sd.remove(StateFile::DeleteLedger) {
+            tracing::warn!(error = %e, "delete ledger: clear failed");
+        }
     }
 }
 
@@ -127,12 +132,13 @@ pub fn parse_ledger(body: &str) -> BTreeSet<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     fn ledger(dir: &TempDir) -> DeleteLedger {
-        DeleteLedger::new(dir.path().join("sync-state").join("suppressed.txt"))
+        DeleteLedger::new(&StateDir::for_test(dir.path()))
     }
 
     #[test]
@@ -185,7 +191,7 @@ mod tests {
     #[test]
     fn missing_file_reads_as_empty_not_error() {
         let d = TempDir::new().unwrap();
-        let l = DeleteLedger::new(d.path().join("nope").join("absent.txt"));
+        let l = DeleteLedger::new(&StateDir::for_test(d.path()));
         assert!(l.paths().is_empty());
         assert!(l.is_empty());
     }
