@@ -1,9 +1,12 @@
 // CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
 // `cargo clippy` without `-D warnings` also fails (see clippy.toml).
 #![deny(clippy::disallowed_methods)]
+// CS-3 T-CS3-11: no std MutexGuard may be held across an `.await`.
+#![deny(clippy::await_holding_lock)]
 pub mod api_client;
 pub mod append_merge;
 pub mod base_seq_store;
+pub mod boot;
 pub mod canonical_form;
 pub mod commands;
 pub mod commands_vaults;
@@ -12,14 +15,18 @@ pub mod conflict_stash;
 pub mod delete_ledger;
 pub mod durable_file;
 pub mod echo_guard;
+#[cfg(test)]
+pub(crate) mod faults;
 pub mod file_watcher;
 pub mod heartbeat;
 pub mod integrity_check;
+pub mod journal_owner;
 pub mod keyring;
 pub mod managed_instance;
 pub mod materializer;
 pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
+pub mod ownership;
 pub mod pairing;
 pub mod pull_backfill;
 pub mod push_client;
@@ -32,6 +39,8 @@ pub mod retry_ledger;
 pub mod scope;
 pub mod sse;
 pub mod state_io;
+pub mod supervise;
+pub mod sync_handles;
 pub mod sync_health;
 pub mod sync_shadow;
 pub mod token_store;
@@ -39,7 +48,7 @@ pub mod tray;
 pub mod tray_state;
 pub mod verify_repair;
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -203,71 +212,56 @@ pub fn run() {
             }
 
             let cfg_path = config::default_config_path();
-            let shared_state = {
-                // S477: display the configured vaults_root verbatim (the
-                // watch root), NOT vaults_root + vault_name. The daemon
-                // watches the entire vaults_root and the wizard surfaces
-                // that scope so users can see what's actually being
-                // synced.
-                // CS-1 §4: the first config load runs the best-effort startup
-                // maintenance (dead-pid temp sweep + dir fsync) on the config
-                // and token dirs first.
-                let (sub, url, vault_dir) = match config::load_at_startup(&cfg_path) {
-                    Ok(c) => (c.subscriber_id, c.nexus_url, c.vaults_root.clone()),
-                    Err(_) => (String::new(), String::new(), std::path::PathBuf::new()),
-                };
-                std::sync::Arc::new(std::sync::RwLock::new(tray_state::TrayState::new(
-                    sub, url, vault_dir,
-                )))
-            };
+            // CS-3 §3.1 / §3.5 steps 2-4: the ONE config read of this process
+            // (CS-1 startup maintenance first). The tray state, the launch
+            // gate, the CS-2 bootstrap set S, the pipelines and V&R all read
+            // this one immutable snapshot (replaces loads L1-L4).
+            let boot_cfg = ownership::BootConfig::load_at_startup(&cfg_path);
+            let boot::StartupPlan {
+                snapshot,
+                tray: shared_state,
+                decision,
+            } = boot::plan_startup(&boot_cfg);
 
             tray::build_tray(app.handle(), shared_state.clone())?;
 
-            // S484: silent auto-update — checks on startup AND every 6h, using
-            // the pubkey + endpoints in tauri.conf.json. Runs detached so a slow
-            // /admin/api/vault-sync/releases/<platform>/latest never blocks SSE
-            // startup; on a staged update it restarts the daemon when idle.
-            // Failures log only — never block the daemon.
-            // Managed-instance mode: NOT spawned — the updater plugin is not
-            // registered (policy.updater=false) and managed instances never
-            // self-update; the vault instance is the sole update leader.
+            // CS-3 D6: the handles slot is managed ALWAYS (even unpaired), so
+            // V&R can refuse with NotPublished instead of failing to resolve.
+            let slot = sync_handles::SyncHandlesSlot::default();
+            app.manage(slot.clone());
+            // CS-3 §3.5: the process supervisor (liveness, exit_once).
+            let sup = supervise::Supervisor::process(std::sync::Arc::new(boot::TauriHost(
+                app.handle().clone(),
+            )));
+
+            // S484: silent auto-update — checks on startup AND every 5 min,
+            // using the pubkey + endpoints in tauri.conf.json. On a staged
+            // update it restarts the daemon when idle, through `exit_once`
+            // (CS-3 r2.1: the same class of non-74 leaver as the watchdog).
+            // Managed-instance mode: NOT spawned (the vault instance is the
+            // sole update leader).
             if policy.updater {
-                spawn_updater_check(app.handle().clone(), shared_state.clone());
+                spawn_updater_check(&sup, app.handle().clone(), shared_state.clone());
             }
 
-            // v0.3: app has no meaning without a valid pairing. Open the
-            // wizard window automatically if config OR token is missing.
-            // Cyril S473: *"the dialog to enter the key should be the first
-            // thing that comes up [...] since the app has no meaning without
-            // a valid connection to the server"*.
-            //
-            // v0.4.29 control-plane P0 (Change 2): this gate used to call
-            // token_store::load() HERE, on the main thread — after an
-            // auto-update the new binary's signature is not in the macOS
-            // Keychain ACL, so that load threw a BLOCKING TouchID/password
-            // prompt (fatal unattended). The gate is now the pure,
-            // non-prompting launch_decision(): config subscriber_id +
-            // token_store::has_persisted_token (cache/file only — never the
-            // keyring). Any legacy keyring touch happens exclusively on the
-            // async sync paths, off the main thread.
-            let subscriber_id = if cfg_path.exists() {
-                config::Config::load_from(&cfg_path)
-                    .map(|c| c.subscriber_id)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let decision = launch_decision(
-                !subscriber_id.is_empty(),
-                !subscriber_id.is_empty() && token_store::has_persisted_token(&subscriber_id),
-            );
+            // v0.3: app has no meaning without a valid pairing; the wizard
+            // opens when config or token is missing (decision from the
+            // snapshot, above).
             if decision.start_sync {
-                // CS-2 §3.2: bootstrap every state dir synchronously, BEFORE
-                // any store load or pipeline. It is the only place a state
-                // directory is created; everything after it goes through
-                // `state_io::registry()`, which never creates.
-                bootstrap_state_dirs(app.handle(), &cfg_path);
-                spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
+                if let Some(snapshot) = snapshot {
+                    // CS-3 §3.5 step 6: CS-2 bootstrap with the snapshot's S
+                    // (synchronous, before any store load or pipeline), the
+                    // supervised custody tick and config_watch, then the boot
+                    // task, which loads nothing.
+                    boot::start_sync(boot::BootEnv {
+                        sup,
+                        snapshot,
+                        slot,
+                        tray: shared_state,
+                        workspace: commands::resolve_workspace_root(),
+                        knobs: boot::BootKnobs::default(),
+                    });
+                }
             }
             // Managed-instance mode implies --silent semantics: NEVER raise
             // the wizard/GUI (policy.allow_wizard=false). An unpaired managed
@@ -350,7 +344,11 @@ pub fn should_restart_now(
 /// available, download + install in the background, then restart the daemon
 /// once it is idle (or the max-defer ceiling is hit). v0.1.4 shipped a fire-
 /// once check; S484 (v0.4.2) adds a 6h periodic loop + restart-when-idle.
-fn spawn_updater_check(app: tauri::AppHandle, tray_state: tray_state::SharedTrayState) {
+fn spawn_updater_check(
+    sup: &std::sync::Arc<supervise::Supervisor>,
+    app: tauri::AppHandle,
+    tray_state: tray_state::SharedTrayState,
+) {
     use std::time::{Duration, Instant};
     // v0.4.12: poll every 5 min (was 6h) so a PUSHED release is detected and
     // surfaced on the tray within minutes — auto-update must react to a push,
@@ -359,76 +357,83 @@ fn spawn_updater_check(app: tauri::AppHandle, tray_state: tray_state::SharedTray
     const POLL_WHEN_STAGED: Duration = Duration::from_secs(60);
     const QUIESCENT_SECS: u64 = 300;
     const MAX_DEFER_SECS: u64 = 24 * 3600;
-    tauri::async_runtime::spawn(async move {
-        let mut staged_at: Option<Instant> = None;
-        loop {
-            // Only check for a new update while none is staged (else the running
-            // binary's version stays old and we'd re-download every cycle).
-            if staged_at.is_none() {
-                match app.updater() {
-                    Ok(updater) => match updater.check().await {
-                        Ok(Some(update)) => {
-                            tracing::info!(
-                                "update available: {} -> {}; downloading",
-                                env!("CARGO_PKG_VERSION"),
-                                update.version
-                            );
-                            // v0.4.12: light up the tray indicator the moment we
-                            // detect the pushed release — obvious + persistent
-                            // until the restart applies it (the user can click
-                            // the tray item to apply now, or it auto-applies on
-                            // idle below).
-                            if let Ok(mut s) = tray_state.write() {
-                                s.set_update_available(Some(update.version.clone()));
-                            }
-                            match update.download_and_install(|_, _| {}, || {}).await {
-                                Ok(()) => {
-                                    staged_at = Some(Instant::now());
-                                    tracing::info!("update staged; restart when idle");
+    let leaver = std::sync::Arc::clone(sup);
+    sup.supervise(
+        supervise::TaskSpec::new("updater", supervise::TaskClass::Optional),
+        async move {
+            let mut staged_at: Option<Instant> = None;
+            loop {
+                // Only check for a new update while none is staged (else the running
+                // binary's version stays old and we'd re-download every cycle).
+                if staged_at.is_none() {
+                    match app.updater() {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                tracing::info!(
+                                    "update available: {} -> {}; downloading",
+                                    env!("CARGO_PKG_VERSION"),
+                                    update.version
+                                );
+                                // v0.4.12: light up the tray indicator the moment we
+                                // detect the pushed release — obvious + persistent
+                                // until the restart applies it (the user can click
+                                // the tray item to apply now, or it auto-applies on
+                                // idle below).
+                                if let Ok(mut s) = tray_state.write() {
+                                    s.set_update_available(Some(update.version.clone()));
                                 }
-                                Err(e) => tracing::warn!("download_and_install failed: {e}"),
+                                match update.download_and_install(|_, _| {}, || {}).await {
+                                    Ok(()) => {
+                                        staged_at = Some(Instant::now());
+                                        tracing::info!("update staged; restart when idle");
+                                    }
+                                    Err(e) => tracing::warn!("download_and_install failed: {e}"),
+                                }
                             }
-                        }
-                        Ok(None) => tracing::debug!("no update available"),
-                        Err(e) => tracing::warn!("update check failed: {e}"),
-                    },
-                    Err(e) => tracing::warn!("updater init failed: {e}"),
+                            Ok(None) => tracing::debug!("no update available"),
+                            Err(e) => tracing::warn!("update check failed: {e}"),
+                        },
+                        Err(e) => tracing::warn!("updater init failed: {e}"),
+                    }
                 }
-            }
-            if let Some(since) = staged_at {
-                let (secs_activity, pending, verify, recon) = match tray_state.read() {
-                    Ok(s) => (
-                        s.last_event_at
-                            .and_then(|t| t.elapsed().ok())
-                            .map(|d| d.as_secs()),
-                        s.uploads_pending as u64,
-                        s.verify_in_progress,
-                        s.recon_in_progress,
-                    ),
-                    Err(_) => (None, 0, false, false),
+                if let Some(since) = staged_at {
+                    let (secs_activity, pending, verify, recon) = match tray_state.read() {
+                        Ok(s) => (
+                            s.last_event_at
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs()),
+                            s.uploads_pending as u64,
+                            s.verify_in_progress,
+                            s.recon_in_progress,
+                        ),
+                        Err(_) => (None, 0, false, false),
+                    };
+                    if should_restart_now(
+                        true,
+                        since.elapsed().as_secs(),
+                        secs_activity,
+                        pending,
+                        verify,
+                        recon,
+                        QUIESCENT_SECS,
+                        MAX_DEFER_SECS,
+                    ) {
+                        tracing::info!("applying staged update — restarting daemon");
+                        // CS-3 r2.1 (lib.rs:421@23ef189d): through exit_once with
+                        // the C9 re-check; nothing happens when an exit or restart
+                        // is already claimed.
+                        leaver.restart_once("updater");
+                    }
+                }
+                let nap = if staged_at.is_some() {
+                    POLL_WHEN_STAGED
+                } else {
+                    CHECK_INTERVAL
                 };
-                if should_restart_now(
-                    true,
-                    since.elapsed().as_secs(),
-                    secs_activity,
-                    pending,
-                    verify,
-                    recon,
-                    QUIESCENT_SECS,
-                    MAX_DEFER_SECS,
-                ) {
-                    tracing::info!("applying staged update — restarting daemon");
-                    app.restart();
-                }
+                tokio::time::sleep(nap).await;
             }
-            let nap = if staged_at.is_some() {
-                POLL_WHEN_STAGED
-            } else {
-                CHECK_INTERVAL
-            };
-            tokio::time::sleep(nap).await;
-        }
-    });
+        },
+    );
 }
 
 /// B2 (Nexus Sync): pure helper that extracts the ordered list of
@@ -472,992 +477,6 @@ pub fn effective_subscriber_id(root: &config::SyncRoot, cfg: &config::Config) ->
     }
 }
 
-/// CS-2 §3.2: bootstrap the state dirs for S = {`cfg.subscriber_id`} plus
-/// every `effective_subscriber_id(root)`, plus the config-scope dir, install
-/// the registry and start the 5 s custody tick. A rejected or failed sub gets
-/// an ERROR log and the existing user notice; its pipeline will not start
-/// (`registry().get` returns `NotBootstrapped`) and nothing falls back to
-/// path I/O.
-fn bootstrap_state_dirs(app: &tauri::AppHandle, cfg_path: &std::path::Path) {
-    let cfg = match config::Config::load_from(cfg_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("state_io bootstrap: config load failed: {e}; no state dirs");
-            return;
-        }
-    };
-    let mut subs = vec![cfg.subscriber_id.clone()];
-    for root in &cfg.sync_roots {
-        let eff = effective_subscriber_id(root, &cfg);
-        if !subs.contains(&eff) {
-            subs.push(eff);
-        }
-    }
-    let workspace = commands::resolve_workspace_root();
-    let config_dir = cfg_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    match state_io::bootstrap(&workspace, &subs, &config_dir) {
-        Ok(reg) => {
-            let reg = state_io::install(reg, &workspace);
-            for (sub, why) in reg.rejected() {
-                if sub == "<config>" {
-                    continue;
-                }
-                notify_user(
-                    app,
-                    "Vault Sync push failed to start",
-                    &format!("state directory for subscriber {sub:?} unavailable: {why}"),
-                );
-            }
-            state_io::spawn_custody_tick();
-        }
-        Err(e) => {
-            tracing::error!("state_io bootstrap failed: {e}; not starting sync");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("state directory bootstrap failed: {e}"),
-            );
-        }
-    }
-}
-
-/// Boot the SSE consumer from a saved config + keyring token. Runs on the
-/// Tauri async runtime so it doesn't block app startup.
-fn spawn_sse_consumer(
-    app: tauri::AppHandle,
-    cfg_path: std::path::PathBuf,
-    tray_state: tray_state::SharedTrayState,
-) {
-    tauri::async_runtime::spawn(async move {
-        let cfg = match config::Config::load_from(&cfg_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("config load failed: {e}");
-                return;
-            }
-        };
-
-        // B2: derive the watch roots from sync_roots. Use the first root as
-        // the redflag gate anchor (covers the primary vault). A future task
-        // can extend this to check all roots.
-        let watch_roots = roots_to_watch(&cfg);
-        if watch_roots.is_empty() {
-            tracing::warn!(
-                "sync_roots is empty — no watch pipeline will start. \
-                 Check config: at least one [[sync_roots]] entry is required."
-            );
-            return;
-        }
-        // Redflag gate: checked against the first sync root (primary vault).
-        // Future: extend to all roots (deferred — multi-root redflag is a
-        // follow-up task).
-        let primary_root = watch_roots[0].0.clone();
-        let gate = redflag::RedflagGate::new(primary_root.clone());
-        match gate.check() {
-            redflag::RedflagStatus::Tripped { path, .. } => {
-                tracing::error!(
-                    "redflag.md present at {:?} — aborting sync startup until removed",
-                    path
-                );
-                if let Ok(mut s) = tray_state.write() {
-                    s.set_redflag_tripped(true);
-                }
-                // S477 §3.3 (v0.3.7): surface to the user via OS notification
-                // so they understand sync is paused (the tray-only daemon
-                // would otherwise be silent).
-                notify_user(
-                    &app,
-                    "Vault Sync paused",
-                    "redflag.md detected at your vaults root — sync paused until removed.",
-                );
-                // Do NOT start SSE consumer or push pipeline. The 60s
-                // monitor task will clear the flag if/when the file is
-                // removed (recovery requires a daemon restart in v0.3.0).
-                spawn_redflag_monitor(gate, tray_state.clone());
-                return;
-            }
-            redflag::RedflagStatus::Clear => {
-                if let Ok(mut s) = tray_state.write() {
-                    s.set_redflag_tripped(false);
-                }
-                // Start the monitor on the Clear path too — if the file
-                // appears mid-session, the monitor catches it on the next
-                // tick and updates the tray. v0.3.0 does NOT auto-pause
-                // the pipeline mid-session; that's a v0.3.1 follow-up.
-                spawn_redflag_monitor(gate.clone(), tray_state.clone());
-            }
-        }
-
-        let token = match token_store::load(&cfg.subscriber_id) {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                tracing::error!(
-                    "no token in keyring or file fallback for subscriber_id={}; re-pair required",
-                    cfg.subscriber_id
-                );
-                // S477 §3.3 (v0.3.7): surface to the user -- the daemon
-                // cannot start sync until the user re-pairs via the wizard.
-                notify_user(
-                    &app,
-                    "Vault Sync needs re-pairing",
-                    "Open the wizard to re-pair this device.",
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!("token_store read failed: {e}");
-                return;
-            }
-        };
-
-        // v0.1.4: scan vault for conflicting Obsidian plugins and disable
-        // them in community-plugins.json before SSE starts materializing.
-        // v0.1.7: scan ALL known Obsidian vaults (not just the configured
-        // one) — Cyril's setup has Mainframe at D:\Vaults\Mainframe with
-        // nexus-sync enabled there but other vaults under D:\Vaults\ may
-        // also have the conflict. Discover via Obsidian's obsidian.json
-        // registry.
-        {
-            let mut vaults_to_scan: Vec<std::path::PathBuf> =
-                obsidian_install_detect::find_known_vaults();
-            // B2: scan each sync_root.path directly (it IS the vault root
-            // now, not a parent container). Also scan any immediate
-            // subdirectories that look like Obsidian vaults in case a
-            // sync_root is a parent container.
-            for (root_path, _route) in &watch_roots {
-                // Add the root itself if it has an .obsidian dir.
-                if root_path.join(".obsidian").is_dir()
-                    && !vaults_to_scan.iter().any(|q| q == root_path)
-                {
-                    vaults_to_scan.push(root_path.clone());
-                }
-                // Also enumerate immediate subdirectories (back-compat: in
-                // case sync_root is a parent container rather than the
-                // vault itself).
-                if let Ok(entries) = std::fs::read_dir(root_path) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.is_dir()
-                            && p.join(".obsidian").is_dir()
-                            && !vaults_to_scan.iter().any(|q| q == &p)
-                        {
-                            vaults_to_scan.push(p);
-                        }
-                    }
-                }
-            }
-            tracing::info!(
-                "scanning {} obsidian vault(s) for conflicting plugins",
-                vaults_to_scan.len()
-            );
-            for vault in &vaults_to_scan {
-                let detect = obsidian_plugin_detect::detect_and_disable(vault);
-                if let Some(line) = obsidian_plugin_detect::summary_line(&detect) {
-                    tracing::info!("[{}] {line}", vault.display());
-                }
-            }
-        }
-        // Arc so the same client (and its connection pool) is shared with the
-        // RC-1 subscriber-registry heartbeat task spawned below (TKT-a38b7c26).
-        let api = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-            Ok(a) => std::sync::Arc::new(a),
-            Err(e) => {
-                tracing::error!("api client init failed: {e}");
-                return;
-            }
-        };
-        let snap = match api.health().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("api health failed: {e}");
-                return;
-            }
-        };
-
-        // S477 v0.3.8 (C): self-report daemon_version + daemon_platform to
-        // the server on every startup. Pairs with (B) User-Agent stamping
-        // so server logs + admin DB query both agree on "what version is
-        // this host running?". Fire-and-forget — failure is non-fatal.
-        match api.patch_self_version().await {
-            Ok(_) => tracing::info!(
-                version = api_client::daemon_version(),
-                platform = api_client::daemon_platform(),
-                "reported daemon_version + daemon_platform to /api/sync/subscribers/me"
-            ),
-            Err(e) => tracing::warn!("daemon_version self-report failed: {e}"),
-        }
-        // v0.3: daemon state OUT of vault (mandate §1 row 13). Workspace
-        // root defaults to LocalAppData/Nexus (or platform equivalent);
-        // falls back to home dir / temp_dir if data_local_dir() is None.
-        let workspace_root = dirs::data_local_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(std::env::temp_dir))
-            .join("Nexus");
-        // D1 (S511, TKT-2dc9a17e): set the production conflict policy EXPLICITLY
-        // to NewerWins. The MaterializerConfig Default is ServerWins
-        // (materializer.rs), and lib.rs historically never overrode it, so
-        // production silently ran the silent-overwrite policy. The S511 write()
-        // path is now divergence-driven (always-stash) regardless of policy, but
-        // we set NewerWins explicitly here so a stray ServerWins value can never
-        // re-arm the old clobber, and the standalone ConflictStash API agrees.
-        // TKT-ddff1877 runtime kill-switch for the append-aware conflict arms:
-        // `VAULT_SYNC_APPEND_ARMS=off` (or 0/false/disabled/no) restores the
-        // pre-fix always-stash floor without a binary swap. Default ON.
-        let append_arms_enabled = materializer::append_arms_enabled_from_env_value(
-            std::env::var("VAULT_SYNC_APPEND_ARMS").ok().as_deref(),
-        );
-        if !append_arms_enabled {
-            tracing::warn!(
-                "VAULT_SYNC_APPEND_ARMS is set to an off-word: append-aware conflict arms DISABLED (pre-fix stash floor for every R4/R5 conflict)"
-            );
-        }
-        let materializer_cfg = materializer::MaterializerConfig {
-            device_id: cfg.subscriber_id.clone(),
-            conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
-            append_arms_enabled,
-            ..Default::default()
-        };
-        // S492 echo guard: shared between the materializer (records its writes)
-        // and every file_watcher (skips the resulting echo events). One guard
-        // for the daemon so the SSE->materialize->watcher->push loop is broken
-        // across all sync_roots.
-        let echo_guard = std::sync::Arc::new(echo_guard::EchoGuard::new());
-        // opfix-vaultsync-dormancy: shared progress-tracking handle. The
-        // PushClient stamps it on every drain that processed >= 1 event; the
-        // per-sync_root watchdog reads it to detect "pending diffs but no
-        // push attempts for N minutes" (R1+R3) and recovers via app.restart()
-        // (R2). One Arc per daemon; all sync_roots share progress liveness so
-        // a stall on ANY root trips the watchdog (and the restarted process
-        // re-arms a fresh watchdog covering all roots).
-        let sync_health = sync_health::SyncHealth::new();
-        // RC-1 client half (TKT-a38b7c26): spawn the subscriber-registry
-        // heartbeat. Periodically PATCHes /api/sync/subscribers/me with the
-        // running daemon version + a fresh last_seen + the truthful last_sync
-        // (from SyncHealth's wall-clock stamp), so the vault_subscribers row
-        // stays fresh for the daemon's lifetime instead of freezing at the
-        // one-shot startup patch_self_version. Tolerates an older server (405)
-        // by logging once and continuing -- escalating to a periodic WARN if
-        // the 405 persists past the tolerance window (a routing gap must stay
-        // visible; PR #10 review). Fire-and-forget: failures are non-fatal and
-        // never block the sync pipeline.
-        heartbeat::spawn(api.clone(), sync_health.clone());
-        // fix/reconcile-server-wins-shadow: persistent per-file "last-synced
-        // server hash" marker. Shared (Arc) across the materializer (records on
-        // every pull), the push_client (records on every accepted push), and the
-        // reconcile backstop (reads to decide push-vs-pull on drift). Lives under
-        // the per-subscriber sync-state runtime dir, beside last_event_id.
-        // B2' (TKT-86ae42a3): pass the sync-root basenames so the store can
-        // (a) migrate pre-v0.4.28 vaults-root-relative keys
-        // (`Mainframe/01_Notes/x.md`) to the post-B2 sync-root-relative form
-        // and (b) keep get/record shape-invariant. Without this, the B2
-        // path-shape cutover orphaned the entire pre-0.4.28 sync history and
-        // every dormant-but-divergent note fell to R5 conflict — the
-        // 07-15..07-18 conflict-file storm.
-        // CS-2: the stores, last_event_id and the compensating journal live
-        // in the primary subscriber's held state dir (bootstrapped in
-        // `.setup()`). NotBootstrapped stops sync with the existing notice.
-        let state_dir = match state_io::registry().get(&cfg.subscriber_id) {
-            Ok(sd) => sd,
-            Err(e) => {
-                tracing::error!("sync not started: {e}");
-                notify_user(
-                    &app,
-                    "Vault Sync push failed to start",
-                    &format!("state directory unavailable: {e}"),
-                );
-                return;
-            }
-        };
-        let vault_folders: Vec<String> = watch_roots
-            .iter()
-            .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
-        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(&state_dir, vault_folders);
-        sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
-        // R7b daemon leg (THESEUS AR-002, TKT-166e1c07): the per-note
-        // observed-base_seq store, keyed IDENTICALLY to the shadow store (same
-        // vault_folders + canonicalization) and persisted to a sibling file. The
-        // push path reads it to declare base_seq on every push/delete (R1); the
-        // materializer + push-accept paths record the server's returned seq only
-        // after byte-verify (R3). Empty/missing => unknown lineage => fail-closed
-        // (R4). Wired into BOTH the materializer (pull leg) and the push_client.
-        let base_seq = base_seq_store::BaseSeqStore::load_with_vault_folders(
-            &state_dir,
-            watch_roots
-                .iter()
-                .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .collect(),
-        );
-        base_seq_store::BaseSeqStore::spawn_periodic_flush(base_seq.clone());
-        // R1 (Vault Sync Convergence P2b, TKT-f74edf99): the durable READ-RECEIPT
-        // store, keyed IDENTICALLY to the shadow / base_seq stores and persisted
-        // to a sibling file. On a typed 409 the push client fetches the exact
-        // server revision body, byte-verifies its hash, and records a receipt
-        // here BEFORE it may declare that revision's seq as a push baseline. This
-        // is the verified-recovery leg that lets a divergent, baseline-absent note
-        // escape the certified deadlock without ever forging an in-sync baseline.
-        let read_receipt = read_receipt::ReadReceiptStore::load_with_vault_folders(
-            &state_dir,
-            watch_roots
-                .iter()
-                .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .collect(),
-        );
-        read_receipt::ReadReceiptStore::spawn_periodic_flush(read_receipt.clone());
-        // D9 (S511, TKT-2dc9a17e): shadow-wipe fast-path. If the shadow store
-        // loaded EMPTY (fresh install / corrupt reset / manual delete), seed
-        // shadow=server for every already-mirrored note BEFORE the push pipeline
-        // (and its reconcile backstop) or the SSE consumer make any decision, so
-        // ~28k notes do not each fall to R5-conflict and spawn a conflict-copy
-        // avalanche. Best-effort + bounded (one reconcile-batch call); on any
-        // failure the always-stash floor keeps the host data-safe. Awaited here,
-        // before spawn_push_pipeline below, so the seed lands first.
-        if shadow.is_empty() {
-            match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-                Ok(seed_api) => {
-                    let _ = reconciliation::seed_shadow_from_server_if_empty(
-                        primary_root.clone(),
-                        std::sync::Arc::new(seed_api),
-                        cfg.subscriber_id.clone(),
-                        shadow.clone(),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::warn!("D9 shadow seed: api client init failed: {e}; skipping seed");
-                }
-            }
-        }
-        // R1 / F-B1.1 (TKT-989ad5f2): open a push-journal handle on the SAME
-        // file push_client drains (resolve_workspace_root + push_journal_path,
-        // the single source of truth) so the anti-strip ARM-1 path can enqueue
-        // its compensating UP push. The journal is file-authoritative (N handles
-        // converge), so a dedicated std-Mutex handle here is safe alongside the
-        // file_watcher/push_client/verify_repair handles. In the single-root
-        // incident configuration (trinity/link) `cfg.subscriber_id` is the
-        // effective subscriber for the primary root; multi-root secondary roots
-        // enqueue to this primary journal (consistent with the SSE consumer
-        // materializing only the primary root — multi-root is deferred).
-        let compensating_journal: Option<
-            std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>,
-        > = {
-            match push_journal::PushJournal::open(&state_dir) {
-                Ok(j) => Some(std::sync::Arc::new(std::sync::Mutex::new(j))),
-                Err(e) => {
-                    tracing::warn!(error = %e, "R1: compensating-push journal open failed; anti-strip ARM 1 will preserve local but not enqueue (converges next reconcile pass)");
-                    None
-                }
-            }
-        };
-
-        // B2: materializer uses the primary sync_root.path as vault root.
-        // Multi-root materialization is a deferred task (one materializer
-        // per sync_root); for now the SSE consumer materializes into the
-        // first root only (back-compat with single-vault setups).
-        let mut materializer = materializer::Materializer::new(
-            primary_root.clone(),
-            snap.shadow_path.clone(),
-            materializer::MaterializerMode::from_str(&snap.materializer_mode),
-            workspace_root,
-            cfg.subscriber_id.clone(),
-            materializer_cfg,
-        )
-        .with_tray_state(tray_state.clone())
-        .with_echo_guard(echo_guard.clone())
-        .with_shadow_store(shadow.clone())
-        // R3 (TKT-166e1c07): the pull leg records the observed base_seq here.
-        .with_base_seq_store(base_seq.clone());
-        if let Some(j) = compensating_journal {
-            materializer = materializer.with_push_journal(j);
-        }
-
-        // Wave 4: spawn a 60s periodic task that refreshes the tray's
-        // `conflict_unresolved` counter from the on-disk stash siblings.
-        // `Materializer: Clone` is shallow — PathBuf/String fields + an
-        // Arc'd debounce timer — so we can hand a clone to the timer task
-        // while the primary instance moves into the SSE consumer.
-        let materializer_for_refresh = materializer.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            // First `tick.tick().await` fires immediately; consume it so we
-            // don't double-scan at startup (sse.run() will also drive
-            // write-path activity).
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                materializer_for_refresh.refresh_conflict_count_into_tray();
-            }
-        });
-
-        // B2 (Nexus Sync): push side — iterate sync_roots, spawning one
-        // watch+push pipeline per sync_root, each rooted at sync_root.path.
-        // Pushed paths are RELATIVE to that root (no vault-name first-segment
-        // prepend — the server handles routing via the route field, which is
-        // wired per-push in a later task; for now all pipelines share the
-        // single cfg.subscriber_id).
-        //
-        // DEFERRED (multi-route/per-subscriber plumbing): each sync_root
-        // carries a `route` string intended for server-side subscriber scope
-        // selection. Sending the correct route on each push request and
-        // registering per-sync_root subscriber IDs requires controller changes
-        // that are out of B2 scope. For now, all roots share one subscriber_id
-        // and the route is unused on the push wire. Tracked for a later task.
-        //
-        // `snap.scope_roots` / `snap.scope_excludes` are consumed by the SSE
-        // consumer below, so clone them for each watcher first.
-        //
-        // The returned `_watch_handles` Vec MUST stay alive for the daemon's
-        // lifetime: dropping any handle stops the corresponding OS watcher.
-        // We bind the Vec into this async scope so it lives across the
-        // forever-awaiting `consumer.run().await` at the tail of this task.
-        let watch_scope_roots = snap.scope_roots.clone();
-        let watch_scope_excludes = snap.scope_excludes.clone();
-        // B2b: iterate sync_roots directly so we have the full SyncRoot struct
-        // (including subscriber_id). effective_subscriber_id resolves the
-        // per-root subscriber (root's own if set, else top-level fallback).
-        let _watch_handles: Vec<_> = cfg
-            .sync_roots
-            .iter()
-            .map(|root| {
-                let eff_sub = effective_subscriber_id(root, &cfg);
-                // fix/reconcile-server-wins-shadow: hand the reconcile backstop
-                // its own materializer clone (to EXECUTE server-wins pulls) +
-                // the shared shadow store (to decide push-vs-pull). Clone here,
-                // BEFORE the primary materializer moves into the SSE consumer.
-                spawn_push_pipeline(
-                    &app,
-                    &cfg,
-                    eff_sub,
-                    root.path.clone(),
-                    watch_scope_roots.clone(),
-                    watch_scope_excludes.clone(),
-                    tray_state.clone(),
-                    echo_guard.clone(),
-                    materializer.clone(),
-                    shadow.clone(),
-                    base_seq.clone(),
-                    read_receipt.clone(),
-                    sync_health.clone(),
-                )
-            })
-            .collect();
-
-        // S477 v0.3.8 (A) / CS-2 (W12): last_event_id is persisted in the
-        // subscriber's held state dir beside the push journal, namespaced by
-        // subscriber_id so multi-subscriber hosts don't collide.
-        // Load on startup so catchup-on-reconnect actually fires server-side.
-        // The Config.last_event_id field is preserved as a back-compat
-        // fallback (older daemons may have populated it via the legacy code
-        // path); disk-persisted value takes precedence.
-        let resumed_id =
-            sse::SseConsumer::load_last_event_id(&state_dir).or(cfg.last_event_id.clone());
-        if let Some(rid) = &resumed_id {
-            tracing::info!(
-                last_event_id = %rid,
-                file = state_io::StateFile::LastEventId.name(),
-                "resuming SSE from persisted last_event_id"
-            );
-        }
-
-        let consumer = match sse::SseConsumer::new(
-            cfg.nexus_url.clone(),
-            token,
-            snap.scope_roots,
-            snap.scope_excludes,
-            materializer,
-        ) {
-            Ok(c) => c.with_tray_state(tray_state).with_state_dir(&state_dir),
-            Err(e) => {
-                tracing::error!("sse consumer init failed: {e}");
-                return;
-            }
-        };
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        tracing::info!(
-            "starting SSE consumer for subscriber_id={}",
-            cfg.subscriber_id
-        );
-        // `consumer.run()` awaits forever (it loops reconnecting on the SSE
-        // long-poll). `_watch_handle` is held across this await, so the OS
-        // watcher + its background task stay alive for the daemon's lifetime.
-        if let Err(e) = consumer.run(resumed_id, shutdown_rx).await {
-            tracing::error!("SSE consumer exited with error: {e}");
-        }
-        // Keep all watch handles alive until the task actually unwinds (only
-        // reached if the SSE consumer returns, which it normally never does).
-        drop(_watch_handles);
-    });
-}
-
-/// v0.3 push pipeline wire-up. Opens the SHARED push journal (same path
-/// verify_repair resolves via `commands::push_journal_path`), starts the
-/// file_watcher (local FS edits → journal), and spawns the push_client drain
-/// loop (journal → `POST /api/sync/push`). Returns the [`file_watcher::WatchHandle`]
-/// which the caller MUST keep alive — dropping it stops the OS watcher.
-///
-/// ## B2 (Nexus Sync): per-sync_root watch_root
-/// `watch_root` is the directory the `FileWatcher` is rooted at — passed
-/// directly from `sync_root.path`. Pushed paths are computed RELATIVE to
-/// `watch_root` by `FileWatcher`, so NO vault-name / first-segment prefix
-/// is added by this function. The old `cfg.vaults_root` field is no longer
-/// used in this path.
-///
-/// ## ApiClient sharing
-/// `ApiClient::new` is cheap (a reqwest client + base URL + token header).
-/// Rather than thread the SSE-side `api` (built only for the one `health()`
-/// call) through an extra `Arc`, we build a FRESH `Arc<ApiClient>` here for the
-/// push_client. Both hold the same bearer token; there is no shared mutable
-/// state, so a second instance is semantically identical and avoids invasive
-/// Arc-threading at the SSE call site.
-///
-/// ## Journal-path consistency with verify_repair
-/// Both call sites resolve the path via `commands::resolve_workspace_root()` +
-/// `commands::push_journal_path(&workspace_root, &subscriber_id)` — the single
-/// source of truth in `commands.rs`. They therefore open THE SAME jsonl file.
-///
-/// ## Dual-handle race disposition
-/// verify_repair opens its own `PushJournal` handle on the same path while the
-/// drain loop here holds another. `PushJournal::open` re-reads the file, and
-/// appends are line-atomic, so verify_repair's appends are picked up by the
-/// drain loop on its next 5s poll tick. This dual-handle pattern is the
-/// documented v0.3.0 limitation (a shared-handle refactor — threading this
-/// `Arc<Mutex<PushJournal>>` into verify_repair_run — is deferred to keep this
-/// wire-up low-risk). The drain loop never loses appends; worst case is a
-/// one-poll-interval (≤5s) latency before verify_repair's enqueued pushes
-/// upload.
-/// B2b (Nexus Sync): `subscriber_id` is now passed in as the *effective*
-/// per-root subscriber, resolved by the caller via
-/// `effective_subscriber_id(&root, &cfg)`.  Every internal use of a
-/// subscriber ID inside this function (token load, journal path, push
-/// client, reconciler, file watcher) now uses this parameter, so each
-/// sync root truly pushes under its own registered subscriber.
-#[allow(clippy::too_many_arguments)]
-fn spawn_push_pipeline(
-    app: &tauri::AppHandle,
-    cfg: &config::Config,
-    subscriber_id: String,
-    watch_root: std::path::PathBuf,
-    scope_roots: Vec<String>,
-    scope_excludes: Vec<String>,
-    tray_state: tray_state::SharedTrayState,
-    echo_guard: std::sync::Arc<echo_guard::EchoGuard>,
-    materializer: materializer::Materializer,
-    shadow: std::sync::Arc<sync_shadow::ShadowStore>,
-    base_seq: std::sync::Arc<base_seq_store::BaseSeqStore>,
-    read_receipt: std::sync::Arc<read_receipt::ReadReceiptStore>,
-    sync_health: std::sync::Arc<sync_health::SyncHealth>,
-) -> Option<file_watcher::WatchHandle> {
-    use std::sync::Arc;
-
-    // R7 (TKT-166e1c07, 2026-07-18 trinity incident): PARK the push side when the
-    // shadow store loaded in the suspect state (vault_folders resolved EMPTY but
-    // vault-prefixed keys are present, i.e. config vault_name is likely missing).
-    // Proceeding would mass-mis-key and re-push the vault. Refuse to start the
-    // push pipeline at all (no drain, no push) and surface it loudly - this is a
-    // park, NOT a silent no-op. The operator must fix the config and restart.
-    if shadow.vault_scope_suspect() {
-        tracing::error!(
-            "push pipeline: PARKED (R7) - vault_folders resolved EMPTY but the shadow store holds \
-             vault-prefixed keys (config vault_name is likely missing). Refusing to start the push \
-             side to avoid a mass re-push (2026-07-18 trinity incident). Fix config vault_name and restart."
-        );
-        notify_user(
-            app,
-            "Vault Sync parked (config error)",
-            "vault_folders resolved empty but prior sync history is present. Push is refused to \
-             avoid a mass re-push. Set vault_name in the config and restart.",
-        );
-        return None;
-    }
-
-    let token = match token_store::load(&subscriber_id) {
-        Ok(Some(t)) => t,
-        _ => {
-            tracing::error!("push pipeline: token unavailable; not starting push side");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                "Authentication token unavailable; not starting push side.",
-            );
-            return None;
-        }
-    };
-
-    // CS-2: the subscriber's held state dir, bootstrapped in `.setup()`
-    // (W14's create_dir_all is gone). NotBootstrapped keeps the existing
-    // "push failed to start" notice; nothing falls back to path I/O.
-    let sd = match state_io::registry().get(&subscriber_id) {
-        Ok(sd) => sd,
-        Err(e) => {
-            tracing::error!("push pipeline: {e}; not starting push side");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("state directory unavailable: {e}"),
-            );
-            return None;
-        }
-    };
-    // P0 2026-08-26 second pass: the suppressed-delete ledger lives beside the
-    // journal in sync-state. It stops pull_backfill resurrecting a suppressed
-    // delete (MEASURED: created=275 at 2026-08-26T00:05:37, which silently
-    // reverted a crash fix) and lets those deletes be REPLAYED when the owner
-    // clears the pause marker, so an intentional bulk delete can complete.
-    // Constructed here because both the backfill task and the file watcher
-    // need the same ledger.
-    let delete_ledger = crate::delete_ledger::DeleteLedger::new(&sd);
-    let delete_ledger_for_backfill = delete_ledger.clone();
-    let journal = match push_journal::PushJournal::open(&sd) {
-        Ok(mut j) => {
-            // Journal-bloat remediation: collapse the accumulated backlog to one
-            // entry per path NOW — while `j` is still OWNED, before it is wrapped
-            // in the shared Arc<Mutex> and the drain loop / file_watcher spawn.
-            // There is no lock to contend, so compaction ALWAYS runs. (The
-            // earlier `journal.try_lock()`-after-Arc could silently lose a
-            // startup race and skip with no log, leaving a 171k-entry /
-            // 82%-duplicate backlog uncollapsed — observed 2026-06-14.) The
-            // pre-dedup file_watcher left journals heavily duplicated; v0.4.18
-            // stops NEW dupes, this clears the legacy ones. Non-fatal; kill
-            // switch VAULT_SYNC_DISABLE_COMPACTION.
-            let compaction_disabled = std::env::var("VAULT_SYNC_DISABLE_COMPACTION")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            if compaction_disabled {
-                tracing::info!(
-                    "push_journal: startup compaction disabled via VAULT_SYNC_DISABLE_COMPACTION"
-                );
-            } else {
-                match j.compact() {
-                    Ok((before, after)) if after < before => tracing::info!(
-                        before,
-                        after,
-                        removed = before - after,
-                        "push_journal: startup compaction collapsed redundant duplicates"
-                    ),
-                    Ok((n, _)) => tracing::info!(
-                        entries = n,
-                        "push_journal: startup compaction — nothing redundant"
-                    ),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "push_journal: startup compaction failed (non-fatal)"
-                    ),
-                }
-            }
-            Arc::new(tokio::sync::Mutex::new(j))
-        }
-        Err(e) => {
-            tracing::error!("push pipeline: journal open failed: {e}; not starting push side");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("journal open failed: {e}"),
-            );
-            return None;
-        }
-    };
-
-    // B2: watch_root is passed in directly from sync_root.path —
-    // paths will be relative to watch_root (no first-segment prefix).
-    let vault_root = watch_root;
-
-    // --- push_client: journal → server drain loop ---
-    let api_for_push = match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            tracing::error!("push pipeline: api client init failed: {e}; not starting push side");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("api client init failed: {e}"),
-            );
-            return None;
-        }
-    };
-    // Managed-instance mode (spec §5): arm the additional conflict-artifact
-    // payload excludes on BOTH the watcher and push gates. Env-derived and
-    // constant for the process lifetime; false in vault mode keeps both
-    // filters byte-identical to pre-0.4.38.
-    let managed = managed_instance::is_managed_mode();
-
-    // PushClientConfig.allowed_extensions carry a LEADING DOT (".md").
-    let push_cfg = push_client::PushClientConfig {
-        allowed_extensions: vec![".md".into(), ".canvas".into()],
-        strip_frontmatter_fields_for_diff: vec!["updated".into()],
-        max_retry_attempts: 5,
-        initial_backoff_ms: 500,
-        max_backoff_ms: 60_000,
-        managed_payload_excludes: managed,
-        ..Default::default()
-    };
-    // D2/B2'd (v0.4.28): ONE enqueue-dedup map shared by the file_watcher
-    // (reads+writes it at enqueue time) and the push_client (updates it after
-    // an ack-materialize-back rewrite).
-    let enqueued_hashes: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
-    let push_client = push_client::PushClient::new(
-        api_for_push,
-        journal.clone(),
-        subscriber_id.clone(),
-        push_cfg,
-        vault_root.clone(),
-    )
-    .with_tray_state(tray_state.clone())
-    .with_shadow_store(shadow.clone())
-    // R1/R2/R3 (TKT-166e1c07): push leg declares + records base_seq.
-    .with_base_seq_store(base_seq.clone())
-    // R1 (TKT-f74edf99): verified read-receipt recovery on a typed 409.
-    .with_read_receipt_store(read_receipt.clone())
-    .with_sync_health(sync_health.clone())
-    // D2 (v0.4.28): ack-materialize-back rides the same materializer clone
-    // the reconcile backstop uses (echo-guarded + shadow-backed).
-    .with_materializer(materializer.clone())
-    .with_enqueued_hashes(enqueued_hashes.clone());
-
-    // Never-fired shutdown channel — the push loop runs for the daemon's
-    // lifetime. We hold the sender in the spawned task so it isn't dropped
-    // (a dropped sender would make `changed()` error → loop exit).
-    let (push_shutdown_tx, push_shutdown_rx) = tokio::sync::watch::channel(false);
-    tracing::info!(
-        "starting push_client drain loop for subscriber_id={}",
-        subscriber_id
-    );
-    tauri::async_runtime::spawn(async move {
-        let _hold_tx = push_shutdown_tx; // keep sender alive for the loop's lifetime
-        push_client.run_loop(push_shutdown_rx).await;
-        tracing::warn!("push_client.run_loop returned (unexpected for a forever loop)");
-    });
-
-    // opfix-vaultsync-dormancy (R1+R2+R3): spawn the progress-stall watchdog
-    // alongside the push loop. It polls the journal depth every 60s; on a
-    // stall it fires the recovery closure which notifies the owner AND
-    // restarts the daemon (the only reliable way to revive a panicked async
-    // task: `tauri::async_runtime::spawn` swallows panics into a JoinHandle
-    // nobody awaits, which is precisely how the engine went quiet while the
-    // updater kept ticking in incident 2026-06-13).
-    {
-        let env = reconciliation::ProcessEnv;
-        let threshold = sync_health::read_threshold(&env);
-        let recovery_disabled = sync_health::is_recovery_disabled(&env);
-        let journal_for_watchdog = journal.clone();
-        let app_handle = app.clone();
-        let subscriber_for_log = subscriber_id.clone();
-        let _watchdog = sync_health::spawn_progress_stall_watchdog(
-            sync_health.clone(),
-            std::time::Duration::from_secs(60),
-            threshold,
-            recovery_disabled,
-            move || {
-                // Async closure: the journal is behind a tokio::sync::Mutex,
-                // which CANNOT be locked via blocking_lock from a tokio
-                // worker thread (panics). Hand the watchdog an async path so
-                // it awaits the lock cleanly.
-                let j = journal_for_watchdog.clone();
-                async move {
-                    let g = j.lock().await;
-                    g.len()
-                }
-            },
-            move |evt| {
-                tracing::error!(
-                    subscriber_id = %subscriber_for_log,
-                    pending = evt.pending,
-                    secs_since_progress = evt.secs_since_progress,
-                    "sync_health: push pipeline STALLED; recovering"
-                );
-                if let Err(e) = app_handle.emit(
-                    "sync_stalled",
-                    &serde_json::json!({
-                        "pending": evt.pending,
-                        "secs_since_progress": evt.secs_since_progress,
-                        "subscriber_id": subscriber_for_log,
-                    }),
-                ) {
-                    tracing::warn!("failed to emit sync_stalled event: {e}");
-                }
-                notify_user(
-                    &app_handle,
-                    "Vault Sync stalled; restarting",
-                    &format!(
-                        "Push pipeline silent for {}m with {} pending edits. Restarting daemon to recover.",
-                        evt.secs_since_progress / 60,
-                        evt.pending
-                    ),
-                );
-                if evt.recovery_will_restart {
-                    // Hard recovery: re-init all sync tasks via a fresh
-                    // process. Matches what should_restart_now plus
-                    // app.restart already does on staged-update apply.
-                    app_handle.restart();
-                }
-            },
-        );
-    }
-
-    // --- S477 v0.3.8 (D) reconciliation backstop ---
-    // Periodic background sweep that diffs local vs server (via the same
-    // VerifyRepair machinery the owner-invoked tray menu uses) and
-    // queues pushes / logs pulls to close any systemic drift. Honors
-    // VAULT_SYNC_DISABLE_RECON kill switch + VAULT_SYNC_RECON_INTERVAL_SECS
-    // cadence override. Shares the push_client's journal handle so any
-    // pushes it queues are picked up by the drain loop above.
-    // Non-fatal on api-client init failure — just skip the backstop;
-    // push pipeline + file_watcher carry on.
-    match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-        Ok(recon_api) => {
-            // fix/reconcile-server-wins-shadow: pass the materializer (to
-            // execute server-wins pulls) + shadow store (to decide direction).
-            let _recon_task = reconciliation::spawn_reconciliation_task(
-                vault_root.clone(),
-                Arc::new(recon_api),
-                journal.clone(),
-                subscriber_id.clone(),
-                tray_state.clone(),
-                materializer.clone(),
-                shadow.clone(),
-            );
-        }
-        Err(e) => {
-            tracing::warn!("reconciliation: api client init failed: {e}; backstop not spawned");
-        }
-    }
-
-    // R6 pull-backfill: full server→local completeness pass. The reconciliation
-    // backstop above only reconciles paths that ALREADY exist locally (it sends
-    // its local manifest to /reconcile-batch); a note that exists only on the
-    // server is never in that manifest and is never pulled. This pass closes
-    // that gap by paging GET /changes?since=0 (the full canonical enumeration)
-    // and materializing every locally-missing, non-substrate note — the exact
-    // create-write the materializer was always capable of but was never asked
-    // to do. Honors VAULT_SYNC_DISABLE_BACKFILL + VAULT_SYNC_BACKFILL_INTERVAL_SECS.
-    // Non-fatal on api-client init failure.
-    match api_client::ApiClient::new(&cfg.nexus_url, &token) {
-        Ok(backfill_api) => {
-            let _backfill_task = pull_backfill::spawn_pull_backfill_task_guarded(
-                Arc::new(backfill_api),
-                materializer.clone(),
-                Some(delete_ledger_for_backfill.clone()),
-            );
-        }
-        Err(e) => {
-            tracing::warn!("pull_backfill: api client init failed: {e}; backfill not spawned");
-        }
-    }
-
-    // --- file_watcher: local FS edits → journal ---
-    // SUBSTRATE NOTE: FileWatcher requires `Arc<std::sync::Mutex<PushJournal>>`
-    // (its append path is synchronous, inside the notify task), whereas
-    // PushClient + verify_repair require `Arc<tokio::sync::Mutex<PushJournal>>`
-    // (async drain). These mutex types are NOT interchangeable, so the watcher
-    // CANNOT share the `journal` handle above. We open a SEPARATE PushJournal
-    // handle on the SAME file path. This widens the documented dual-handle
-    // pattern to three handles (watcher std-mutex, push_client tokio-mutex,
-    // verify_repair tokio-mutex) — all on one jsonl file. Appends are
-    // line-atomic and the drain loop re-reads, so no append is lost; worst
-    // case is ≤5s poll latency. A unified single-mutex journal is deferred.
-    let watcher_journal = match push_journal::PushJournal::open(&sd) {
-        Ok(j) => Arc::new(std::sync::Mutex::new(j)),
-        Err(e) => {
-            tracing::error!(
-                "push pipeline: watcher journal open failed: {e}; push_client running but no local-edit detection"
-            );
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("watcher journal open failed: {e}"),
-            );
-            return None;
-        }
-    };
-    // FileWatcherConfig.allowed_extensions are WITHOUT a leading dot ("md").
-    // P0 2026-08-26: attach the pause marker next to the push journal in
-    // sync-state. `paused` is sticky and its only pre-fix exit was the tray
-    // action, which is unreachable on the headless `cage` daemon — so the valve
-    // was a one-way trapdoor that silently discarded every delete for 13.5h
-    // after it tripped. Removing this file is now the headless resume.
-    let burst = Arc::new(std::sync::Mutex::new(
-        redflag::DeleteBurstDetector::new(20, std::time::Duration::from_secs(30))
-            .with_pause_marker(&sd),
-    ));
-    // S484: expose the valve so the tray "Resume delete propagation" action
-    // can reset it in place (no daemon restart). Register before `burst` is
-    // moved into the file watcher below.
-    redflag::register_delete_burst_handle(burst.clone());
-    let watcher_cfg = file_watcher::FileWatcherConfig {
-        allowed_extensions: vec!["md".into(), "canvas".into()],
-        scope_roots,
-        scope_excludes,
-        debounce_ms: 500,
-        managed_payload_excludes: managed,
-    };
-    let watcher = match file_watcher::FileWatcher::new(
-        vault_root,
-        watcher_journal,
-        burst,
-        watcher_cfg,
-        subscriber_id.clone(),
-    ) {
-        // D6: gate the enqueue dedup on the shadow's last-server-ACCEPTED hash.
-        // D7: heartbeat + storm-fence into SyncHealth for the auto-recovery
-        // watchdog. Both share the same Arcs the push pipeline already holds.
-        Ok(w) => w
-            .with_tray_state(tray_state)
-            .with_echo_guard(echo_guard)
-            .with_shadow_store(shadow.clone())
-            .with_sync_health(sync_health.clone())
-            .with_enqueued_hashes(enqueued_hashes.clone())
-            .with_delete_ledger(delete_ledger),
-        Err(e) => {
-            tracing::error!("push pipeline: file_watcher init failed: {e}; push_client running but no local-edit detection");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("file_watcher init failed: {e}"),
-            );
-            return None;
-        }
-    };
-    match watcher.start() {
-        Ok(handle) => {
-            tracing::info!("file_watcher started for subscriber_id={}", subscriber_id);
-            Some(handle)
-        }
-        Err(file_watcher::FileWatcherError::InotifyLimitExceeded { current }) => {
-            // S477 §3.5 (v0.3.7): Linux inotify watch-limit exhaustion. Surface
-            // a structured Tauri event to the wizard so it can render the
-            // sysctl-one-liner banner. Also log + OS-notify so the user sees
-            // the failure even if the wizard window is closed.
-            tracing::error!(
-                "push pipeline: inotify watch limit exceeded (current={current}); raise fs.inotify.max_user_watches"
-            );
-            if let Err(emit_err) = app.emit("inotify_limit_exceeded", current) {
-                tracing::warn!("failed to emit inotify_limit_exceeded event: {emit_err}");
-            }
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!(
-                    "Linux inotify watch limit exceeded (current={current}). \
-                     Run: sudo sysctl -w fs.inotify.max_user_watches=524288"
-                ),
-            );
-            None
-        }
-        Err(e) => {
-            tracing::error!("push pipeline: file_watcher start failed: {e}; push_client running but no local-edit detection");
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("file_watcher start failed: {e}"),
-            );
-            None
-        }
-    }
-}
-
 /// One iteration of the redflag monitor. Extracted as a `pub fn` so it can
 /// be unit-tested directly without spawning a tokio task.
 ///
@@ -1487,19 +506,15 @@ pub fn redflag_tick(gate: &redflag::RedflagGate, tray_state: &tray_state::Shared
     }
 }
 
-/// Periodic 60s check that re-evaluates redflag.md. If the file disappears
-/// after a Tripped state, clears the tray flag and logs a recovery line.
-/// (For v0.3.0, daemon does NOT auto-restart sync on recovery — owner must
-/// restart the daemon. Recovery just unblocks the path back to clean.)
-fn spawn_redflag_monitor(gate: redflag::RedflagGate, tray_state: tray_state::SharedTrayState) {
-    tauri::async_runtime::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            redflag_tick(&gate, &tray_state);
-        }
-    });
-}
+/// Unit CS-3 in-process tests (T-CS3-3..-22).
+#[cfg(test)]
+#[path = "cs3_tests.rs"]
+mod cs3_tests;
+
+/// Unit CS-3 daemon-subprocess harness and tests.
+#[cfg(test)]
+#[path = "cs3_harness.rs"]
+mod cs3_harness;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]

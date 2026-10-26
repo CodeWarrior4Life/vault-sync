@@ -35,6 +35,7 @@
 "delete_ledger::DeleteLedger::display" = "the ledger's DisplayPath for operator text"
 "redflag::DeleteBurstDetector::pause_marker_display" = "the marker path in the DELETE SUPPRESSED WARN (resume_by)"
 "redflag::DeleteBurstDetector::write_pause_marker" = "the `rm <path>` line inside the pause marker body"
+"boot::diagnose_stranded" = "CS-3 §3.6 (G-6): the stranded journal's DisplayPath in the diagnose-only WARN (read-only; nothing writes it)"
 
 # Gate 3/C7: a confined state-file name literal that is NOT a state path.
 [allowed_literals]

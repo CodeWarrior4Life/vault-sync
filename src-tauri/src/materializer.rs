@@ -24,9 +24,8 @@ use crate::conflict_stash::{ConflictClassifier, ConflictPolicy, ConflictStash, S
 use crate::integrity_check::{
     ByteLevelResult, ExpectedIntegrity, IntegrityChecker, IntegrityError, IntegrityResult,
 };
-use crate::push_journal::{
-    new_event_id, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
-};
+use crate::journal_owner::JournalOwner;
+use crate::push_journal::{new_event_id, PushAction, PushBase, PushEvent, CURRENT_SCHEMA};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::scope::is_safe_path;
 use crate::sync_shadow::canonical_sync_path;
@@ -413,10 +412,11 @@ pub struct Materializer {
     /// normalization). The local file is byte-unchanged in that case, so the
     /// file_watcher never fires — without this proactive enqueue the pull
     /// re-hits the anti-strip guard every pass (the 8,081 phantom-pull
-    /// deadlock). Its own `PushJournal` handle on the shared jsonl file (the
-    /// journal is file-authoritative; N handles converge). `None` keeps the
-    /// pre-fix behavior (preserve local, rely on the watcher).
-    push_journal: Option<Arc<Mutex<PushJournal>>>,
+    /// deadlock). CS-3 (J6, G2): the journal owner of the sub whose pipeline
+    /// is rooted at the primary root, the journal that root's drain loop
+    /// drains. `None` keeps the pre-fix behavior (preserve local, rely on
+    /// the watcher / next reconcile pass).
+    push_journal: Option<Arc<JournalOwner>>,
 }
 
 impl Clone for Materializer {
@@ -477,7 +477,7 @@ impl Materializer {
     /// R1 / F-B1.1 (TKT-989ad5f2): attach the push-journal handle used to
     /// enqueue the ARM-1 compensating UP push. Builder; `None` (unset) keeps
     /// the pre-fix preserve-and-wait-for-watcher behavior.
-    pub fn with_push_journal(mut self, journal: Arc<Mutex<PushJournal>>) -> Self {
+    pub fn with_push_journal(mut self, journal: Arc<JournalOwner>) -> Self {
         self.push_journal = Some(journal);
         self
     }
@@ -518,16 +518,12 @@ impl Materializer {
             queued_at: chrono::Utc::now(),
             device_id: self.config.device_id.clone(),
         };
-        match journal.lock() {
-            Ok(mut j) => match j.append(evt) {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!(path, tag, error = %e, "compensating push append failed");
-                    false
-                }
-            },
+        // Lock order (CS-3 §3.2, recorded from the code): the caller holds
+        // this path's materializer lock; the journal owner is taken inside it.
+        match journal.append(evt) {
+            Ok(()) => true,
             Err(e) => {
-                warn!(path, tag, error = %e, "push-journal mutex poisoned; compensating push not enqueued");
+                warn!(path, tag, error = %e, "compensating push append failed");
                 false
             }
         }
@@ -705,7 +701,21 @@ impl Materializer {
     /// Returns an `Arc<Mutex<()>>` the caller locks across the
     /// exists -> compare -> stash -> persist critical section (D2c). The outer
     /// registry mutex is held only briefly to look up / insert the entry.
+    /// CS-3 T-CS3-12: test access to the path lock.
+    #[cfg(test)]
+    pub(crate) fn path_lock_for_test(&self, key: &str) -> Arc<Mutex<()>> {
+        self.path_lock_for(key)
+    }
+
     fn path_lock_for(&self, key: &str) -> Arc<Mutex<()>> {
+        // CS-3 D16 (P6): the recorded order is path lock -> journal. Taking a
+        // path lock while this thread holds a journal lock is the one
+        // inversion the code could plausibly grow (T-CS3-12).
+        #[cfg(debug_assertions)]
+        assert!(
+            !crate::push_journal::journal_held(),
+            "JOURNAL_HELD: Materializer::path_lock_for called while holding the push journal lock (CS-3 lock order: path lock -> journal)"
+        );
         let mut reg = self.path_locks.lock().unwrap_or_else(|p| p.into_inner());
         reg.entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -3573,7 +3583,7 @@ mod tests {
         TempDir,
         Materializer,
         Arc<ShadowStore>,
-        Arc<Mutex<PushJournal>>,
+        Arc<JournalOwner>,
     ) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
@@ -3581,9 +3591,8 @@ mod tests {
             &sdir.path().join("shadow_hashes.json"),
         ));
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let journal = Arc::new(Mutex::new(
-            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
-        ));
+        let journal =
+            crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(jdir.path()));
         let m = m
             .with_shadow_store(shadow.clone())
             .with_push_journal(journal.clone());
@@ -3638,7 +3647,7 @@ mod tests {
             "local frontmatter must be preserved (guard never strips)"
         );
         // A compensating UP push was enqueued, CAS base = the server hash.
-        let batch = journal.lock().unwrap().drain(10).unwrap();
+        let batch = journal.drain(10).unwrap();
         assert_eq!(batch.len(), 1, "exactly one compensating push enqueued");
         assert_eq!(batch[0].0.path, rel);
         assert_eq!(batch[0].0.action, PushAction::Modify);
@@ -3700,7 +3709,7 @@ mod tests {
         );
         // ARM 2 does NOT enqueue a compensating push (it converges via align).
         assert_eq!(
-            journal.lock().unwrap().drain(10).unwrap().len(),
+            journal.drain(10).unwrap().len(),
             0,
             "ARM 2 enqueues no compensating push"
         );
@@ -4652,7 +4661,7 @@ mod tests {
         Materializer,
         Arc<ShadowStore>,
         Arc<crate::base_seq_store::BaseSeqStore>,
-        Arc<Mutex<PushJournal>>,
+        Arc<JournalOwner>,
     ) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
@@ -4665,9 +4674,8 @@ mod tests {
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let journal = Arc::new(Mutex::new(
-            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
-        ));
+        let journal =
+            crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(jdir.path()));
         let m = m
             .with_shadow_store(shadow.clone())
             .with_base_seq_store(bs.clone())
@@ -4829,7 +4837,7 @@ mod tests {
         );
 
         // The compensating push: CAS base = the head hash, content = local.
-        let batch = journal.lock().unwrap().drain(10).unwrap();
+        let batch = journal.drain(10).unwrap();
         assert_eq!(batch.len(), 1, "exactly one compensating push");
         assert_eq!(batch[0].0.path, wire);
         assert_eq!(batch[0].0.action, PushAction::Modify);
@@ -4912,7 +4920,7 @@ mod tests {
             "observed replaces the single lineage entry"
         );
 
-        let batch = journal.lock().unwrap().drain(10).unwrap();
+        let batch = journal.drain(10).unwrap();
         assert_eq!(batch.len(), 1, "exactly one compensating push");
         assert_eq!(
             batch[0].0.base_hash,
@@ -4966,10 +4974,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
         assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
-        assert!(
-            journal.lock().unwrap().drain(10).unwrap().is_empty(),
-            "nothing enqueued"
-        );
+        assert!(journal.drain(10).unwrap().is_empty(), "nothing enqueued");
     }
 
     /// Arranger requirement (3): ARM B must REFUSE when the shadow names a
@@ -5000,7 +5005,7 @@ mod tests {
         );
         assert_eq!(conflict_copies(&dir).len(), 1);
         assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
-        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        assert!(journal.drain(10).unwrap().is_empty());
     }
 
     /// An OLDER-but-genuine ancestor shadow (the daemon last synced an earlier
@@ -5051,7 +5056,7 @@ mod tests {
             "no duplicated history"
         );
         assert!(conflict_copies(&dir).is_empty());
-        assert_eq!(journal.lock().unwrap().drain(10).unwrap().len(), 1);
+        assert_eq!(journal.drain(10).unwrap().len(), 1);
     }
 
     /// ARM A needs no shadow: a stale head is lossless to preserve against
@@ -5079,7 +5084,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&target).unwrap(), local);
         assert!(conflict_copies(&dir).is_empty());
-        assert_eq!(journal.lock().unwrap().drain(10).unwrap().len(), 1);
+        assert_eq!(journal.drain(10).unwrap().len(), 1);
     }
 
     /// Local is a strict line-prefix of the head (the server already holds
@@ -5116,7 +5121,7 @@ mod tests {
             conflict_copies(&dir).is_empty(),
             "no junk fork for a contained local"
         );
-        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        assert!(journal.drain(10).unwrap().is_empty());
         assert_eq!(bs.get_adopted(rel), Some(1001));
     }
 
@@ -5163,7 +5168,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
         assert_eq!(std::fs::read(&target).unwrap(), server_bytes);
-        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        assert!(journal.drain(10).unwrap().is_empty());
     }
 
     /// The arms are Live-only: in Shadow mode the pre-existing behavior stands
@@ -5187,7 +5192,7 @@ mod tests {
             matches!(out, MaterializeOutcome::Stashed { .. }),
             "got {out:?}"
         );
-        assert!(journal.lock().unwrap().drain(10).unwrap().is_empty());
+        assert!(journal.drain(10).unwrap().is_empty());
         drop((vaults, ws));
     }
 
@@ -5207,9 +5212,8 @@ mod tests {
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let journal = Arc::new(Mutex::new(
-            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
-        ));
+        let journal =
+            crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(jdir.path()));
         let m = m
             .with_shadow_store(shadow.clone())
             .with_push_journal(journal.clone());
@@ -5239,10 +5243,7 @@ mod tests {
             stale,
             "pre-fix behaviour: head materialized"
         );
-        assert!(
-            journal.lock().unwrap().drain(10).unwrap().is_empty(),
-            "nothing enqueued"
-        );
+        assert!(journal.drain(10).unwrap().is_empty(), "nothing enqueued");
     }
 
     #[test]
@@ -5331,7 +5332,7 @@ mod tests {
             let lost_local = lines_lost(&local, &on_disk).len();
             let lost_server = lines_lost(&stale, &on_disk).len();
             let forks = conflict_copies(&dir).len();
-            let enqueued = journal.lock().unwrap().drain(10).unwrap().len();
+            let enqueued = journal.drain(10).unwrap().len();
             println!(
                 "ARM A (stale head {} bytes vs local {} bytes): outcome={out:?} lines_lost_local={lost_local} lines_lost_server={lost_server} forks={forks} compensating_pushes={enqueued} elapsed={dt:?}",
                 stale.len(),
@@ -5372,7 +5373,7 @@ mod tests {
             let lost_server = lines_lost(&server_bytes, &on_disk).len();
             let merged_lines = std::str::from_utf8(&on_disk).unwrap().lines().count();
             let forks = conflict_copies(&dir).len();
-            let enqueued = journal.lock().unwrap().drain(10).unwrap().len();
+            let enqueued = journal.drain(10).unwrap().len();
             println!(
                 "ARM B (two appenders): outcome=Merged merged_lines={merged_lines} (fixture {fixture_lines} + 2) lines_lost_local={lost_local} lines_lost_server={lost_server} forks={forks} compensating_pushes={enqueued} dup_check={} elapsed={dt:?}",
                 count_line(&on_disk, APPENDED_LINK) == 1 && count_line(&on_disk, APPENDED_TRINITY) == 1

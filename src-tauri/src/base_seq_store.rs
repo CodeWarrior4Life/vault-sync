@@ -346,17 +346,22 @@ impl BaseSeqStore {
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
     /// The immediate first tick is consumed so we don't flush at t=0.
-    pub fn spawn_periodic_flush(store: Arc<BaseSeqStore>) {
+    /// CS-3: returns its `JoinHandle` for the supervisor (class Required).
+    pub fn spawn_periodic_flush(
+        store: Arc<BaseSeqStore>,
+    ) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
         tauri::async_runtime::spawn(async move {
-            let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+            let mut tick = tokio::time::interval(crate::supervise::tick(FLUSH_INTERVAL));
             tick.tick().await;
             loop {
                 tick.tick().await;
+                #[cfg(test)]
+                crate::faults::point("flush_base_seq");
                 if let Err(e) = store.flush() {
                     warn!(error = %e, "base_seq store: periodic flush failed");
                 }
             }
-        });
+        })
     }
 }
 

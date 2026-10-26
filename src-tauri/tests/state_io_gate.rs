@@ -23,6 +23,14 @@
 //! `fn fsync_dir` outside durable_file (T-CS2-20); exactly one caller of
 //! `PushJournal::scratch()`, the D9 seed, and `scratch` is not `pub` (C10).
 //!
+//! Unit CS-3 (TKT-b6d8c4ba) adds: exactly one production caller of
+//! `PushJournal::open_claimed`, in `JournalOwner::open`, and no non-test
+//! `PushJournal::open`/`open_with_capacity` (T-CS3-5); exactly one
+//! production call of `JournalOwner::open`, in the `SyncHandles` builder's
+//! get-or-open `journal_for_root(&RootSpec)` (gate C2, T-CS3-25); exactly one
+//! caller of `JournalOwner::wrap_scratch`, the D9 seed (T-CS3-21); and no
+//! `allow(clippy::await_holding_lock)` outside `#[cfg(test)]` (T-CS3-11).
+//!
 //! `STATE_IO_GATE_ROOT` (a src-tauri dir) points the tree checks at another
 //! tree; the negcontrol script uses it on planted scratch copies.
 #![allow(clippy::disallowed_methods)]
@@ -56,6 +64,8 @@ const STATE_FILE_NAMES: &[&str] = &[
 ];
 
 const DISALLOWED_LINTS: &[&str] = &["clippy::disallowed_methods", "clippy::disallowed_method"];
+/// CS-3 T-CS3-11: never suppressible outside `#[cfg(test)]` (no exemption).
+const AWAIT_LOCK_LINTS: &[&str] = &["clippy::await_holding_lock"];
 const GROUP_LINTS: &[&str] = &["clippy::style", "clippy::all", "warnings"];
 
 // ---------------------------------------------------------------------------
@@ -118,6 +128,13 @@ struct Facts {
     sealed_impls: Vec<(String, String)>,
     fn_defs: Vec<(String, String)>,
     scratch_callers: Vec<String>,
+    /// CS-3: production call sites of these constructors, by item path.
+    open_claimed_callers: Vec<String>,
+    owner_open_callers: Vec<String>,
+    wrap_scratch_callers: Vec<String>,
+    /// CS-3 T-CS3-25: `(item path, input types)` of every non-test fn named
+    /// `journal_for_root`.
+    journal_for_root_sigs: Vec<(String, Vec<String>)>,
     violations: Vec<String>,
 }
 
@@ -312,9 +329,24 @@ impl Scanner<'_> {
                         let p = self.path();
                         self.facts.scratch_callers.push(p);
                     }
+                    if i >= 3 && self.in_test == 0 {
+                        let owner = toks[i - 3].to_string();
+                        self.record_ctor(&owner, &name);
+                    }
                 }
                 TokenTree::Punct(_) => {}
             }
+        }
+    }
+
+    /// CS-3: record a production call of a guarded constructor.
+    fn record_ctor(&mut self, owner: &str, name: &str) {
+        let p = self.path();
+        match (owner, name) {
+            ("PushJournal", "open_claimed") => self.facts.open_claimed_callers.push(p),
+            ("JournalOwner", "open") => self.facts.owner_open_callers.push(p),
+            ("JournalOwner", "wrap_scratch") => self.facts.wrap_scratch_callers.push(p),
+            _ => {}
         }
     }
 
@@ -374,6 +406,12 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     tokens_to_string(&ToTokensDisplay(a))
                 ));
             }
+            if lints.iter().any(|l| AWAIT_LOCK_LINTS.contains(&l.as_str())) {
+                self.violation(format!(
+                    "CS-3 T-CS3-11: allow(clippy::await_holding_lock) outside #[cfg(test)]: {}",
+                    tokens_to_string(&ToTokensDisplay(a))
+                ));
+            }
         }
         syn::visit::visit_attribute(self, a);
     }
@@ -394,6 +432,20 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         let name = n.sig.ident.to_string();
         if self.in_test == 0 && !is_cfg_test(&n.attrs) {
             let owner = self.path();
+            if name == "journal_for_root" {
+                let inputs = n
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|a| match a {
+                        syn::FnArg::Typed(t) => Some(tokens_to_string(&TypeDisplay(&t.ty))),
+                        syn::FnArg::Receiver(_) => None,
+                    })
+                    .collect();
+                self.facts
+                    .journal_for_root_sigs
+                    .push((format!("{owner}::{name}"), inputs));
+            }
             self.facts.fn_defs.push((owner, name.clone()));
             if name == "scratch" && matches!(n.vis, syn::Visibility::Public(_)) {
                 self.violation("PushJournal::scratch must not be `pub` (C10)".into());
@@ -499,6 +551,10 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             {
                 let path = self.path();
                 self.facts.scratch_callers.push(path);
+            }
+            if segs.len() >= 2 && self.in_test == 0 {
+                let (owner, name) = (&segs[segs.len() - 2], &segs[segs.len() - 1]);
+                self.record_ctor(owner, name);
             }
         }
         syn::visit::visit_expr_call(self, n);
@@ -662,6 +718,59 @@ fn tree_invariants(facts: &Facts, ex: &Exemptions) -> Vec<String> {
         v.push(format!(
             "C10: PushJournal::scratch() must have exactly one caller, the D9 seed; found {:?}",
             facts.scratch_callers
+        ));
+    }
+    v.extend(cs3_invariants(facts));
+    v
+}
+
+/// Unit CS-3 structural invariants (T-CS3-5, T-CS3-21, T-CS3-25).
+fn cs3_invariants(facts: &Facts) -> Vec<String> {
+    let mut v = Vec::new();
+    // T-CS3-5: one production constructor, one production caller.
+    if facts.open_claimed_callers != vec!["journal_owner::JournalOwner::open".to_string()] {
+        v.push(format!(
+            "T-CS3-5: PushJournal::open_claimed must have exactly one production caller, JournalOwner::open; found {:?}",
+            facts.open_claimed_callers
+        ));
+    }
+    for unclaimed in ["open", "open_with_capacity"] {
+        if facts
+            .fn_defs
+            .iter()
+            .any(|(m, n)| m == "push_journal::PushJournal" && n == unclaimed)
+        {
+            v.push(format!(
+                "T-CS3-5: PushJournal::{unclaimed} must exist only under #[cfg(test)]"
+            ));
+        }
+    }
+    // T-CS3-25 (gate C2, static): JournalOwner::open only in the builder's
+    // get-or-open, whose input is a root.
+    let builder = "boot::JournalTable::journal_for_root".to_string();
+    if facts.owner_open_callers != vec![builder.clone()] {
+        v.push(format!(
+            "T-CS3-25 (C2): JournalOwner::open must have exactly one production call, in {builder}; found {:?}",
+            facts.owner_open_callers
+        ));
+    }
+    let sig_ok = facts
+        .journal_for_root_sigs
+        .iter()
+        .any(|(p, inputs)| p == &builder && inputs.iter().any(|t| t == "&RootSpec"));
+    if !sig_ok {
+        v.push(format!(
+            "T-CS3-25 (C2): {builder} must take a `&RootSpec` (keyed by roots, never by S); found {:?}",
+            facts.journal_for_root_sigs
+        ));
+    }
+    // T-CS3-21: the D9 seed is the only wrap_scratch caller.
+    if facts.wrap_scratch_callers
+        != vec!["reconciliation::seed_shadow_from_server_if_empty".to_string()]
+    {
+        v.push(format!(
+            "T-CS3-21 (C10): JournalOwner::wrap_scratch must have exactly one caller, the D9 seed; found {:?}",
+            facts.wrap_scratch_callers
         ));
     }
     v
@@ -946,4 +1055,127 @@ fn t_cs2_35_scratch_single_caller() {
         "impl PushJournal { pub fn scratch() -> Self { todo!() } }"
     )
     .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Unit CS-3 (TKT-b6d8c4ba) gate rules
+// ---------------------------------------------------------------------------
+
+/// T-CS3-5 (gate half): exactly one production caller of
+/// `PushJournal::open_claimed`, in `JournalOwner::open`; `PushJournal::open`
+/// exists only under `#[cfg(test)]`. A second caller and a non-test `open`
+/// each fail.
+#[test]
+fn t_cs3_5_one_production_journal_constructor() {
+    let (f, ex) = tree_with(&[]);
+    assert_eq!(
+        f.open_claimed_callers,
+        vec!["journal_owner::JournalOwner::open".to_string()]
+    );
+    assert!(cs3_invariants(&f).is_empty(), "{:?}", cs3_invariants(&f));
+    let (f, ex2) = tree_with(&[(
+        "commands_plant",
+        "fn g(sd: &S, c: C) { let _ = crate::push_journal::PushJournal::open_claimed(sd, c); }",
+    )]);
+    assert!(tree_invariants(&f, &ex2)
+        .iter()
+        .any(|v| v.contains("T-CS3-5") && v.contains("open_claimed")));
+    let (f, _) = tree_with(&[(
+        "push_journal",
+        "impl PushJournal { pub fn open(sd: &S) -> Self { todo!() } }",
+    )]);
+    assert!(tree_invariants(&f, &ex)
+        .iter()
+        .any(|v| v.contains("T-CS3-5") && v.contains("PushJournal::open must")));
+}
+
+/// T-CS3-11 (gate half): an `allow(clippy::await_holding_lock)` outside
+/// `#[cfg(test)]` fails (every attribute form); under `#[cfg(test)]` it
+/// passes.
+#[test]
+fn t_cs3_11_await_holding_lock_allow_refused() {
+    for plant in [
+        "#[allow(clippy::await_holding_lock)] async fn f() {}",
+        "#[expect(clippy::await_holding_lock)] async fn f() {}",
+        "#[cfg_attr(unix, allow(clippy::await_holding_lock))] async fn f() {}",
+        "#![allow(clippy::await_holding_lock)] fn f() {}",
+        "struct S; impl S { #[allow(clippy::await_holding_lock)] async fn m(&self) {} }",
+    ] {
+        assert!(
+            scan_one("supervise", plant)
+                .iter()
+                .any(|v| v.contains("T-CS3-11")),
+            "planted allow not caught: {plant}"
+        );
+    }
+    assert!(scan_one(
+        "supervise",
+        "#[cfg(test)] mod tests { #[allow(clippy::await_holding_lock)] async fn f() {} }"
+    )
+    .is_empty());
+}
+
+/// T-CS3-21 (gate half): exactly one `JournalOwner::wrap_scratch` caller, the
+/// D9 seed; a second caller (also inside a macro body) fails.
+#[test]
+fn t_cs3_21_wrap_scratch_single_caller() {
+    let (f, _) = tree_with(&[]);
+    assert_eq!(
+        f.wrap_scratch_callers,
+        vec!["reconciliation::seed_shadow_from_server_if_empty".to_string()]
+    );
+    for plant in [
+        "fn g() { let _ = crate::journal_owner::JournalOwner::wrap_scratch(x()); }",
+        "fn g() { tracing::info!(\"{:?}\", JournalOwner::wrap_scratch(x())); }",
+    ] {
+        let (f, ex) = tree_with(&[("verify_repair_plant", plant)]);
+        assert!(
+            tree_invariants(&f, &ex)
+                .iter()
+                .any(|v| v.contains("T-CS3-21")),
+            "not caught: {plant}"
+        );
+    }
+}
+
+/// T-CS3-25 (gate C2, static): exactly one production call of
+/// `JournalOwner::open`, inside `journal_for_root(&RootSpec)`. A planted
+/// call keyed by the top-level sub fails in lib.rs AND in any other module
+/// (materializer.rs), and so does a builder keyed by a sub string.
+#[test]
+fn t_cs3_25_owner_open_only_in_root_builder() {
+    let (f, ex) = tree_with(&[]);
+    assert_eq!(
+        f.owner_open_callers,
+        vec!["boot::JournalTable::journal_for_root".to_string()]
+    );
+    assert!(cs3_invariants(&f).is_empty(), "{:?}", cs3_invariants(&f));
+    let plant = "fn plant(s: &Snap) { let _ = JournalOwner::open(&registry().get(&s.top_sub).unwrap(), &s.top_sub); }";
+    for module in ["lib", "materializer"] {
+        let (f, ex) = tree_with(&[(module, plant)]);
+        assert!(
+            tree_invariants(&f, &ex)
+                .iter()
+                .any(|v| v.contains("T-CS3-25")),
+            "plant in {module} not caught"
+        );
+    }
+    let (f, _) = tree_with(&[(
+        "boot",
+        "impl JournalTable { fn journal_for_root(&mut self, sub: &str) {} }",
+    )]);
+    let sigs_only = Facts {
+        journal_for_root_sigs: f
+            .journal_for_root_sigs
+            .iter()
+            .filter(|(_, i)| !i.iter().any(|t| t == "&RootSpec"))
+            .cloned()
+            .collect(),
+        owner_open_callers: vec!["boot::JournalTable::journal_for_root".to_string()],
+        ..Facts::default()
+    };
+    assert!(cs3_invariants(&sigs_only)
+        .iter()
+        .any(|v| v.contains("&RootSpec")));
+    let _ = ex;
 }

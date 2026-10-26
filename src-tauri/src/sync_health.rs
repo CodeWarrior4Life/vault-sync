@@ -309,7 +309,7 @@ pub fn spawn_progress_stall_watchdog<P, Fut, S>(
     recovery_disabled: bool,
     mut pending_fn: P,
     mut on_stall: S,
-) -> tauri::async_runtime::JoinHandle<()>
+) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd>
 where
     P: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = usize> + Send,
@@ -332,10 +332,15 @@ where
         let watcher_threshold = DEFAULT_WATCHER_STALE_SECS;
         loop {
             ticker.tick().await;
+            #[cfg(test)]
+            crate::faults::point("stall_watchdog");
             let pending = pending_fn().await;
             let elapsed = health.secs_since_progress();
             // D7: combined decision, fires on push-stall OR watcher-fenced OR
             // watcher-heartbeat-stale (the latter two regardless of pending).
+            // CS-3 gate C4 / E2: for `WatcherFenced` the recovery callback
+            // neither restarts nor notifies (the supervisor owns the fence's
+            // one restart or one notice); the watchdog then ends.
             let fenced = health.is_watcher_fenced();
             let watcher_idle = health.secs_since_watcher_alive();
             if let Some(trigger) = recovery_trigger(
@@ -366,7 +371,7 @@ where
                 // we've at least notified the owner). Exit the loop: a
                 // restarted process spawns a fresh watchdog; a kill-switched
                 // host shouldn't re-fire the same alert every minute.
-                return;
+                return crate::supervise::TaskEnd::Completed;
             }
         }
     })
@@ -410,6 +415,38 @@ pub enum StateHealthEvent {
     DurableWriteUncertain { file: String },
     /// The configured sync-state leaf is a symlink (TKT-98d5f42d F2).
     StateDirSymlinked { sub: String },
+    /// CS-3 §3.1 (AR-1C-005): `config.toml` on disk no longer hashes to the
+    /// snapshot this process runs on. Raised once per distinct disk hash;
+    /// nothing reloads (restart-not-reload). `disk_sha8` is `"absent"` when
+    /// the file is gone.
+    ConfigPendingRestart {
+        snapshot_sha8: String,
+        disk_sha8: String,
+    },
+    /// CS-3 §3.1: the bytes on disk hash to the snapshot again.
+    ConfigPendingRestartCleared { snapshot_sha8: String },
+    /// CS-3 §3.5: a supervised task ended (`cause`: panic, returned,
+    /// storm_fence).
+    TaskEnded { name: String, cause: String },
+    /// CS-3 §3.5: a supervised task ended by its kill switch (by design).
+    TaskDisabled { name: String },
+    /// CS-3 §3.3: a root's pipeline failed at `stage`; V&R refuses the root.
+    PipelineFailed { root: usize, stage: String },
+    /// CS-3 §3.5 (gate C6): the server rejected this device's token on the
+    /// SSE stream; pull and push stopped for `sub` (Terminal, no exit).
+    SseAuthFailed { sub: String, status: u16 },
+    /// CS-3 §3.5 B1: the boot task stopped before publishing handles.
+    BootAborted { stage: String },
+    /// CS-3 §3.6 (G-6, DIAGNOSE ONLY): a rootless sub's journal holds lines
+    /// nothing will drain. Counts are by action; the file is untouched.
+    StrandedJournal {
+        sub: String,
+        bytes: u64,
+        create: usize,
+        modify: usize,
+        delete: usize,
+        unparsed: usize,
+    },
 }
 
 impl StateHealthEvent {
@@ -420,6 +457,16 @@ impl StateHealthEvent {
             StateHealthEvent::StateFsUnsupported { .. } => "state_fs_unsupported",
             StateHealthEvent::DurableWriteUncertain { .. } => "durable_write_uncertain",
             StateHealthEvent::StateDirSymlinked { .. } => "state_dir_symlinked",
+            StateHealthEvent::ConfigPendingRestart { .. } => "config_pending_restart",
+            StateHealthEvent::ConfigPendingRestartCleared { .. } => {
+                "config_pending_restart_cleared"
+            }
+            StateHealthEvent::TaskEnded { .. } => "task_ended",
+            StateHealthEvent::TaskDisabled { .. } => "task_disabled",
+            StateHealthEvent::PipelineFailed { .. } => "pipeline_failed",
+            StateHealthEvent::SseAuthFailed { .. } => "sse_auth_failed",
+            StateHealthEvent::BootAborted { .. } => "boot_aborted",
+            StateHealthEvent::StrandedJournal { .. } => "stranded_journal",
         }
     }
 }
@@ -474,6 +521,65 @@ pub fn raise_state_event(e: StateHealthEvent) -> bool {
         StateHealthEvent::DurableWriteUncertain { file } => {
             tracing::warn!(sync_health_event = e.name(), file = %file, "sync_health: durable_write_uncertain")
         }
+        StateHealthEvent::ConfigPendingRestart {
+            snapshot_sha8,
+            disk_sha8,
+        } => tracing::warn!(
+            sync_health_event = e.name(),
+            snapshot_sha8 = %snapshot_sha8,
+            disk_sha8 = %disk_sha8,
+            "sync_health: config.toml changed on disk; this daemon keeps running on its startup snapshot until a restart (nothing reloads)"
+        ),
+        StateHealthEvent::ConfigPendingRestartCleared { snapshot_sha8 } => tracing::info!(
+            sync_health_event = e.name(),
+            snapshot_sha8 = %snapshot_sha8,
+            "sync_health: config.toml matches the running snapshot again"
+        ),
+        StateHealthEvent::TaskEnded { name, cause } => tracing::warn!(
+            sync_health_event = e.name(),
+            task = %name,
+            cause = %cause,
+            "sync_health: task_ended"
+        ),
+        StateHealthEvent::TaskDisabled { name } => tracing::info!(
+            sync_health_event = e.name(),
+            task = %name,
+            "sync_health: task_disabled (kill switch)"
+        ),
+        StateHealthEvent::PipelineFailed { root, stage } => tracing::warn!(
+            sync_health_event = e.name(),
+            root = *root,
+            stage = %stage,
+            "sync_health: pipeline_failed; Verify and repair refuses this root"
+        ),
+        StateHealthEvent::SseAuthFailed { sub, status } => tracing::warn!(
+            sync_health_event = e.name(),
+            sub = %sub,
+            status = *status,
+            "sync_health: sse_auth_failed; pull and push stopped for this subscriber until re-pair"
+        ),
+        StateHealthEvent::BootAborted { stage } => tracing::warn!(
+            sync_health_event = e.name(),
+            stage = %stage,
+            "sync_health: boot_aborted; sync not started"
+        ),
+        StateHealthEvent::StrandedJournal {
+            sub,
+            bytes,
+            create,
+            modify,
+            delete,
+            unparsed,
+        } => tracing::warn!(
+            sync_health_event = e.name(),
+            sub = %sub,
+            bytes = *bytes,
+            create = *create,
+            modify = *modify,
+            delete = *delete,
+            unparsed = *unparsed,
+            "sync_health: stranded_journal (diagnose only; the file is left byte-identical)"
+        ),
     }
     if g.log.len() >= STATE_EVENT_CAP {
         g.log.pop_front();

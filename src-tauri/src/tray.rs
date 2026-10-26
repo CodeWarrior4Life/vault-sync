@@ -272,7 +272,9 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 let app_handle = app.clone();
                 let st_done = st.clone();
                 tauri::async_runtime::spawn(async move {
-                    let result = commands::verify_repair_run().await;
+                    // CS-3 §3.4 (P10): the tray passes its AppHandle; V&R
+                    // borrows from the managed SyncHandlesSlot.
+                    let result = commands::verify_repair_run(app_handle.clone()).await;
                     if let Ok(mut s) = st_done.write() {
                         s.set_verify_in_progress(false);
                     }

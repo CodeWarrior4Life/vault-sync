@@ -45,8 +45,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::journal_owner::JournalOwner;
 use crate::push_journal::{
-    new_event_id, JournalError, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalError, PushAction, PushBase, PushEvent, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, is_junk_path, PathClassification};
 use crate::redflag::DeleteBurstDetector;
@@ -150,7 +151,26 @@ pub struct WatchHandle {
         notify_debouncer_full::RecommendedCache,
     >,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    _task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<WatcherEnd>>,
+}
+
+/// CS-3 §3.5: how the watcher's event loop ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherEnd {
+    /// Its `WatchHandle` was dropped (the boot task's teardown).
+    Shutdown,
+    /// The notify channel closed (the debouncer was dropped).
+    ChannelClosed,
+    /// The storm circuit-breaker fenced and halted the loop (gate C4).
+    Fenced,
+}
+
+impl WatchHandle {
+    /// CS-3: hand the event loop's `JoinHandle` to the supervisor. Dropping
+    /// the `WatchHandle` still stops the loop.
+    pub fn take_task(&mut self) -> Option<tokio::task::JoinHandle<WatcherEnd>> {
+        self.task.take()
+    }
 }
 
 impl Drop for WatchHandle {
@@ -198,9 +218,15 @@ fn read_inotify_limit() -> Option<u64> {
 /// halt the watcher so the cause is recoverable from the log post-mortem.
 const STORM_BREAKER_THRESHOLD: u64 = 200;
 
+/// CS-3 T-CS3-17: the storm threshold in effect (a test may lower it).
+fn storm_threshold(w: &FileWatcher) -> u64 {
+    w.storm_threshold
+}
+
 pub struct FileWatcher {
     vault_root: PathBuf,
-    journal: Arc<Mutex<PushJournal>>,
+    /// CS-3 (J5): the same journal owner the root's drain loop borrows.
+    journal: Arc<JournalOwner>,
     burst: Arc<Mutex<DeleteBurstDetector>>,
     config: FileWatcherConfig,
     device_id: String,
@@ -211,6 +237,9 @@ pub struct FileWatcher {
     /// Count of CONSECUTIVE journal `CapacityExceeded` append failures. Reset
     /// to 0 on any successful append. Feeds the storm circuit-breaker.
     cap_fail_streak: Arc<AtomicU64>,
+    /// Consecutive `CapacityExceeded` appends that trip the breaker
+    /// ([`STORM_BREAKER_THRESHOLD`]; a test harness may lower it).
+    storm_threshold: u64,
     /// Set true once the storm breaker trips. The FS-watcher loop checks this
     /// and halts so a wedged-at-capacity journal can't drive a hot-spin.
     fenced: Arc<AtomicBool>,
@@ -266,7 +295,7 @@ pub struct FileWatcher {
 impl FileWatcher {
     pub fn new(
         vault_root: impl Into<PathBuf>,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
         burst: Arc<Mutex<DeleteBurstDetector>>,
         config: FileWatcherConfig,
         device_id: impl Into<String>,
@@ -280,6 +309,7 @@ impl FileWatcher {
             tray_state: None,
             delete_ledger: None,
             cap_fail_streak: Arc::new(AtomicU64::new(0)),
+            storm_threshold: STORM_BREAKER_THRESHOLD,
             fenced: Arc::new(AtomicBool::new(false)),
             echo_guard: None,
             enqueued_hashes: Arc::new(Mutex::new(HashMap::new())),
@@ -298,6 +328,15 @@ impl FileWatcher {
     /// D6 (S511): attach the shared shadow store so the enqueue dedup is gated
     /// on the last-server-ACCEPTED hash (not the in-memory enqueued hash alone).
     /// Attach the suppressed-delete ledger (P0 2026-08-26 second pass).
+    /// CS-3 T-CS3-17: override the storm breaker's threshold (the boot
+    /// knobs pass `None` in production, keeping [`STORM_BREAKER_THRESHOLD`]).
+    pub fn with_storm_threshold(mut self, n: Option<u64>) -> Self {
+        if let Some(n) = n {
+            self.storm_threshold = n.max(1);
+        }
+        self
+    }
+
     pub fn with_delete_ledger(mut self, ledger: crate::delete_ledger::DeleteLedger) -> Self {
         self.delete_ledger = Some(ledger);
         self
@@ -369,7 +408,7 @@ impl FileWatcher {
             return false;
         }
         let streak = self.cap_fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        if streak >= STORM_BREAKER_THRESHOLD {
+        if streak >= storm_threshold(self) {
             // Trip exactly once (first thread/iteration to swap false->true).
             return !self.fenced.swap(true, Ordering::Relaxed);
         }
@@ -846,13 +885,16 @@ impl FileWatcher {
             // (quiet vault, no FS events) still stamps SyncHealth and is not
             // mistaken for a dead/hung watch loop. 30s is well under the
             // watcher-stale window (DEFAULT_WATCHER_STALE_SECS = 300s).
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+            let mut heartbeat =
+                tokio::time::interval(crate::supervise::tick(Duration::from_secs(30)));
             // Stamp once immediately so the watchdog's staleness check arms from
             // a known-alive baseline the moment the watcher starts.
             me.mark_watcher_alive();
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
+                        #[cfg(test)]
+                        crate::faults::point("watcher");
                         // Idle or busy, the loop is alive: stamp the heartbeat.
                         me.mark_watcher_alive();
                         // P0 2026-08-26: headless resume for the delete-burst
@@ -887,14 +929,14 @@ impl FileWatcher {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             tracing::info!("file_watcher: shutdown signal received");
-                            break;
+                            return WatcherEnd::Shutdown;
                         }
                     }
                     maybe = rx.recv() => {
                         // An event batch arrived: the loop is alive.
                         me.mark_watcher_alive();
                         match maybe {
-                            None => break, // channel closed → debouncer dropped
+                            None => return WatcherEnd::ChannelClosed, // debouncer dropped
                             Some(Ok(events)) => {
                                 for de in events {
                                     // v0.4.9 ROOT-CAUSE FIX: drop non-mutating
@@ -929,9 +971,9 @@ impl FileWatcher {
                                     // the daemon" and nothing restarted.
                                     me.mark_watcher_fenced();
                                     tracing::error!(
-                                        "file_watcher: storm circuit-breaker fenced, halting event loop; SyncHealth watcher_fenced set so the watchdog will auto-recover (restart). See the STORM CIRCUIT-BREAKER diagnostic above."
+                                        "file_watcher: storm circuit-breaker fenced, halting event loop; the supervisor owns the one restart (CS-3 gate C4). See the STORM CIRCUIT-BREAKER diagnostic above."
                                     );
-                                    break;
+                                    return WatcherEnd::Fenced;
                                 }
                             }
                             Some(Err(errors)) => {
@@ -949,7 +991,7 @@ impl FileWatcher {
         Ok(WatchHandle {
             _watcher: debouncer,
             shutdown_tx,
-            _task: task,
+            task: Some(task),
         })
     }
 
@@ -998,29 +1040,24 @@ impl FileWatcher {
             });
         }
         let queued = events.len();
-        match self.journal.lock() {
-            Ok(mut j) => match j.append_batch(events) {
-                Ok(n) => {
-                    tracing::warn!(
-                        replayed = n,
-                        skipped_present,
-                        total_in_ledger = paths.len(),
-                        "file_watcher: REPLAYED suppressed deletes after operator resume — these were dropped while the burst valve was latched and are now propagating"
-                    );
-                    // Only clear once the batch is durably appended; a failure
-                    // must leave the ledger intact so the next resume retries.
-                    ledger.clear();
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        queued,
-                        "file_watcher: FAILED to replay suppressed deletes; ledger RETAINED so the next resume retries. Those deletes are still un-propagated."
-                    );
-                }
-            },
+        match self.journal.append_batch(events) {
+            Ok(n) => {
+                tracing::warn!(
+                    replayed = n,
+                    skipped_present,
+                    total_in_ledger = paths.len(),
+                    "file_watcher: REPLAYED suppressed deletes after operator resume — these were dropped while the burst valve was latched and are now propagating"
+                );
+                // Only clear once the batch is durably appended; a failure
+                // must leave the ledger intact so the next resume retries.
+                ledger.clear();
+            }
             Err(e) => {
-                tracing::error!(error = %e, "file_watcher: journal mutex poisoned during suppressed-delete replay; ledger retained");
+                tracing::error!(
+                    error = %e,
+                    queued,
+                    "file_watcher: FAILED to replay suppressed deletes; ledger RETAINED so the next resume retries. Those deletes are still un-propagated."
+                );
             }
         }
     }
@@ -1173,48 +1210,45 @@ impl FileWatcher {
                     );
                     return;
                 };
-                match self.journal.lock() {
-                    Ok(mut j) => match j.append(push_evt) {
-                        Ok(()) => {
-                            // Success resets the consecutive-capacity streak.
-                            self.record_append_capacity(false);
-                            // Remember what we just enqueued for this path so a
-                            // subsequent identical-content event is deduped.
-                            // Recorded only on a successful append, so a failed
-                            // append never suppresses the retry.
-                            if let (Some(sha), Some(p)) = (&content_sha, write_path) {
-                                if let Ok(mut m) = self.enqueued_hashes.lock() {
-                                    m.insert(p.to_string(), sha.clone());
-                                }
+                match self.journal.append(push_evt) {
+                    Ok(()) => {
+                        // Success resets the consecutive-capacity streak.
+                        self.record_append_capacity(false);
+                        // Remember what we just enqueued for this path so a
+                        // subsequent identical-content event is deduped.
+                        // Recorded only on a successful append, so a failed
+                        // append never suppresses the retry.
+                        if let (Some(sha), Some(p)) = (&content_sha, write_path) {
+                            if let Ok(mut m) = self.enqueued_hashes.lock() {
+                                m.insert(p.to_string(), sha.clone());
                             }
                         }
-                        Err(e) => {
-                            let is_capacity = matches!(e, JournalError::CapacityExceeded { .. });
-                            if is_capacity {
-                                // DEBUG, not WARN: a capacity failure under a
-                                // wedged journal can fire thousands/sec — warn
-                                // here was the 290 MB log-spam half of the
-                                // storm. The breaker below is the loud signal.
-                                tracing::debug!("file_watcher: journal append failed: {e}");
-                            } else {
-                                tracing::warn!("file_watcher: journal append failed: {e}");
-                            }
-                            if self.record_append_capacity(is_capacity) {
-                                let journal_dir = j
-                                    .display()
-                                    .map(|d| d.to_string())
-                                    .unwrap_or_else(|| "<scratch>".to_string());
-                                tracing::error!(
-                                    target: "vault_sync_daemon::file_watcher",
-                                    threshold = STORM_BREAKER_THRESHOLD,
-                                    error = %e,
-                                    "STORM CIRCUIT-BREAKER TRIPPED: {STORM_BREAKER_THRESHOLD} consecutive journal CapacityExceeded failures — the push journal is wedged at its 100MB cap and the file_watcher would hot-spin (the S489/S490 storm: 85% CPU, 290MB logs, all new events dropped). HALTING the file_watcher to prevent CPU/log runaway. Likely cause: a reconciliation/materializer backlog filled the journal faster than push_client could drain it. Investigate the push journal (state dir: {journal_dir}; at cap?) and push_client drain health (server reachable? reconciliation HTTP errors?). The watcher will NOT auto-resume — restart the daemon after the backlog clears."
-                                );
-                            }
-                        }
-                    },
+                    }
                     Err(e) => {
-                        tracing::warn!("file_watcher: journal mutex poisoned: {e}");
+                        let is_capacity = matches!(e, JournalError::CapacityExceeded { .. });
+                        if is_capacity {
+                            // DEBUG, not WARN: a capacity failure under a
+                            // wedged journal can fire thousands/sec — warn
+                            // here was the 290 MB log-spam half of the
+                            // storm. The breaker below is the loud signal.
+                            tracing::debug!("file_watcher: journal append failed: {e}");
+                        } else {
+                            tracing::warn!("file_watcher: journal append failed: {e}");
+                        }
+                        if self.record_append_capacity(is_capacity) {
+                            let journal_dir = self
+                                .journal
+                                .display()
+                                .map(|d| d.to_string())
+                                .unwrap_or_else(|| "<scratch>".to_string());
+                            tracing::error!(
+                                target: "vault_sync_daemon::file_watcher",
+                                threshold = self.storm_threshold,
+                                error = %e,
+                                "STORM CIRCUIT-BREAKER TRIPPED: {} consecutive journal CapacityExceeded failures — the push journal is wedged at its 100MB cap and the file_watcher would hot-spin (the S489/S490 storm: 85% CPU, 290MB logs, all new events dropped). HALTING the file_watcher to prevent CPU/log runaway. Likely cause: a reconciliation/materializer backlog filled the journal faster than push_client could drain it. Investigate the push journal (state dir: {journal_dir}; at cap?) and push_client drain health (server reachable? reconciliation HTTP errors?). The watcher will NOT auto-resume — restart the daemon after the backlog clears.",
+                                self.storm_threshold
+                            );
+                        }
                     }
                 }
             }
@@ -1409,14 +1443,11 @@ fn rewrite_decision_path(d: FilterDecision, p: String) -> FilterDecision {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::push_journal::PushJournal;
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn make_journal(dir: &TempDir) -> Arc<Mutex<PushJournal>> {
-        Arc::new(Mutex::new(
-            PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap(),
-        ))
+    fn make_journal(dir: &TempDir) -> Arc<JournalOwner> {
+        crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(dir.path()))
     }
 
     fn make_burst() -> Arc<Mutex<DeleteBurstDetector>> {
@@ -1523,7 +1554,7 @@ mod tests {
             w.handle_fs_path(&abs).await;
         }
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             0,
             "materializer soft-delete echoes must NOT enqueue delete pushes"
         );
@@ -1563,7 +1594,7 @@ mod tests {
         guard.record_delete(rel);
         std::fs::remove_file(&abs).unwrap();
         w.handle_fs_path(&abs).await;
-        assert_eq!(w.journal.lock().unwrap().len(), 0, "echo suppressed");
+        assert_eq!(w.journal.len(), 0, "echo suppressed");
 
         // Recreate, then a genuine user delete: must enqueue (create + delete).
         std::fs::write(&abs, b"body again").unwrap();
@@ -1571,7 +1602,7 @@ mod tests {
         std::fs::remove_file(&abs).unwrap();
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             2,
             "recreate + user delete must both enqueue (echo entry was consumed)"
         );
@@ -1589,16 +1620,12 @@ mod tests {
 
         // First event → enqueues (and records the enqueued hash).
         w.handle_fs_path(&abs).await;
-        assert_eq!(
-            w.journal.lock().unwrap().len(),
-            1,
-            "first event for a path must enqueue"
-        );
+        assert_eq!(w.journal.len(), 1, "first event for a path must enqueue");
 
         // Second event, content UNCHANGED → redundant no-op → must NOT enqueue.
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             1,
             "redundant identical-content event must be deduped (no second entry)"
         );
@@ -1607,7 +1634,7 @@ mod tests {
         std::fs::write(&abs, b"---\ntitle: x\n---\nCHANGED body\n").unwrap();
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             2,
             "a real edit (changed bytes) MUST enqueue"
         );
@@ -1636,14 +1663,14 @@ mod tests {
 
         // First event enqueues (records enqueued_hashes[p]=sha).
         w.handle_fs_path(&abs).await;
-        assert_eq!(w.journal.lock().unwrap().len(), 1, "first event enqueues");
+        assert_eq!(w.journal.len(), 1, "first event enqueues");
 
         // The push was NOT accepted: the shadow has NO record for this path.
         // A second identical event must therefore NOT be suppressed (the content
         // is not server-confirmed) and must re-enqueue.
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             2,
             "D6: an un-accepted content must re-enqueue, not be silently dropped"
         );
@@ -1658,7 +1685,7 @@ mod tests {
         shadow.record(rel, &sha);
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             2,
             "once server-accepted, a redundant identical event is suppressed"
         );
@@ -1704,7 +1731,7 @@ mod tests {
         // A touch event past the echo TTL: unchanged bytes, no echo entry.
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             0,
             "B2'd: a touch with unchanged canonical bytes must NOT enqueue a push"
         );
@@ -1713,7 +1740,7 @@ mod tests {
         std::fs::write(&abs, b"a real edit\n").unwrap();
         w.handle_fs_path(&abs).await;
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             1,
             "a genuine edit must never be suppressed"
         );
@@ -1879,7 +1906,7 @@ mod tests {
         std::fs::write(&abs, bytes).unwrap();
         w.handle_fs_path(&abs).await; // recreate identical bytes → MUST enqueue
         assert_eq!(
-            w.journal.lock().unwrap().len(),
+            w.journal.len(),
             3,
             "recreate after delete must enqueue even with pre-delete-identical bytes"
         );
@@ -2517,7 +2544,7 @@ mod tests {
         // Wait for debounce + processing.
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
-        let j = journal.lock().unwrap();
+        let j = journal.clone();
         assert!(!j.is_empty(), "expected at least one event in journal");
     }
 

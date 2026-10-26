@@ -6,6 +6,9 @@
 #              warnings` on a planted scratch copy must exit non-zero WITH a
 #              "use of a disallowed method" diagnostic (a compile error does
 #              not count as a catch).
+#   lint-*   : CS-3 T-CS3-11 (`#![deny(clippy::await_holding_lock)]` at the
+#              crate roots). `cargo clippy --lib -- -D warnings` on the planted
+#              copy must exit non-zero WITH an await_holding_lock diagnostic.
 #   others   : gates 2/3 and C6/C7/C8/C10 (tests/state_io_gate.rs). The gate
 #              test, built once from the real tree, is run against the
 #              planted scratch copy via STATE_IO_GATE_ROOT and must fail.
@@ -40,7 +43,15 @@ for p in "$FIX"/*.patch; do
     rm -rf "$scratch"
     continue
   fi
-  if [ "$kind" = "gate1" ]; then
+  if [ "$kind" = "lint" ]; then
+    (cd "$scratch/src-tauri" && cargo clippy --lib -- -D warnings) >"$scratch/out" 2>&1
+    rc=$?
+    if ! grep -q "await_holding_lock" "$scratch/out"; then
+      echo "     $name: clippy rc=$rc without an await_holding_lock diagnostic:" >&2
+      tail -20 "$scratch/out" >&2
+      rc=0
+    fi
+  elif [ "$kind" = "gate1" ]; then
     (cd "$scratch/src-tauri" && cargo clippy --lib -- -D warnings) >"$scratch/out" 2>&1
     rc=$?
     if ! grep -q "use of a disallowed method" "$scratch/out"; then
@@ -57,7 +68,7 @@ for p in "$FIX"/*.patch; do
     echo "FAIL $name: the planted mutation PASSED its gate" >&2
     fails=$((fails + 1))
   else
-    why=$( (grep -m1 'use of a disallowed method' "$scratch/out"; grep -A1 'state_io gate violations' "$scratch/out" | tail -1) | head -1 | head -c 220)
+    why=$( (grep -m1 -e 'use of a disallowed method' -e 'await_holding_lock' "$scratch/out"; grep -A1 'state_io gate violations' "$scratch/out" | tail -1) | head -1 | head -c 220)
     echo "ok   $name: caught (rc=$rc) :: $why"
   fi
   rm -rf "$scratch"

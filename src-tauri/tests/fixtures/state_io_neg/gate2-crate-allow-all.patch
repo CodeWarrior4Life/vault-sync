@@ -1,9 +1,9 @@
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1,6 +1,7 @@
- // CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
- // `cargo clippy` without `-D warnings` also fails (see clippy.toml).
+@@ -3,6 +3,7 @@
  #![deny(clippy::disallowed_methods)]
+ // CS-3 T-CS3-11: no std MutexGuard may be held across an `.await`.
+ #![deny(clippy::await_holding_lock)]
 +#![allow(clippy::all)]
  pub mod api_client;
  pub mod append_merge;

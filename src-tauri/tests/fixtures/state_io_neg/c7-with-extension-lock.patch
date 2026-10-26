@@ -1,13 +1,13 @@
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1501,6 +1501,10 @@
-     });
+@@ -506,6 +506,10 @@
+     }
  }
  
 +pub fn cs2_plant(p: &std::path::Path) -> std::path::PathBuf {
 +    p.with_extension("lock")
 +}
 +
+ /// Unit CS-3 in-process tests (T-CS3-3..-22).
  #[cfg(test)]
- #[allow(clippy::disallowed_methods)]
- mod tests {
+ #[path = "cs3_tests.rs"]

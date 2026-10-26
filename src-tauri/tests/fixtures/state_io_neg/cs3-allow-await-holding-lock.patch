@@ -1,0 +1,12 @@
+--- a/src/supervise.rs
++++ b/src/supervise.rs
+@@ -34,6 +34,9 @@
+ /// EX_SOFTWARE: a Required task ended unexpectedly (CS-3 D4).
+ pub const EXIT_TASK_ENDED: i32 = 70;
+ 
++#[allow(clippy::await_holding_lock)]
++pub async fn cs3_plant() {}
++
+ /// A periodic task's tick. Tests in the daemon-subprocess harness shorten
+ /// every periodic tick with `CS3_FAST_TICK_MS`; production returns
+ /// `default` unchanged.

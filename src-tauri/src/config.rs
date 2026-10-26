@@ -51,6 +51,12 @@ fn write_config_bytes(path: &Path, bytes: &[u8]) -> Result<Commit, ConfigError> 
 /// the best-effort startup maintenance (dead-pid temp sweep + directory fsync)
 /// on the config dir and the token dir. This narrows the window after an
 /// `Uncertain` write; it does not prove durability.
+/// CS-3 T-CS3-1: every config load in this process (both loaders), counted
+/// across threads (the `config_load:` seam event is thread-local).
+#[cfg(test)]
+pub(crate) static CONFIG_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn load_at_startup(path: &Path) -> Result<Config, ConfigError> {
     let token_dir = crate::token_store::token_dir();
     load_at_startup_with(path, &token_dir)
@@ -223,6 +229,8 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         #[cfg(test)]
         crate::durable_file::seams::record_event(format!("config_load:{}", path.display()));
+        #[cfg(test)]
+        CONFIG_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !path.exists() {
             return Err(ConfigError::NotFound);
         }

@@ -214,6 +214,10 @@ pub(crate) fn store_impl(
     Ok(TokenStored { backend, commit })
 }
 
+/// CS-3 T-CS3-14: every subscriber id `load` was asked for, in order.
+#[cfg(test)]
+pub(crate) static LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Load a token. v0.4.29 order: cache → FILE → keyring. The keyring is a
 /// legacy-only fallback (pre-0.4.29 installs stored keyring-only); when it
 /// still holds the token, the migration shim writes the file so the NEXT
@@ -221,6 +225,11 @@ pub(crate) fn store_impl(
 /// `VAULT_SYNC_TOKEN_BACKEND=file` the keyring is never consulted — a
 /// missing file is `Ok(None)`, which drives re-pair.
 pub fn load(subscriber_id: &str) -> Result<Option<String>, TokenStoreError> {
+    #[cfg(test)]
+    LOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(subscriber_id.to_string());
     load_impl(
         subscriber_id,
         &token_file_path(subscriber_id)?,

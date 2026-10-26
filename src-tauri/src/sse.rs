@@ -70,6 +70,21 @@ pub struct SseConsumer {
     /// TKT-fc62ea8a: max silence tolerated on the stream before the session
     /// is force-reconnected. See [`LIVENESS_WINDOW`].
     liveness_window: std::time::Duration,
+    /// CS-3 §3.3 readiness: called on every `Connected` (the handles latch
+    /// `sse_connected_once`).
+    on_connected: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// CS-3 §3.5 (P13): the HTTP status of an SSE auth failure (401/403) that
+/// made [`SseConsumer::run`] stop by design, if `e` is one.
+pub fn auth_failure_status(e: &anyhow::Error) -> Option<u16> {
+    match e.downcast_ref::<SseError>() {
+        Some(SseError::UnexpectedResponse(resp, _)) => {
+            let s = resp.status();
+            (s == 401 || s == 403).then_some(s)
+        }
+        _ => None,
+    }
 }
 
 /// TKT-fc62ea8a: event-arrival liveness window. The server emits a
@@ -104,7 +119,14 @@ impl SseConsumer {
             tray_state: None,
             state_dir: None,
             liveness_window: LIVENESS_WINDOW,
+            on_connected: None,
         })
+    }
+
+    /// CS-3 §3.3: run `f` on every `Connected`.
+    pub fn with_on_connected(mut self, f: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_connected = Some(f);
+        self
     }
 
     /// TKT-fc62ea8a: override the liveness window (tests use sub-second
@@ -279,6 +301,8 @@ impl SseConsumer {
             // restart) or a dead origin generator — either way the only
             // recovery is a reconnect, which also triggers server-side
             // catch-up from the persisted last_event_id.
+            #[cfg(test)]
+            crate::faults::point("sse_consumer");
             let event = match tokio::time::timeout(self.liveness_window, stream.try_next()).await {
                 Ok(next) => match next? {
                     Some(ev) => ev,
@@ -303,6 +327,9 @@ impl SseConsumer {
                 SSE::Connected(_) => {
                     debug!("SSE connected");
                     self.ts_set(ConnectionStatus::Connected);
+                    if let Some(f) = &self.on_connected {
+                        f();
+                    }
                 }
                 SSE::Event(ev) => {
                     if ev.event_type != "enrichment_complete" {

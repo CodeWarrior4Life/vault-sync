@@ -13,28 +13,28 @@
 //! * Mandate §1 row 11 (extension-gate outbound: only allowed exts pushed)
 //! * Mandate §2 R2 (CAS / base_hash mismatch → caller refetches+merges+replays)
 //!
-//! Concurrency: `PushJournal` requires `&mut self`, so we hold it under a
-//! single async `Mutex`. R12 single-instance guarantees no cross-process
-//! contention.
+//! Concurrency (CS-3): the journal is the subscriber's one
+//! [`JournalOwner`](crate::journal_owner::JournalOwner), borrowed; it holds
+//! no guard, so nothing is held across an `.await`. R12 single-instance
+//! guarantees no cross-process contention.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
-use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-
 use crate::api_client::{
     ApiClient, ApiError, NotePayload, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
+use crate::journal_owner::JournalOwner;
 use crate::push_journal::{
-    new_event_id, JournalCursor, PushAction, PushBase, PushEvent, PushJournal, CURRENT_SCHEMA,
+    new_event_id, JournalCursor, PushAction, PushBase, PushEvent, CURRENT_SCHEMA,
 };
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::read_receipt::verify_receipt;
 use crate::tray_state::SharedTrayState;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
 /// S5 (v0.4.28): how long `drain_once` stands down after the server's
 /// min-daemon-version gate answers 426. Long enough to avoid a retry-loop
@@ -165,7 +165,8 @@ pub enum PushOutcome {
 
 pub struct PushClient {
     api: Arc<ApiClient>,
-    journal: Arc<Mutex<PushJournal>>,
+    /// CS-3 (J2): the subscriber's one journal owner, borrowed.
+    journal: Arc<JournalOwner>,
     device_id: String,
     config: PushClientConfig,
     /// Absolute path to the configured `vaults_root`. Used to resolve a
@@ -223,12 +224,15 @@ pub struct PushClient {
     /// is suppressed by the watcher's layer-2 dedup instead of emitting an
     /// idempotent echo push.
     enqueued_hashes: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>>,
+    /// CS-3 §3.3 readiness: called after every `drain_once` in `run_loop`
+    /// (the root's `FIRST_DRAIN_DONE` bit is a latch).
+    drain_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl PushClient {
     pub fn new(
         api: Arc<ApiClient>,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
         device_id: String,
         config: PushClientConfig,
         vault_root: PathBuf,
@@ -247,6 +251,7 @@ impl PushClient {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         }
     }
 
@@ -440,16 +445,14 @@ impl PushClient {
             }
         }
 
-        let batch: Vec<(PushEvent, JournalCursor)> = {
-            let mut j = self.journal.lock().await;
-            match j.drain(self.config.batch_size) {
+        let batch: Vec<(PushEvent, JournalCursor)> =
+            match self.journal.drain(self.config.batch_size) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!("push_journal drain failed: {e}");
                     return Vec::new();
                 }
-            }
-        };
+            };
 
         // Router-by-path concurrency: group the drained batch by path so each
         // path becomes a SEQUENTIAL chain — the server's per-path CAS never
@@ -515,16 +518,12 @@ impl PushClient {
             out.push((evt, outcome));
         }
         if !to_ack.is_empty() {
-            let mut j = self.journal.lock().await;
-            let _ = j.ack_batch(to_ack);
+            let _ = self.journal.ack_batch(to_ack);
         }
 
         // Snapshot the journal depth so the tray's "Pending uploads" item
         // reflects what's still queued.
-        let pending_after = {
-            let j = self.journal.lock().await;
-            j.len()
-        };
+        let pending_after = self.journal.len();
         if let Some(tray) = &self.tray_state {
             if let Ok(mut w) = tray.write() {
                 w.set_uploads_pending(pending_after);
@@ -561,10 +560,25 @@ impl PushClient {
     /// next tick fires after the short `busy_loop_interval_ms`; when caught up
     /// (no outcomes) it waits the full `loop_interval_ms`. This drains a deep
     /// backlog quickly without busy-spinning while idle.
+    /// CS-3 §3.3: run `f` after every drain in `run_loop`.
+    pub fn with_drain_hook(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.drain_hook = Some(f);
+        self
+    }
+
     pub async fn run_loop(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         loop {
+            #[cfg(test)]
+            crate::faults::point("drain_loop");
+            #[cfg(test)]
+            if crate::faults::armed("drain_loop.return") {
+                return;
+            }
             // Drain one batch.
             let outcomes = self.drain_once().await;
+            if let Some(h) = &self.drain_hook {
+                h();
+            }
             // Backlog present (we did work) → short interval; idle → full interval.
             let interval = if outcomes.is_empty() {
                 Duration::from_millis(self.config.loop_interval_ms)
@@ -1411,8 +1425,7 @@ impl PushClient {
             queued_at: chrono::Utc::now(),
             device_id: self.device_id.clone(),
         };
-        let mut j = self.journal.lock().await;
-        match j.append(evt) {
+        match self.journal.append(evt) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(path, error = %e, "terminal 409+404 (R5): re-create append failed");
@@ -1626,7 +1639,8 @@ fn strip_yaml_fields(fm_block: &str, fields: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::api_client::ApiClient;
-    use crate::push_journal::{PushAction, PushEvent, PushJournal, CURRENT_SCHEMA};
+    use crate::journal_owner::JournalOwner;
+    use crate::push_journal::{PushAction, PushEvent, CURRENT_SCHEMA};
     use chrono::Utc;
     use mockito::Server;
     use std::path::PathBuf;
@@ -1661,16 +1675,16 @@ mod tests {
         }
     }
 
-    fn make_journal_with(events: Vec<PushEvent>) -> (TempDir, Arc<Mutex<PushJournal>>) {
+    fn make_journal_with(events: Vec<PushEvent>) -> (TempDir, Arc<JournalOwner>) {
         let dir = TempDir::new().unwrap();
-        let mut j = PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap();
+        let j = crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(dir.path()));
         for e in events {
             j.append(e).unwrap();
         }
-        (dir, Arc::new(Mutex::new(j)))
+        (dir, j)
     }
 
-    async fn make_client(base_url: &str, journal: Arc<Mutex<PushJournal>>) -> PushClient {
+    async fn make_client(base_url: &str, journal: Arc<JournalOwner>) -> PushClient {
         let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
         PushClient::new(
             api,
@@ -1704,11 +1718,12 @@ mod tests {
         let reg = crate::state_io::bootstrap(&ws, &["sub-t3".to_string()], &cfg).unwrap();
         let reg = crate::state_io::install(reg, &ws);
         let sd = reg.get("sub-t3").unwrap();
-        let mut j = PushJournal::open(&sd).unwrap();
+        let journal = crate::journal_owner::JournalOwner::open(&sd, "sub-t3").unwrap();
         for i in 0..3 {
-            j.append(evt(&format!("notes/{i}.md"), b"body\n")).unwrap();
+            journal
+                .append(evt(&format!("notes/{i}.md"), b"body\n"))
+                .unwrap();
         }
-        let journal = Arc::new(Mutex::new(j));
         if std::env::var("CS2_T3_RENAME").as_deref() == Ok("1") {
             let leaf = PathBuf::from(sd.display(None).to_string());
             crate::state_io::test_hooks::set_before_push_gate(Some(Box::new(move || {
@@ -1783,7 +1798,7 @@ mod tests {
 
     async fn make_client_with_root(
         base_url: &str,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
         vault_root: PathBuf,
     ) -> PushClient {
         let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
@@ -1818,7 +1833,7 @@ mod tests {
     /// shared enqueued_hashes map.
     async fn make_align_client(
         base_url: &str,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
     ) -> (PushClient, AlignFx) {
         let vault = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
@@ -2563,11 +2578,8 @@ mod tests {
         let cfg = config_for_test();
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
-            journal: Arc::new(Mutex::new(
-                PushJournal::open(&crate::state_io::StateDir::for_test(
-                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
-                ))
-                .unwrap(),
+            journal: crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(
+                Box::leak(Box::new(TempDir::new().unwrap())).path(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2580,6 +2592,7 @@ mod tests {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -2596,11 +2609,8 @@ mod tests {
         let cfg = config_for_test();
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
-            journal: Arc::new(Mutex::new(
-                PushJournal::open(&crate::state_io::StateDir::for_test(
-                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
-                ))
-                .unwrap(),
+            journal: crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(
+                Box::leak(Box::new(TempDir::new().unwrap())).path(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2613,6 +2623,7 @@ mod tests {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -2625,11 +2636,8 @@ mod tests {
         let cfg = config_for_test();
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
-            journal: Arc::new(Mutex::new(
-                PushJournal::open(&crate::state_io::StateDir::for_test(
-                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
-                ))
-                .unwrap(),
+            journal: crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(
+                Box::leak(Box::new(TempDir::new().unwrap())).path(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2642,6 +2650,7 @@ mod tests {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -2653,11 +2662,8 @@ mod tests {
         let cfg = config_for_test();
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
-            journal: Arc::new(Mutex::new(
-                PushJournal::open(&crate::state_io::StateDir::for_test(
-                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
-                ))
-                .unwrap(),
+            journal: crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(
+                Box::leak(Box::new(TempDir::new().unwrap())).path(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2670,6 +2676,7 @@ mod tests {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -2698,7 +2705,7 @@ mod tests {
         let outcomes = client.drain_once().await;
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0].1, PushOutcome::Sent { .. }));
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 0);
     }
 
@@ -2738,11 +2745,7 @@ mod tests {
                 .all(|(_, o)| matches!(o, PushOutcome::Sent { .. })),
             "all four accepted"
         );
-        assert_eq!(
-            journal.lock().await.len(),
-            0,
-            "journal fully drained (batch-acked)"
-        );
+        assert_eq!(journal.len(), 0, "journal fully drained (batch-acked)");
         let mut paths: Vec<&str> = outcomes.iter().map(|(e, _)| e.path.as_str()).collect();
         paths.sort();
         paths.dedup();
@@ -2827,7 +2830,7 @@ mod tests {
             PushOutcome::Skipped(SkipReason::FileVanished)
         ));
         // Ack'd → drained out of the journal.
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 0);
         m.assert_async().await;
     }
@@ -2848,7 +2851,7 @@ mod tests {
             outcomes[0].1,
             PushOutcome::Failed(FailureReason::NetworkExhausted { .. })
         ));
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 1, "failed event must stay in journal for retry");
     }
 
@@ -2871,7 +2874,7 @@ mod tests {
             other => panic!("expected ConflictUnrecoverable, got {other:?}"),
         }
         // Conflict is terminal — event was ack'd (resolver handles refetch+replay).
-        let j = journal.lock().await;
+        let j = journal.clone();
         assert_eq!(j.len(), 0);
     }
 
@@ -2902,7 +2905,7 @@ mod tests {
         );
         // Acked: the journal entry is consumed, never retried.
         assert_eq!(
-            journal.lock().await.len(),
+            journal.len(),
             0,
             "422 outcome must be acked (journal drained)"
         );
@@ -3450,11 +3453,8 @@ mod tests {
         // does no filesystem I/O (just rasp_fence + extension + idempotency).
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
-            journal: Arc::new(Mutex::new(
-                PushJournal::open(&crate::state_io::StateDir::for_test(
-                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
-                ))
-                .unwrap(),
+            journal: crate::journal_owner::test_owner(&crate::state_io::StateDir::for_test(
+                Box::leak(Box::new(TempDir::new().unwrap())).path(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -3467,6 +3467,7 @@ mod tests {
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             materializer: None,
             enqueued_hashes: None,
+            drain_hook: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
@@ -3559,7 +3560,7 @@ mod tests {
         }
         // NOT acked: the local edit stays journaled for after the upgrade.
         assert_eq!(
-            journal.lock().await.len(),
+            journal.len(),
             1,
             "426 must NOT ack - the edit is preserved, not dropped"
         );
@@ -3629,7 +3630,7 @@ mod tests {
     /// TempDir so refetch/merge materialization lands somewhere real.
     async fn make_baseseq_client(
         base_url: &str,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
     ) -> (
         PushClient,
         TempDir,
@@ -3820,7 +3821,7 @@ mod tests {
     /// store, returned so tests can assert the verified receipt landed.
     async fn make_receipt_client(
         base_url: &str,
-        journal: Arc<Mutex<PushJournal>>,
+        journal: Arc<JournalOwner>,
     ) -> (
         PushClient,
         TempDir,
@@ -4166,11 +4167,7 @@ mod tests {
         // Round 2: a FRESH local edit on the same note. It must now push with
         // the recovered baseline and be ACCEPTED -- the note is no longer stuck.
         let local_v2: &[u8] = b"line A\nline B\nlocal extra\nand more\n";
-        journal
-            .lock()
-            .await
-            .append(evt("01_Notes/x.md", local_v2))
-            .unwrap();
+        journal.append(evt("01_Notes/x.md", local_v2)).unwrap();
         std::fs::write(vault.path().join("01_Notes/x.md"), local_v2).unwrap();
 
         let out2 = client.drain_once().await;
@@ -4321,7 +4318,7 @@ mod tests {
         let _ = client.drain_once().await;
 
         // The losing event was acked; a NEW explicit CREATE was enqueued.
-        let remaining = journal.lock().await.drain(10).unwrap();
+        let remaining = journal.drain(10).unwrap();
         assert_eq!(
             remaining.len(),
             1,
@@ -4347,14 +4344,13 @@ mod tests {
 
     // ─── TKT-ddff1877: CAS-409 against a STALE head (append ARM A) end-to-end ──
 
-    /// Like [`make_receipt_client`] but the materializer also holds a SECOND
-    /// `PushJournal` handle on the SAME journal file (as `lib.rs` wires it), so
+    /// Like [`make_receipt_client`] but the materializer also borrows the
+    /// SAME journal owner (CS-3: one owner per file, as `lib.rs` wires it), so
     /// the append arms' compensating push lands where the next `drain_once`
     /// reads it.
     async fn make_append_client(
         base_url: &str,
-        journal: Arc<Mutex<PushJournal>>,
-        journal_path: &std::path::Path,
+        journal: Arc<JournalOwner>,
     ) -> (
         PushClient,
         TempDir,
@@ -4373,12 +4369,6 @@ mod tests {
         let rr = crate::read_receipt::ReadReceiptStore::load(
             &crate::state_io::StateDir::for_test_file(&sdir.path().join("read_receipt.json")),
         );
-        let mat_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            PushJournal::open(&crate::state_io::StateDir::for_test(
-                journal_path.parent().unwrap(),
-            ))
-            .unwrap(),
-        ));
         let mat = Materializer::new(
             vault.path().to_path_buf(),
             None,
@@ -4392,7 +4382,7 @@ mod tests {
         )
         .with_shadow_store(shadow.clone())
         .with_base_seq_store(bs.clone())
-        .with_push_journal(mat_journal)
+        .with_push_journal(journal.clone())
         .with_echo_guard(Arc::new(EchoGuard::new()));
         let api = Arc::new(ApiClient::new(base_url, "vsk_test").unwrap());
         let client = PushClient::new(
@@ -4499,13 +4489,8 @@ mod tests {
             .create_async()
             .await;
 
-        let (jdir, journal) = make_journal_with(vec![evt("01_Notes/rec.md", local)]);
-        let (client, vault, bs, shadow) = make_append_client(
-            &srv.url(),
-            journal.clone(),
-            &jdir.path().join("push_journal.jsonl"),
-        )
-        .await;
+        let (_jdir, journal) = make_journal_with(vec![evt("01_Notes/rec.md", local)]);
+        let (client, vault, bs, shadow) = make_append_client(&srv.url(), journal.clone()).await;
         std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
         std::fs::write(vault.path().join("01_Notes/rec.md"), local).unwrap();
         // Lineage: we last adopted 1000 (our own earlier push); the shadow names
@@ -4545,7 +4530,7 @@ mod tests {
             "observed head replaces the single lineage entry (same as the receipt path); adoption returns with the accepted retry"
         );
         assert_eq!(
-            journal.lock().await.len(),
+            journal.len(),
             1,
             "the 409'd entry was acked and exactly one compensating push is pending"
         );
@@ -4570,7 +4555,7 @@ mod tests {
             shadow.get("01_Notes/rec.md").as_deref(),
             Some(local_sha.as_str())
         );
-        assert_eq!(journal.lock().await.len(), 0, "journal drained");
+        assert_eq!(journal.len(), 0, "journal drained");
         assert!(conflict_forks_under(vault.path()).is_empty());
         assert_eq!(
             std::fs::read(vault.path().join("01_Notes/rec.md")).unwrap(),

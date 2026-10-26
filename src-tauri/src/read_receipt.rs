@@ -248,17 +248,22 @@ impl ReadReceiptStore {
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
-    pub fn spawn_periodic_flush(store: Arc<ReadReceiptStore>) {
+    /// CS-3: returns its `JoinHandle` for the supervisor (class Required).
+    pub fn spawn_periodic_flush(
+        store: Arc<ReadReceiptStore>,
+    ) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
         tauri::async_runtime::spawn(async move {
-            let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+            let mut tick = tokio::time::interval(crate::supervise::tick(FLUSH_INTERVAL));
             tick.tick().await;
             loop {
                 tick.tick().await;
+                #[cfg(test)]
+                crate::faults::point("flush_read_receipt");
                 if let Err(e) = store.flush() {
                     warn!(error = %e, "read-receipt store: periodic flush failed");
                 }
             }
-        });
+        })
     }
 }
 
