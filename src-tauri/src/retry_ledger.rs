@@ -17,11 +17,12 @@
 //! losing the ledger never loses data, it only loses history.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::state_io::{StateDir, StateFile};
 
 /// One stuck item's durable retry state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +47,8 @@ struct LedgerFile {
 /// Thread-safe durable retry ledger persisted to a JSON file.
 #[derive(Debug)]
 pub struct RetryLedger {
-    path: PathBuf,
+    /// CS-2 (W13): the config-scope state dir; `None` = in-memory only.
+    sd: Option<Arc<StateDir>>,
     inner: Mutex<HashMap<String, RetryEntry>>,
 }
 
@@ -76,17 +78,24 @@ impl RetryLedger {
     /// Load the ledger from `path`. A missing or corrupt file yields an EMPTY
     /// ledger (never an error): the ledger is observability, and a fresh empty
     /// one is always safe.
-    pub fn load(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let inner = Self::read_file(&path).unwrap_or_default();
+    pub fn load(sd: &Arc<StateDir>) -> Self {
+        let inner = Self::read_file(sd).unwrap_or_default();
         Self {
-            path,
+            sd: Some(Arc::clone(sd)),
             inner: Mutex::new(inner),
         }
     }
 
-    fn read_file(path: &Path) -> Option<HashMap<String, RetryEntry>> {
-        let bytes = std::fs::read(path).ok()?;
+    /// A ledger that persists nothing (the config dir is not bootstrapped).
+    pub fn in_memory() -> Self {
+        Self {
+            sd: None,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn read_file(sd: &StateDir) -> Option<HashMap<String, RetryEntry>> {
+        let bytes = sd.read(StateFile::ReconcileRetryLedger).ok()??;
         let parsed: LedgerFile = serde_json::from_slice(&bytes).ok()?;
         Some(parsed.entries)
     }
@@ -145,34 +154,40 @@ impl RetryLedger {
             entries: self.inner.lock().unwrap().clone(),
         };
         if let Err(e) = self.write_file(&snapshot) {
-            tracing::warn!(path = %self.path.display(), error = %e, "retry_ledger: persist failed (non-fatal; rescan still retries)");
+            tracing::warn!(file = StateFile::ReconcileRetryLedger.name(), error = %e, "retry_ledger: persist failed (non-fatal; rescan still retries)");
         }
     }
 
+    /// W13 (CS-2): config-scope `replace_atomic` (CS-1 unique temp, 0600,
+    /// `sync_all`, `renameat`, dir sync) instead of create_dir_all + a fixed
+    /// `*.json.tmp` + rename.
     fn write_file(&self, snapshot: &LedgerFile) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let Some(sd) = &self.sd else {
+            return Ok(());
+        };
         let bytes = serde_json::to_vec_pretty(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // tmp + rename so a crash mid-write never truncates the ledger.
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.path)?;
+        let _commit = sd
+            .replace_atomic(StateFile::ReconcileRetryLedger, &bytes)
+            .map_err(|n| n.0)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn cfg_sd(d: &std::path::Path) -> Arc<StateDir> {
+        StateDir::for_test_scoped(d, crate::state_io::Scope::ConfigDir)
+    }
+
     #[test]
     fn record_and_clear_roundtrip() {
         let dir = tempdir().unwrap();
-        let p = dir.path().join("ledger.json");
-        let l = RetryLedger::load(&p);
+        let l = RetryLedger::load(&cfg_sd(dir.path()));
         assert!(l.is_empty());
 
         l.record_failure("a.md", "fetch: boom");
@@ -187,7 +202,7 @@ mod tests {
     #[test]
     fn repeated_failures_increment_attempts_preserve_first_ts() {
         let dir = tempdir().unwrap();
-        let l = RetryLedger::load(dir.path().join("l.json"));
+        let l = RetryLedger::load(&cfg_sd(dir.path()));
         l.record_failure("x.md", "err1");
         let first = l.pending()[0].first_failed_ts;
         l.record_failure("x.md", "err2");
@@ -201,13 +216,12 @@ mod tests {
     fn state_is_durable_across_reload() {
         // The durability guarantee: a failed item survives a daemon restart.
         let dir = tempdir().unwrap();
-        let p = dir.path().join("durable.json");
         {
-            let l = RetryLedger::load(&p);
+            let l = RetryLedger::load(&cfg_sd(dir.path()));
             l.record_failure("stuck.md", "fetch: decode error");
         }
         // Fresh instance == simulated daemon restart.
-        let l2 = RetryLedger::load(&p);
+        let l2 = RetryLedger::load(&cfg_sd(dir.path()));
         assert_eq!(l2.len(), 1, "failed item must persist across reload");
         assert_eq!(l2.pending()[0].path, "stuck.md");
     }
@@ -215,16 +229,16 @@ mod tests {
     #[test]
     fn corrupt_file_loads_as_empty_not_error() {
         let dir = tempdir().unwrap();
-        let p = dir.path().join("corrupt.json");
+        let p = dir.path().join("reconcile-retry-ledger.json");
         std::fs::write(&p, b"{not valid json").unwrap();
-        let l = RetryLedger::load(&p);
+        let l = RetryLedger::load(&cfg_sd(dir.path()));
         assert!(l.is_empty(), "corrupt ledger must load empty, never panic");
     }
 
     #[test]
     fn error_string_is_capped() {
         let dir = tempdir().unwrap();
-        let l = RetryLedger::load(dir.path().join("cap.json"));
+        let l = RetryLedger::load(&cfg_sd(dir.path()));
         l.record_failure("big.md", &"x".repeat(5000));
         assert!(l.pending()[0].last_error.len() <= ERROR_CAP + 3);
     }

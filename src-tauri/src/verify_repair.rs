@@ -2164,7 +2164,10 @@ mod tests {
         );
         let ledger_dir = TempDir::new().unwrap();
         let ledger = std::sync::Arc::new(crate::retry_ledger::RetryLedger::load(
-            ledger_dir.path().join("ledger.json"),
+            &crate::state_io::StateDir::for_test_scoped(
+                ledger_dir.path(),
+                crate::state_io::Scope::ConfigDir,
+            ),
         ));
         let vr = vr
             .with_materializer(mat)
