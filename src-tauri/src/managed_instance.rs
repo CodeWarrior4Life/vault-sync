@@ -28,7 +28,9 @@
 //!   (R12 — the lock above replaces it, keyed by config dir instead of
 //!   app identity), NO updater (the vault instance is the sole update leader
 //!   for the shared binary), NO autostart (login-item registration is
-//!   app-global), and never raise the wizard/GUI (implied `--silent`).
+//!   app-global), never raise the wizard/GUI (implied `--silent`), and build
+//!   NO tray icon (TKT-31dc4efa — one menu-bar icon per app, the vault
+//!   instance's; the shared tray STATE is still maintained in both modes).
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -212,6 +214,12 @@ pub struct PluginPolicy {
     /// May the pairing wizard window ever be shown/raised? Managed mode
     /// implies `--silent` semantics: never.
     pub allow_wizard: bool,
+    /// Build the menu-bar / system-tray ICON (TKT-31dc4efa): vault mode
+    /// only. A managed instance is a second copy of the same app; building
+    /// its tray put a second, identical Nexus Sync icon in the macOS menu
+    /// bar. Only the icon UI is skipped — the shared `SharedTrayState` is
+    /// still created and written by every pipeline in both modes.
+    pub tray: bool,
 }
 
 /// The single source of truth for per-mode plugin registration.
@@ -221,6 +229,7 @@ pub fn plugin_policy(managed: bool) -> PluginPolicy {
         updater: !managed,
         autostart: !managed,
         allow_wizard: !managed,
+        tray: !managed,
     }
 }
 
@@ -621,6 +630,7 @@ mod tests {
                 updater: false,
                 autostart: false,
                 allow_wizard: false,
+                tray: false,
             }
         );
         assert_eq!(
@@ -630,7 +640,27 @@ mod tests {
                 updater: true,
                 autostart: true,
                 allow_wizard: true,
+                tray: true,
             }
+        );
+    }
+
+    /// TKT-31dc4efa: the managed (harness-memory) instance must build NO
+    /// tray icon — two identical Nexus Sync icons in the macOS menu bar was
+    /// the defect. The vault instance keeps its tray (behavior unchanged).
+    #[test]
+    fn plugin_policy_managed_builds_no_tray_icon() {
+        assert!(
+            !plugin_policy(true).tray,
+            "managed-instance mode must NOT build a tray icon"
+        );
+    }
+
+    #[test]
+    fn plugin_policy_vault_mode_still_builds_tray_icon() {
+        assert!(
+            plugin_policy(false).tray,
+            "vault (non-managed) mode must keep building its tray icon"
         );
     }
 }

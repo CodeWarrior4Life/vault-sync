@@ -1211,6 +1211,7 @@ async fn storm_fence(recovery_disabled: bool) -> (Arc<RecordingHost>, Arc<Superv
             scope_excludes: vec![],
             debounce_ms: 50,
             managed_payload_excludes: false,
+            storage_prefix: None,
         },
         "sub-y",
     )
