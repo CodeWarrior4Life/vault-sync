@@ -590,12 +590,17 @@ fn t_cs1_17_apple_dir_durability_rule() {
     });
     assert_eq!(branch, DirSyncBranch::Failed);
     assert!(out.is_err());
-    // Non-Apple: EINVAL stays tolerated as Durable (unchanged rule).
-    let (branch, out) = classify_dir_sync(false, Err(io::Error::from_raw_os_error(22)), || {
-        panic!("no fallback off Apple")
-    });
-    assert_eq!(branch, DirSyncBranch::ToleratedUnsupported);
-    assert_eq!(out.unwrap(), Commit::Durable);
+    // Non-Apple unix: EINVAL stays tolerated as Durable (unchanged rule).
+    // Unix only: raw 22 is EINVAL there, but a different Windows error code,
+    // and Windows never reaches this classifier (dir_durability is cfg(unix)).
+    #[cfg(unix)]
+    {
+        let (branch, out) = classify_dir_sync(false, Err(io::Error::from_raw_os_error(22)), || {
+            panic!("no fallback off Apple")
+        });
+        assert_eq!(branch, DirSyncBranch::ToleratedUnsupported);
+        assert_eq!(out.unwrap(), Commit::Durable);
+    }
 }
 
 /// T-CS1-17 (§4b, seam half): a fault seam forces the ENOTSUP branch through
