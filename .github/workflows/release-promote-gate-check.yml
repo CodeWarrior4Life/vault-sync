@@ -34,7 +34,9 @@ jobs:
           wf = yaml.safe_load(open(".github/workflows/release.yml"))
           steps = [s for job in wf["jobs"].values() for s in job.get("steps", [])
                    if s.get("name", "").startswith("Promote on Nexus")]
-          want = "${{ vars.VAULT_SYNC_AUTOPROMOTE == 'true' }}"
+          # Built from two halves: a literal dollar-brace-brace inside run: is
+          # evaluated by Actions BEFORE python sees it (the first run read 'false').
+          want = "$" + "{{ vars.VAULT_SYNC_AUTOPROMOTE == 'true' }}"
           print(f"promote steps found: {len(steps)}")
           for s in steps:
               print(f"if: {s.get('if')!r}")
