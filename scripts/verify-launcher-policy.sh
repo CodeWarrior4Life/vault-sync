@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # Unit CS-3 (TKT-b6d8c4ba) T-CS3-24, gates C5 and C10 (and E1), hardened by
-# gate K2: verify that the launcher supervising the vault-sync daemon
+# gates K2, L1 and L2: verify that the launcher supervising the vault-sync daemon
 # restarts it on exit 70 (a Required task ended, CS-3) AND on exit 74
 # (custody lost, CS-2), prevents at most 78 (the CS-4 refusal), and
 # supervises the daemon binary itself. Read-only: it never starts, stops,
 # enables or edits anything.
 #
 # systemd: the EFFECTIVE values come from `systemctl --user show` (so drop-ins
-# and masking are accounted for), never from parsing unit files. launchd: the
-# agent plist, with interpreter wrappers resolved to their script.
+# and masking are accounted for), never from parsing unit files, and the unit
+# must be running (ActiveState=active, MainPID>0; L1). launchd: the agent
+# plist, with interpreter wrappers resolved to their script, and the LIVE
+# agent state from `launchctl print` / `print-disabled` (loaded, not
+# disabled, a PID; L1). A pass-through wrapper (cage) is accepted only when
+# its exact absolute path is given with --via (L2); there is no default
+# wrapper allowlist.
 #
 # Usage:
-#   verify-launcher-policy.sh [--name NAME] [--daemon PATH]
+#   verify-launcher-policy.sh [--name NAME] [--daemon PATH] [--via PATH]...
 #                             [--systemd-show FILE] [--agent-dir DIR]...
+#                             [--launchctl-print FILE]
+#                             [--launchctl-disabled FILE]
 #
 #   --name          the systemd unit (NAME.service) or launchd agent
 #                   (NAME.plist, or a plist whose Label is NAME). Default:
@@ -20,9 +27,20 @@
 #                   elsewhere.
 #   --daemon        the daemon binary's absolute path (allowlist). Default:
 #                   any path whose basename is `vault-sync-daemon`.
+#   --via           an exact absolute path of a pass-through wrapper (e.g.
+#                   /usr/bin/cage) that ExecStart may run; repeatable. The
+#                   daemon must still be identified right after it: the next
+#                   non-option argument is the daemon or its AppImage, or a
+#                   script whose last command execs it. NOTE: --via does not
+#                   make a host E1-clean; E1 also needs the 7.1 #2 journald
+#                   receipts (status=70 and status=74) on that host.
 #   --systemd-show  fixture mode: read the `systemctl --user show` output
 #                   from FILE instead of running systemctl (CI needs no live
 #                   units).
+#   --launchctl-print, --launchctl-disabled
+#                   fixture mode: read the `launchctl print gui/$UID/NAME` and
+#                   `launchctl print-disabled gui/$UID` output from FILEs
+#                   (an empty print FILE means the agent is not loaded).
 #   --agent-dir     a launchd agent directory. Default (macOS only):
 #                   ~/Library/LaunchAgents /Library/LaunchAgents
 #                   /Library/LaunchDaemons.
@@ -34,8 +52,10 @@
 #       most 78, and runs the daemon binary directly (or, on launchd, through
 #       an interpreter script whose last command `exec`s the daemon)
 #   2   usage or parse error (including an unknown exit-status name)
-#   10  no supervisor: no unit and no agent, a masked or not-found unit, or a
-#       launchd agent with Disabled=true
+#   10  no supervisor: no unit and no agent, a masked or not-found unit, a
+#       unit that is not running (ActiveState not active, MainPID 0), a
+#       launchd agent with Disabled=true, not loaded (booted out), disabled in
+#       launchctl print-disabled, or with no PID
 #   11  the policy does not restart on 70 and 74: Restart=no, on-success,
 #       on-abnormal, on-watchdog, on-abort or unset; SuccessExitStatus making
 #       70 or 74 (numeric or symbolic, e.g. SOFTWARE IOERR) a success; a
@@ -44,12 +64,13 @@
 #   12  RestartPreventExitStatus names any status other than 78 (70 and 74
 #       included; names are mapped, so CONFIG is 78)
 #   13  the supervised program is not the daemon: `open`, `env`, a shell or
-#       any other binary or wrapper, or a script that does not end by
+#       any other binary or wrapper (unless its exact path is given with
+#       --via and the daemon follows it), or a script that does not end by
 #       `exec`ing the daemon
 set -uo pipefail
 
 usage() {
-  sed -n '2,49p' "$0" >&2
+  sed -n '/^# Unit CS-3/,/^set -uo pipefail/p' "$0" | sed '$d' >&2
   exit 2
 }
 
@@ -57,12 +78,21 @@ name=""
 daemon=""
 show_file=""
 agent_dirs=()
+via=()
+lc_print=""
+lc_disabled=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) [ $# -ge 2 ] || usage; name="$2"; shift 2 ;;
     --daemon) [ $# -ge 2 ] || usage; daemon="$2"; shift 2 ;;
     --systemd-show) [ $# -ge 2 ] || usage; show_file="$2"; shift 2 ;;
     --agent-dir) [ $# -ge 2 ] || usage; agent_dirs+=("$2"); shift 2 ;;
+    --via)
+      [ $# -ge 2 ] || usage
+      case "$2" in /*) ;; *) echo "verify-launcher-policy: --via needs an absolute path: $2" >&2; exit 2 ;; esac
+      via+=("$2"); shift 2 ;;
+    --launchctl-print) [ $# -ge 2 ] || usage; lc_print="$2"; shift 2 ;;
+    --launchctl-disabled) [ $# -ge 2 ] || usage; lc_disabled="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "verify-launcher-policy: unknown argument: $1" >&2; usage ;;
   esac
@@ -93,6 +123,61 @@ is_daemon() {
   else
     [ "$(basename -- "$p")" = "vault-sync-daemon" ]
   fi
+}
+
+# The daemon's AppImage: the exact --daemon path when given, else an
+# `.AppImage` whose basename names vault-sync.
+is_appimage() {
+  local p="$1" b
+  [ -n "$p" ] || return 1
+  if [ -n "$daemon" ]; then
+    [ "$p" = "$daemon" ]
+    return
+  fi
+  b=$(basename -- "$p" | tr '[:upper:]' '[:lower:]')
+  case "$b" in
+    *vault-sync*.appimage) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# L2: true iff $1 is one of the exact --via paths. No default list exists.
+is_via() {
+  local v
+  [ ${#via[@]} -gt 0 ] || return 1
+  for v in "${via[@]}"; do
+    [ "$1" = "$v" ] && return 0
+  done
+  return 1
+}
+
+# The unit's effective Environment (systemd), for `exec "$VAR"` targets.
+unit_env=""
+env_value() {
+  printf '%s\n' "$unit_env" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -1
+}
+
+# Resolve a script's exec target: a literal path, or `$VAR` / `${VAR}`
+# looked up in the unit Environment, else in the script's own last
+# `VAR=...` assignment (one level: a literal, or `${OTHER...}` from the
+# unit Environment).
+resolve_target() {
+  local t="$1" script="$2" var val inner
+  case "$t" in
+    \$\{*\}) var=${t#\$\{}; var=${var%\}} ;;
+    \$*) var=${t#\$} ;;
+    *) printf '%s\n' "$t"; return 0 ;;
+  esac
+  val=$(env_value "$var")
+  if [ -z "$val" ]; then
+    val=$(grep -E "^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+)?$var=" "$script" | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+)?$var=//" | tr -d '"'"'")
+    case "$val" in
+      \$\{*)
+        inner=${val#\$\{}; inner=${inner%%[:\}]*}
+        val=$(env_value "$inner") ;;
+    esac
+  fi
+  printf '%s\n' "$val"
 }
 
 # Exit-status names systemd accepts for the BSD sysexits range.
@@ -128,14 +213,17 @@ check_systemd() {
     if ! command -v systemctl >/dev/null 2>&1; then return 10; fi
     show=$(systemctl --user show "$name.service" \
       -p LoadState -p UnitFileState -p Restart -p RestartPreventExitStatus \
-      -p SuccessExitStatus -p ExecStart -p FragmentPath 2>/dev/null) || return 10
+      -p SuccessExitStatus -p ExecStart -p FragmentPath \
+      -p ActiveState -p MainPID -p Environment 2>/dev/null) || return 10
   fi
   prop() { printf '%s\n' "$show" | sed -n "s/^$1=//p" | tail -1; }
-  local load ufs restart prevent success exec
+  local load ufs restart prevent success exec active mainpid
   load=$(prop LoadState); ufs=$(prop UnitFileState)
+  active=$(prop ActiveState); mainpid=$(prop MainPID)
+  unit_env=$(prop Environment)
   restart=$(prop Restart); prevent=$(prop RestartPreventExitStatus)
   success=$(prop SuccessExitStatus); exec=$(prop ExecStart)
-  echo "systemd $name: LoadState=${load:-?} UnitFileState=${ufs:-?} Restart=${restart:-?} RestartPreventExitStatus=[$prevent] SuccessExitStatus=[$success]"
+  echo "systemd $name: LoadState=${load:-?} UnitFileState=${ufs:-?} ActiveState=${active:-?} MainPID=${mainpid:-?} Restart=${restart:-?} RestartPreventExitStatus=[$prevent] SuccessExitStatus=[$success]"
   case "$load" in
     loaded) ;;
     masked)
@@ -151,6 +239,16 @@ check_systemd() {
     echo "systemd $name: UnitFileState=$ufs" >&2
     return 10
   fi
+  # L1: the live state. A loaded but stopped unit supervises nothing.
+  if [ "$active" != "active" ]; then
+    echo "systemd $name: ActiveState=${active:-<unset>}; the unit is not running, so nothing supervises the daemon" >&2
+    return 10
+  fi
+  case "$mainpid" in
+    ''|*[!0-9]*|0)
+      echo "systemd $name: MainPID=${mainpid:-<unset>}; no main process" >&2
+      return 10 ;;
+  esac
   case "$restart" in
     always|on-failure) ;;
     *)
@@ -183,11 +281,38 @@ check_systemd() {
     echo "systemd $name: no ExecStart path in the effective unit" >&2
     return 2
   fi
-  if ! is_daemon "$path"; then
-    echo "systemd $name: ExecStart runs $path, not the daemon binary; exit codes are not the daemon's" >&2
+  if is_daemon "$path"; then
+    return 0
+  fi
+  # L2: a pass-through wrapper, ONLY at an exact --via path.
+  if is_via "$path"; then
+    local argv next a
+    argv=$(printf '%s\n' "$exec" | sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p' | head -1)
+    next=""
+    set -f
+    # shellcheck disable=SC2086
+    set -- $argv
+    set +f
+    shift  # argv[0], the wrapper
+    for a in "$@"; do
+      case "$a" in
+        -*) continue ;;
+        *) next="$a"; break ;;
+      esac
+    done
+    if is_daemon "$next" || is_appimage "$next"; then
+      echo "systemd $name: wrapper $path accepted via --via (exact path); the daemon follows it: $next"
+      return 0
+    fi
+    if [ -n "$next" ] && [ -f "$next" ] && script_execs_daemon "$next" appimage; then
+      echo "systemd $name: wrapper $path accepted via --via (exact path); the daemon follows it through $next"
+      return 0
+    fi
+    echo "systemd $name: wrapper $path is allowed via --via, but no daemon follows it (next: ${next:-<none>})" >&2
     return 13
   fi
-  return 0
+  echo "systemd $name: ExecStart runs $path, not the daemon binary; exit codes are not the daemon's (a pass-through wrapper needs its exact path given with --via)" >&2
+  return 13
 }
 
 # ---------------------------------------------------------------------------
@@ -230,9 +355,10 @@ is_interpreter() {
   esac
 }
 
-# 0 iff the script's last command is `exec <daemon> ...`.
+# 0 iff the script's last command is `exec <daemon> ...` (with a second
+# argument `appimage`, the daemon's AppImage also counts).
 script_execs_daemon() {
-  local script="$1" last target
+  local script="$1" allow="${2:-}" last target
   [ -f "$script" ] || return 1
   last=$(grep -v '^[[:space:]]*#' "$script" | grep -v '^[[:space:]]*$' | tail -1 | sed 's/^[[:space:]]*//')
   case "$last" in
@@ -240,6 +366,10 @@ script_execs_daemon() {
     *) echo "launchd $name: script $script does not end by exec'ing the daemon (last command: $last)" >&2; return 1 ;;
   esac
   target=$(printf '%s\n' "$last" | awk '{print $2}' | tr -d '"'"'")
+  target=$(resolve_target "$target" "$script")
+  if [ "$allow" = "appimage" ] && is_appimage "$target"; then
+    return 0
+  fi
   if ! is_daemon "$target"; then
     echo "launchd $name: script $script execs $target, not the daemon binary" >&2
     return 1
@@ -302,6 +432,33 @@ check_launchd() {
   echo "launchd $name: plist=$plist Disabled=$dis KeepAlive=$ka program=${p0:-<none>} arg1=${p1:-<none>}"
   if [ "$dis" = "true" ]; then
     echo "launchd $name: Disabled=true; launchd does not run or supervise the agent" >&2
+    return 10
+  fi
+  # L1: the live agent state.
+  local print disabled pid
+  if [ -n "$lc_print" ]; then
+    print=$(cat -- "$lc_print" 2>/dev/null) || print=""
+  else
+    print=$(launchctl print "gui/$(id -u)/$name" 2>/dev/null) || print=""
+  fi
+  if [ -z "$print" ]; then
+    echo "launchd $name: launchctl print found no loaded agent (booted out or never bootstrapped)" >&2
+    return 10
+  fi
+  if [ -n "$lc_disabled" ]; then
+    disabled=$(cat -- "$lc_disabled" 2>/dev/null) || disabled=""
+  elif [ -n "$lc_print" ]; then
+    disabled=""
+  else
+    disabled=$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null) || disabled=""
+  fi
+  if printf '%s\n' "$disabled" | grep -Eq "\"$name\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
+    echo "launchd $name: launchctl print-disabled lists the agent as disabled" >&2
+    return 10
+  fi
+  pid=$(printf '%s\n' "$print" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1)
+  if [ -z "$pid" ] || [ "$pid" -eq 0 ]; then
+    echo "launchd $name: the loaded agent has no PID (not running)" >&2
     return 10
   fi
   if [ -z "$p0" ]; then

@@ -5,3 +5,5 @@ RestartPreventExitStatus=
 SuccessExitStatus=
 ExecStart={ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no }
 FragmentPath=/u1/vs-fx.service
+ActiveState=active
+MainPID=4242
