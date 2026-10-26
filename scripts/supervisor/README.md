@@ -31,46 +31,97 @@ The repo copy is the source. Nothing in this repo installs it; placement on a ho
 
 ## O5-2a: alert on an inactive vault-sync unit
 
-Gate ruling LSEC-9325-B6D8-O5-ONFAILURE-RULING, O5-2 ("No Silent Holds"): before any host switches its
-units to `Restart=on-failure`, a vault-sync unit that is not active for more than 15 min must alert.
-The not_receiving logic cannot see that case: a stopped daemon reports nothing, and that reads as
-"inconclusive". So the supervisor now runs one extra check each tick, **before** and independent of
-the not_receiving logic. The not_receiving logic is unchanged byte for byte: the tests strip the
-O5-2a block and get the imported sha256 back, and they run a differential against the pinned
-imported copy.
+Rulings: LSEC-9325-B6D8-O5-ONFAILURE-RULING O5-2 ("No Silent Holds"), LSEC-40A8-B6D8-O52-ROUTE-AND-KEY-RULING, and
+Pitboss PB-ADEB-O52A, -O52A-KEY and -O52A-NAME. Before any host switches its units to `Restart=on-failure`, a
+vault-sync unit that has been inactive for more than 15 min must alert.
 
-For each watched unit:
+The not_receiving logic cannot see that case: a stopped daemon reads "inconclusive". So the supervisor runs one
+extra check each tick, **before** the not_receiving logic and independent of it. That logic is unchanged byte for
+byte: the tests strip the O5-2a block and get the imported sha256 back, and they run a differential against the
+pinned imported copy.
+
+The check is **alert only**. It never starts, stops or restarts a unit, and it never exits the script.
+
+### Per unit (default `nexus-vault-sync.service nexus-vault-sync-memory.service`)
 
 | State | Action |
 |---|---|
-| `LoadState=not-found` (the unit does not exist here, e.g. icarus has no `-memory`) | skipped; any stale state for it is cleared |
-| `systemctl` unreadable (empty answer) | inconclusive: no state change, no alert |
-| not active (`inactive`, `failed`, `activating`, ...; a masked unit counts too) | `unit.<u>.inactive_since` is written at the first such tick |
-| not active for `>= NVS_INACTIVE_SECS` | ONE alert; re-alert at most once per `NVS_REALERT_SECS` while it stays not active |
-| active again after an alert | one "recovered" emit on the same identity key; state cleared |
-| active again before the threshold | logged, no emit; state cleared |
+| `LoadState=not-found` (not on this host; icarus has no `-memory`) | skipped; stale state cleared |
+| `systemctl` unreadable | inconclusive: no change |
+| not active (`inactive`, `failed`, masked, ...) | `unit.<u>.inactive_since` written at the first such tick |
+| not active for `>= NVS_INACTIVE_SECS` (900) | ALERT: a P0-tier page to the host arranger, plus the lnotify notice; at most once per `NVS_REALERT_SECS` (3600) |
+| page undeliverable or no arranger resolves | `operator_escalate` at once; the notice body says the page FAILED; **this tick exits 3** (after the deaf path has run) |
+| still not active `NVS_ESCALATE_SECS` (1800) after a DELIVERED page | `operator_escalate`, **once per episode** |
+| active again after an alert | one "recovered" page and notice (same identity key); state cleared |
+| active again before the threshold | logged only |
 
-The check only alerts. It never starts, stops or restarts a unit. It never exits the script, so the
-not_receiving check always runs after it.
+### The page target: resolved at send time, never pinned
 
-| Env | Default | Meaning |
-|---|---|---|
-| `NVS_WATCH_UNITS` | `nexus-vault-sync.service nexus-vault-sync-memory.service` | units to watch (space-separated) |
-| `NVS_INACTIVE_SECS` | `900` | not-active time before the first alert |
-| `NVS_REALERT_SECS` | `3600` | minimum gap between alerts for one unit |
-| `NVS_LNOTIFY` | `lnotify` on PATH, else `~/.local/bin/lnotify` | the lattice-notify CLI |
-| `NVS_PAGE_CSID` | *(none)* | the arranger's FULL conductor session id. If unset, the page is skipped and logged loudly (`PAGE SKIPPED (LOUD)`). A value that is not a full uuid is refused the same way. |
-| `NVS_PAGE_KEY_NAME` | `CONDUCTOR_SERVICE_KEY_NVS_SUPERVISOR` | the conductor service key NAME used for the page |
-| `NVS_PAGE_KEY_FILE` | `~/whetstone/.env` | where that NAME is looked up |
-| `NVS_PAGE_URL` | `https://nexus.obsidian-inc.com/api/conductor/coord/emit` | the conductor emit route |
+An arranger csid dies at every seat rotation, so a pinned csid pages a dead inbox. The target is resolved at
+each send:
 
-### The two alert legs
+1. **The live arranger role marker**, `~/.claude/runtime/conductor.role.arranger-<csid>`.
+   - Its one writer is `~/.claude/scripts/pb-role-marker.py`. By that writer's contract the FILENAME is
+     authoritative.
+   - The csid must fullmatch the uuid shape before any path use. The resolved path must stay inside the runtime
+     dir, so a symlink that escapes it is rejected.
+   - A content line naming a different csid is a tamper signal, and the marker is rejected.
+   - If more than one marker is live, the newest `claimed_at` wins (mtime if absent), and the choice is logged
+     LOUD.
+   - Released markers live in `~/.claude/backups/role-markers/` and are never read.
+2. **The live roster row carrying the HOST's own arranger name** (`GET /api/conductor/sessions/list?status=live`).
+   - The name map is `link` → `pitboss`, `icarus` → `pitboss-icarus`, `trinity` → `pitboss-trinity`, overridable
+     with `NVS_ROSTER_NAME` in the host's drop-in.
+   - **An unknown host with no override has no name fallback.** A constant `pitboss` would page link's seat from
+     icarus.
+3. **Neither resolves: FAIL LOUD.** `operator_escalate` fires, the notice still fires, and the tick exits 3.
 
-1. **lnotify, infra rail, claim `notice`.** The command is `lnotify legacy --principal <host>.nexus-vault-sync-supervisor@lattice --app nexus-vault-sync --venture lattice --event-type unit.stopped|unit.recovered --claim notice --identity-key nexus-vault-sync.unit-inactive:<host>:<unit>`. `notice` needs no grant, so it cannot be clamped. It routes to `nexus_vault_note` and the ledger only. `nexus_nudge` (the interruptive operator surface) accepts only `decision` and `block`, so this alert can **never** reach the main Cody chat. No coalesce-count promotion threshold is registered for this principal, so a repeat stays `notice`. The identity key is per host+unit, so repeats bump one ledger fact (`coalesce_count`) instead of opening new threads.
-2. **Conductor page to the arranger.** `POST /api/conductor/coord/emit` with `{"kind":"talk","session_id":<NVS_PAGE_CSID>,"body":{from,topic,detail}}`, the route the fleet's scripts use (`~/.claude/scripts/emit-fleet`, `myaccess_monitor.py`). It authenticates with a named CONDUCTOR service key, never `NEXUS_API_KEY`, which is the operator. The key is read by NAME inside python and reaches curl on stdin (`-K -`), never argv, env or stdout. If the key is missing, the page is skipped and the log names the provisioning gap.
+`NVS_PAGE_CSID` is an explicit **override for tests and emergencies only**. It is validated, logged as an override,
+and must never be set in a shipped unit or drop-in.
+
+### Route and key
+
+- **Page:** `POST /api/conductor/coord/emit` with
+  `{"kind":"page","session_id":<csid>,"body":{"tier":"decision","reason":"P0 vault-sync unit <u> on <host>: INACTIVE|RECOVERED","message":...}}`.
+  This is the fleet pager shape of `pb-prompt-watch.py:293-294`. The fleet's P0 pagers (`pb-p0-watch.py:1525-1526`,
+  `LOUD_TIER = "decision"` at `:1654`) mark P0 the same way: tier `decision` (a routing value) with a "P0" reason.
+- **Key:** the host's standard Nexus key resolver in its **EXEC form**, `~/.local/bin/nexus-api-key.sh exec --
+  python3 ...`. The value is injected only into the child's env as `NEXUS_API_KEY`, the variable
+  `pb-prompt-watch.py:236` reads. It reaches curl on stdin (`-K -`), never argv and never stdout. No conductor
+  service key is used. The sync-nightly key is never used.
+- **Escalate:** `python3 ~/.claude/scripts/operator_escalate.py --subject S --body B --severity critical`, the same
+  invocation as `pb-seat-parity.py:282-285` (severity `critical`, no `--await-ack` in a oneshot), bounded at 180 s.
+- **Notice:** every alert also writes the durable record:
+  `lnotify legacy --principal <host>.nexus-vault-sync-supervisor@lattice --app nexus-vault-sync --venture lattice
+  --event-type unit.stopped|unit.recovered --claim notice --identity-key nexus-vault-sync.unit-inactive:<host>:<unit>`.
+  - It goes to the vault-note route and the ledger. The interruptive `nexus_nudge` route accepts only
+    decision/block, so the notice never reaches it.
+  - It needs no grant. No coalesce threshold is registered for this principal.
+
+| Env | Default |
+|---|---|
+| `NVS_WATCH_UNITS` | `nexus-vault-sync.service nexus-vault-sync-memory.service` |
+| `NVS_INACTIVE_SECS` / `NVS_REALERT_SECS` / `NVS_ESCALATE_SECS` | `900` / `3600` / `1800` |
+| `NVS_ROSTER_NAME` | from the hostname map (link, icarus, trinity); unset for other hosts |
+| `NVS_ROLE_RUNTIME` | `~/.claude/runtime` |
+| `NVS_KEY_HELPER` | `~/.local/bin/nexus-api-key.sh` (exec form) |
+| `NVS_ESCALATE` / `NVS_ESCALATE_SEVERITY` | `~/.claude/scripts/operator_escalate.py` / `critical` |
+| `NVS_NEXUS_BASE` | `https://nexus.obsidian-inc.com` |
+| `NVS_LNOTIFY` | `lnotify` on PATH, else `~/.local/bin/lnotify` |
+| `NVS_PAGE_CSID` | unset. OVERRIDE for tests and emergencies only |
+
+### Placement proof required before any Restart-policy change (O52-4)
+
+On each host, after a separate placement GO:
+
+1. A real page event id within 15 min of stopping a canary unit cleanly.
+2. An `operator_escalate` on a forced-undeliverable page.
+
+The resolver's unit context is checked for real at placement.
 
 ## Tests
 
-`bash scripts/supervisor/test-supervisor.sh` runs in about 6 s with bash and python3 only. Every external
-command (systemctl, curl, lnotify, logger, `date +%s`, hostname) is a PATH shim, so it touches no real unit,
-journal, network or notify rail. CI runs it on ubuntu.
+`bash scripts/supervisor/test-supervisor.sh` runs in about 8 s with bash and python3 only. It uses PATH shims
+for systemctl, curl, lnotify, logger, `date +%s` and hostname, plus a stub resolver and a stub `operator_escalate.py`
+under a temp HOME. Nothing touches a real unit, the journal, the network, the rail, an inbox or the operator.
+CI runs it on ubuntu.
