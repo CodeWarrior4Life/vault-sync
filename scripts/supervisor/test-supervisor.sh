@@ -64,6 +64,7 @@ EOF
 { printf 'ARGV'; printf ' %q' "\$@"; printf '\nMSG '; cat; printf '\n'; } >> "$c/lnotify.log"
 EOF
   printf '#!/usr/bin/env bash\nexit 0\n' > "$b/logger"
+  printf '#!/usr/bin/env bash\n[ -f "%s/killsync" ] && { rm -f "%s/killsync"; kill -9 $PPID; sleep 5; }\nexit 0\n' "$c" "$c" > "$b/sync"
   cat > "$b/date" <<EOF
 #!/usr/bin/env bash
 [ "\$*" = "+%s" ] && { cat "$c/now"; exit 0; }
@@ -123,11 +124,15 @@ STRIPPED="$T/stripped.sh"
 "$PY" - "$SUP" "$STRIPPED" <<'PY'
 import sys
 s = open(sys.argv[1]).read()
-a = s.index("# ---- O5-2a (LSEC-9325-B6D8-O5-ONFAILURE-RULING")
-b = s.index("# ---- end O5-2a\n") + len("# ---- end O5-2a\n")
-open(sys.argv[2], "w").write(s[:a] + s[b:])
+for start, end in (("# ---- state-io (TKT-8b4f38a0", "# ---- end state-io\n"),
+                   ("# ---- O5-2a (LSEC-9325-B6D8-O5-ONFAILURE-RULING", "# ---- end O5-2a\n")):
+    a = s.index(start); b = s.index(end) + len(end); s = s[:a] + s[b:]
+# TKT-8b4f38a0: the deaf path's three state writes became atomic; map them back to the imported bytes.
+for f in ("last_confirmed", "deaf_since", "last_restart"):
+    s = s.replace('st_write "$ST/%s" "$NOW"' % f, 'echo "$NOW" > "$ST/%s"' % f)
+open(sys.argv[2], "w").write(s)
 PY
-check "stripping the O5-2a block yields the imported original (sha256 $ORIG_SHA)" \
+check "stripping the O5-2a + state-io blocks (and mapping the 3 atomic deaf-path writes back) yields the imported original (sha256 $ORIG_SHA)" \
   test "$(sha256sum "$STRIPPED" | cut -d' ' -f1)" = "$ORIG_SHA"
 check "pinned imported copy is intact (sha256 $ORIG_SHA)" test "$(sha256sum "$ORIG" | cut -d' ' -f1)" = "$ORIG_SHA"
 
@@ -328,8 +333,63 @@ tick "$D" $((T0+960))
 check "per-tick cap: the deferred unit pages on the next tick" test "$(npage "$D")" = 2
 check "the shipped drop-ins bound the tick: TimeoutStartSec=55 on link and icarus" \
   bash -c "grep -qx 'TimeoutStartSec=55' '$HERE/systemd/link/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf' && grep -qx 'TimeoutStartSec=55' '$HERE/systemd/icarus/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf'"
-check "the per-call budget fits the bound: lnotify+page+escalate defaults (5+15+15) + deaf fetch (10) < 55" \
-  bash -c "grep -q 'NVS_LNOTIFY_TIMEOUT:-5' '$SUP' && grep -q 'NVS_PAGE_TIMEOUT:-15' '$SUP' && grep -q 'NVS_ESCALATE_TIMEOUT:-15' '$SUP' && grep -q 'NVS_MAX_ALERTS_PER_TICK:-1' '$SUP' && [ \$((5+15+15+10)) -lt 55 ]"
+check "the per-call budget fits the bound: systemctl 2x2x2 + page 12 + lnotify 5 + escalate 12 + other notice 5 + deaf fetch ~11 = 53 < 55" \
+  bash -c "grep -q 'NVS_SYSTEMCTL_TIMEOUT:-2' '$SUP' && grep -q 'NVS_LNOTIFY_TIMEOUT:-5' '$SUP' && grep -q 'NVS_PAGE_TIMEOUT:-12' '$SUP' && grep -q 'NVS_ESCALATE_TIMEOUT:-12' '$SUP' && grep -q 'NVS_MAX_ALERTS_PER_TICK:-1' '$SUP' && [ \$((2*2*2 + 12+5+12 + 5 + 11)) -lt 55 ]"
+
+# --- 11. #33 C1 (TKT-8b4f38a0): corrupt state never aborts a tick; writes are atomic -----------------------
+for kind in empty garbage partial twolines; do
+  D=$(newbox "c1-$kind"); setunit "$D" $U1 loaded inactive; health "$D" not_receiving
+  tick "$D" $T0
+  S=$(st "$D")
+  for f in deaf_since last_confirmed "unit.$U1.inactive_since"; do
+    case $kind in
+      empty) : > "$S/$f" ;;
+      garbage) printf 'not-a-number\n' > "$S/$f" ;;
+      partial) printf '1800\0\0\0' > "$S/$f" ;;     # a torn write: digits then zero fill
+      twolines) printf '1800\n900' > "$S/$f" ;;      # digits on two lines (would break $((NOW-$(cat f))))
+    esac
+  done
+  tick "$D" $((T0+60))
+  check "C1 $kind state files: the tick exits normally (0), it does not abort" test "$(rc "$D")" = 0
+  check "C1 $kind state files: logged loudly and treated as absent" \
+    bash -c "[ \$(grep -c 'STATE CORRUPT (LOUD)' '$S/log') = 3 ]"
+  check "C1 $kind state files: the deaf path ran (window re-opened, last_confirmed rewritten)" \
+    bash -c "[ \"\$(cat '$S/last_confirmed')\" = $((T0+60)) ] && [ \"\$(cat '$S/deaf_since')\" = $((T0+60)) ]"
+  check "C1 $kind state files: the inactive window re-opened" test "$(cat "$S/unit.$U1.inactive_since")" = $((T0+60))
+done
+# SIGKILL between the temp write and the rename (a TimeoutStartSec kill mid-write); the next tick is healthy.
+D=$(newbox c1-kill); setunit "$D" $U1 loaded active; health "$D" not_receiving
+tick "$D" $T0
+S=$(st "$D")
+check "C1 kill: setup has a valid last_confirmed" test "$(cat "$S/last_confirmed")" = $T0
+touch "$D/ctl/killsync"
+tick "$D" $((T0+60))
+check "C1 kill: the tick was killed mid-write (rc 137)" test "$(rc "$D")" = 137
+check "C1 kill: the state file still holds the previous whole value (never torn)" test "$(cat "$S/last_confirmed")" = $T0
+check "C1 kill: the killed write left only its temp file" bash -c "ls '$S' | grep -q '^last_confirmed.tmp.'"
+tick "$D" $((T0+120))
+check "C1 kill: the next tick is healthy (rc 0, value written, temp file gone)" \
+  bash -c "[ \$(cat '$D/ctl/rc') = 0 ] && [ \"\$(cat '$S/last_confirmed')\" = $((T0+120)) ] && ! ls '$S' | grep -q '\.tmp\.'"
+
+# --- 12. #33 C2: a hung systemctl is cut at its timeout; C3: last_alert seeded from last_raise -----------
+D=$(newbox c2-hang); setunit "$D" $U1 loaded inactive; health "$D" not_receiving
+cat > "$D/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$D/bin/systemctl"
+start=$(date +%s); EXTRA_ENV=NVS_SYSTEMCTL_TIMEOUT=1 tick "$D" $T0; el=$(( $(date +%s) - start ))
+check "C2 hung systemctl: cut at NVS_SYSTEMCTL_TIMEOUT (tick ${el}s < 6s), inconclusive, deaf path ran" \
+  bash -c "[ $el -lt 6 ] && grep -q 'systemctl unreadable' '$(st "$D")/log' && [ \"\$(cat '$(st "$D")/last_confirmed')\" = $T0 ]"
+D=$(newbox c3); setunit "$D" $U1 loaded inactive
+mkdir -p "$(st "$D")"; echo $((T0+600)) > "$(st "$D")/unit.$U1.last_raise"   # a raise 300 s before this episode alerts
+tick "$D" $T0; tick "$D" $((T0+900))
+check "C3: no last_alert but a recent last_raise -> no raise (held, notice only)" test "$(npage "$D")" = 0
+check "C3: last_alert is SEEDED from last_raise" test "$(cat "$(st "$D")/unit.$U1.last_alert")" = $((T0+600))
+tick "$D" $((T0+600+3599))
+check "C3: still no raise before last_raise + 3600" test "$(npage "$D")" = 0
+tick "$D" $((T0+600+3600))
+check "C3: the raise happens at last_raise + 3600" test "$(npage "$D")" = 1
 
 # --- 8. the not_receiving path is unchanged: differential run vs the pinned imported original ----------------
 diffrun(){  # $1 label  $2 unit state for U1

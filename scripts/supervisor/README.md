@@ -61,13 +61,56 @@ The check is **alert only**. It never starts, stops or restarts a unit, and it n
 The deaf path below re-opens its not_receiving window when two confirmations are more than 180 s apart, so a hung
 notify call must never hold a tick. Three bounds apply:
 
-- **Every external call has its own timeout.** lnotify `NVS_LNOTIFY_TIMEOUT` (5 s). The resolve and page child
-  `NVS_PAGE_TIMEOUT` (15 s), with each curl inside it at `NVS_CURL_MAX_TIME` (6 s). `operator_escalate`
-  `NVS_ESCALATE_TIMEOUT` (15 s).
+- **Every external call has its own timeout.** `systemctl` `NVS_SYSTEMCTL_TIMEOUT` (2 s per call). lnotify
+  `NVS_LNOTIFY_TIMEOUT` (5 s). The resolve and page child `NVS_PAGE_TIMEOUT` (12 s), with each curl inside it at
+  `NVS_CURL_MAX_TIME` (5 s). `operator_escalate` `NVS_ESCALATE_TIMEOUT` (12 s).
 - **At most `NVS_MAX_ALERTS_PER_TICK` (1) paging alerts per tick.** A raise or escalate beyond that is deferred to
   the next tick and logged. Notices (recovery, held raise) are not capped; each is bounded at 5 s.
 - **The unit carries `TimeoutStartSec=55`** (`systemd/*/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf`).
-  That is under the 60 s timer period and above the worst case of 5 + 15 + 15 s, plus the 10 s health fetch.
+  The worst case, recomputed per #33 gate C2:
+
+  | Part | Seconds |
+  |---|---|
+  | `systemctl`, 2 units x 2 calls x 2 s | 8 |
+  | the one paging unit: page 12 + lnotify 5 + escalate 12 | 29 |
+  | the other unit's single notice | 5 |
+  | the deaf path's health fetch (`curl -m 10`) and parse | ~11 |
+  | **total** | **~53 (under 55)** |
+
+  The deaf path's own `systemctl show` / `restart` run only in its restart branch, and TimeoutStartSec is their
+  bound. A killed `systemctl restart` client does not cancel the queued job.
+
+### State files are atomic and validated (TKT-8b4f38a0, #33 gate C1)
+
+Every state file holds one epoch. That covers `deaf_since`, `last_confirmed` and `last_restart`, and every
+`unit.<u>.*` file.
+
+- **Writes** go to a temp file in the same dir, are fsync'd (coreutils `sync FILE`), then renamed into place
+  (`mv -f`). A reader sees the old value or the new one, never a torn one.
+- **At the start of every tick:**
+  - any state file that is not digits only is logged `STATE CORRUPT (LOUD)` and removed. That covers empty files,
+    letters, NUL bytes and an interior newline. Removing it means treated as absent: a window re-opens and a clock
+    restarts.
+  - leftover `*.tmp.*` files from a killed write are removed.
+
+  Before this, an empty file from a mid-write kill made `$((NOW-$(cat f)))` abort every later tick with rc 1, the
+  deaf path included.
+
+The deaf path's only edits are its three state writes. The tests map them back and get the imported sha256.
+
+### Flapping (#33 gate C4)
+
+A unit that goes down, recovers and goes down again within the hour raises (pages) **once**. The
+`unit.<u>.last_raise` clock survives recovery. Every later episode inside `NVS_RAISE_COOLDOWN_SECS` (3600):
+
+- is recorded ONCE as a notice ("raise held by the cross-episode cooldown"). There is no page and no escalate;
+- has its `last_alert` SEEDED from `last_raise` (C3), so its first possible raise is `last_raise + 3600`.
+
+The same holds after a supervisor restart, because the state lives in files.
+
+Each recovery is a notice. So a unit flapping every few minutes produces one page per hour plus a ledger trail of
+notices on one identity key. The operator hears about it only through escalate (b), when a raised episode is still
+inactive 30 min after its page.
 
 ### The page target: resolved at send time, never pinned
 
@@ -132,7 +175,7 @@ and must never be set in a shipped unit or drop-in.
 | `NVS_WATCH_UNITS` | `nexus-vault-sync.service nexus-vault-sync-memory.service` |
 | `NVS_INACTIVE_SECS` / `NVS_REALERT_SECS` / `NVS_ESCALATE_SECS` | `900` / `3600` / `1800` |
 | `NVS_RAISE_COOLDOWN_SECS` | `3600` (cross-episode) |
-| `NVS_LNOTIFY_TIMEOUT` / `NVS_PAGE_TIMEOUT` / `NVS_ESCALATE_TIMEOUT` / `NVS_CURL_MAX_TIME` | `5` / `15` / `15` / `6` |
+| `NVS_SYSTEMCTL_TIMEOUT` / `NVS_LNOTIFY_TIMEOUT` / `NVS_PAGE_TIMEOUT` / `NVS_ESCALATE_TIMEOUT` / `NVS_CURL_MAX_TIME` | `2` / `5` / `12` / `12` / `5` |
 | `NVS_MAX_ALERTS_PER_TICK` | `1` |
 | `NVS_ROSTER_NAME` | from the hostname map (link, icarus, trinity); unset for other hosts |
 | `NVS_ROLE_RUNTIME` | `~/.claude/runtime` |
