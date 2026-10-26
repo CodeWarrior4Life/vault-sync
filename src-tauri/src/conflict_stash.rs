@@ -243,6 +243,9 @@ pub enum StashError {
     Io(#[from] io::Error),
     #[error("invalid path: {0}")]
     InvalidPath(String),
+    /// CS-2 gate 4: the target resolves into a registered state dir.
+    #[error("{0}")]
+    ForeignStateWrite(String),
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +387,7 @@ impl ConflictStash {
     /// - Atomic tmp+rename (tempfile::NamedTempFile + persist).
     /// - Never overwrite an existing stash file — append `-2`, `-3`, ...
     /// - Path safety: parent dir's canonical path must stay within vault_root.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_stash(
         &self,
         original_path: &str,
@@ -396,6 +400,9 @@ impl ConflictStash {
         let parent = base_path
             .parent()
             .ok_or_else(|| StashError::InvalidPath(format!("{base_path:?} has no parent")))?;
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&base_path)
+            .map_err(|e| StashError::ForeignStateWrite(e.to_string()))?;
         fs::create_dir_all(parent)?;
 
         // Path-safety: ensure the resolved parent stays within vault_root.
@@ -461,6 +468,7 @@ impl ConflictStash {
     /// Append one `{original, stash, device, lsn, ts}` mapping line to the
     /// manifest under `vault_root`. JSONL so concurrent writers append cleanly
     /// and a partial line never corrupts prior entries.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     fn record_stash_manifest(
         &self,
         original_path: &str,
@@ -484,6 +492,9 @@ impl ConflictStash {
             "ts": ts,
         });
         let manifest_path = self.vault_root.join(Self::MANIFEST_RELPATH);
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&manifest_path)
+            .map_err(|e| StashError::ForeignStateWrite(e.to_string()))?;
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -586,6 +597,7 @@ fn walk_dir(root: &Path, visit: &mut dyn FnMut(&Path)) -> Result<(), io::Error> 
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

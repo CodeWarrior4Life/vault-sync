@@ -38,6 +38,7 @@ pub fn list_vault_folders_impl(vaults_root: &Path) -> Vec<VaultFolderInfo> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

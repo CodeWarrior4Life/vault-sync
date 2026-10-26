@@ -45,6 +45,7 @@ pub fn is_safe_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

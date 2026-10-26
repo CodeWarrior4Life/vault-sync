@@ -16,6 +16,7 @@ use crate::api_client::ApiClient;
 use crate::config;
 use crate::conflict_stash::parse_conflict_filename;
 use crate::push_journal::PushJournal;
+use crate::state_io::StateDir;
 use crate::token_store;
 use crate::verify_repair::{VerifyRepair, VerifyRepairConfig, VerifyRepairReport};
 
@@ -30,20 +31,6 @@ pub(crate) fn resolve_workspace_root() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(std::env::temp_dir))
         .join("Nexus")
-}
-
-/// Compute the push-journal path used by both the SSE/file-watcher write
-/// side and verify_repair. Single source of truth so the two paths can never
-/// drift.
-pub(crate) fn push_journal_path(
-    workspace_root: &std::path::Path,
-    subscriber_slug: &str,
-) -> PathBuf {
-    workspace_root
-        .join(".lattice-runtime")
-        .join(subscriber_slug)
-        .join("sync-state")
-        .join("push_journal.jsonl")
 }
 
 /// Build a `VerifyRepair` from explicit inputs (config + token + workspace +
@@ -61,19 +48,15 @@ pub(crate) fn push_journal_path(
 pub(crate) fn build_verify_repair(
     cfg: &config::Config,
     token: &str,
-    workspace_root: PathBuf,
+    sd: &Arc<StateDir>,
     vault_root: PathBuf,
     subscriber_id: &str,
 ) -> Result<(VerifyRepair, Arc<Mutex<PushJournal>>), String> {
     let api = ApiClient::new(&cfg.nexus_url, token).map_err(|e| e.to_string())?;
     let api_arc = Arc::new(api);
 
-    let journal_path = push_journal_path(&workspace_root, subscriber_id);
-    if let Some(parent) = journal_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create_dir_all({}) failed: {e}", parent.display()))?;
-    }
-    let journal = PushJournal::open(&journal_path).map_err(|e| e.to_string())?;
+    // W15 (CS-2): no create_dir_all; the journal lives in the held dir.
+    let journal = PushJournal::open(sd).map_err(|e| e.to_string())?;
     let journal_arc = Arc::new(Mutex::new(journal));
 
     // fix/reconcile-server-wins-shadow: wire the (read-only) shadow store so the
@@ -86,12 +69,7 @@ pub(crate) fn build_verify_repair(
     // backstop (which is wired with a materializer). This avoids constructing a
     // materializer here without the server health snapshot (mode/shadow_path),
     // which could write to the wrong place.
-    let shadow_path = workspace_root
-        .join(".lattice-runtime")
-        .join(subscriber_id)
-        .join("sync-state")
-        .join("shadow_hashes.json");
-    let shadow = crate::sync_shadow::ShadowStore::load(shadow_path);
+    let shadow = crate::sync_shadow::ShadowStore::load(sd);
 
     let vr = VerifyRepair::new(
         vault_root,
@@ -102,6 +80,15 @@ pub(crate) fn build_verify_repair(
     )
     .with_shadow(shadow);
     Ok((vr, journal_arc))
+}
+
+/// CS-2 (W15): the held state dir of a bootstrapped subscriber. Any other
+/// subscriber gets an error string; nothing is created (the registry never
+/// creates).
+pub(crate) fn verify_repair_state_dir(subscriber_id: &str) -> Result<Arc<StateDir>, String> {
+    crate::state_io::registry()
+        .get(subscriber_id)
+        .map_err(|e| format!("verify and repair: {e}"))
 }
 
 /// Owner-invokable Tauri command. Loads the daemon config, pulls the token
@@ -133,8 +120,6 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
         }
     };
 
-    let workspace_root = resolve_workspace_root();
-
     // B4: iterate sync_roots, running one VerifyRepair per root.
     // Derive the per-root (vault_root, subscriber_id) pairs using the
     // same priority logic as lib::effective_subscriber_id.
@@ -152,13 +137,11 @@ pub async fn verify_repair_run() -> Result<VerifyRepairReport, String> {
     // Aggregate all per-root reports into one combined report.
     let mut combined = VerifyRepairReport::default();
     for (vault_root, subscriber_id) in &pairs {
-        let (vr, _journal) = build_verify_repair(
-            &cfg,
-            &token,
-            workspace_root.clone(),
-            vault_root.clone(),
-            subscriber_id,
-        )?;
+        // CS-2 (W15): only a bootstrapped subscriber has a state dir; any
+        // other returns an error string and writes nothing.
+        let sd = verify_repair_state_dir(subscriber_id)?;
+        let (vr, _journal) =
+            build_verify_repair(&cfg, &token, &sd, vault_root.clone(), subscriber_id)?;
         let report = vr.run().await.map_err(|e| e.to_string())?;
         tracing::info!(
             root = %vault_root.display(),
@@ -325,6 +308,7 @@ fn walk_conflicts(root: &Path, visit: &mut dyn FnMut(&Path)) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -349,29 +333,18 @@ mod tests {
         }
     }
 
+    /// T-CS2-12 (Verify-and-repair half): a subscriber that was not
+    /// bootstrapped gets an error string and nothing is created.
     #[test]
-    fn push_journal_path_matches_workspace_layout() {
-        let ws = PathBuf::from("/tmp/ws");
-        let p = push_journal_path(&ws, "sub-abc");
-        // Forward-slash representation may differ on Windows but the segments
-        // must match — assert via Path components rather than string compare.
-        let comps: Vec<_> = p.components().map(|c| c.as_os_str().to_owned()).collect();
-        let last4: Vec<&str> = comps
-            .iter()
-            .rev()
-            .take(4)
-            .rev()
-            .map(|s| s.to_str().unwrap())
-            .collect();
-        assert_eq!(
-            last4,
-            vec![
-                ".lattice-runtime",
-                "sub-abc",
-                "sync-state",
-                "push_journal.jsonl"
-            ]
-        );
+    fn t_cs2_12_verify_repair_unbootstrapped_sub_errors() {
+        let e = verify_repair_state_dir("sub-never-bootstrapped").unwrap_err();
+        assert!(e.contains("not bootstrapped"), "{e}");
+    }
+
+    fn sd_for(ws: &TempDir, sub: &str) -> Arc<StateDir> {
+        let d = ws.path().join(sub);
+        fs::create_dir_all(&d).unwrap();
+        StateDir::for_test(&d)
     }
 
     #[test]
@@ -387,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_verify_repair_creates_journal_dir_and_returns_runnable() {
+    async fn build_verify_repair_opens_journal_in_held_dir_and_returns_runnable() {
         // Tempdir for the vault parent + tempdir for the workspace; assert
         // the journal path's parent is created on disk and the returned vr
         // is well-formed enough to invoke build_local_manifest.
@@ -409,7 +382,7 @@ mod tests {
         let (vr, _journal) = build_verify_repair(
             &cfg,
             "vsk_test",
-            workspace.path().to_path_buf(),
+            &sd_for(&workspace, &cfg.subscriber_id),
             vault_root,
             &cfg.subscriber_id,
         )
@@ -420,10 +393,13 @@ mod tests {
         // (no vault folder prefix, since vault_root IS the vault folder).
         assert_eq!(m[0].path, "a.md");
 
-        let journal_path = push_journal_path(workspace.path(), &cfg.subscriber_id);
-        assert!(journal_path.parent().unwrap().is_dir());
-        // The file itself is created by `PushJournal::open`.
-        assert!(journal_path.exists());
+        // CS-2: the file is created by `PushJournal::open` in the HELD dir;
+        // no directory is created at verify time.
+        assert!(workspace
+            .path()
+            .join(&cfg.subscriber_id)
+            .join("push_journal.jsonl")
+            .exists());
     }
 
     #[tokio::test]
@@ -448,7 +424,7 @@ mod tests {
         let (vr, _journal) = build_verify_repair(
             &cfg,
             "vsk_test",
-            workspace.path().to_path_buf(),
+            &sd_for(&workspace, &cfg.subscriber_id),
             vault_root,
             &cfg.subscriber_id,
         )
@@ -498,7 +474,7 @@ mod tests {
         let (vr, _journal) = build_verify_repair(
             &cfg,
             "vsk_test",
-            workspace.path().to_path_buf(),
+            &sd_for(&workspace, &cfg.subscriber_id),
             vault_root,
             &cfg.subscriber_id,
         )
@@ -672,7 +648,7 @@ mod tests {
         let (vr_a, _j_a) = build_verify_repair(
             &cfg,
             "vsk_test",
-            workspace.path().to_path_buf(),
+            &sd_for(&workspace, "sub-a"),
             root_a.path().to_path_buf(),
             "sub-a",
         )
@@ -681,7 +657,7 @@ mod tests {
         let (vr_b, _j_b) = build_verify_repair(
             &cfg,
             "vsk_test",
-            workspace.path().to_path_buf(),
+            &sd_for(&workspace, "sub-b"),
             root_b.path().to_path_buf(),
             "sub-b",
         )
@@ -773,7 +749,7 @@ mod tests {
             let (vr, _j) = build_verify_repair(
                 &cfg,
                 "vsk_test",
-                workspace.path().to_path_buf(),
+                &sd_for(&workspace, subscriber_id),
                 vault_root.clone(),
                 subscriber_id,
             )

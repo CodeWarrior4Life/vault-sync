@@ -62,6 +62,7 @@ pub fn is_managed_mode() -> bool {
 ///
 /// `dunce::canonicalize` is used so Windows does not grow a `\\?\` prefix
 /// (no-op on non-Windows) — consistent with the daemon's other path handling.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn resolve_config_dir(raw: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(raw)?;
     dunce::canonicalize(raw)
@@ -133,6 +134,7 @@ pub fn acquire_daemon_lock(canonical_config_dir: &Path) -> Result<DaemonLock, Lo
 ///   [`LockError::Held`] (one final attempt is made at the deadline).
 /// - Open failure or `TryLockError::Error` (an I/O error): return
 ///   [`LockError::Io`] IMMEDIATELY, with no retry.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn acquire_daemon_lock_with(
     canonical_config_dir: &Path,
     window: Duration,
@@ -223,6 +225,7 @@ pub fn plugin_policy(managed: bool) -> PluginPolicy {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod test_env {
     //! Process-wide env-var serialization for tests. `std::env::set_var`
     //! mutates process state; any test touching `NEXUS_SYNC_CONFIG_DIR` MUST
@@ -277,6 +280,7 @@ pub(crate) mod test_env {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
 
     /// T-1d-3b (gate C1, kills M3): a genuine `TryLockError::Error` is returned on

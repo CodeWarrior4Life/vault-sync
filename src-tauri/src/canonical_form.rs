@@ -56,6 +56,7 @@ pub fn canonicalize_bytes(input: &[u8]) -> Result<String, CanonicalizeError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;

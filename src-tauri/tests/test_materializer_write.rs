@@ -1,6 +1,8 @@
 //! Integration test surface for the v0.3 materializer. The bulk of unit
 //! coverage now lives in `src/materializer.rs::tests`; this file keeps a
 //! cross-crate-boundary smoke test against the public API.
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 
 use tempfile::TempDir;
 use vault_sync_daemon::api_client::NotePayload;

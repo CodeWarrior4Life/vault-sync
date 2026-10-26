@@ -133,7 +133,7 @@ impl Default for VerifyRepairConfig {
             hardcoded_excludes: vec![
                 ".obsidian/".into(),
                 ".lattice-sync/".into(),
-                ".lattice-runtime".into(),
+                crate::state_io::layout::RUNTIME_DIR_NAME.into(),
                 ".trash/".into(),
                 "._/".into(),
                 "_archive/".into(),
@@ -1156,6 +1156,7 @@ fn hash_file(path: &Path) -> Result<(String, u64), std::io::Error> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::api_client::ApiClient;
@@ -1179,8 +1180,7 @@ mod tests {
 
     async fn make_journal() -> (TempDir, Arc<Mutex<PushJournal>>) {
         let dir = TempDir::new().unwrap();
-        let p = dir.path().join("push_journal.jsonl");
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap();
         (dir, Arc::new(Mutex::new(j)))
     }
 
@@ -1577,7 +1577,9 @@ mod tests {
         let (vr, journal, _jd) =
             make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/a.md", "deadbeef"); // last-synced server hash == current server hash
         let vr = vr.with_shadow(shadow);
         let report = vr.run().await.unwrap();
@@ -1680,7 +1682,9 @@ mod tests {
         // with each server hash so they classify as genuine local edits (push),
         // exercising the modify_paths_sample cap (fix/reconcile-server-wins-shadow).
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let mut diff_entries = Vec::new();
         for i in 0..60 {
             let rel = format!("notes/f{i:03}.md");
@@ -2161,7 +2165,10 @@ mod tests {
         );
         let ledger_dir = TempDir::new().unwrap();
         let ledger = std::sync::Arc::new(crate::retry_ledger::RetryLedger::load(
-            ledger_dir.path().join("ledger.json"),
+            &crate::state_io::StateDir::for_test_scoped(
+                ledger_dir.path(),
+                crate::state_io::Scope::ConfigDir,
+            ),
         ));
         let vr = vr
             .with_materializer(mat)

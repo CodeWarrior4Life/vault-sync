@@ -84,6 +84,9 @@ pub enum MaterializerError {
     Stash(#[from] StashError),
     #[error("integrity-check error: {0}")]
     Integrity(String),
+    /// CS-2 gate 4: the target resolves into a registered state dir.
+    #[error("{0}")]
+    ForeignStateWrite(String),
 }
 
 impl From<IntegrityError> for MaterializerError {
@@ -244,6 +247,7 @@ pub enum AlignOutcome {
 /// is already byte-faithful, so a timestamp-set failure is logged, never fatal.
 /// `created`/`file_mtime` are unix-timestamp floats from the server payload;
 /// either may be absent (older server) — we set whatever we have.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 fn restore_server_times(target: &Path, payload: &NotePayload) {
     let to_systime = |ts: Option<f64>| -> Option<std::time::SystemTime> {
         ts.and_then(|t| {
@@ -664,7 +668,7 @@ impl Materializer {
         // Allow callers to override the trailing folder name via
         // shadow_subdir, but anchor it under <workspace>/.lattice-runtime/<slug>.
         self.workspace_root
-            .join(".lattice-runtime")
+            .join(crate::state_io::layout::RUNTIME_DIR_NAME)
             .join(&self.subscriber_slug)
             .join(&self.shadow_subdir)
     }
@@ -724,6 +728,7 @@ impl Materializer {
     /// is arbitrary-writer-wins under clock skew + ~15 concurrent writers) and
     /// names any conflict stash deterministically so concurrent writers across
     /// the fleet converge on ONE stash filename instead of spawning N copies.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_with_change_seq(
         &self,
         payload: &NotePayload,
@@ -1219,6 +1224,10 @@ impl Materializer {
                                 let parent = target.parent().ok_or_else(|| {
                                     MaterializerError::PathTraversal(payload.path.clone())
                                 })?;
+                                // CS-2 gate 4: never into a state dir.
+                                crate::state_io::refuse_state_target(&target).map_err(|e| {
+                                    MaterializerError::ForeignStateWrite(e.to_string())
+                                })?;
                                 fs::create_dir_all(parent)?;
                                 let mut tmp = NamedTempFile::new_in(parent)?;
                                 tmp.write_all(&merged)?;
@@ -1365,6 +1374,10 @@ impl Materializer {
 
         // 7. Path-safety + parent dir.
         let canonical_root = self.canonical_root_for_mode();
+        // CS-2 gate 4: refuse a target that resolves into a state dir before
+        // any directory is created or byte written.
+        crate::state_io::refuse_state_target(&target)
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
             let canonical_parent = parent
@@ -1508,6 +1521,7 @@ impl Materializer {
     /// `canonical_sha` MUST be the sha256 hex of `canonical_bytes` (the caller
     /// verified it against the server's hash - unverified local
     /// canonicalization is banned, B2'b).
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_aligned_bytes(
         &self,
         rel_path: &str,
@@ -1593,6 +1607,9 @@ impl Materializer {
         let parent = target
             .parent()
             .expect("vault-relative target always has a parent");
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&target)
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         fs::create_dir_all(parent)?;
         let mut tmp = NamedTempFile::new_in(parent)?;
         tmp.write_all(canonical_bytes)?;
@@ -1625,6 +1642,7 @@ impl Materializer {
 
     /// Pick the canonical-root directory for the active mode.  Used by the
     /// path-traversal sanity check.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     fn canonical_root_for_mode(&self) -> PathBuf {
         let raw_root = match self.mode {
             MaterializerMode::Live => self.vaults_root.clone(),
@@ -1713,6 +1731,7 @@ impl Materializer {
     /// Soft-delete preserves the v0.2 contract (move to `<name>.deleted-<ts>`).
     /// In live mode it operates on the vault tree; in shadow mode on the
     /// runtime tree.  Disabled mode no-ops.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn soft_delete(&self, path: &str) -> Result<(), MaterializerError> {
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
@@ -1801,6 +1820,10 @@ impl Materializer {
         if let (Some(g), true) = (&self.echo_guard, record_echo) {
             g.record_delete(path);
         }
+        // CS-2 gate 4: neither end of the rename may resolve into state.
+        crate::state_io::refuse_state_target(&target)
+            .and_then(|_| crate::state_io::refuse_state_target(&renamed))
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         if let Err(e) = fs::rename(&target, &renamed) {
             if let (Some(g), true) = (&self.echo_guard, record_echo) {
                 g.unrecord_delete(path);
@@ -2145,12 +2168,14 @@ fn serialize_with_frontmatter(payload: &NotePayload) -> String {
 /// `\\?\` via `dunce::simplified`'s inverse (we canonicalize through dunce on the
 /// target before the OS call). Code path is compiled only on Windows and must be
 /// re-verified on a booted Neo before Windows sync is re-enabled.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 #[cfg(not(windows))]
 fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
     tmp.persist(target).map_err(|e| e.error)?;
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 #[cfg(windows)]
 fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
     use std::os::windows::ffi::OsStrExt;
@@ -2266,7 +2291,29 @@ fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerE
 // Tests
 // ---------------------------------------------------------------------------
 
+/// CS-2 T-CS2-11: a well-formed payload for `path` (as the server sends it).
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
+pub(crate) fn test_payload(path: &str, body: &str) -> NotePayload {
+    use sha2::{Digest, Sha256};
+    let fm = serde_json::json!({"title": "Test"});
+    let fm_yaml = serde_yaml::to_string(&fm).unwrap_or_default();
+    let serialized = format!("---\n{fm_yaml}---\n\n{body}");
+    NotePayload {
+        path: path.to_string(),
+        frontmatter: fm,
+        body: body.into(),
+        sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
+        modified: Some("2026-05-27T00:00:00Z".into()),
+        file_mtime: None,
+        created: None,
+        change_seq: None,
+        enriched_body: Some(serialized),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -2756,12 +2803,12 @@ mod tests {
 
         // Pre-B2 shadow file: legacy vault-prefixed key, value == the CURRENT
         // server hash (server unchanged since we last synced).
-        let shadow_file = ws_tmp.path().join("shadow.json");
+        let shadow_file = ws_tmp.path().join("shadow_hashes.json");
         let mut legacy = std::collections::HashMap::new();
         legacy.insert("Mainframe/01_Notes/storm.md".to_string(), p.sha256.clone());
         std::fs::write(&shadow_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
         let shadow = crate::sync_shadow::ShadowStore::load_with_vault_folders(
-            shadow_file,
+            &crate::state_io::StateDir::for_test_file(&shadow_file),
             vec!["Mainframe".into()],
         );
 
@@ -3054,7 +3101,9 @@ mod tests {
     ) {
         use crate::sync_shadow::ShadowStore;
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let (vaults, ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let wire = format!("{VAULT}/01_Inbox/foo.md");
@@ -3161,7 +3210,9 @@ mod tests {
     fn delete_leg_stash_uses_base_seq_when_known() {
         let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
         let bdir = TempDir::new().unwrap();
-        let bs = crate::base_seq_store::BaseSeqStore::load(bdir.path().join("base_seq.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&bdir.path().join("base_seq.json")),
+        );
         bs.record_adopted(&wire, 7);
         let m = m.with_base_seq_store(bs);
         shadow.record(&wire, &sha256_hex("server v1"));
@@ -3262,7 +3313,9 @@ mod tests {
     fn successful_write_records_shadow_hash() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload("01_Inbox/foo.md", "hello");
@@ -3280,7 +3333,9 @@ mod tests {
     fn integrity_failed_write_does_not_record_shadow() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload_with_bad_sha("01_Inbox/foo.md", "hello");
@@ -3299,7 +3354,9 @@ mod tests {
     fn b1_shadow_mode_write_does_not_record_baseline() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_v, _ws, m_base) = mk(MaterializerMode::Shadow, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload("01_Inbox/foo.md", "hello");
@@ -3499,7 +3556,9 @@ mod tests {
     ) -> (TempDir, TempDir, Materializer, Arc<ShadowStore>) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let m = m.with_shadow_store(shadow.clone());
         (v, w, m, shadow)
     }
@@ -3518,10 +3577,12 @@ mod tests {
     ) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())
@@ -4022,9 +4083,11 @@ mod tests {
     #[tokio::test]
     async fn records_observed_base_seq_only_from_server_change_seq() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
 
@@ -4067,9 +4130,11 @@ mod tests {
     #[tokio::test]
     async fn noop_identical_records_base_seq_r4() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
         let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -4112,9 +4177,11 @@ mod tests {
     #[tokio::test]
     async fn preserve_local_edit_never_records_base_seq_r2() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -4250,11 +4317,11 @@ mod tests {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec![VAULT.to_string()],
         );
         let m = m
@@ -4472,12 +4539,15 @@ mod tests {
     fn r1_scope_suspect_shadow_mints_no_conflict_copy() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let sdir = TempDir::new().unwrap();
-        let spath = sdir.path().join("shadow.json");
+        let spath = sdir.path().join("shadow_hashes.json");
         // A store holding vault-prefixed keys, loaded with EMPTY vault_folders.
         let mut seed = std::collections::HashMap::new();
         seed.insert(format!("{VAULT}/01_Notes/other.md"), "deadbeef".to_string());
         std::fs::write(&spath, serde_json::to_vec(&seed).unwrap()).unwrap();
-        let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
+        let shadow = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&spath),
+            vec![],
+        );
         assert!(
             shadow.vault_scope_suspect(),
             "fixture must reproduce the suspect state"
@@ -4587,16 +4657,16 @@ mod tests {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())
@@ -5133,12 +5203,12 @@ mod tests {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())

@@ -1,0 +1,13 @@
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -307,6 +307,10 @@
+ // tests
+ // ---------------------------------------------------------------------------
+ 
++pub fn cs2_plant() -> usize {
++    crate::push_journal::PushJournal::scratch().len()
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

@@ -1,0 +1,29 @@
+--- /dev/null
++++ b/src/util.rs
+@@ -0,0 +1,3 @@
++pub fn w(p: &std::path::Path) {
++    let _ = std::fs::write(p, b"");
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -37,6 +37,7 @@
+ pub mod token_store;
+ pub mod tray;
+ pub mod tray_state;
++pub mod util;
+ pub mod verify_repair;
+ 
+ use tauri::{Emitter, Manager};
+--- a/src/delete_ledger.rs
++++ b/src/delete_ledger.rs
+@@ -129,6 +129,10 @@
+         .filter(|l| !l.trim().is_empty())
+         .map(|l| l.to_string())
+         .collect()
++}
++
++pub fn cs2_plant(p: &std::path::Path) {
++    crate::util::w(p);
+ }
+ 
+ #[cfg(test)]

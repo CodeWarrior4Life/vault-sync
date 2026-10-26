@@ -1,0 +1,11 @@
+--- a/state_io_exemptions.toml
++++ b/state_io_exemptions.toml
+@@ -30,6 +30,8 @@
+ # Gate C7: every `.display(<one argument>)` call site outside state_io (a
+ # DisplayPath turns back into a path string via to_string/format!). Keyed by
+ # the enclosing item; the reason names the operator text it feeds.
++"delete_ledger::no_such_item" = "stale plant"
++
+ [display_sites]
+ "push_journal::PushJournal::display" = "the journal's DisplayPath for the file_watcher storm-breaker ERROR"
+ "delete_ledger::DeleteLedger::display" = "the ledger's DisplayPath for operator text"

@@ -22,6 +22,8 @@
 //! still produces that state today. The D3 gate — that `shadow_hash_for_ack`
 //! now records `server_hash` on Accepted instead of the local raw sha — is
 //! `push_client::tests::test_ack_materialize_rewrite_then_shadow`.
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 
 use mockito::Server;
 use std::sync::Arc;
@@ -52,7 +54,12 @@ fn test_b1_alternation_regression() {
     let ws = TempDir::new().unwrap();
     let sdir = TempDir::new().unwrap();
     std::fs::create_dir_all(vaults.path().join(VAULT)).unwrap();
-    let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+    let shadow = ShadowStore::load(
+        &vault_sync_daemon::state_io::bootstrap(sdir.path(), &["itest".to_string()], sdir.path())
+            .unwrap()
+            .get("itest")
+            .unwrap(),
+    );
     let echo = Arc::new(EchoGuard::new());
     let mat = Materializer::new(
         vaults.path().to_path_buf(),
@@ -173,7 +180,12 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
     // LOCAL raw sha, matching what the old (pre-D3-fix) Accepted arm used to
     // record. This is what makes decide_direction choose Pull over Push for
     // a "drift" delta instead of Noop.
-    let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+    let shadow = ShadowStore::load(
+        &vault_sync_daemon::state_io::bootstrap(sdir.path(), &["itest".to_string()], sdir.path())
+            .unwrap()
+            .get("itest")
+            .unwrap(),
+    );
     shadow.record(rel, &local_raw_sha);
 
     let mut srv = Server::new_async().await;
@@ -209,8 +221,16 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
         .await;
 
     let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
-    let journal_path = jdir.path().join("push_journal.jsonl");
-    let journal = Arc::new(Mutex::new(PushJournal::open(&journal_path).unwrap()));
+    // CS-2: the journal lives in a bootstrapped StateDir (the public API).
+    let cfg_dir = tempfile::TempDir::new().unwrap();
+    let reg = vault_sync_daemon::state_io::bootstrap(
+        jdir.path(),
+        &["sub-b1-vr".to_string()],
+        cfg_dir.path(),
+    )
+    .unwrap();
+    let sd = reg.get("sub-b1-vr").unwrap();
+    let journal = Arc::new(Mutex::new(PushJournal::open(&sd).unwrap()));
     let mat = Materializer::new(
         vault.path().to_path_buf(),
         Some("shadow/".into()),

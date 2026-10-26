@@ -1,0 +1,15 @@
+--- a/src/sse.rs
++++ b/src/sse.rs
+@@ -427,6 +427,12 @@
+     }
+ }
+ 
++#[cfg(unix)]
++pub fn cs2_plant() {
++    // SAFETY: plant.
++    unsafe { libc::unlink(c"x".as_ptr()) };
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

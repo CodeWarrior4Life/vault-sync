@@ -1,0 +1,93 @@
+# Unit CS-2 (TKT-23091e72) gate 1: state_io is the ONLY code allowed to
+# create, write, rename or remove sync-state files. Every path-taking write
+# primitive is disallowed crate-wide; the exempt items are listed, with a
+# reason each, in state_io_exemptions.toml and policed by
+# tests/state_io_gate.rs (gate 2).
+#
+# New direct dependency? Extend this list with its file-writing APIs and add a
+# [reviewed_deps] line in state_io_exemptions.toml (gate C6).
+#
+# Platform-specific paths (libc does not exist on Windows; the Apple, Linux
+# and Windows extensions exist only there) carry `allow-invalid = true` so a
+# leg where the path does not resolve does not warn. The negcontrol step
+# (scripts/state_io_gate_negcontrol.sh) proves the libc entries resolve on
+# ubuntu.
+disallowed-methods = [
+  # --- std ---
+  { path = "std::fs::write", reason = "state I/O goes through state_io::StateDir (CS-2 gate 1)" },
+  { path = "std::fs::copy", reason = "CS-2 gate 1: path-based write" },
+  { path = "std::fs::rename", reason = "CS-2 gate 1: path-based rename" },
+  { path = "std::fs::remove_file", reason = "CS-2 gate 1: path-based unlink" },
+  { path = "std::fs::remove_dir", reason = "CS-2 gate 1: path-based rmdir" },
+  { path = "std::fs::remove_dir_all", reason = "CS-2 gate 1: path-based recursive delete" },
+  { path = "std::fs::create_dir", reason = "CS-2 gate 1: write-time directory creation" },
+  { path = "std::fs::create_dir_all", reason = "CS-2 gate 1: write-time directory creation (bootstrap is the only creator)" },
+  { path = "std::fs::hard_link", reason = "CS-2 gate 1: path-based link" },
+  { path = "std::fs::set_permissions", reason = "CS-2 gate 1: path-based chmod" },
+  { path = "std::fs::soft_link", reason = "CS-2 gate C5: path-based symlink" },
+  { path = "std::fs::File::create", reason = "CS-2 gate 1: path-based create" },
+  { path = "std::fs::File::create_new", reason = "CS-2 gate 1: path-based create" },
+  { path = "std::fs::OpenOptions::open", reason = "CS-2 gate 1: path-based open for write" },
+  { path = "std::fs::DirBuilder::create", reason = "CS-2 gate 1: write-time directory creation" },
+  { path = "std::os::unix::fs::symlink", reason = "CS-2 gate 1: path-based symlink", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_file", reason = "CS-2 gate C5: path-based symlink", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_dir", reason = "CS-2 gate C5: path-based symlink", allow-invalid = true },
+  # --- tokio (the `fs` feature is enabled) ---
+  { path = "tokio::fs::write", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::copy", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::rename", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::remove_file", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::remove_dir", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::remove_dir_all", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::create_dir", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::create_dir_all", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::hard_link", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::set_permissions", reason = "CS-2 gate C5" },
+  { path = "tokio::fs::symlink", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "tokio::fs::File::create", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::File::create_new", reason = "CS-2 gate C5" },
+  { path = "tokio::fs::OpenOptions::open", reason = "CS-2 gate 1" },
+  { path = "tokio::fs::DirBuilder::create", reason = "CS-2 gate C5" },
+  # --- tempfile ---
+  { path = "tempfile::NamedTempFile::new", reason = "CS-2 gate 1: unanchored temp" },
+  { path = "tempfile::NamedTempFile::new_in", reason = "CS-2 gate 1: path-anchored temp" },
+  { path = "tempfile::NamedTempFile::persist", reason = "CS-2 gate 1: path-based rename" },
+  { path = "tempfile::NamedTempFile::persist_noclobber", reason = "CS-2 gate C5" },
+  { path = "tempfile::NamedTempFile::keep", reason = "CS-2 gate C5" },
+  { path = "tempfile::NamedTempFile::with_prefix_in", reason = "CS-2 gate C5" },
+  { path = "tempfile::TempPath::persist", reason = "CS-2 gate C5" },
+  { path = "tempfile::Builder::tempfile", reason = "CS-2 gate 1" },
+  { path = "tempfile::Builder::tempfile_in", reason = "CS-2 gate 1" },
+  { path = "tempfile::Builder::tempdir", reason = "CS-2 gate C5" },
+  { path = "tempfile::Builder::tempdir_in", reason = "CS-2 gate C5" },
+  { path = "tempfile::tempfile_in", reason = "CS-2 gate 1" },
+  { path = "tempfile::tempdir", reason = "CS-2 gate C5 (the old W16 scratch API)" },
+  { path = "tempfile::tempdir_in", reason = "CS-2 gate C5" },
+  { path = "tempfile::TempDir::new", reason = "CS-2 gate C5" },
+  { path = "tempfile::TempDir::new_in", reason = "CS-2 gate C5" },
+  # --- libc (direct cfg(unix) dependency) ---
+  { path = "libc::open", reason = "CS-2 gate 1: raw open", allow-invalid = true },
+  { path = "libc::open64", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::openat", reason = "CS-2 gate 1: raw openat (state_io only)", allow-invalid = true },
+  { path = "libc::openat64", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::creat", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::rename", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::renameat", reason = "CS-2 gate 1 (state_io only)", allow-invalid = true },
+  { path = "libc::renameat2", reason = "CS-2 gate 1 (Linux)", allow-invalid = true },
+  { path = "libc::renamex_np", reason = "CS-2 gate C5 (Apple)", allow-invalid = true },
+  { path = "libc::renameatx_np", reason = "CS-2 gate C5 (Apple)", allow-invalid = true },
+  { path = "libc::unlink", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::unlinkat", reason = "CS-2 gate 1 (state_io only)", allow-invalid = true },
+  { path = "libc::mkdir", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::mkdirat", reason = "CS-2 gate 1 (state_io bootstrap only)", allow-invalid = true },
+  { path = "libc::rmdir", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::link", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::linkat", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::symlink", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::symlinkat", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::truncate", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::ftruncate", reason = "CS-2 gate C5", allow-invalid = true },
+  { path = "libc::fsync", reason = "CS-2 gate 1: raw fsync (only the exempt Apple fallback in durable_file)", allow-invalid = true },
+  { path = "libc::fdatasync", reason = "CS-2 gate 1", allow-invalid = true },
+  { path = "libc::syscall", reason = "CS-2 gate C5: raw syscall escape hatch", allow-invalid = true },
+]

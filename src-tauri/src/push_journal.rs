@@ -3,7 +3,8 @@
 //! Each line is a single JSON object representing one queued push event. The
 //! journal lives outside the vault tree at
 //! `<workspace>/.lattice-runtime/<slug>/sync-state/push_journal.jsonl`
-//! (caller decides; this module accepts a `PathBuf` to the journal file).
+//! (CS-2: the handle holds an `Arc<StateDir>`; every byte goes through the
+//! held directory fd, never a path).
 //!
 //! Concurrency (Unit 1a, TKT-b25fce06): every operation that touches the
 //! file takes an exclusive `File::lock` (flock / LockFileEx) on the sibling
@@ -34,10 +35,12 @@
 //! bodies and blow past the capacity cap. The binary-streaming / sidecar path
 //! (spec §1 row 11) is deferred future work.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::state_io::{DisplayPath, NotCommitted, StateDir, StateFile};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -289,37 +292,14 @@ pub enum JournalError {
 /// runtime thread on a contended journal).
 const LOCK_WAIT_ALARM: Duration = Duration::from_secs(5);
 
-/// Feeds the unique rewrite temp name (J2): strictly increasing within the
-/// process, so two rewrites never pick the same `<nanos>` even when the clock
-/// reads equal. `<pid>` separates processes.
-static TMP_NANOS: AtomicU64 = AtomicU64::new(0);
-
 /// Per-thread identity for the C1 re-entrancy guard (0 = no holder).
 static NEXT_THREAD_TAG: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static THREAD_TAG: u64 = NEXT_THREAD_TAG.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Sibling lock-file path for a journal: `push_journal.jsonl` ->
-/// `push_journal.lock` (C6). Derived from the journal's own name so two
-/// journals in one directory never share a lock.
-fn lock_path_for(journal: &Path) -> PathBuf {
-    journal.with_extension("lock")
-}
-
-/// Open (creating if needed, mode 0600 on unix) this handle's OWN lock fd.
-/// C3: every handle opens its own description; it is never `try_clone`d,
-/// because a clone shares the open file description and therefore the flock.
-/// C6: the lock file holds no data and is never truncated, renamed or deleted.
-fn open_lock_file(lock_path: &Path) -> io::Result<File> {
-    let mut o = OpenOptions::new();
-    o.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    o.open(lock_path)
+fn nc(n: NotCommitted) -> JournalError {
+    JournalError::Io(n.0)
 }
 
 /// Proof that the journal lock is held. Only [`PushJournal::with_lock`]
@@ -335,7 +315,6 @@ struct JournalFaults {
     fail_append_sync: std::sync::atomic::AtomicBool,
     crash_at: std::sync::Mutex<Option<CrashPoint>>,
     lock_acquisitions: AtomicU64,
-    tmp_names: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 /// T-J6 crash-injection points inside `rewrite_locked`.
@@ -363,29 +342,55 @@ impl JournalFaults {
         }
         Ok(())
     }
-    fn is_simulated_crash(e: &JournalError) -> bool {
-        matches!(e, JournalError::Corruption(m) if m.starts_with(SIMULATED_CRASH))
+
+    /// CS-2: the rewrite now runs inside CS-1 `durable_file` (through the
+    /// StateDir), so the 1a temp-side fault points are armed on its
+    /// thread-local seams for the duration of one rewrite.
+    fn arm_durable_seams(&self) {
+        use crate::durable_file::seams;
+        if self.fail_rewrite_sync.load(Ordering::SeqCst) {
+            seams::fail_sync_all(5);
+        }
+        match *self.crash_at.lock().unwrap() {
+            Some(CrashPoint::TempWritten) => seams::crash_at(seams::Point::AfterWrite),
+            Some(CrashPoint::TempSynced) => seams::crash_at(seams::Point::AfterSync),
+            Some(CrashPoint::Renamed) => seams::crash_at(seams::Point::AfterRename),
+            _ => {}
+        }
     }
+}
+
+/// Where a journal's bytes live.
+enum Backing {
+    /// The real journal: `push_journal.jsonl` in a held state dir.
+    Dir(Arc<StateDir>),
+    /// D9 seed scratch sink (CS-2 D5, gate C10): touches no filesystem and
+    /// counts appends. Built only by [`PushJournal::scratch`].
+    Scratch(AtomicU64),
 }
 
 /// File-authoritative journal handle. Holds NO cached event list — `drain`
 /// and `ack` re-read the on-disk file every call so any number of handles on
-/// the same path converge on the same state (v0.3 stale-state fix).
+/// the same file converge on the same state (v0.3 stale-state fix).
 ///
 /// Unit 1a (TKT-b25fce06): every operation that touches the file runs under
 /// an exclusive `flock`/`LockFileEx` on the sibling `push_journal.lock`, held
 /// from the read through the rename. Each handle opens its OWN lock fd (C3),
 /// so the four production handles in one process exclude each other exactly
 /// as two processes do.
+///
+/// CS-2 (TKT-23091e72): the handle holds `(Arc<StateDir>, StateFile)`, never
+/// a path. Every byte goes through the held directory fd.
 pub struct PushJournal {
-    path: PathBuf,
+    backing: Backing,
     /// Current file size in bytes: a projection, re-measured from disk inside
     /// the lock before every capacity decision (J5) and after every rewrite.
     total_bytes: AtomicU64,
     /// Capacity guard in bytes (default 100 MB per spec §4.2).
     max_bytes: u64,
-    /// C3: this handle's own lock fd. Never `try_clone`d.
-    lock_file: File,
+    /// C3: this handle's own lock fd. Never `try_clone`d. `None` only for
+    /// the scratch sink.
+    lock_file: Option<File>,
     /// Serializes threads that share ONE handle by reference (a shared open
     /// file description would not exclude them via flock).
     local: std::sync::Mutex<()>,
@@ -399,29 +404,24 @@ pub struct PushJournal {
 const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl PushJournal {
-    /// Open (or create) the journal at `path`. Scans existing lines and
-    /// recovers from corrupt-tail / unknown-schema lines by skipping them
-    /// with a tracing warning.
-    pub fn open(path: &Path) -> Result<Self, JournalError> {
-        Self::open_with_capacity(path, DEFAULT_MAX_BYTES)
+    /// Open (or create) the journal in the held state dir. Scans existing
+    /// lines and recovers from corrupt-tail / unknown-schema lines by
+    /// skipping them with a tracing warning.
+    pub fn open(sd: &Arc<StateDir>) -> Result<Self, JournalError> {
+        Self::open_with_capacity(sd, DEFAULT_MAX_BYTES)
     }
 
-    pub fn open_with_capacity(path: &Path, max_bytes: u64) -> Result<Self, JournalError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        // Touch the file so subsequent appends always succeed.
-        let _ = OpenOptions::new().create(true).append(true).open(path)?;
-
-        let lock_file = open_lock_file(&lock_path_for(path))?;
+    pub fn open_with_capacity(sd: &Arc<StateDir>, max_bytes: u64) -> Result<Self, JournalError> {
+        // W1 (CS-2): no create_dir_all. Create the FILE if absent through the
+        // held dir (`O_CREAT|O_EXCL|O_NOFOLLOW`, 0600); a gone dir is ENOENT.
+        sd.ensure_file(StateFile::PushJournal).map_err(nc)?;
+        // W2: a fresh lock description per handle (1a C3 preserved).
+        let lock_file = sd.open_lock(StateFile::PushJournalLock)?;
         let j = Self {
-            path: path.to_path_buf(),
+            backing: Backing::Dir(Arc::clone(sd)),
             total_bytes: AtomicU64::new(0),
             max_bytes,
-            lock_file,
+            lock_file: Some(lock_file),
             local: std::sync::Mutex::new(()),
             holder: AtomicU64::new(0),
             #[cfg(test)]
@@ -436,6 +436,59 @@ impl PushJournal {
             Ok(())
         })?;
         Ok(j)
+    }
+
+    /// The D9 seed's scratch journal (CS-2 D5, gate C10): an in-memory sink
+    /// that touches no filesystem. The seed never enqueues; an append is a
+    /// bug, so it is counted, WARNed in every build and debug-asserted.
+    /// Exactly one caller (the D9 seed), asserted by `tests/state_io_gate.rs`.
+    pub(crate) fn scratch() -> Self {
+        Self {
+            backing: Backing::Scratch(AtomicU64::new(0)),
+            total_bytes: AtomicU64::new(0),
+            max_bytes: DEFAULT_MAX_BYTES,
+            lock_file: None,
+            local: std::sync::Mutex::new(()),
+            holder: AtomicU64::new(0),
+            #[cfg(test)]
+            faults: JournalFaults::default(),
+        }
+    }
+
+    /// Appends the scratch sink has absorbed (always 0 for a real journal).
+    #[cfg(test)]
+    pub(crate) fn scratch_appends(&self) -> u64 {
+        match &self.backing {
+            Backing::Scratch(n) => n.load(Ordering::SeqCst),
+            Backing::Dir(_) => 0,
+        }
+    }
+
+    fn scratch_append(&self, n: usize) -> bool {
+        let Backing::Scratch(c) = &self.backing else {
+            return false;
+        };
+        c.fetch_add(n as u64, Ordering::SeqCst);
+        tracing::warn!(
+            events = n,
+            "push_journal: append to the D9 seed SCRATCH journal; the seed must never enqueue (CS-2 gate C10). Dropped."
+        );
+        #[cfg(not(test))]
+        debug_assert!(false, "append to the scratch journal (CS-2 C10)");
+        true
+    }
+
+    /// Operator text naming the journal file (CS-2: the journal's
+    /// `DisplayPath`; `None` for the scratch sink).
+    pub fn display(&self) -> Option<DisplayPath> {
+        self.sd().map(|sd| sd.display(Some(StateFile::PushJournal)))
+    }
+
+    fn sd(&self) -> Option<&Arc<StateDir>> {
+        match &self.backing {
+            Backing::Dir(sd) => Some(sd),
+            Backing::Scratch(_) => None,
+        }
     }
 
     /// Run `f` holding this handle's exclusive journal lock. ONLY the
@@ -466,7 +519,9 @@ impl PushJournal {
             fn drop(&mut self) {
                 self.j.holder.store(0, Ordering::SeqCst);
                 if self.flocked {
-                    let _ = self.j.lock_file.unlock();
+                    if let Some(l) = &self.j.lock_file {
+                        let _ = l.unlock();
+                    }
                 }
             }
         }
@@ -479,8 +534,10 @@ impl PushJournal {
             flocked: false,
             _local: local,
         };
-        self.lock_file.lock()?;
-        held.flocked = true;
+        if let Some(l) = &self.lock_file {
+            l.lock()?;
+            held.flocked = true;
+        }
         let waited = started.elapsed();
         if waited > LOCK_WAIT_ALARM {
             tracing::error!(
@@ -497,7 +554,15 @@ impl PushJournal {
 
     /// Re-read the on-disk size into the projection (J5). Lock held.
     fn refresh_total_bytes_locked(&self, _l: &Locked) -> Result<u64, JournalError> {
-        let n = std::fs::metadata(&self.path)?.len();
+        let n = match self.sd() {
+            Some(sd) => sd.len(StateFile::PushJournal)?.ok_or_else(|| {
+                JournalError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "push journal is absent from the held state dir",
+                ))
+            })?,
+            None => 0,
+        };
         self.total_bytes.store(n, Ordering::SeqCst);
         Ok(n)
     }
@@ -506,9 +571,17 @@ impl PushJournal {
     /// schema) events in append order. This is the authoritative read — every
     /// `drain` / `ack` calls it so separate handles converge. Applies the
     /// same corrupt-tail / forward-compat tolerance as the original scan.
-    /// Lock held.
+    /// Lock held. CS-2: read through the held dir fd (`O_NOFOLLOW`).
     fn read_live_from_locked(&self, _l: &Locked) -> Result<Vec<PushEvent>, JournalError> {
-        let file = File::open(&self.path)?;
+        let Some(sd) = self.sd() else {
+            return Ok(Vec::new());
+        };
+        let file = sd.open_read(StateFile::PushJournal)?.ok_or_else(|| {
+            JournalError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "push journal is absent from the held state dir",
+            ))
+        })?;
         let reader = BufReader::new(file);
 
         let mut entries: Vec<PushEvent> = Vec::new();
@@ -592,13 +665,15 @@ impl PushJournal {
         Ok(entries)
     }
 
-    /// Atomically append one event. Open append+create, write line+\n,
-    /// `sync_data`, close.
+    /// Atomically append one event: write line+\n, `sync_data`.
     ///
     /// Preserves the original hard-error-on-capacity contract: a single append
     /// that would exceed the cap returns `CapacityExceeded` and writes nothing.
     /// The capacity check and the write happen under ONE lock acquisition.
     pub fn append(&mut self, evt: PushEvent) -> Result<(), JournalError> {
+        if self.scratch_append(1) {
+            return Ok(());
+        }
         let mut line = serde_json::to_string(&evt)?;
         line.push('\n');
         self.with_lock("append", move |j, l| {
@@ -621,22 +696,25 @@ impl PushJournal {
         })
     }
 
-    /// Append N events in ONE file open/write/sync/close cycle.
+    /// Append N events as ONE `write_all` then ONE `sync_data`.
     ///
-    /// Opens the journal once, serializes each event to one jsonl line, writes
-    /// them all, then `sync_data` once (J4). Returns the number of events
-    /// appended; returns `Ok(n)` only after the sync succeeded. A sync error
-    /// is returned as `Err` (callers treat `Err` as "not written").
+    /// Serializes each event to one jsonl line, writes the whole batch, then
+    /// `sync_data` once (J4). Returns the number of events appended; returns
+    /// `Ok(n)` only after the sync succeeded. A sync error is returned as
+    /// `Err` (callers treat `Err` as "not written").
     ///
-    /// Capacity policy (graceful degradation): events are written one at a
+    /// Capacity policy (graceful degradation): events are admitted one at a
     /// time against the running size, re-measured from disk inside the lock
     /// first (J5). The moment the NEXT event would push the file past
-    /// `max_bytes`, writing stops — already written events stay, the rest are
-    /// dropped, and a warning is logged. A huge first-sync therefore degrades
-    /// to "write what fits" instead of erroring the whole batch.
+    /// `max_bytes`, admission stops — the admitted events are written, the
+    /// rest are dropped, and a warning is logged. A huge first-sync therefore
+    /// degrades to "write what fits" instead of erroring the whole batch.
     pub fn append_batch(&mut self, events: Vec<PushEvent>) -> Result<usize, JournalError> {
         if events.is_empty() {
             return Ok(0);
+        }
+        if self.scratch_append(events.len()) {
+            return Ok(events.len());
         }
         self.with_lock("append_batch", move |j, l| j.append_batch_locked(l, events))
     }
@@ -649,20 +727,22 @@ impl PushJournal {
         if events.is_empty() {
             return Ok(0);
         }
+        let Some(sd) = self.sd() else {
+            return Ok(0);
+        };
 
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        // W3 (CS-2): an fd-bound appender on the held dir, never a path.
+        let mut f = sd.open_append(StateFile::PushJournal).map_err(nc)?;
 
         // J5 (and the S490 runaway fix): the capacity decision uses the size
         // re-read from disk INSIDE the lock, never the per-handle projection,
         // which is stale whenever another handle appended or rewrote.
-        let mut total = f.metadata()?.len();
+        let mut total = f.len()?;
         self.total_bytes.store(total, Ordering::SeqCst);
 
         let count = events.len();
         let mut written = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
         for evt in events {
             let mut line = serde_json::to_string(&evt)?;
             line.push('\n');
@@ -679,29 +759,24 @@ impl PushJournal {
                 break;
             }
 
-            f.write_all(line.as_bytes())?;
+            buf.extend_from_slice(line.as_bytes());
             total = total.saturating_add(added);
             written += 1;
         }
 
-        f.flush()?;
-        self.total_bytes.store(total, Ordering::SeqCst);
         if written > 0 {
-            // J4: durable before we report it written.
-            self.sync_appended(&f)?;
+            f.write_all(&buf).map_err(nc)?;
+            self.total_bytes.store(total, Ordering::SeqCst);
+            // J4: durable before we report it written. A created file whose
+            // dir sync failed is CommittedDurabilityUncertain: the bytes are
+            // visible and the journal is at-least-once (1a J4), so it counts.
+            #[cfg(test)]
+            if self.faults.fail_append_sync.load(Ordering::SeqCst) {
+                return Err(io::Error::other("injected sync_data failure").into());
+            }
+            let _commit = f.sync_data().map_err(nc)?;
         }
-        drop(f);
         Ok(written)
-    }
-
-    /// `sync_data` on the appended journal (J4), with a test fault point.
-    fn sync_appended(&self, f: &File) -> Result<(), JournalError> {
-        #[cfg(test)]
-        if self.faults.fail_append_sync.load(Ordering::SeqCst) {
-            return Err(io::Error::other("injected sync_data failure").into());
-        }
-        f.sync_data()?;
-        Ok(())
     }
 
     /// Read up to `n` live events from the head of the file, without removing
@@ -792,93 +867,33 @@ impl PushJournal {
         self.total_bytes.load(Ordering::SeqCst)
     }
 
-    /// Unique temp path for one rewrite (J2):
-    /// `push_journal.jsonl.tmp-<pid>-<nanos>`, opened with `create_new`.
-    fn unique_tmp_path(&self) -> PathBuf {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        // Plain CAS loop: `fetch_update` is deprecated on newer stable
-        // (renamed `try_update`), which does not exist on older toolchains.
-        let mut prev = TMP_NANOS.load(Ordering::SeqCst);
-        loop {
-            let next = now.max(prev.saturating_add(1));
-            match TMP_NANOS.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => break,
-                Err(actual) => prev = actual,
-            }
-        }
-        let nanos = now.max(prev.saturating_add(1));
-        let base = self
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "push_journal.jsonl".to_string());
-        self.path
-            .with_file_name(format!("{base}.tmp-{}-{nanos}", std::process::id()))
-    }
-
     /// Atomically and durably rewrite the file to contain exactly `events`,
     /// then refresh the byte projection. Lock held (C1).
     ///
-    /// J2: a unique `create_new` temp; on any error before the rename it is
-    /// unlinked. J3: the temp's `sync_all` error is propagated, and after the
-    /// rename the directory is fsynced (unix, C5).
+    /// W4 (CS-2): CS-1 `replace_atomic` over the StateDir anchor, still
+    /// inside the 1a journal lock: a unique `create_new` 0600 temp
+    /// `push_journal.jsonl.tmp-<pid>-<nanos>-<seq>` (J2), `sync_all` with its
+    /// error propagated (J3), `renameat` as the commit point, then the
+    /// directory sync. `Commit` of either kind counts as committed (the
+    /// journal is at-least-once); `NotCommitted` propagates as `JournalError`.
     fn rewrite_locked(&self, _l: &Locked, events: &[PushEvent]) -> Result<(), JournalError> {
-        let tmp_path = self.unique_tmp_path();
-        #[cfg(test)]
-        self.faults.tmp_names.lock().unwrap().push(tmp_path.clone());
-        let mut tmp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
-        let staged: Result<(), JournalError> = (|| {
-            for evt in events {
-                let mut line = serde_json::to_string(evt)?;
-                line.push('\n');
-                tmp.write_all(line.as_bytes())?;
-            }
-            tmp.flush()?;
-            #[cfg(test)]
-            self.faults.crash_point(CrashPoint::TempWritten)?;
-            self.sync_rewrite_tmp(&tmp)?;
-            #[cfg(test)]
-            self.faults.crash_point(CrashPoint::TempSynced)?;
-            Ok(())
-        })();
-        drop(tmp);
-        if let Err(e) = staged {
-            #[cfg(test)]
-            let crashed = JournalFaults::is_simulated_crash(&e);
-            #[cfg(not(test))]
-            let crashed = false;
-            if !crashed {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
+        let Some(sd) = self.sd() else {
+            return Ok(());
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        for evt in events {
+            bytes.extend_from_slice(serde_json::to_string(evt)?.as_bytes());
+            bytes.push(b'\n');
         }
         #[cfg(test)]
-        self.faults.crash_point(CrashPoint::Renamed)?;
-        crate::durable_file::fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
+        self.faults.arm_durable_seams();
+        let r = sd.replace_atomic(StateFile::PushJournal, &bytes);
+        #[cfg(test)]
+        crate::durable_file::seams::clear_crash_at();
+        let _commit = r.map_err(nc)?;
         #[cfg(test)]
         self.faults.crash_point(CrashPoint::DirSynced)?;
-        self.total_bytes
-            .store(std::fs::metadata(&self.path)?.len(), Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// `sync_all` on the rewrite temp file (J3), with a test fault point.
-    fn sync_rewrite_tmp(&self, tmp: &File) -> Result<(), JournalError> {
-        #[cfg(test)]
-        if self.faults.fail_rewrite_sync.load(Ordering::SeqCst) {
-            return Err(io::Error::other("injected sync_all failure").into());
-        }
-        tmp.sync_all()?;
+        self.refresh_total_bytes_locked(_l)?;
         Ok(())
     }
 
@@ -928,9 +943,19 @@ impl PushJournal {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// CS-2: a test StateDir holding the directory that contains `p` (the
+    /// journal is always `push_journal.jsonl` in it).
+    fn sd_of(p: &Path) -> Arc<StateDir> {
+        StateDir::for_test(p.parent().unwrap())
+    }
 
     fn evt(path: &str, action: PushAction) -> PushEvent {
         PushEvent {
@@ -954,7 +979,7 @@ mod tests {
     #[test]
     fn compact_collapses_duplicates_keeping_latest_per_path() {
         let dir = TempDir::new().unwrap();
-        let mut j = PushJournal::open(&dir.path().join("j.jsonl")).unwrap();
+        let mut j = PushJournal::open(&StateDir::for_test(dir.path())).unwrap();
         // 3 redundant entries for a.md (remember the LAST id), 2 for b.md, 1 c.md.
         let mut last_a = String::new();
         for _ in 0..3 {
@@ -986,7 +1011,7 @@ mod tests {
     #[test]
     fn compact_is_noop_without_duplicates() {
         let dir = TempDir::new().unwrap();
-        let mut j = PushJournal::open(&dir.path().join("j.jsonl")).unwrap();
+        let mut j = PushJournal::open(&StateDir::for_test(dir.path())).unwrap();
         j.append(evt("a.md", PushAction::Create)).unwrap();
         j.append(evt("b.md", PushAction::Create)).unwrap();
         assert_eq!(j.compact().unwrap(), (2, 2));
@@ -994,7 +1019,7 @@ mod tests {
     }
 
     fn journal_path(dir: &TempDir) -> PathBuf {
-        dir.path().join("sync-state").join("push_journal.jsonl")
+        dir.path().join("push_journal.jsonl")
     }
 
     #[test]
@@ -1045,7 +1070,7 @@ mod tests {
     fn open_empty_file_returns_empty_journal() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&sd_of(&p)).unwrap();
         assert_eq!(j.len(), 0);
         assert!(j.is_empty());
         assert_eq!(j.total_bytes(), 0);
@@ -1057,12 +1082,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             j.append(evt("notes/a.md", PushAction::Create)).unwrap();
             j.append(evt("notes/b.md", PushAction::Modify)).unwrap();
             assert_eq!(j.len(), 2);
         }
-        let j2 = PushJournal::open(&p).unwrap();
+        let j2 = PushJournal::open(&sd_of(&p)).unwrap();
         assert_eq!(j2.len(), 2);
         assert!(j2.total_bytes() > 0);
     }
@@ -1072,7 +1097,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
         // Pick a max so small the first append blows it.
-        let mut j = PushJournal::open_with_capacity(&p, 32).unwrap();
+        let mut j = PushJournal::open_with_capacity(&sd_of(&p), 32).unwrap();
         let err = j.append(evt("notes/a.md", PushAction::Create)).unwrap_err();
         match err {
             JournalError::CapacityExceeded { max, .. } => assert_eq!(max, 32),
@@ -1094,7 +1119,7 @@ mod tests {
         let cap = 400u64; // a few entries fit, then the cap trips
 
         // Handle A (file_watcher role): append until the cap is reached.
-        let mut a = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut a = PushJournal::open_with_capacity(&sd_of(&p), cap).unwrap();
         let mut n = 0;
         loop {
             match a.append(evt(&format!("notes/{n}.md"), PushAction::Create)) {
@@ -1107,7 +1132,7 @@ mod tests {
         assert!(n > 0, "should write at least one event before the cap");
 
         // Handle B (push_client role): drain + ack everything → file → 0 bytes.
-        let mut b = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut b = PushJournal::open_with_capacity(&sd_of(&p), cap).unwrap();
         let cursors: Vec<_> = b
             .drain(10_000)
             .unwrap()
@@ -1128,7 +1153,7 @@ mod tests {
     fn drain_does_not_remove_until_ack() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         j.append(evt("notes/a.md", PushAction::Create)).unwrap();
         j.append(evt("notes/b.md", PushAction::Modify)).unwrap();
 
@@ -1145,7 +1170,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             for i in 0..4 {
                 j.append(evt(&format!("notes/{i}.md"), PushAction::Create))
                     .unwrap();
@@ -1157,7 +1182,7 @@ mod tests {
             }
             assert_eq!(j.len(), 1);
         }
-        let mut j2 = PushJournal::open(&p).unwrap();
+        let mut j2 = PushJournal::open(&sd_of(&p)).unwrap();
         assert_eq!(j2.len(), 1);
         let batch = j2.drain(10).unwrap();
         assert_eq!(batch[0].0.path, "notes/3.md");
@@ -1168,7 +1193,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             for i in 0..3 {
                 j.append(evt(&format!("notes/{i}.md"), PushAction::Create))
                     .unwrap();
@@ -1179,7 +1204,7 @@ mod tests {
             let mut f = OpenOptions::new().append(true).open(&p).unwrap();
             f.write_all(b"{not valid json at all").unwrap();
         }
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&sd_of(&p)).unwrap();
         assert_eq!(j.len(), 3);
     }
 
@@ -1187,7 +1212,7 @@ mod tests {
     fn nack_keeps_event() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         j.append(evt("notes/a.md", PushAction::Create)).unwrap();
         let batch = j.drain(10).unwrap();
         j.nack(batch[0].1.clone()).unwrap();
@@ -1202,7 +1227,7 @@ mod tests {
         // rewrites the file, so on-disk size shrinks immediately.
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         for i in 0..10 {
             j.append(evt(&format!("notes/{i}.md"), PushAction::Create))
                 .unwrap();
@@ -1229,7 +1254,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             for i in 0..100 {
                 j.append(evt(&format!("notes/{i}.md"), PushAction::Create))
                     .unwrap();
@@ -1240,7 +1265,7 @@ mod tests {
         let f = OpenOptions::new().write(true).open(&p).unwrap();
         f.set_len(len.saturating_sub(10)).unwrap();
 
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&sd_of(&p)).unwrap();
         // 99 should remain intact; the 100th line lost its trailing bytes
         // and is skipped by the corrupt-tail handler.
         assert_eq!(j.len(), 99);
@@ -1308,7 +1333,7 @@ mod tests {
         writeln!(f, "{future_line}").unwrap();
         drop(f);
 
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&sd_of(&p)).unwrap();
         // Only the v1 event is loaded; v2 is skipped (logged as warning).
         assert_eq!(j.len(), 1);
     }
@@ -1331,11 +1356,11 @@ mod tests {
             device_id: "dev-test".to_string(),
         };
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             j.append(lazy.clone()).unwrap();
             assert_eq!(j.len(), 1);
         }
-        let mut j2 = PushJournal::open(&p).unwrap();
+        let mut j2 = PushJournal::open(&sd_of(&p)).unwrap();
         let batch = j2.drain(10).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0.content_bytes, None);
@@ -1350,13 +1375,13 @@ mod tests {
             .map(|i| evt(&format!("notes/{i}.md"), PushAction::Create))
             .collect();
         {
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             let written = j.append_batch(events).unwrap();
             assert_eq!(written, 1000);
             assert_eq!(j.len(), 1000);
         }
         // Reopen and confirm all 1000 persisted.
-        let mut j2 = PushJournal::open(&p).unwrap();
+        let mut j2 = PushJournal::open(&sd_of(&p)).unwrap();
         assert_eq!(j2.len(), 1000);
         let batch = j2.drain(2000).unwrap();
         assert_eq!(batch.len(), 1000);
@@ -1376,7 +1401,7 @@ mod tests {
             .collect();
         let line_len = |e: &PushEvent| serde_json::to_string(e).unwrap().len() as u64 + 1;
         let cap = line_len(&events[0]) + line_len(&events[1]) + 1;
-        let mut j = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut j = PushJournal::open_with_capacity(&sd_of(&p), cap).unwrap();
         let written = j.append_batch(events).unwrap();
         assert_eq!(written, 2, "only 2 of 10 events fit under the cap");
         assert_eq!(j.len(), 2);
@@ -1400,8 +1425,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
 
-        let mut a = PushJournal::open(&p).unwrap();
-        let mut b = PushJournal::open(&p).unwrap();
+        let mut a = PushJournal::open(&sd_of(&p)).unwrap();
+        let mut b = PushJournal::open(&sd_of(&p)).unwrap();
 
         // A appends AFTER B was already opened.
         a.append(evt("notes/from-a.md", PushAction::Create))
@@ -1421,12 +1446,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
 
-        let mut a = PushJournal::open(&p).unwrap();
+        let mut a = PushJournal::open(&sd_of(&p)).unwrap();
         a.append(evt("notes/0.md", PushAction::Create)).unwrap();
         a.append(evt("notes/1.md", PushAction::Create)).unwrap();
         a.append(evt("notes/2.md", PushAction::Create)).unwrap();
 
-        let mut b = PushJournal::open(&p).unwrap();
+        let mut b = PushJournal::open(&sd_of(&p)).unwrap();
         let batch = b.drain(10).unwrap();
         assert_eq!(batch.len(), 3);
         // Ack the middle one by its cursor (event id).
@@ -1434,7 +1459,7 @@ mod tests {
         b.ack(acked_cur).unwrap();
 
         // A fresh handle sees exactly the two un-acked events.
-        let mut c = PushJournal::open(&p).unwrap();
+        let mut c = PushJournal::open(&sd_of(&p)).unwrap();
         let remaining = c.drain(10).unwrap();
         assert_eq!(remaining.len(), 2);
         let paths: Vec<&str> = remaining.iter().map(|(e, _)| e.path.as_str()).collect();
@@ -1454,7 +1479,7 @@ mod tests {
     }
 
     fn ids_on_disk(p: &Path) -> Vec<String> {
-        let j = PushJournal::open(p).unwrap();
+        let j = PushJournal::open(&sd_of(p)).unwrap();
         j.with_lock("test", |j, l| j.read_live_from_locked(l))
             .unwrap()
             .into_iter()
@@ -1483,7 +1508,7 @@ mod tests {
         };
         let n: usize = std::env::var("PJ_TJ1_CHILD_N").unwrap().parse().unwrap();
         let out = std::env::var("PJ_TJ1_CHILD_OUT").unwrap();
-        let mut j = PushJournal::open(Path::new(&p)).unwrap();
+        let mut j = PushJournal::open(&sd_of(Path::new(&p))).unwrap();
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let mut e = lazy_evt(&format!("child/{i}.md"));
@@ -1510,10 +1535,10 @@ mod tests {
         let p = journal_path(&dir);
 
         // Four independently opened handles (each with its own lock fd).
-        let mut appender = PushJournal::open(&p).unwrap();
-        let mut duper = PushJournal::open(&p).unwrap();
-        let mut acker = PushJournal::open(&p).unwrap();
-        let mut compactor = PushJournal::open(&p).unwrap();
+        let mut appender = PushJournal::open(&sd_of(&p)).unwrap();
+        let mut duper = PushJournal::open(&sd_of(&p)).unwrap();
+        let mut acker = PushJournal::open(&sd_of(&p)).unwrap();
+        let mut compactor = PushJournal::open(&sd_of(&p)).unwrap();
 
         let child_out = dir.path().join("child_ids.txt");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1637,15 +1662,17 @@ mod tests {
     fn tj2_rewriters_use_unique_temp_and_leave_none_behind() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut seed = PushJournal::open(&p).unwrap();
+        // One shared StateDir so its syscall recorder sees every temp name.
+        let shared = sd_of(&p);
+        let mut seed = PushJournal::open(&shared).unwrap();
         for i in 0..20 {
             seed.append(lazy_evt(&format!("d/{}.md", i % 3))).unwrap();
         }
         let workers: Vec<_> = (0..2)
             .map(|w| {
-                let p = p.clone();
+                let sd = Arc::clone(&shared);
                 std::thread::spawn(move || {
-                    let mut j = PushJournal::open(&p).unwrap();
+                    let mut j = PushJournal::open(&sd).unwrap();
                     for i in 0..40 {
                         // Re-add duplicates so every compact really rewrites.
                         j.append(lazy_evt(&format!("d/{}.md", i % 3))).unwrap();
@@ -1654,19 +1681,25 @@ mod tests {
                         let ids: Vec<_> = j.drain(1).unwrap().into_iter().map(|(_, c)| c).collect();
                         j.ack_batch(ids).unwrap();
                     }
-                    let names = j.faults.tmp_names.lock().unwrap().clone();
-                    (w, names)
+                    (w, ())
                 })
             })
             .collect();
-        let mut all = Vec::new();
         for h in workers {
-            let (_, names) = h.join().unwrap();
-            all.extend(names);
+            h.join().unwrap();
         }
+        let all: Vec<String> = shared
+            .seams
+            .recorder
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.strip_prefix("openat:"))
+            .filter(|n| n.contains(".tmp-"))
+            .map(str::to_string)
+            .collect();
         let pid = std::process::id().to_string();
-        for n in &all {
-            let s = n.file_name().unwrap().to_string_lossy();
+        for s in &all {
             assert!(
                 s.starts_with("push_journal.jsonl.tmp-") && s.contains(&pid),
                 "unexpected temp name {s}"
@@ -1701,7 +1734,7 @@ mod tests {
     fn tj3_rewrite_sync_error_propagates_and_keeps_old_journal() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         for i in 0..4 {
             j.append(lazy_evt(&format!("n/{i}.md"))).unwrap();
         }
@@ -1728,7 +1761,7 @@ mod tests {
     fn tj4_append_sync_error_returns_err() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         j.faults.fail_append_sync.store(true, Ordering::SeqCst);
         let r = j.append_batch(vec![lazy_evt("a.md"), lazy_evt("b.md")]);
         assert!(
@@ -1748,9 +1781,9 @@ mod tests {
         let p = journal_path(&dir);
         let probe = serde_json::to_string(&lazy_evt("cap/00.md")).unwrap().len() as u64 + 1;
         let cap = probe * 10 + 5;
-        let mut b = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut b = PushJournal::open_with_capacity(&sd_of(&p), cap).unwrap();
         assert_eq!(b.total_bytes(), 0);
-        let mut a = PushJournal::open_with_capacity(&p, cap).unwrap();
+        let mut a = PushJournal::open_with_capacity(&sd_of(&p), cap).unwrap();
         for i in 0..6 {
             a.append(lazy_evt(&format!("cap/a{i}.md"))).unwrap();
         }
@@ -1781,7 +1814,7 @@ mod tests {
         ] {
             let dir = TempDir::new().unwrap();
             let p = journal_path(&dir);
-            let mut j = PushJournal::open(&p).unwrap();
+            let mut j = PushJournal::open(&sd_of(&p)).unwrap();
             for i in 0..6 {
                 j.append(lazy_evt(&format!("c/{i}.md"))).unwrap();
             }
@@ -1799,7 +1832,7 @@ mod tests {
             );
             assert_eq!(after == new, expect_new, "{point:?}");
             // The journal stays fully usable after the restart.
-            let mut j2 = PushJournal::open(&p).unwrap();
+            let mut j2 = PushJournal::open(&sd_of(&p)).unwrap();
             j2.append(lazy_evt("c/after.md")).unwrap();
             assert_eq!(j2.len(), after.len() + 1);
         }
@@ -1824,7 +1857,7 @@ mod tests {
             .tempdir_in(&base)
             .unwrap();
         let p = dir.path().join("push_journal.jsonl");
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         for i in 0..20 {
             j.append(evt(&format!("warm/{i}.md"), PushAction::Modify))
                 .unwrap();
@@ -1857,7 +1890,7 @@ mod tests {
     fn tj8_ack_locks_once_and_reentry_trips_guard() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         for i in 0..3 {
             j.append(lazy_evt(&format!("r/{i}.md"))).unwrap();
         }
@@ -1884,7 +1917,7 @@ mod tests {
         }
         // The guard released the flock and the flag on unwind.
         assert_eq!(j.len(), 2);
-        let mut other = PushJournal::open(&p).unwrap();
+        let mut other = PushJournal::open(&sd_of(&p)).unwrap();
         other.append(lazy_evt("r/x.md")).unwrap();
         assert_eq!(j.len(), 3);
     }
@@ -1894,7 +1927,7 @@ mod tests {
     fn lock_file_is_0600_sibling_and_never_removed() {
         let dir = TempDir::new().unwrap();
         let p = journal_path(&dir);
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&sd_of(&p)).unwrap();
         let lp = p.parent().unwrap().join("push_journal.lock");
         assert!(lp.exists());
         #[cfg(unix)]
@@ -1916,5 +1949,41 @@ mod tests {
             0,
             "lock file holds no data"
         );
+    }
+
+    /// T-CS2-35 (gate C10, behaviour half): an append to the scratch journal
+    /// is counted and emits the WARN (in every build profile; the debug
+    /// assert is compiled out of test builds). The single-caller half is
+    /// asserted by `tests/state_io_gate.rs`.
+    #[test]
+    fn t_cs2_35_scratch_append_warns_and_counts() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        let mut j = PushJournal::scratch();
+        tracing::subscriber::with_default(sub, || {
+            assert_eq!(j.scratch_appends(), 0);
+            j.append(lazy_evt("x.md")).unwrap();
+            assert_eq!(j.append_batch(vec![lazy_evt("y.md")]).unwrap(), 1);
+        });
+        assert_eq!(j.scratch_appends(), 2);
+        assert_eq!(j.len(), 0, "the scratch sink stores nothing");
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("SCRATCH journal").count(), 2, "{log}");
+        assert!(log.contains("WARN"), "{log}");
     }
 }

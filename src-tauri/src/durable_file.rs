@@ -21,6 +21,11 @@
 //! files this design creates. It is NEVER used for `config.toml`, which
 //! `Config::load_from` reads as raw TOML.
 
+// CS-2 gate 2: durable_file is exempt from gate 1 as a whole (it IS the
+// CS-1 write layer: PathAnchor pathname calls and the single Apple
+// `libc::fsync` fallback). Listed in state_io_exemptions.toml.
+#![allow(clippy::disallowed_methods)]
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -59,10 +64,51 @@ impl Commit {
 #[error("not committed (previous file untouched): {0}")]
 pub struct NotCommitted(pub io::Error);
 
-/// A directory that small files are written into. CS-1 has [`PathAnchor`];
-/// CS-2 adds `StateDir`.
-pub trait Anchor {
-    fn dir(&self) -> &Path;
+/// Seal for [`Anchor`] (CS-2 gate C8). Rust privacy cannot seal a trait
+/// between two sibling modules of one crate, so the seal is enforced by the
+/// gate test `tests/state_io_gate.rs`: exactly two `impl Sealed for` sites
+/// exist, [`PathAnchor`] here and `StateAnchor` in `state_io`.
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+/// Mutex key for [`replace_monotone_set`]: the anchor's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum MutexKey {
+    /// A canonicalized directory path ([`PathAnchor`]).
+    Path(PathBuf),
+    /// The `(st_dev, st_ino)` of a held directory (`state_io::StateAnchor`).
+    DevIno(u64, u64),
+}
+
+/// A directory that small files are written into, as a set of OPERATIONS
+/// (CS-2 §3.7, D4). CS-1's `dir() -> &Path` was reshaped into this so a
+/// `StateDir` never has to hand out its path (I-OWN-2). Two implementations
+/// exist: [`PathAnchor`] (pathname calls) and `state_io::StateAnchor` (`*at`
+/// calls on a held directory fd, private to `state_io`). The step logic and
+/// the outcome mapping live ONCE, in this module.
+pub(crate) trait Anchor: sealed::Sealed {
+    /// Create `tmp_name` with `O_CREAT|O_EXCL|O_NOFOLLOW` (create_new) and
+    /// `mode` (unix), opened for writing. Never re-opens an existing name.
+    fn create_tmp_excl(&self, tmp_name: &str, mode: u32) -> io::Result<File>;
+    /// Rename `from` over `to` inside the anchor (the commit point).
+    fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+    /// Unlink `name` inside the anchor.
+    fn unlink(&self, name: &str) -> io::Result<()>;
+    /// Is the entry at `name` a symlink? `false` when absent.
+    fn is_symlink(&self, name: &str) -> io::Result<bool>;
+    /// Open `name` for reading; `None` when absent.
+    fn open_read(&self, name: &str) -> io::Result<Option<File>>;
+    /// Sync the directory and classify the outcome (CS-1 §3/§4b) through the
+    /// ONE mapping function [`classify_dir_sync`].
+    fn sync_dir(&self) -> io::Result<Commit>;
+    /// Identity of the anchor for the monotone-set mutex.
+    fn mutex_key(&self) -> io::Result<MutexKey>;
+    /// Runs immediately before the commit rename (CS-2: custody).
+    fn pre_commit(&self) -> io::Result<()>;
+    /// Test-only: a path for a name, handed to the CS-1 test hooks.
+    #[cfg(test)]
+    fn test_path(&self, name: &str) -> PathBuf;
 }
 
 /// An anchor that is just a directory path.
@@ -92,11 +138,71 @@ impl PathAnchor {
         };
         Ok((PathAnchor(dir), name))
     }
-}
 
-impl Anchor for PathAnchor {
     fn dir(&self) -> &Path {
         &self.0
+    }
+}
+
+impl sealed::Sealed for PathAnchor {}
+
+impl Anchor for PathAnchor {
+    fn create_tmp_excl(&self, tmp_name: &str, mode: u32) -> io::Result<File> {
+        // CS-1: a missing anchor dir is created here, 0700 on unix (C4).
+        ensure_dir(self.dir())?;
+        let mut o = OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        o.open(self.dir().join(tmp_name))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        commit_rename(&self.dir().join(from), &self.dir().join(to))
+    }
+
+    fn unlink(&self, name: &str) -> io::Result<()> {
+        fs::remove_file(self.dir().join(name))
+    }
+
+    fn is_symlink(&self, name: &str) -> io::Result<bool> {
+        match fs::symlink_metadata(self.dir().join(name)) {
+            Ok(m) => Ok(m.file_type().is_symlink()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_read(&self, name: &str) -> io::Result<Option<File>> {
+        match File::open(self.dir().join(name)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn sync_dir(&self) -> io::Result<Commit> {
+        dir_durability(self.dir())
+    }
+
+    fn mutex_key(&self) -> io::Result<MutexKey> {
+        ensure_dir(self.dir())?;
+        // C6: canonicalize failure is an error, never a raw-path fallback.
+        Ok(MutexKey::Path(fs::canonicalize(self.dir())?))
+    }
+
+    fn pre_commit(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_path(&self, name: &str) -> PathBuf {
+        self.dir().join(name)
     }
 }
 
@@ -192,25 +298,17 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
 /// Open a fresh temp with `create_new` (never re-opening an existing path)
 /// and mode 0600 in the same open on unix. EEXIST retries with a fresh name
 /// up to [`TEMP_OPEN_TRIES`] times (C6).
-fn open_temp(dir: &Path, name: &str) -> io::Result<(File, PathBuf)> {
+fn open_temp(a: &impl Anchor, name: &str) -> io::Result<(File, String)> {
     let mut last_err = None;
     for _ in 0..TEMP_OPEN_TRIES {
         #[cfg(test)]
         let candidate = seams::next_forced_temp_name().unwrap_or_else(|| temp_name(name));
         #[cfg(not(test))]
         let candidate = temp_name(name);
-        let path = dir.join(&candidate);
-        let mut o = OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
-        }
-        match o.open(&path) {
-            Ok(f) => return Ok((f, path)),
+        match a.create_tmp_excl(&candidate, 0o600) {
+            Ok(f) => return Ok((f, candidate)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                tracing::debug!(temp = %path.display(), "temp name exists; retrying with a fresh name");
+                tracing::debug!(temp = %candidate, "temp name exists; retrying with a fresh name");
                 last_err = Some(e);
             }
             Err(e) => return Err(e),
@@ -248,11 +346,9 @@ fn rename_retrying_sharing_violation(
     }
 }
 
-fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if let Some(e) = seams::take_rename_failure() {
-        return Err(e);
-    }
+/// Pathname rename used by [`PathAnchor`] (and the Windows `StateAnchor`),
+/// with the C3 sharing-violation retry on Windows.
+pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         rename_retrying_sharing_violation(|| fs::rename(from, to), std::thread::sleep)
@@ -268,6 +364,9 @@ fn sync_temp(f: &File) -> io::Result<()> {
     if let Some(e) = seams::take_sync_all_failure() {
         return Err(e);
     }
+    // std `sync_all` issues F_FULLFSYNC on Apple (CS-2 T-CS2-18 records it).
+    #[cfg(test)]
+    seams::record_event("sync_all:temp".to_string());
     f.sync_all()
 }
 
@@ -371,23 +470,16 @@ fn dir_durability(dir: &Path) -> io::Result<Commit> {
         } else {
             dir
         };
-        let (branch, out) = match File::open(d) {
-            Ok(f) => {
+        match File::open(d) {
+            Ok(f) => dir_file_durability(&f, d),
+            Err(e) => {
+                let (branch, out) = classify_dir_sync(APPLE, Err(e), || Ok(()));
                 #[cfg(test)]
-                let first = match seams::take_dir_fsync_failure(d) {
-                    Some(e) => Err(e),
-                    None => primary_dir_sync(&f),
-                };
-                #[cfg(not(test))]
-                let first = primary_dir_sync(&f);
-                classify_dir_sync(APPLE, first, || plain_fsync(&f))
+                seams::record_event(format!("dir_sync_branch:{branch:?}"));
+                let _ = branch;
+                out
             }
-            Err(e) => classify_dir_sync(APPLE, Err(e), || Ok(())),
-        };
-        #[cfg(test)]
-        seams::record_event(format!("dir_sync_branch:{branch:?}"));
-        let _ = branch;
-        out
+        }
     }
     #[cfg(not(unix))]
     {
@@ -396,10 +488,32 @@ fn dir_durability(dir: &Path) -> io::Result<Commit> {
     }
 }
 
-/// Fsync a directory after a rename inside it. The ONE directory-fsync
-/// implementation in the tree (C8; absorbed from Unit 1a's
-/// `push_journal::fsync_dir`), kept for 1a's callers (the push journal and
-/// `flush_durable`, which move onto `durable_file` in CS-2). Tolerated
+/// Sync an OPEN directory and classify the outcome (§3, §4b). Shared by both
+/// anchors: [`PathAnchor`] opens the directory, `state_io` passes its held
+/// directory fd (CS-2 §3.7). `label` keys the test fault seam only.
+#[cfg(unix)]
+pub(crate) fn dir_file_durability(f: &File, label: &Path) -> io::Result<Commit> {
+    #[cfg(test)]
+    let first = match seams::take_dir_fsync_failure(label) {
+        Some(e) => Err(e),
+        None => primary_dir_sync(f),
+    };
+    #[cfg(not(test))]
+    let first = {
+        let _ = label;
+        primary_dir_sync(f)
+    };
+    let (branch, out) = classify_dir_sync(APPLE, first, || plain_fsync(f));
+    #[cfg(test)]
+    seams::record_event(format!("dir_sync_branch:{branch:?}"));
+    let _ = branch;
+    out
+}
+
+/// Fsync a directory by path. The ONE directory-fsync implementation in the
+/// tree (CS-1 C8; absorbed from Unit 1a's `push_journal::fsync_dir`). Since
+/// CS-2 its only callers are inside this module: [`PathAnchor::sync_dir`]
+/// (through [`dir_durability`]) and the startup maintenance. Tolerated
 /// outcomes (non-Apple EINVAL/ENOTSUP, the Apple fallback, non-unix) are
 /// `Ok`; any other error is returned.
 pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
@@ -440,36 +554,36 @@ fn dir_fsync_tolerable(e: &io::Error) -> bool {
 ///
 /// `Err(NotCommitted)` guarantees the previous file is byte-identical and the
 /// temp is gone. `Ok` means the new bytes are visible; see [`Commit`].
-pub fn replace_atomic(a: &impl Anchor, name: &str, bytes: &[u8]) -> Result<Commit, NotCommitted> {
+pub(crate) fn replace_atomic(
+    a: &impl Anchor,
+    name: &str,
+    bytes: &[u8],
+) -> Result<Commit, NotCommitted> {
     #[cfg(test)]
     seams::record_call(name);
-    let dir = a.dir();
     validate_name(name).map_err(NotCommitted)?;
-    ensure_dir(dir).map_err(NotCommitted)?;
-    let target = dir.join(name);
     // C4: refuse a symlinked target. `rename` would replace the link itself,
     // but a link at a path we own is a planted redirection; refuse it.
-    match fs::symlink_metadata(&target) {
-        Ok(m) if m.file_type().is_symlink() => {
+    match a.is_symlink(name) {
+        Ok(true) => {
             return Err(NotCommitted(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("refusing to replace a symlink: {}", target.display()),
+                format!("refusing to replace a symlink: {name}"),
             )));
         }
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Ok(false) => {}
         Err(e) => return Err(NotCommitted(e)),
     }
 
-    let (mut f, temp) = open_temp(dir, name).map_err(NotCommitted)?;
-    let abandon = |e: io::Error, temp: &Path| -> NotCommitted {
-        if let Err(rm) = fs::remove_file(temp) {
-            tracing::warn!(temp = %temp.display(), error = %rm, "could not unlink temp after a failed replace");
+    let (mut f, temp) = open_temp(a, name).map_err(NotCommitted)?;
+    let abandon = |e: io::Error, temp: &str| -> NotCommitted {
+        if let Err(rm) = a.unlink(temp) {
+            tracing::warn!(temp = %temp, error = %rm, "could not unlink temp after a failed replace");
         }
         NotCommitted(e)
     };
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::AfterOpen, &temp) {
+    if let Some(e) = seams::at(seams::Point::AfterOpen, &a.test_path(&temp)) {
         return Err(e);
     }
 
@@ -478,14 +592,14 @@ pub fn replace_atomic(a: &impl Anchor, name: &str, bytes: &[u8]) -> Result<Commi
         return Err(abandon(e, &temp));
     }
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::MidWrite, &temp) {
+    if let Some(e) = seams::at(seams::Point::MidWrite, &a.test_path(&temp)) {
         return Err(e);
     }
     if let Err(e) = f.write_all(second) {
         return Err(abandon(e, &temp));
     }
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::AfterWrite, &temp) {
+    if let Some(e) = seams::at(seams::Point::AfterWrite, &a.test_path(&temp)) {
         return Err(e);
     }
     if let Err(e) = sync_temp(&f) {
@@ -494,18 +608,27 @@ pub fn replace_atomic(a: &impl Anchor, name: &str, bytes: &[u8]) -> Result<Commi
     }
     drop(f);
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::AfterSync, &temp) {
+    if let Some(e) = seams::at(seams::Point::AfterSync, &a.test_path(&temp)) {
         return Err(e);
     }
-    // The rename is the commit point.
-    if let Err(e) = commit_rename(&temp, &target) {
+    // CS-2: the anchor's last check before the commit point (custody for a
+    // `StateDir`); a failure abandons the temp and commits nothing.
+    if let Err(e) = a.pre_commit() {
         return Err(abandon(e, &temp));
     }
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::AfterRename, &target) {
+    if let Some(e) = seams::take_rename_failure() {
+        return Err(abandon(e, &temp));
+    }
+    // The rename is the commit point.
+    if let Err(e) = a.rename(&temp, name) {
+        return Err(abandon(e, &temp));
+    }
+    #[cfg(test)]
+    if let Some(e) = seams::at(seams::Point::AfterRename, &a.test_path(name)) {
         return Err(e);
     }
-    Ok(post_commit_durability(dir))
+    Ok(post_commit_durability(a))
 }
 
 /// After the rename: the new bytes are visible. The directory sync decides
@@ -513,11 +636,11 @@ pub fn replace_atomic(a: &impl Anchor, name: &str, bytes: &[u8]) -> Result<Commi
 /// commit point is `CommittedDurabilityUncertain`, never `NotCommitted`.
 /// Windows has no write-through rename available here (no `windows-sys`
 /// dependency), so it reports `CommittedDurabilityUncertain` (C3).
-fn post_commit_durability(dir: &Path) -> Commit {
-    match dir_durability(dir) {
+fn post_commit_durability(a: &impl Anchor) -> Commit {
+    match a.sync_dir() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed after commit; durability uncertain");
+            tracing::warn!(error = %e, "directory sync failed after commit; durability uncertain");
             Commit::CommittedDurabilityUncertain
         }
     }
@@ -561,24 +684,35 @@ fn unframe(raw: &[u8]) -> Result<Vec<u8>, CorruptKind> {
 }
 
 /// Atomically replace `<anchor>/<name>` with the framed `body`.
-pub fn replace_framed(a: &impl Anchor, name: &str, body: &[u8]) -> Result<Commit, NotCommitted> {
+#[cfg_attr(not(test), allow(dead_code))] // first framed file arrives in CS-4 (CS-2 §3.1)
+pub(crate) fn replace_framed(
+    a: &impl Anchor,
+    name: &str,
+    body: &[u8],
+) -> Result<Commit, NotCommitted> {
     replace_atomic(a, name, &frame(body))
 }
 
 /// Read a framed file. `Ok(None)` when it does not exist; `Corrupt` on a bad
 /// frame or hash (NEVER `None`, which would read as "absent").
-pub fn read_framed(a: &impl Anchor, name: &str) -> Result<Option<Vec<u8>>, FramedReadError> {
+#[cfg_attr(not(test), allow(dead_code))] // first framed file arrives in CS-4 (CS-2 §3.1)
+pub(crate) fn read_framed(a: &impl Anchor, name: &str) -> Result<Option<Vec<u8>>, FramedReadError> {
     validate_name(name).map_err(FramedReadError::Io)?;
-    let raw = match fs::read(a.dir().join(name)) {
-        Ok(r) => r,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+    let mut raw = Vec::new();
+    match a.open_read(name) {
+        Ok(Some(mut f)) => {
+            use std::io::Read;
+            f.read_to_end(&mut raw).map_err(FramedReadError::Io)?;
+        }
+        Ok(None) => return Ok(None),
         Err(e) => return Err(FramedReadError::Io(e)),
-    };
+    }
     unframe(&raw).map(Some).map_err(FramedReadError::Corrupt)
 }
 
-fn monotone_lock(key: PathBuf) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+fn monotone_lock(key: (MutexKey, String)) -> Arc<Mutex<()>> {
+    #[allow(clippy::type_complexity)]
+    static LOCKS: OnceLock<Mutex<HashMap<(MutexKey, String), Arc<Mutex<()>>>>> = OnceLock::new();
     let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
     g.entry(key).or_default().clone()
@@ -601,12 +735,10 @@ pub(crate) fn replace_monotone_set(
         return Err(MonotoneError::InvalidElement);
     }
     validate_name(name).map_err(MonotoneError::Io)?;
-    ensure_dir(a.dir()).map_err(MonotoneError::Io)?;
-    // C6: canonicalize failure is an error, never a raw-path fallback.
-    let key = fs::canonicalize(a.dir())
-        .map_err(MonotoneError::Io)?
-        .join(name);
-    let lock = monotone_lock(key);
+    // C6: the key is the anchor identity (canonicalized dir or held dev/ino);
+    // a failure is an error, never a raw-path fallback.
+    let key = a.mutex_key().map_err(MonotoneError::Io)?;
+    let lock = monotone_lock((key, name.to_string()));
     let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
 
     let existing = match read_framed(a, name) {
@@ -616,7 +748,7 @@ pub(crate) fn replace_monotone_set(
         Err(FramedReadError::Io(e)) => return Err(MonotoneError::Io(e)),
     };
     #[cfg(test)]
-    if let Some(e) = seams::at(seams::Point::MonotoneAfterRead, &a.dir().join(name)) {
+    if let Some(e) = seams::at(seams::Point::MonotoneAfterRead, &a.test_path(name)) {
         return Err(MonotoneError::Io(e.0));
     }
     let text =
@@ -633,7 +765,7 @@ pub(crate) fn replace_monotone_set(
 
 /// Parse the pid out of a temp name `<name>.tmp-<pid>-<nanos>-<seq>`.
 /// `None` when the name does not have exactly that shape.
-fn parse_temp_pid(file_name: &str) -> Option<u32> {
+pub(crate) fn parse_temp_pid(file_name: &str) -> Option<u32> {
     let idx = file_name.rfind(TEMP_MARKER)?;
     if idx == 0 {
         return None;
@@ -655,7 +787,7 @@ fn parse_temp_pid(file_name: &str) -> Option<u32> {
 
 /// Is `pid` a live process? `None` when liveness cannot be determined, which
 /// the sweep treats as alive.
-fn pid_alive(pid: u32) -> Option<bool> {
+pub(crate) fn pid_alive(pid: u32) -> Option<bool> {
     #[cfg(unix)]
     {
         let p = i32::try_from(pid).ok()?;
@@ -750,6 +882,7 @@ pub fn startup_maintenance(dirs: &[&Path]) {
 /// Test-only fault injection and observation points. All state is
 /// THREAD-LOCAL so parallel tests never see each other's faults.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod seams {
     use super::NotCommitted;
     use std::cell::RefCell;
@@ -809,6 +942,10 @@ pub(crate) mod seams {
     /// Simulate the process stopping at `p`: return early WITHOUT cleanup.
     pub(crate) fn crash_at(p: Point) {
         STATE.with(|s| s.borrow_mut().crash_at = Some(p));
+    }
+    /// Disarm a `crash_at` (CS-2: the journal arms it per rewrite).
+    pub(crate) fn clear_crash_at() {
+        STATE.with(|s| s.borrow_mut().crash_at = None);
     }
     pub(crate) fn set_hook(h: Hook) {
         STATE.with(|s| s.borrow_mut().hook = Some(h));
@@ -881,5 +1018,6 @@ pub(crate) mod seams {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 #[path = "durable_file_tests.rs"]
 mod tests;

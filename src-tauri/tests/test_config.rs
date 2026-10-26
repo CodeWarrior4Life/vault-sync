@@ -1,3 +1,5 @@
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 use std::path::PathBuf;
 use tempfile::TempDir;
 use vault_sync_daemon::config::{Config, ConfigError, SyncRoot};

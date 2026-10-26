@@ -121,17 +121,6 @@ impl EnvReader for MapEnv {
     }
 }
 
-/// AR-003 (TKT-c41c2225): where the durable reconcile retry ledger lives —
-/// beside the daemon config (NOT in the vault). Routed through
-/// `default_config_path()` so managed-instance mode (`NEXUS_SYNC_CONFIG_DIR`)
-/// relocates it together with config.toml and the token files.
-pub fn retry_ledger_path() -> PathBuf {
-    crate::config::default_config_path()
-        .parent()
-        .map(|d| d.join("reconcile-retry-ledger.json"))
-        .unwrap_or_else(|| PathBuf::from("reconcile-retry-ledger.json"))
-}
-
 /// Run ONE reconciliation pass.
 ///
 /// Calls `VerifyRepair::run()` against the same vault/api/journal the
@@ -166,7 +155,15 @@ pub async fn run_reconciliation_pass(
     // AR-003 (TKT-c41c2225): durable retry ledger for failed/deferred pulls,
     // stored beside the daemon config (NOT in the vault). Loaded per pass; state
     // persists across passes and daemon restarts.
-    let retry_ledger = Arc::new(crate::retry_ledger::RetryLedger::load(retry_ledger_path()));
+    // CS-2 (W13): the config-scope StateDir (bootstrapped on the config
+    // dir, so managed-instance mode relocates it with config.toml).
+    let retry_ledger = Arc::new(match crate::state_io::registry().config_dir() {
+        Ok(sd) => crate::retry_ledger::RetryLedger::load(&sd),
+        Err(e) => {
+            tracing::warn!("reconciliation: retry ledger not persisted: {e}");
+            crate::retry_ledger::RetryLedger::in_memory()
+        }
+    });
 
     let vr = VerifyRepair::new(
         vault_root,
@@ -296,26 +293,15 @@ pub async fn seed_shadow_from_server_if_empty(
 
     // Build the local manifest via the SAME machinery the reconcile pass uses
     // (RASP fence + excludes + extension gate applied identically). VerifyRepair
-    // requires a journal handle but seeding NEVER enqueues a push, so we hand it
-    // a throwaway journal in a temp dir that is dropped when this fn returns.
-    let scratch_dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = %e, "reconciliation: D9 seed could not create scratch dir, skipping seed");
-            return 0;
-        }
-    };
-    let scratch_journal = match PushJournal::open(&scratch_dir.path().join("seed_scratch.jsonl")) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!(error = %e, "reconciliation: D9 seed could not open scratch journal, skipping seed");
-            return 0;
-        }
-    };
+    // requires a journal handle but seeding NEVER enqueues a push, so it gets
+    // the in-memory scratch sink (CS-2 D5, W16): no temp dir, no file.
+    let scratch_journal = Arc::new(Mutex::new(PushJournal::scratch()));
+    #[cfg(test)]
+    let _rec = seed_test::Recorder(Arc::clone(&scratch_journal));
     let vr = VerifyRepair::new(
         vault_root,
         Arc::clone(&api),
-        Arc::new(Mutex::new(scratch_journal)),
+        scratch_journal,
         device_id,
         VerifyRepairConfig::default(),
     );
@@ -526,7 +512,31 @@ pub fn spawn_reconciliation_task(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// T-CS2-22 observation: the scratch-append count of the last D9 seed run
+/// on this thread, recorded when the seed returns.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod seed_test {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    thread_local! {
+        pub(crate) static LAST_SCRATCH_APPENDS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Recorder(pub(crate) Arc<Mutex<crate::push_journal::PushJournal>>);
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            let n = self.0.try_lock().map(|j| j.scratch_appends()).ok();
+            LAST_SCRATCH_APPENDS.with(|c| c.set(n));
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -690,7 +700,9 @@ mod tests {
     #[tokio::test]
     async fn d9_seed_is_noop_when_shadow_non_empty() {
         let sdir = tempfile::tempdir().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/already-known.md", "h");
         assert!(!shadow.is_empty());
 
@@ -759,5 +771,101 @@ mod tests {
         // The fallback must not have leaked in.
         assert!(!pairs[0].1.contains("should-not-appear"));
         assert!(!pairs[1].1.contains("should-not-appear"));
+    }
+
+    const T22_CHILD: &str = "CS2_T22_CHILD";
+
+    /// T-CS2-22 helper, NOT a test on its own: runs one D9 seed in a child
+    /// process whose system temp dir is an empty directory owned by the
+    /// parent. Prints the scratch-append count.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "T-CS2-22 subprocess helper; spawned by t_cs2_22_d9_seed_touches_no_filesystem"]
+    async fn t_cs2_22_child_seed() {
+        let Ok(url) = std::env::var(T22_CHILD) else {
+            return;
+        };
+        let vault = PathBuf::from(std::env::var("CS2_T22_VAULT").unwrap());
+        let sdir = PathBuf::from(std::env::var("CS2_T22_STATE").unwrap());
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.join("shadow_hashes.json")),
+        );
+        let api = Arc::new(ApiClient::new(&url, "vsk_test").unwrap());
+        let _n = seed_shadow_from_server_if_empty(vault, api, "dev-test".into(), shadow).await;
+        let appends = seed_test::LAST_SCRATCH_APPENDS.with(|c| c.get());
+        println!("SCRATCH_APPENDS={appends:?}");
+    }
+
+    /// T-CS2-22 (D9 scratch): a D9 seed run creates no file and no directory
+    /// in the system temp dir (the child's TMPDIR is an empty dir we watch)
+    /// and the scratch journal records 0 appends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t_cs2_22_d9_seed_touches_no_filesystem() {
+        let mut srv = mockito::Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(r#"{"deltas":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let watched = tmp.path().join("watched-tmp");
+        std::fs::create_dir(&watched).unwrap();
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(vault.join("notes")).unwrap();
+        std::fs::write(vault.join("notes/a.md"), b"hello").unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        // An inotify/FSEvents watch on the child's temp dir: a scratch dir
+        // created and removed again within the seed is still an event.
+        use notify::Watcher;
+        let (wtx, wrx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |r| {
+            let _ = wtx.send(r);
+        })
+        .unwrap();
+        watcher
+            .watch(&watched, notify::RecursiveMode::Recursive)
+            .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "reconciliation::tests::t_cs2_22_child_seed",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(T22_CHILD, srv.url())
+            .env("CS2_T22_VAULT", &vault)
+            .env("CS2_T22_STATE", &state)
+            .env("TMPDIR", &watched)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("SCRATCH_APPENDS=Some(0)"),
+            "scratch must record 0 appends: {stdout}"
+        );
+        m.assert_async().await;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let during: Vec<notify::Event> = wrx.try_iter().filter_map(Result::ok).collect();
+        assert!(
+            during.is_empty(),
+            "the D9 seed touched the temp dir: {during:?}"
+        );
+        let created: Vec<_> = std::fs::read_dir(&watched).unwrap().collect();
+        assert!(
+            created.is_empty(),
+            "entries left in the temp dir: {created:?}"
+        );
+        // Positive control: the watch does see a create.
+        std::fs::write(watched.join("probe"), b"x").unwrap();
+        let seen = wrx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(Result::ok);
+        assert!(seen.is_some(), "the temp-dir watch must observe a create");
     }
 }

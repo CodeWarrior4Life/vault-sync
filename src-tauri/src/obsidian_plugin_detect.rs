@@ -43,6 +43,7 @@ pub struct DetectResult {
 /// each conflicting plugin currently enabled, remove it from the enabled
 /// list. Returns the list of plugins it disabled so the caller can surface
 /// a tray notification.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn detect_and_disable(vault_root: &Path) -> DetectResult {
     let mut result = DetectResult::default();
     let obsidian_dir = vault_root.join(".obsidian");
@@ -96,6 +97,11 @@ pub fn detect_and_disable(vault_root: &Path) -> DetectResult {
             return result;
         }
     };
+    // CS-2 gate 4: never into a state dir.
+    if let Err(e) = crate::state_io::refuse_state_target(&community_plugins_path) {
+        warn!("not writing community-plugins.json: {e}");
+        return result;
+    }
     if let Err(e) = fs::write(&community_plugins_path, serialized) {
         warn!("failed to write community-plugins.json: {e}");
         return result;
@@ -121,6 +127,7 @@ pub fn summary_line(r: &DetectResult) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

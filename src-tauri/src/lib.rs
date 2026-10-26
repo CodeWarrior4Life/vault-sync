@@ -1,3 +1,6 @@
+// CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
+// `cargo clippy` without `-D warnings` also fails (see clippy.toml).
+#![deny(clippy::disallowed_methods)]
 pub mod api_client;
 pub mod append_merge;
 pub mod base_seq_store;
@@ -28,6 +31,7 @@ pub mod redflag;
 pub mod retry_ledger;
 pub mod scope;
 pub mod sse;
+pub mod state_io;
 pub mod sync_health;
 pub mod sync_shadow;
 pub mod token_store;
@@ -258,6 +262,11 @@ pub fn run() {
                 !subscriber_id.is_empty() && token_store::has_persisted_token(&subscriber_id),
             );
             if decision.start_sync {
+                // CS-2 §3.2: bootstrap every state dir synchronously, BEFORE
+                // any store load or pipeline. It is the only place a state
+                // directory is created; everything after it goes through
+                // `state_io::registry()`, which never creates.
+                bootstrap_state_dirs(app.handle(), &cfg_path);
                 spawn_sse_consumer(app.handle().clone(), cfg_path, shared_state);
             }
             // Managed-instance mode implies --silent semantics: NEVER raise
@@ -460,6 +469,58 @@ pub fn effective_subscriber_id(root: &config::SyncRoot, cfg: &config::Config) ->
         root.subscriber_id.clone()
     } else {
         cfg.subscriber_id.clone()
+    }
+}
+
+/// CS-2 §3.2: bootstrap the state dirs for S = {`cfg.subscriber_id`} plus
+/// every `effective_subscriber_id(root)`, plus the config-scope dir, install
+/// the registry and start the 5 s custody tick. A rejected or failed sub gets
+/// an ERROR log and the existing user notice; its pipeline will not start
+/// (`registry().get` returns `NotBootstrapped`) and nothing falls back to
+/// path I/O.
+fn bootstrap_state_dirs(app: &tauri::AppHandle, cfg_path: &std::path::Path) {
+    let cfg = match config::Config::load_from(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("state_io bootstrap: config load failed: {e}; no state dirs");
+            return;
+        }
+    };
+    let mut subs = vec![cfg.subscriber_id.clone()];
+    for root in &cfg.sync_roots {
+        let eff = effective_subscriber_id(root, &cfg);
+        if !subs.contains(&eff) {
+            subs.push(eff);
+        }
+    }
+    let workspace = commands::resolve_workspace_root();
+    let config_dir = cfg_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    match state_io::bootstrap(&workspace, &subs, &config_dir) {
+        Ok(reg) => {
+            let reg = state_io::install(reg, &workspace);
+            for (sub, why) in reg.rejected() {
+                if sub == "<config>" {
+                    continue;
+                }
+                notify_user(
+                    app,
+                    "Vault Sync push failed to start",
+                    &format!("state directory for subscriber {sub:?} unavailable: {why}"),
+                );
+            }
+            state_io::spawn_custody_tick();
+        }
+        Err(e) => {
+            tracing::error!("state_io bootstrap failed: {e}; not starting sync");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("state directory bootstrap failed: {e}"),
+            );
+        }
     }
 }
 
@@ -694,18 +755,26 @@ fn spawn_sse_consumer(
         // path-shape cutover orphaned the entire pre-0.4.28 sync history and
         // every dormant-but-divergent note fell to R5 conflict — the
         // 07-15..07-18 conflict-file storm.
+        // CS-2: the stores, last_event_id and the compensating journal live
+        // in the primary subscriber's held state dir (bootstrapped in
+        // `.setup()`). NotBootstrapped stops sync with the existing notice.
+        let state_dir = match state_io::registry().get(&cfg.subscriber_id) {
+            Ok(sd) => sd,
+            Err(e) => {
+                tracing::error!("sync not started: {e}");
+                notify_user(
+                    &app,
+                    "Vault Sync push failed to start",
+                    &format!("state directory unavailable: {e}"),
+                );
+                return;
+            }
+        };
         let vault_folders: Vec<String> = watch_roots
             .iter()
             .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
-        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("shadow_hashes.json"),
-            vault_folders,
-        );
+        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(&state_dir, vault_folders);
         sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
         // R7b daemon leg (THESEUS AR-002, TKT-166e1c07): the per-note
         // observed-base_seq store, keyed IDENTICALLY to the shadow store (same
@@ -715,11 +784,7 @@ fn spawn_sse_consumer(
         // after byte-verify (R3). Empty/missing => unknown lineage => fail-closed
         // (R4). Wired into BOTH the materializer (pull leg) and the push_client.
         let base_seq = base_seq_store::BaseSeqStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("base_seq.json"),
+            &state_dir,
             watch_roots
                 .iter()
                 .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -734,11 +799,7 @@ fn spawn_sse_consumer(
         // is the verified-recovery leg that lets a divergent, baseline-absent note
         // escape the certified deadlock without ever forging an in-sync baseline.
         let read_receipt = read_receipt::ReadReceiptStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("read_receipt.json"),
+            &state_dir,
             watch_roots
                 .iter()
                 .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -782,11 +843,7 @@ fn spawn_sse_consumer(
         let compensating_journal: Option<
             std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>,
         > = {
-            let jp = commands::push_journal_path(
-                &commands::resolve_workspace_root(),
-                &cfg.subscriber_id,
-            );
-            match push_journal::PushJournal::open(&jp) {
+            match push_journal::PushJournal::open(&state_dir) {
                 Ok(j) => Some(std::sync::Arc::new(std::sync::Mutex::new(j))),
                 Err(e) => {
                     tracing::warn!(error = %e, "R1: compensating-push journal open failed; anti-strip ARM 1 will preserve local but not enqueue (converges next reconcile pass)");
@@ -857,10 +914,6 @@ fn spawn_sse_consumer(
         // forever-awaiting `consumer.run().await` at the tail of this task.
         let watch_scope_roots = snap.scope_roots.clone();
         let watch_scope_excludes = snap.scope_excludes.clone();
-        // Resolve the journal workspace root via the SAME helper verify_repair
-        // uses (`commands::resolve_workspace_root`), guaranteeing both call
-        // sites open the identical push_journal.jsonl file.
-        let workspace_root_for_journal = commands::resolve_workspace_root();
         // B2b: iterate sync_roots directly so we have the full SyncRoot struct
         // (including subscriber_id). effective_subscriber_id resolves the
         // per-root subscriber (root's own if set, else top-level fallback).
@@ -878,7 +931,6 @@ fn spawn_sse_consumer(
                     &cfg,
                     eff_sub,
                     root.path.clone(),
-                    workspace_root_for_journal.clone(),
                     watch_scope_roots.clone(),
                     watch_scope_excludes.clone(),
                     tray_state.clone(),
@@ -892,25 +944,19 @@ fn spawn_sse_consumer(
             })
             .collect();
 
-        // S477 v0.3.8 (A): per-subscriber on-disk path for last_event_id
-        // persistence. Lives alongside the push_journal under the workspace
-        // runtime dir, namespaced by subscriber_id so multi-subscriber
-        // hosts don't collide.
-        let last_event_id_path = commands::resolve_workspace_root()
-            .join(".lattice-runtime")
-            .join(&cfg.subscriber_id)
-            .join("sync-state")
-            .join("last_event_id");
+        // S477 v0.3.8 (A) / CS-2 (W12): last_event_id is persisted in the
+        // subscriber's held state dir beside the push journal, namespaced by
+        // subscriber_id so multi-subscriber hosts don't collide.
         // Load on startup so catchup-on-reconnect actually fires server-side.
         // The Config.last_event_id field is preserved as a back-compat
         // fallback (older daemons may have populated it via the legacy code
         // path); disk-persisted value takes precedence.
         let resumed_id =
-            sse::SseConsumer::load_last_event_id(&last_event_id_path).or(cfg.last_event_id.clone());
+            sse::SseConsumer::load_last_event_id(&state_dir).or(cfg.last_event_id.clone());
         if let Some(rid) = &resumed_id {
             tracing::info!(
                 last_event_id = %rid,
-                path = %last_event_id_path.display(),
+                file = state_io::StateFile::LastEventId.name(),
                 "resuming SSE from persisted last_event_id"
             );
         }
@@ -922,9 +968,7 @@ fn spawn_sse_consumer(
             snap.scope_excludes,
             materializer,
         ) {
-            Ok(c) => c
-                .with_tray_state(tray_state)
-                .with_last_event_id_path(last_event_id_path),
+            Ok(c) => c.with_tray_state(tray_state).with_state_dir(&state_dir),
             Err(e) => {
                 tracing::error!("sse consumer init failed: {e}");
                 return;
@@ -995,7 +1039,6 @@ fn spawn_push_pipeline(
     cfg: &config::Config,
     subscriber_id: String,
     watch_root: std::path::PathBuf,
-    workspace_root: std::path::PathBuf,
     scope_roots: Vec<String>,
     scope_excludes: Vec<String>,
     tray_state: tray_state::SharedTrayState,
@@ -1042,8 +1085,21 @@ fn spawn_push_pipeline(
         }
     };
 
-    // Shared journal — SAME path verify_repair uses (commands.rs SoT).
-    let journal_path = commands::push_journal_path(&workspace_root, &subscriber_id);
+    // CS-2: the subscriber's held state dir, bootstrapped in `.setup()`
+    // (W14's create_dir_all is gone). NotBootstrapped keeps the existing
+    // "push failed to start" notice; nothing falls back to path I/O.
+    let sd = match state_io::registry().get(&subscriber_id) {
+        Ok(sd) => sd,
+        Err(e) => {
+            tracing::error!("push pipeline: {e}; not starting push side");
+            notify_user(
+                app,
+                "Vault Sync push failed to start",
+                &format!("state directory unavailable: {e}"),
+            );
+            return None;
+        }
+    };
     // P0 2026-08-26 second pass: the suppressed-delete ledger lives beside the
     // journal in sync-state. It stops pull_backfill resurrecting a suppressed
     // delete (MEASURED: created=275 at 2026-08-26T00:05:37, which silently
@@ -1051,28 +1107,9 @@ fn spawn_push_pipeline(
     // clears the pause marker, so an intentional bulk delete can complete.
     // Constructed here because both the backfill task and the file watcher
     // need the same ledger.
-    let delete_ledger = crate::delete_ledger::DeleteLedger::new(
-        journal_path
-            .parent()
-            .map(|d| d.join("delete-burst-SUPPRESSED"))
-            .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-SUPPRESSED")),
-    );
+    let delete_ledger = crate::delete_ledger::DeleteLedger::new(&sd);
     let delete_ledger_for_backfill = delete_ledger.clone();
-    if let Some(parent) = journal_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::error!(
-                "push pipeline: create_dir_all({}) failed: {e}; not starting push side",
-                parent.display()
-            );
-            notify_user(
-                app,
-                "Vault Sync push failed to start",
-                &format!("create_dir_all({}) failed: {e}", parent.display()),
-            );
-            return None;
-        }
-    }
-    let journal = match push_journal::PushJournal::open(&journal_path) {
+    let journal = match push_journal::PushJournal::open(&sd) {
         Ok(mut j) => {
             // Journal-bloat remediation: collapse the accumulated backlog to one
             // entry per path NOW — while `j` is still OWNED, before it is wrapped
@@ -1321,7 +1358,7 @@ fn spawn_push_pipeline(
     // verify_repair tokio-mutex) — all on one jsonl file. Appends are
     // line-atomic and the drain loop re-reads, so no append is lost; worst
     // case is ≤5s poll latency. A unified single-mutex journal is deferred.
-    let watcher_journal = match push_journal::PushJournal::open(&journal_path) {
+    let watcher_journal = match push_journal::PushJournal::open(&sd) {
         Ok(j) => Arc::new(std::sync::Mutex::new(j)),
         Err(e) => {
             tracing::error!(
@@ -1341,13 +1378,9 @@ fn spawn_push_pipeline(
     // action, which is unreachable on the headless `cage` daemon — so the valve
     // was a one-way trapdoor that silently discarded every delete for 13.5h
     // after it tripped. Removing this file is now the headless resume.
-    let burst_marker = journal_path
-        .parent()
-        .map(|d| d.join("delete-burst-PAUSED"))
-        .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-PAUSED"));
     let burst = Arc::new(std::sync::Mutex::new(
         redflag::DeleteBurstDetector::new(20, std::time::Duration::from_secs(30))
-            .with_pause_marker(burst_marker),
+            .with_pause_marker(&sd),
     ));
     // S484: expose the valve so the tray "Resume delete propagation" action
     // can reset it in place (no daemon restart). Register before `burst` is
@@ -1469,6 +1502,7 @@ fn spawn_redflag_monitor(gate: redflag::RedflagGate, tray_state: tray_state::Sha
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -1511,27 +1545,11 @@ mod tests {
         let _ = PathBuf::new();
     }
 
-    /// The push pipeline (spawn_push_pipeline) and verify_repair
-    /// (commands::build_verify_repair) MUST resolve the identical journal file.
-    /// Both go through `commands::resolve_workspace_root` +
-    /// `commands::push_journal_path`. This test pins that both call sites
-    /// produce byte-identical paths for the same subscriber_id, so the
-    /// verify-repair appends and the drain loop operate on one file.
-    #[test]
-    fn push_journal_path_identical_from_both_call_sites() {
-        // lib.rs spawn_push_pipeline resolution.
-        let ws_spawn = commands::resolve_workspace_root();
-        let spawn_side = commands::push_journal_path(&ws_spawn, "sub-xyz");
-
-        // verify_repair_run resolution (commands.rs).
-        let ws_vr = commands::resolve_workspace_root();
-        let vr_side = commands::push_journal_path(&ws_vr, "sub-xyz");
-
-        assert_eq!(
-            spawn_side, vr_side,
-            "push journal path must match between push pipeline and verify_repair"
-        );
-    }
+    // CS-2: `push_journal_path_identical_from_both_call_sites` was removed
+    // with `commands::push_journal_path`. The push pipeline and
+    // verify_repair now both resolve the journal as
+    // `state_io::registry().get(sub)` + `StateFile::PushJournal`: one held
+    // directory, one fixed name, no path to compare.
 
     // -------------------------------------------------------------------------
     // B2: roots_to_watch helper tests
@@ -1686,6 +1704,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod launch_gate_tests {
     use super::launch_decision;
 
@@ -1736,6 +1755,7 @@ mod launch_gate_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod restart_gate_tests {
     use super::should_restart_now;
 

@@ -381,6 +381,7 @@ pub fn default_config_path() -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -888,6 +889,7 @@ daemon_platform = "macos-aarch64"
 /// env lock (`managed_instance::test_env`) — `default_config_path()` reads the
 /// env at call time, so unserialized mutation would race parallel tests.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod managed_mode_tests {
     use super::*;
     use crate::managed_instance::test_env::ScopedConfigDirEnv;
@@ -910,9 +912,14 @@ mod managed_mode_tests {
         let tok = crate::token_store::token_file_path("sub-managed");
         assert_eq!(tok, canon.join("token-sub-managed.bin"));
 
-        // reconciliation retry ledger: sibling of config.toml too.
-        let ledger = crate::reconciliation::retry_ledger_path();
-        assert_eq!(ledger, canon.join("reconcile-retry-ledger.json"));
+        // reconciliation retry ledger: sibling of config.toml too. CS-2: it
+        // is the config-scope StateDir's ReconcileRetryLedger, and that
+        // StateDir is bootstrapped on `default_config_path().parent()`.
+        assert_eq!(cfg_path.parent().unwrap(), canon.as_path());
+        assert_eq!(
+            crate::state_io::StateFile::ReconcileRetryLedger.scope(),
+            crate::state_io::Scope::ConfigDir
+        );
     }
 
     /// Spec §5.1 canonicalization: a SYMLINKED spelling of the same directory

@@ -391,7 +391,104 @@ pub struct StallEvent {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Unit CS-2 (TKT-23091e72): process-wide state-I/O health events.
+///
+/// `state_io` raises these BEFORE any [`SyncHealth`] instance exists (the
+/// bootstrap runs in `.setup()`), so they live in a process-global bounded
+/// log rather than on the instance. Each raise also emits one structured
+/// log line (`sync_health_event = <name>`) so journald carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateHealthEvent {
+    /// A holder lost custody of a state dir and is exiting 74 (CS-2 §3.3).
+    OwnershipLost { reason: String },
+    /// Bootstrap created the leaf state dir this boot (CS-2 §3.2 step 2).
+    StateDirCreated { sub: String },
+    /// The state dir sits on a filesystem outside the supported set
+    /// (observe-only in CS-2, enforced in CS-4; §3.2 step 4).
+    StateFsUnsupported { fs_type: String },
+    /// A state replace committed but its directory sync failed (§3.4 W5-W7).
+    DurableWriteUncertain { file: String },
+}
+
+impl StateHealthEvent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            StateHealthEvent::OwnershipLost { .. } => "ownership_lost",
+            StateHealthEvent::StateDirCreated { .. } => "state_dir_created",
+            StateHealthEvent::StateFsUnsupported { .. } => "state_fs_unsupported",
+            StateHealthEvent::DurableWriteUncertain { .. } => "durable_write_uncertain",
+        }
+    }
+}
+
+const STATE_EVENT_CAP: usize = 256;
+/// `durable_write_uncertain{file}` is rate-limited to one per file per hour.
+const UNCERTAIN_RATE_LIMIT: Duration = Duration::from_secs(3600);
+
+struct StateEvents {
+    log: std::collections::VecDeque<StateHealthEvent>,
+    last_uncertain: std::collections::HashMap<String, Instant>,
+}
+
+fn state_events_store() -> &'static std::sync::Mutex<StateEvents> {
+    static S: std::sync::OnceLock<std::sync::Mutex<StateEvents>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(StateEvents {
+            log: std::collections::VecDeque::new(),
+            last_uncertain: std::collections::HashMap::new(),
+        })
+    })
+}
+
+/// Raise a CS-2 state health event. Returns `false` when it was suppressed
+/// by the `durable_write_uncertain` rate limit.
+pub fn raise_state_event(e: StateHealthEvent) -> bool {
+    let mut g = state_events_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let StateHealthEvent::DurableWriteUncertain { file } = &e {
+        let now = Instant::now();
+        if let Some(prev) = g.last_uncertain.get(file) {
+            if now.duration_since(*prev) < UNCERTAIN_RATE_LIMIT {
+                return false;
+            }
+        }
+        g.last_uncertain.insert(file.clone(), now);
+    }
+    match &e {
+        StateHealthEvent::OwnershipLost { reason } => {
+            tracing::error!(sync_health_event = e.name(), reason = %reason, "sync_health: ownership_lost")
+        }
+        StateHealthEvent::StateDirCreated { sub } => {
+            tracing::warn!(sync_health_event = e.name(), sub = %sub, "sync_health: state_dir_created")
+        }
+        StateHealthEvent::StateFsUnsupported { fs_type } => {
+            tracing::warn!(sync_health_event = e.name(), fs_type = %fs_type, "sync_health: state_fs_unsupported")
+        }
+        StateHealthEvent::DurableWriteUncertain { file } => {
+            tracing::warn!(sync_health_event = e.name(), file = %file, "sync_health: durable_write_uncertain")
+        }
+    }
+    if g.log.len() >= STATE_EVENT_CAP {
+        g.log.pop_front();
+    }
+    g.log.push_back(e);
+    true
+}
+
+/// Snapshot of the raised CS-2 state health events (bounded, oldest first).
+pub fn state_events() -> Vec<StateHealthEvent> {
+    state_events_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .log
+        .iter()
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

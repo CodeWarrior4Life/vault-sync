@@ -1,0 +1,12 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1501,6 +1501,9 @@
+     });
+ }
+ 
++pub struct CsPlant;
++impl crate::durable_file::sealed::Sealed for CsPlant {}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {
