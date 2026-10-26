@@ -271,7 +271,9 @@ fn sync_temp(f: &File) -> io::Result<()> {
     f.sync_all()
 }
 
-/// Apple targets get the §4b directory-durability rule.
+/// Apple targets get the §4b directory-durability rule. Unix only: every
+/// reader sits in a `cfg(unix)` block, so Windows would flag it dead.
+#[cfg(unix)]
 const APPLE: bool = cfg!(target_vendor = "apple");
 
 /// Apple errno values for "F_FULLFSYNC is not supported on this fd" (§4b):
