@@ -881,19 +881,20 @@ impl FileWatcher {
         // keep `vault_root`, config, journal, burst, device_id.
         let me = Arc::new(self);
         let task = tokio::spawn(async move {
-            #[cfg(test)]
-            crate::faults::point("watcher");
             // D7 (S511): periodic liveness heartbeat so an IDLE-but-alive watcher
             // (quiet vault, no FS events) still stamps SyncHealth and is not
             // mistaken for a dead/hung watch loop. 30s is well under the
             // watcher-stale window (DEFAULT_WATCHER_STALE_SECS = 300s).
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+            let mut heartbeat =
+                tokio::time::interval(crate::supervise::tick(Duration::from_secs(30)));
             // Stamp once immediately so the watchdog's staleness check arms from
             // a known-alive baseline the moment the watcher starts.
             me.mark_watcher_alive();
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
+                        #[cfg(test)]
+                        crate::faults::point("watcher");
                         // Idle or busy, the loop is alive: stamp the heartbeat.
                         me.mark_watcher_alive();
                         // P0 2026-08-26: headless resume for the delete-burst

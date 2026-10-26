@@ -138,6 +138,26 @@ impl RootHandles {
     pub fn ready_bits(&self) -> u8 {
         self.ready.load(Ordering::SeqCst)
     }
+    /// What this root still lacks to be ready (empty = ready): its watcher
+    /// started, its first drain done, its pipeline client set, its journal.
+    /// The process-wide `sse` condition is added by [`SyncHandles::borrow`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let bits = self.ready_bits();
+        let mut m = Vec::new();
+        if bits & WATCHER_STARTED == 0 {
+            m.push("watcher");
+        }
+        if bits & FIRST_DRAIN_DONE == 0 {
+            m.push("first_drain");
+        }
+        if self.api.get().is_none() {
+            m.push("api");
+        }
+        if self.journal.is_none() {
+            m.push("journal");
+        }
+        m
+    }
     /// The RootDegrading flag (the reconcile backstop's supervisor clears it).
     pub fn alive_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.alive)
@@ -323,25 +343,17 @@ impl SyncHandles {
                 task: "reconcile_backstop",
             });
         }
-        let bits = r.ready_bits();
-        let mut missing = Vec::new();
-        if bits & WATCHER_STARTED == 0 {
-            missing.push("watcher");
-        }
-        if bits & FIRST_DRAIN_DONE == 0 {
-            missing.push("first_drain");
-        }
+        let mut missing = r.missing();
         if !self.sse_connected_once() {
-            missing.push("sse");
+            // Keep the reported order: watcher, first_drain, sse, api, journal.
+            let at = missing
+                .iter()
+                .position(|m| *m == "api" || *m == "journal")
+                .unwrap_or(missing.len());
+            missing.insert(at, "sse");
         }
         let api = r.api().cloned();
-        if api.is_none() {
-            missing.push("api");
-        }
         let journal = r.journal().cloned();
-        if journal.is_none() {
-            missing.push("journal");
-        }
         if !missing.is_empty() {
             return Err(BorrowRefused::RootNotReady { root: key, missing });
         }

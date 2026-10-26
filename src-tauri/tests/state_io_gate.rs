@@ -1164,14 +1164,16 @@ fn t_cs3_25_owner_open_only_in_root_builder() {
         "boot",
         "impl JournalTable { fn journal_for_root(&mut self, sub: &str) {} }",
     )]);
-    let mut sigs_only = Facts::default();
-    sigs_only.journal_for_root_sigs = f
-        .journal_for_root_sigs
-        .iter()
-        .filter(|(_, i)| !i.iter().any(|t| t == "&RootSpec"))
-        .cloned()
-        .collect();
-    sigs_only.owner_open_callers = vec!["boot::JournalTable::journal_for_root".to_string()];
+    let sigs_only = Facts {
+        journal_for_root_sigs: f
+            .journal_for_root_sigs
+            .iter()
+            .filter(|(_, i)| !i.iter().any(|t| t == "&RootSpec"))
+            .cloned()
+            .collect(),
+        owner_open_callers: vec!["boot::JournalTable::journal_for_root".to_string()],
+        ..Facts::default()
+    };
     assert!(cs3_invariants(&sigs_only)
         .iter()
         .any(|v| v.contains("&RootSpec")));

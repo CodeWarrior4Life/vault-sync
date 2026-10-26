@@ -110,6 +110,12 @@ impl JournalOwner {
         &self.j
     }
 
+    /// Test access to the journal's held state dir.
+    #[cfg(test)]
+    pub(crate) fn state_dir(&self) -> Option<Arc<StateDir>> {
+        self.j.state_dir_for_test()
+    }
+
     /// Test constructor over an unclaimed handle (unit tests that build a
     /// journal per test without a registry).
     #[cfg(test)]
@@ -195,12 +201,5 @@ fn run_marked<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 pub(crate) fn test_owner(sd: &Arc<StateDir>) -> Arc<JournalOwner> {
     let j = offload(|| PushJournal::open(sd)).expect("open test journal");
-    JournalOwner::for_test(j, "test")
-}
-
-/// Test helper: [`test_owner`] with a byte capacity.
-#[cfg(test)]
-pub(crate) fn test_owner_with_capacity(sd: &Arc<StateDir>, max: u64) -> Arc<JournalOwner> {
-    let j = offload(|| PushJournal::open_with_capacity(sd, max)).expect("open test journal");
     JournalOwner::for_test(j, "test")
 }

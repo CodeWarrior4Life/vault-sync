@@ -221,6 +221,26 @@ pub fn bootstrap_state_dirs(
     }
 }
 
+/// D14 / G-7: register the three stores for the bounded pre-exit flush.
+/// Every write goes through `guard_mutation`; errors are ignored.
+pub(crate) fn register_store_flush(
+    sup: &Supervisor,
+    shadow: &Arc<sync_shadow::ShadowStore>,
+    base_seq: &Arc<base_seq_store::BaseSeqStore>,
+    read_receipt: &Arc<read_receipt::ReadReceiptStore>,
+) {
+    let (s, b, r) = (
+        Arc::clone(shadow),
+        Arc::clone(base_seq),
+        Arc::clone(read_receipt),
+    );
+    sup.register_pre_exit_flush(move || {
+        let _ = s.flush();
+        let _ = b.flush();
+        let _ = r.flush();
+    });
+}
+
 /// A Terminal `boot_aborted{stage}` (B1): no exit, the slot stays empty.
 fn boot_aborted(stage: &str) -> TaskEnd {
     TaskEnd::Terminal {
@@ -486,20 +506,7 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         TaskSpec::new("flush:read_receipt", TaskClass::Required),
         read_receipt::ReadReceiptStore::spawn_periodic_flush(Arc::clone(&read_receipt)),
     );
-    {
-        // D14 / G-7: the bounded pre-exit flush. Every write goes through
-        // `guard_mutation`; errors are ignored.
-        let (s, b, r) = (
-            Arc::clone(&shadow),
-            Arc::clone(&base_seq),
-            Arc::clone(&read_receipt),
-        );
-        sup.register_pre_exit_flush(move || {
-            let _ = s.flush();
-            let _ = b.flush();
-            let _ = r.flush();
-        });
-    }
+    register_store_flush(&sup, &shadow, &base_seq, &read_receipt);
 
     // ---- B3: D9 shadow-wipe fast path (unchanged except the J8 wrap). ----
     if shadow.is_empty() {
@@ -687,7 +694,7 @@ fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
 
 /// Gate C6 (No Silent Holds): the SSE 401/403 Terminal stop and its one
 /// dedicated notice: what stopped, why, and the one action that lifts it.
-fn sse_auth_terminal(sub: &str, status: u16) -> TaskEnd {
+pub(crate) fn sse_auth_terminal(sub: &str, status: u16) -> TaskEnd {
     TaskEnd::Terminal {
         reason: "sse_auth_failed".to_string(),
         event: Some(StateHealthEvent::SseAuthFailed {

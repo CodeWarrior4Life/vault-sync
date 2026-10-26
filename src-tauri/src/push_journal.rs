@@ -698,6 +698,12 @@ impl PushJournal {
         self.faults.force_capacity.store(on, Ordering::SeqCst);
     }
 
+    /// Test access to the held state dir (`None` for the scratch sink).
+    #[cfg(test)]
+    pub(crate) fn state_dir_for_test(&self) -> Option<Arc<StateDir>> {
+        self.sd().cloned()
+    }
+
     /// True for the D9 seed's scratch sink.
     pub(crate) fn is_scratch(&self) -> bool {
         matches!(self.backing, Backing::Scratch(_))

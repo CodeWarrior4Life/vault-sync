@@ -506,6 +506,16 @@ pub fn redflag_tick(gate: &redflag::RedflagGate, tray_state: &tray_state::Shared
     }
 }
 
+/// Unit CS-3 in-process tests (T-CS3-3..-22).
+#[cfg(test)]
+#[path = "cs3_tests.rs"]
+mod cs3_tests;
+
+/// Unit CS-3 daemon-subprocess harness and tests.
+#[cfg(test)]
+#[path = "cs3_harness.rs"]
+mod cs3_harness;
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {

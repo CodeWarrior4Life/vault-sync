@@ -157,6 +157,8 @@ pub struct Supervisor {
     live: watch::Sender<Liveness>,
     pre_exit: Mutex<Vec<PreExitFlush>>,
     notices: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    hooks: test_hooks::Hooks,
 }
 
 static PROCESS_LIVE: OnceLock<watch::Sender<Liveness>> = OnceLock::new();
@@ -202,6 +204,8 @@ impl Supervisor {
             live,
             pre_exit: Mutex::new(Vec::new()),
             notices: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            hooks: test_hooks::Hooks::default(),
         })
     }
 
@@ -410,11 +414,16 @@ impl Supervisor {
             );
             return;
         }
-        self.pre_exit_flush();
-        if self.custody_lost_before_leaving(who, Leave::Exit(EXIT_TASK_ENDED)) {
-            return;
-        }
-        self.leave(Leave::Exit(EXIT_TASK_ENDED));
+        // The flush, the re-check and the log flush block for up to ~2.3 s;
+        // off the runtime worker (D3), so tasks woken by the stop (a parked
+        // V&R) still run.
+        crate::journal_owner::offload(|| {
+            self.pre_exit_flush();
+            if self.custody_lost_before_leaving(who, Leave::Exit(EXIT_TASK_ENDED)) {
+                return;
+            }
+            self.leave(Leave::Exit(EXIT_TASK_ENDED));
+        });
     }
 
     /// The stall watchdog's PushStall/WatcherStale restart and the updater's
@@ -430,10 +439,12 @@ impl Supervisor {
             );
             return false;
         }
-        if self.custody_lost_before_leaving(who, Leave::Restart) {
-            return true;
-        }
-        self.leave(Leave::Restart);
+        crate::journal_owner::offload(|| {
+            if self.custody_lost_before_leaving(who, Leave::Restart) {
+                return;
+            }
+            self.leave(Leave::Restart);
+        });
         true
     }
 
@@ -443,7 +454,7 @@ impl Supervisor {
     /// return true.
     fn custody_lost_before_leaving(&self, who: &str, intended: Leave) -> bool {
         #[cfg(test)]
-        test_hooks::run_before_recheck(who);
+        self.hooks.run_before_recheck(who);
         let latched_before = self.gate.mutation_latched();
         let custody = crate::state_io::custody_all();
         let mutation_latch = self.gate.mutation_latched();
@@ -480,9 +491,13 @@ impl Supervisor {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let mut in_flush = self.hooks.take_in_pre_exit_flush();
         std::thread::spawn(move || {
             #[cfg(test)]
-            test_hooks::run_in_pre_exit_flush();
+            if let Some(h) = in_flush.as_mut() {
+                h();
+            }
             for f in fs {
                 f();
             }
@@ -496,40 +511,56 @@ impl Supervisor {
     }
 }
 
-/// Test seams for the exit-precedence orders (T-CS3-19, T-CS3-22).
+/// Test seams for the exit-precedence orders (T-CS3-19, T-CS3-22), held
+/// per supervisor so parallel in-process tests never see each other's.
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::sync::Mutex;
 
-    type Hook = Box<dyn FnMut(&str) + Send>;
-    static BEFORE_RECHECK: Mutex<Option<Hook>> = Mutex::new(None);
-    static IN_PRE_EXIT_FLUSH: Mutex<Option<Box<dyn FnMut() + Send>>> = Mutex::new(None);
+    pub(crate) type Hook = Box<dyn FnMut(&str) + Send>;
+    pub(crate) type FlushHook = Box<dyn FnMut() + Send>;
 
-    /// Runs after a leaver's claim, right before its C9 re-check.
-    pub(crate) fn set_before_recheck(h: Option<Hook>) {
-        *BEFORE_RECHECK.lock().unwrap_or_else(|p| p.into_inner()) = h;
+    #[derive(Default)]
+    pub(crate) struct Hooks {
+        before_recheck: Mutex<Option<Hook>>,
+        in_pre_exit_flush: Mutex<Option<FlushHook>>,
     }
-    pub(super) fn run_before_recheck(who: &str) {
-        if let Some(h) = BEFORE_RECHECK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-        {
-            h(who);
+
+    impl Hooks {
+        pub(super) fn run_before_recheck(&self, who: &str) {
+            if let Some(h) = self
+                .before_recheck
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
+                h(who);
+            }
+        }
+        pub(super) fn take_in_pre_exit_flush(&self) -> Option<FlushHook> {
+            self.in_pre_exit_flush
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
         }
     }
 
-    /// Runs inside the pre-exit flush, before the store flushes.
-    pub(crate) fn set_in_pre_exit_flush(h: Option<Box<dyn FnMut() + Send>>) {
-        *IN_PRE_EXIT_FLUSH.lock().unwrap_or_else(|p| p.into_inner()) = h;
-    }
-    pub(super) fn run_in_pre_exit_flush() {
-        if let Some(h) = IN_PRE_EXIT_FLUSH
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-        {
-            h();
+    impl super::Supervisor {
+        /// Runs after a leaver's claim, right before its C9 re-check.
+        pub(crate) fn set_before_recheck(&self, h: Option<Hook>) {
+            *self
+                .hooks
+                .before_recheck
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = h;
+        }
+        /// Runs once inside the pre-exit flush, before the store flushes.
+        pub(crate) fn set_in_pre_exit_flush(&self, h: Option<FlushHook>) {
+            *self
+                .hooks
+                .in_pre_exit_flush
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = h;
         }
     }
 }

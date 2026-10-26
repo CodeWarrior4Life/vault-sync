@@ -701,6 +701,12 @@ impl Materializer {
     /// Returns an `Arc<Mutex<()>>` the caller locks across the
     /// exists -> compare -> stash -> persist critical section (D2c). The outer
     /// registry mutex is held only briefly to look up / insert the entry.
+    /// CS-3 T-CS3-12: test access to the path lock.
+    #[cfg(test)]
+    pub(crate) fn path_lock_for_test(&self, key: &str) -> Arc<Mutex<()>> {
+        self.path_lock_for(key)
+    }
+
     fn path_lock_for(&self, key: &str) -> Arc<Mutex<()>> {
         // CS-3 D16 (P6): the recorded order is path lock -> journal. Taking a
         // path lock while this thread holds a journal lock is the one
