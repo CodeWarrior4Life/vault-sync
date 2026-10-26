@@ -15,6 +15,42 @@ COOLDOWN_SECS="${NVS_COOLDOWN_SECS:-1200}" # >= 20 min between restarts
 ST="$HOME/.local/state/nexus-vault-sync-supervisor"; mkdir -p "$ST"
 NOW=$(date +%s)
 log(){ logger -t nexus-vault-sync-supervisor -- "$*"; echo "$(date -u +%FT%TZ) $*" >> "$ST/log"; }
+# ---- state-io (TKT-8b4f38a0; #33 gate C1): every state file holds one epoch. A plain `echo > f` killed mid-write
+# (TimeoutStartSec, OOM, power) left an empty or partial file, and a later `$((NOW-$(cat f)))` then aborted EVERY tick
+# with rc 1, deaf path included. Now:
+#   write = a temp file in the same dir, fsync'd (coreutils `sync FILE` = fsync(2) on that file; no interpreter per
+#           write), then an atomic `mv -f` rename: a reader sees the old value or the new one, never a torn one;
+#   read  = at the start of every tick, any state file that is not exactly one line of digits is logged LOUDLY and
+#           removed (= treated as ABSENT, the safe default: a window re-opens, a clock restarts), and leftover temp
+#           files from a killed write are removed. Every later `cat` therefore sees a valid epoch or no file.
+st_write(){  # $1 path  $2 epoch
+  local tmp="$1.tmp.$$"
+  printf '%s\n' "$2" > "$tmp" && sync "$tmp" 2>/dev/null
+  mv -f "$tmp" "$1"
+}
+# valid = digits only (1-20 of them), optionally followed by newlines; nothing else (no NUL, no interior newline).
+# Byte counts, not grep: GNU grep may treat a NUL as a line end, so "1800\0\0" would pass `grep -x '[0-9]+'`.
+st_valid(){
+  local v other
+  other=$(LC_ALL=C tr -d '0-9\n' < "$1" | LC_ALL=C wc -c)      # any NUL / letter / space -> invalid
+  [ "$other" -eq 0 ] || return 1
+  v=$(cat "$1")                                                  # trailing newlines stripped
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac                     # empty, or an interior newline -> invalid
+  [ "${#v}" -le 20 ]
+}
+st_sanitize(){
+  local f
+  rm -f "$ST"/*.tmp.* 2>/dev/null
+  for f in "$ST/deaf_since" "$ST/last_confirmed" "$ST/last_restart" "$ST"/unit.*.inactive_since "$ST"/unit.*.last_alert \
+           "$ST"/unit.*.paged_at "$ST"/unit.*.escalated "$ST"/unit.*.last_raise; do
+    [ -e "$f" ] || continue
+    st_valid "$f" && continue
+    log "STATE CORRUPT (LOUD): $f is not one epoch ($(LC_ALL=C wc -c < "$f") bytes: $(LC_ALL=C tr -c '0-9A-Za-z' '?' < "$f" | head -c 24)) — treated as ABSENT and removed (TKT-8b4f38a0)"
+    rm -f "$f"
+  done
+}
+st_sanitize
+# ---- end state-io
 # ---- O5-2a (LSEC-9325-B6D8-O5-ONFAILURE-RULING, O5-2 "No Silent Holds"; route+key per LSEC-40A8-B6D8-O52-ROUTE-AND-KEY-RULING
 # and Pitboss PB-ADEB-O52A*): alert on an INACTIVE vault-sync unit. The not_receiving logic below cannot see a STOPPED
 # unit (a stopped daemon reads "inconclusive"). So, first and independently, for each watched unit that exists here:
@@ -44,12 +80,34 @@ KEY_HELPER="${NVS_KEY_HELPER:-$HOME/.local/bin/nexus-api-key.sh}"
 ESCALATE="${NVS_ESCALATE:-$HOME/.claude/scripts/operator_escalate.py}"
 ESCALATE_SEVERITY="${NVS_ESCALATE_SEVERITY:-critical}"
 TICK_RC=0                                     # 3 = no arranger resolved, or the page was undeliverable, this tick
+# N1 (#31 follow-up): at most one RAISE (page) per unit per NVS_RAISE_COOLDOWN_SECS, ACROSS episodes: a unit that flaps
+# inactive/active does not re-raise every episode. The clock (unit.<u>.last_raise) survives recovery.
+RAISE_COOLDOWN_SECS="${NVS_RAISE_COOLDOWN_SECS:-3600}"
+# N2 (#31 follow-up; budget recomputed per #33 gate C2): the tick is bounded so a hung call cannot hold the deaf path
+# below past its 180 s confirmation gap. Every external call in this block has its own timeout, at most
+# NVS_MAX_ALERTS_PER_TICK (1) paging alerts run per tick (the rest wait for the next tick, logged), and the service
+# carries TimeoutStartSec=55 (systemd/*/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf). Worst case, all
+# defaults, two watched units:
+#   systemctl: 2 units x 2 calls x 2 s                                   =  8 s
+#   the one paging unit: page 12 + lnotify 5 + operator_escalate 12      = 29 s
+#   the other unit: one notice (recovery / held raise), lnotify 5        =  5 s
+#   deaf path: health fetch (curl -m 10) + its python parse              = ~11 s
+#   total                                                                = ~53 s  <  55 s
+# The deaf path's own systemctl calls (show, restart) only run in the restart branch; they are not bounded here
+# (TimeoutStartSec is their bound: a killed `systemctl restart` client does not cancel the queued restart job).
+SYSTEMCTL_TIMEOUT="${NVS_SYSTEMCTL_TIMEOUT:-2}"
+LNOTIFY_TIMEOUT="${NVS_LNOTIFY_TIMEOUT:-5}"
+PAGE_TIMEOUT="${NVS_PAGE_TIMEOUT:-12}"        # the whole resolve + page child (each curl inside: NVS_CURL_MAX_TIME)
+ESCALATE_TIMEOUT="${NVS_ESCALATE_TIMEOUT:-12}"
+MAX_ALERTS_PER_TICK="${NVS_MAX_ALERTS_PER_TICK:-1}"
+export NVS_CURL_MAX_TIME="${NVS_CURL_MAX_TIME:-5}"   # x2 curls (roster + page) inside the 12 s page child
+ALERTS_THIS_TICK=0
 escalate_op(){  # $1 unit  $2 subject  $3 body
   local out rc
   if [ ! -f "$ESCALATE" ]; then
     log "ESCALATE MISSING ($ESCALATE) — operator NOT paged for unit=$1: $2"; return 1
   fi
-  out=$(timeout 180 python3 "$ESCALATE" --subject "$2" --body "$3" --severity "$ESCALATE_SEVERITY" 2>&1); rc=$?
+  out=$(timeout "$ESCALATE_TIMEOUT" python3 "$ESCALATE" --subject "$2" --body "$3" --severity "$ESCALATE_SEVERITY" 2>&1); rc=$?
   log "ESCALATE rc=$rc severity=$ESCALATE_SEVERITY unit=$1 subject=$2"
   [ "$rc" = 0 ] || printf '%s\n' "$out" | tail -3 >> "$ST/escalate.err"
   return "$rc"
@@ -66,12 +124,13 @@ key = os.environ.get("NEXUS_API_KEY") or ""          # injected by the resolver'
 
 def curl(path, body=None):
     """GET/POST base+path; the bearer goes to curl on STDIN (-K -), never argv. Returns (http_code, body)."""
-    argv = ["curl", "-sS", "-m", "25", "-A", "curl/8.7.1", "-K", "-", "-w", "\n%{http_code}", base + path]
+    argv = ["curl", "-sS", "-m", os.environ.get("NVS_CURL_MAX_TIME", "6"), "-A", "curl/8.7.1", "-K", "-",
+            "-w", "\n%{http_code}", base + path]
     if body is not None:
         argv[1:1] = ["-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(body)]
     try:
         r = subprocess.run(argv, input='header = "Authorization: Bearer %s"\n' % key, capture_output=True,
-                           text=True, errors="replace", timeout=40)
+                           text=True, errors="replace", timeout=int(os.environ.get("NVS_CURL_MAX_TIME", "6")) + 2)
     except (OSError, subprocess.SubprocessError) as e:
         return "000", str(e)
     out, _, code = r.stdout.rpartition("\n")
@@ -172,14 +231,20 @@ else:
     print("RESULT UNDELIVERABLE %s %s http=%s" % (csid, src, code))
 PY
 )
-  "${helper[@]}" python3 -c "$py" "$PAGE_OVERRIDE" "$ROLE_RUNTIME" "$ROSTER_NAME" "$NEXUS_BASE" "$HOST_SHORT" "$1" "$2" "$3" 2>&1
+  timeout "$PAGE_TIMEOUT" "${helper[@]}" python3 -c "$py" "$PAGE_OVERRIDE" "$ROLE_RUNTIME" "$ROSTER_NAME" "$NEXUS_BASE" "$HOST_SHORT" "$1" "$2" "$3" 2>&1
 }
-unit_alert(){  # $1 unit  $2 raised|recovered  $3 one-line detail  -> sets PAGE_OK=1 when the page was delivered
+unit_alert(){  # $1 unit  $2 raised|recovered|suppressed  $3 one-line detail  -> PAGE_OK=1 when a page was delivered
   local u="$1" kind="$2" detail="$3" ev out res st csid
   PAGE_OK=0
-  [ "$kind" = recovered ] && ev=unit.recovered || ev=unit.stopped
+  [ "$kind" = raised ] && ev=unit.stopped || ev=unit.recovered
+  [ "$kind" = suppressed ] && ev=unit.stopped
   local ikey="nexus-vault-sync.unit-inactive:${HOST_SHORT}:${u}"
   local msg="[nexus-vault-sync-supervisor@${HOST_SHORT}] ${u}: ${detail}"
+  # N1: a recovery, or a raise held by the cross-episode cooldown, is a NOTICE only: no page, never an escalate.
+  if [ "$kind" != raised ]; then
+    notify_notice "$u" "$kind" "$ev" "$ikey" "$msg"
+    return 0
+  fi
   # (1) the P0-tier page to the host arranger, target resolved now.
   out=$(page_arranger "$u" "$kind" "$msg")
   while IFS= read -r line; do case "$line" in "LOG "*) log "${line#LOG }" ;; esac; done <<< "$out"
@@ -194,30 +259,35 @@ unit_alert(){  # $1 unit  $2 raised|recovered  $3 one-line detail  -> sets PAGE_
 page to the host arranger FAILED (${st:-UNDELIVERABLE}): $(printf '%s' "$res" | cut -d' ' -f5-)" ;;
   esac
   # (2) lnotify NOTICE: the durable record of every alert (vault-note route + ledger; never the nexus_nudge surface).
-  if [ -x "$LNOTIFY" ] && printf '%s' "$msg" | "$LNOTIFY" legacy --principal "${HOST_SHORT}.nexus-vault-sync-supervisor@lattice" \
-       --app nexus-vault-sync --venture lattice --event-type "$ev" --claim notice --identity-key "$ikey" \
-       --subject "$u" --sender nexus-vault-sync-supervisor --caused-by "$u" >/dev/null 2>>"$ST/lnotify.err"; then
-    log "ALERT-NOTIFY-OK kind=$kind unit=$u ikey=$ikey"
-  else
-    log "ALERT-NOTIFY-FAILED kind=$kind unit=$u ikey=$ikey (lnotify=$LNOTIFY; see $ST/lnotify.err)"
-  fi
-  # (3) operator_escalate when the arranger could not be reached (O52 condition a).
+  notify_notice "$u" "$kind" "$ev" "$ikey" "$msg"
+  # (3) operator_escalate when the arranger could not be reached (O52 condition a). Raises only.
   if [ "$PAGE_OK" = 0 ]; then
-    escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: ${kind^^}, arranger page FAILED" "$msg"
-    [ "$kind" = raised ] && echo "$NOW" > "$ST/unit.$u.escalated"
+    escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: INACTIVE, arranger page FAILED" "$msg"
+    st_write "$ST/unit.$u.escalated" "$NOW"
+  fi
+}
+notify_notice(){  # $1 unit  $2 kind  $3 event type  $4 identity key  $5 message   (bounded by NVS_LNOTIFY_TIMEOUT)
+  if [ -x "$LNOTIFY" ] && printf '%s' "$5" | timeout "$LNOTIFY_TIMEOUT" "$LNOTIFY" legacy \
+       --principal "${HOST_SHORT}.nexus-vault-sync-supervisor@lattice" \
+       --app nexus-vault-sync --venture lattice --event-type "$3" --claim notice --identity-key "$4" \
+       --subject "$1" --sender nexus-vault-sync-supervisor --caused-by "$1" >/dev/null 2>>"$ST/lnotify.err"; then
+    log "ALERT-NOTIFY-OK kind=$2 unit=$1 ikey=$4"
+  else
+    log "ALERT-NOTIFY-FAILED kind=$2 unit=$1 ikey=$4 (lnotify=$LNOTIFY, timeout ${LNOTIFY_TIMEOUT}s; see $ST/lnotify.err)"
   fi
 }
 check_inactive_units(){
-  local u load act f_since f_alert f_paged f_esc since dur last
+  local u load act f_since f_alert f_paged f_esc f_raise since dur last
   for u in $WATCH_UNITS; do
     f_since="$ST/unit.$u.inactive_since"; f_alert="$ST/unit.$u.last_alert"
+    f_raise="$ST/unit.$u.last_raise"          # N1: survives recovery (cross-episode raise cooldown)
     f_paged="$ST/unit.$u.paged_at"; f_esc="$ST/unit.$u.escalated"
-    load=$(systemctl --user show -p LoadState --value "$u" 2>/dev/null)
+    load=$(timeout "$SYSTEMCTL_TIMEOUT" systemctl --user show -p LoadState --value "$u" 2>/dev/null)
     case "$load" in
-      not-found) rm -f "$f_since" "$f_alert" "$f_paged" "$f_esc"; continue ;;   # not on this host: skipped
+      not-found) rm -f "$f_since" "$f_alert" "$f_paged" "$f_esc" "$f_raise"; continue ;;   # not on this host: skipped
       "") log "unit $u: systemctl unreadable — inconclusive, no change"; continue ;;
     esac
-    act=$(systemctl --user is-active "$u" 2>/dev/null)
+    act=$(timeout "$SYSTEMCTL_TIMEOUT" systemctl --user is-active "$u" 2>/dev/null)
     case "$act" in
       "") log "unit $u: is-active unreadable — inconclusive, no change"; continue ;;
       active)
@@ -232,21 +302,43 @@ check_inactive_units(){
           rm -f "$f_since" "$f_alert" "$f_paged" "$f_esc"
         fi ;;
       *)
-        [ -f "$f_since" ] || { echo "$NOW" > "$f_since"; log "unit $u not active ($act, LoadState=$load) — inactive window opened"; }
+        [ -f "$f_since" ] || { st_write "$f_since" "$NOW"; log "unit $u not active ($act, LoadState=$load) — inactive window opened"; }
         since=$(cat "$f_since"); dur=$((NOW-since))
         [ "$dur" -ge "$INACTIVE_SECS" ] || continue
         # O52 condition (b): still inactive ESCALATE_SECS after a DELIVERED page -> operator_escalate, once per episode.
         if [ -f "$f_paged" ] && [ ! -f "$f_esc" ] && [ $((NOW-$(cat "$f_paged"))) -ge "$ESCALATE_SECS" ]; then
-          echo "$NOW" > "$f_esc"
+          if [ "$ALERTS_THIS_TICK" -ge "$MAX_ALERTS_PER_TICK" ]; then
+            log "unit $u: escalate deferred to the next tick (per-tick alert cap $MAX_ALERTS_PER_TICK reached)"; continue
+          fi
+          ALERTS_THIS_TICK=$((ALERTS_THIS_TICK+1))
+          st_write "$f_esc" "$NOW"
           escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: STILL INACTIVE ${dur}s after a delivered arranger page" \
             "[nexus-vault-sync-supervisor@${HOST_SHORT}] ${u} NOT ACTIVE ($act) for ${dur}s since $(date -u -d "@$since" +%FT%TZ); the host arranger was paged $((NOW-$(cat "$f_paged")))s ago and the unit is still down."
         fi
+        # N1 + C3: the first threshold crossing of an episode, while the cross-episode raise cooldown runs, is recorded
+        # ONCE as a notice only; last_alert is SEEDED from last_raise (C3), so neither a new episode nor a restart of
+        # the supervisor can re-raise before last_raise + the cooldown.
+        if [ ! -f "$f_alert" ]; then
+          last=$(cat "$f_raise" 2>/dev/null || echo 0)
+          if [ $((NOW-last)) -lt "$RAISE_COOLDOWN_SECS" ]; then
+            st_write "$f_alert" "$last"
+            log "unit $u INACTIVE ${dur}s: raise held by the cross-episode cooldown (last raise $((NOW-last))s ago < ${RAISE_COOLDOWN_SECS}s) — notice only"
+            unit_alert "$u" suppressed "NOT ACTIVE ($act) for ${dur}s; a raise for this unit was paged $((NOW-last))s ago (flapping), so this episode is recorded as a notice only (cooldown ${RAISE_COOLDOWN_SECS}s)."
+            continue
+          fi
+        fi
         last=$(cat "$f_alert" 2>/dev/null || echo 0)
         [ $((NOW-last)) -ge "$REALERT_SECS" ] || continue
-        echo "$NOW" > "$f_alert"
+        last=$(cat "$f_raise" 2>/dev/null || echo 0)
+        [ $((NOW-last)) -ge "$RAISE_COOLDOWN_SECS" ] || continue
+        if [ "$ALERTS_THIS_TICK" -ge "$MAX_ALERTS_PER_TICK" ]; then
+          log "unit $u: alert deferred to the next tick (per-tick alert cap $MAX_ALERTS_PER_TICK reached)"; continue
+        fi
+        ALERTS_THIS_TICK=$((ALERTS_THIS_TICK+1))
+        st_write "$f_alert" "$NOW"; st_write "$f_raise" "$NOW"
         log "unit $u INACTIVE ${dur}s (>= ${INACTIVE_SECS}s; state=$act) — alerting"
         unit_alert "$u" raised "NOT ACTIVE ($act) for ${dur}s since $(date -u -d "@$since" +%FT%TZ) (threshold ${INACTIVE_SECS}s). Alert only: nothing was restarted. Re-alert at most every ${REALERT_SECS}s."
-        [ "$PAGE_OK" = 1 ] && [ ! -f "$f_paged" ] && echo "$NOW" > "$f_paged" ;;
+        [ "$PAGE_OK" = 1 ] && [ ! -f "$f_paged" ] && st_write "$f_paged" "$NOW" ;;
     esac
   done
 }
@@ -271,8 +363,8 @@ esac
 # older than 3 ticks (180 s) — e.g. the tailnet was unreadable in between — the window re-opens from now.
 LASTC=$(cat "$ST/last_confirmed" 2>/dev/null || echo 0)
 if [ -f "$ST/deaf_since" ] && [ $((NOW-LASTC)) -gt 180 ]; then log "confirmation gap $((NOW-LASTC))s > 180s — window re-opened"; rm -f "$ST/deaf_since"; fi
-echo "$NOW" > "$ST/last_confirmed"
-[ -f "$ST/deaf_since" ] || { echo "$NOW" > "$ST/deaf_since"; log "not_receiving observed for $SID — window opened"; exit 0; }
+st_write "$ST/last_confirmed" "$NOW"
+[ -f "$ST/deaf_since" ] || { st_write "$ST/deaf_since" "$NOW"; log "not_receiving observed for $SID — window opened"; exit 0; }
 SINCE=$(cat "$ST/deaf_since"); DEAF=$((NOW-SINCE))
 [ "$DEAF" -ge "$DEAF_SECS" ] || exit 0
 # C1 (lsec): the cooldown floors on the unit's REAL last start too, so a manual/nexus-issued restart counts.
@@ -282,4 +374,4 @@ UNIT_START=$(systemctl --user show "$UNIT" -p ExecMainStartTimestamp --value 2>/
 [ $((NOW-LAST)) -ge "$COOLDOWN_SECS" ] || { log "deaf ${DEAF}s but cooldown active — no action"; exit 0; }
 SINCE_ISO=$(date -u -d "@$SINCE" +%FT%TZ)
 log "INTENT: INTERRUPTED-WINDOW restart of $UNIT — $SID not_receiving since $SINCE_ISO, duration_at_interruption=${DEAF}s (>= ${DEAF_SECS}s). This is NOT a cure: natural windows of 4 and 14 min self-healed untouched (TKT-978e7918)."
-if systemctl --user restart "$UNIT"; then echo "$NOW" > "$ST/last_restart"; rm -f "$ST/deaf_since" "$ST/last_confirmed"; log "OUTCOME: INTERRUPTED-WINDOW restart issued ok window_start=$SINCE_ISO duration=${DEAF}s (RESTART — counts against the 60-min fixed bar)"; else log "OUTCOME: INTERRUPTED-WINDOW restart FAILED rc=$? window_start=$SINCE_ISO duration=${DEAF}s"; fi
+if systemctl --user restart "$UNIT"; then st_write "$ST/last_restart" "$NOW"; rm -f "$ST/deaf_since" "$ST/last_confirmed"; log "OUTCOME: INTERRUPTED-WINDOW restart issued ok window_start=$SINCE_ISO duration=${DEAF}s (RESTART — counts against the 60-min fixed bar)"; else log "OUTCOME: INTERRUPTED-WINDOW restart FAILED rc=$? window_start=$SINCE_ISO duration=${DEAF}s"; fi
