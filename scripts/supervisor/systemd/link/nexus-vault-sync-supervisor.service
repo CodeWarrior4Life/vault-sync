@@ -1,0 +1,6 @@
+[Unit]
+Description=Interim restart-on-deaf supervisor for nexus-vault-sync (TKT-978e7918; 15 min continuous not_receiving)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nexus-vault-sync-supervisor.sh
