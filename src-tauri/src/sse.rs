@@ -158,6 +158,18 @@ impl SseConsumer {
         self
     }
 
+    /// TKT-35f75318: this consumer's defensive scope decision for one
+    /// route-RELATIVE wire path (its own route, scope roots and excludes).
+    /// The event loop calls this, so tests that drive it cover the real check.
+    pub(crate) fn event_in_scope(&self, wire_path: &str) -> bool {
+        sse_event_in_scope(
+            wire_path,
+            self.route.as_deref(),
+            &self.scope_roots,
+            &self.scope_excludes,
+        )
+    }
+
     /// TKT-35f75318: set the route of the root this consumer materializes into
     /// (the primary sync_root). Empty string = bare vault = `None`.
     pub fn with_route(mut self, route: &str) -> Self {
@@ -380,12 +392,7 @@ impl SseConsumer {
                         error!("path traversal rejected at SSE: {}", env.path);
                         continue;
                     }
-                    if !sse_event_in_scope(
-                        &env.path,
-                        self.route.as_deref(),
-                        &self.scope_roots,
-                        &self.scope_excludes,
-                    ) {
+                    if !self.event_in_scope(&env.path) {
                         debug!("defensive scope drop: {}", env.path);
                         continue;
                     }
