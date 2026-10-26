@@ -156,7 +156,10 @@ fn gate(fixture: &str, want: i32) -> String {
 /// Mutation: drop the masked check.
 #[test]
 fn t_cs3_24_k2_x1_masked_unit() {
-    let _ = gate("x1", 10);
+    let out = gate("x1", 10);
+    // The masked check itself refused (a masked unit is also not active, so
+    // the L1 ActiveState check alone would give 10 too).
+    assert!(out.contains("the unit is masked"), "{out}");
 }
 
 /// x2: a bash wrapper whose script runs `open` (no exec): 13.
