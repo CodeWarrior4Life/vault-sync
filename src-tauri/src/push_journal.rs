@@ -857,11 +857,16 @@ impl PushJournal {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let prev = TMP_NANOS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                Some(now.max(p.saturating_add(1)))
-            })
-            .unwrap_or(0);
+        // Plain CAS loop: `fetch_update` is deprecated on newer stable
+        // (renamed `try_update`), which does not exist on older toolchains.
+        let mut prev = TMP_NANOS.load(Ordering::SeqCst);
+        loop {
+            let next = now.max(prev.saturating_add(1));
+            match TMP_NANOS.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
         let nanos = now.max(prev.saturating_add(1));
         let base = self
             .path
