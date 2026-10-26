@@ -49,11 +49,68 @@ The check is **alert only**. It never starts, stops or restarts a unit, and it n
 | `LoadState=not-found` (not on this host; icarus has no `-memory`) | skipped; stale state cleared |
 | `systemctl` unreadable | inconclusive: no change |
 | not active (`inactive`, `failed`, masked, ...) | `unit.<u>.inactive_since` written at the first such tick |
-| not active for `>= NVS_INACTIVE_SECS` (900) | ALERT: a P0-tier page to the host arranger, plus the lnotify notice; at most once per `NVS_REALERT_SECS` (3600) |
+| not active for `>= NVS_INACTIVE_SECS` (900) | ALERT (a RAISE): a P0-tier page to the host arranger, plus the lnotify notice; at most once per `NVS_REALERT_SECS` (3600) within an episode |
+| a raise inside `NVS_RAISE_COOLDOWN_SECS` (3600) of this unit's previous raise, even across a recovery (flapping) | held: recorded ONCE per episode as a notice only. No page, no escalate. The `unit.<u>.last_raise` clock survives recovery. |
 | page undeliverable or no arranger resolves | `operator_escalate` at once; the notice body says the page FAILED; **this tick exits 3** (after the deaf path has run) |
 | still not active `NVS_ESCALATE_SECS` (1800) after a DELIVERED page | `operator_escalate`, **once per episode** |
-| active again after an alert | one "recovered" page and notice (same identity key); state cleared |
+| active again after an alert | one "recovered" **notice** (same identity key). A recovery is never paged and never escalated. Episode state is cleared; `last_raise` stays. |
 | active again before the threshold | logged only |
+
+### The tick is bounded (N2)
+
+The deaf path below re-opens its not_receiving window when two confirmations are more than 180 s apart, so a hung
+notify call must never hold a tick. Three bounds apply:
+
+- **Every external call has its own timeout.** `systemctl` `NVS_SYSTEMCTL_TIMEOUT` (2 s per call). lnotify
+  `NVS_LNOTIFY_TIMEOUT` (5 s). The resolve and page child `NVS_PAGE_TIMEOUT` (12 s), with each curl inside it at
+  `NVS_CURL_MAX_TIME` (5 s). `operator_escalate` `NVS_ESCALATE_TIMEOUT` (12 s).
+- **At most `NVS_MAX_ALERTS_PER_TICK` (1) paging alerts per tick.** A raise or escalate beyond that is deferred to
+  the next tick and logged. Notices (recovery, held raise) are not capped; each is bounded at 5 s.
+- **The unit carries `TimeoutStartSec=55`** (`systemd/*/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf`).
+  The worst case, recomputed per #33 gate C2:
+
+  | Part | Seconds |
+  |---|---|
+  | `systemctl`, 2 units x 2 calls x 2 s | 8 |
+  | the one paging unit: page 12 + lnotify 5 + escalate 12 | 29 |
+  | the other unit's single notice | 5 |
+  | the deaf path's health fetch (`curl -m 10`) and parse | ~11 |
+  | **total** | **~53 (under 55)** |
+
+  The deaf path's own `systemctl show` / `restart` run only in its restart branch, and TimeoutStartSec is their
+  bound. A killed `systemctl restart` client does not cancel the queued job.
+
+### State files are atomic and validated (TKT-8b4f38a0, #33 gate C1)
+
+Every state file holds one epoch. That covers `deaf_since`, `last_confirmed` and `last_restart`, and every
+`unit.<u>.*` file.
+
+- **Writes** go to a temp file in the same dir, are fsync'd (coreutils `sync FILE`), then renamed into place
+  (`mv -f`). A reader sees the old value or the new one, never a torn one.
+- **At the start of every tick:**
+  - any state file that is not digits only is logged `STATE CORRUPT (LOUD)` and removed. That covers empty files,
+    letters, NUL bytes and an interior newline. Removing it means treated as absent: a window re-opens and a clock
+    restarts.
+  - leftover `*.tmp.*` files from a killed write are removed.
+
+  Before this, an empty file from a mid-write kill made `$((NOW-$(cat f)))` abort every later tick with rc 1, the
+  deaf path included.
+
+The deaf path's only edits are its three state writes. The tests map them back and get the imported sha256.
+
+### Flapping (#33 gate C4)
+
+A unit that goes down, recovers and goes down again within the hour raises (pages) **once**. The
+`unit.<u>.last_raise` clock survives recovery. Every later episode inside `NVS_RAISE_COOLDOWN_SECS` (3600):
+
+- is recorded ONCE as a notice ("raise held by the cross-episode cooldown"). There is no page and no escalate;
+- has its `last_alert` SEEDED from `last_raise` (C3), so its first possible raise is `last_raise + 3600`.
+
+The same holds after a supervisor restart, because the state lives in files.
+
+Each recovery is a notice. So a unit flapping every few minutes produces one page per hour plus a ledger trail of
+notices on one identity key. The operator hears about it only through escalate (b), when a raised episode is still
+inactive 30 min after its page.
 
 ### The page target: resolved at send time, never pinned
 
@@ -75,6 +132,21 @@ each send:
    - **An unknown host with no override has no name fallback.** A constant `pitboss` would page link's seat from
      icarus.
 3. **Neither resolves: FAIL LOUD.** `operator_escalate` fires, the notice still fires, and the tick exits 3.
+
+**Stale role markers (N3).** A released marker is moved to `~/.claude/backups/role-markers/` by `pb-role-marker.py`
+and is never read. A marker can still linger in `runtime/` when its seat died without a release: a crash, or a
+manual edit. Nothing here can tell that a csid is dead, because the marker is a flag, not a liveness proof. So:
+
+- **Validation** rejects only malformed markers: a non-uuid filename, a path escaping the runtime dir, or content
+  naming another csid.
+- **Newest `claimed_at` wins** when more than one valid marker is live, and the choice is logged LOUD. A successor's
+  marker (`handover` or `claim`) is newer than a lingering predecessor's, so the live seat wins.
+- **If the only marker left is a dead seat's**, the page goes to that dead inbox. The conductor accepts it (2xx), so
+  the script cannot see the failure. The backstop is escalate (b): still inactive 30 min after a "delivered" page,
+  `operator_escalate` fires once.
+
+So a stale-only marker costs at most 30 min before the operator hears. The fix for a stale marker is
+`pb-role-marker.py release <csid> --force --reason ...`; this script never deletes markers.
 
 `NVS_PAGE_CSID` is an explicit **override for tests and emergencies only**. It is validated, logged as an override,
 and must never be set in a shipped unit or drop-in.
@@ -102,6 +174,9 @@ and must never be set in a shipped unit or drop-in.
 |---|---|
 | `NVS_WATCH_UNITS` | `nexus-vault-sync.service nexus-vault-sync-memory.service` |
 | `NVS_INACTIVE_SECS` / `NVS_REALERT_SECS` / `NVS_ESCALATE_SECS` | `900` / `3600` / `1800` |
+| `NVS_RAISE_COOLDOWN_SECS` | `3600` (cross-episode) |
+| `NVS_SYSTEMCTL_TIMEOUT` / `NVS_LNOTIFY_TIMEOUT` / `NVS_PAGE_TIMEOUT` / `NVS_ESCALATE_TIMEOUT` / `NVS_CURL_MAX_TIME` | `2` / `5` / `12` / `12` / `5` |
+| `NVS_MAX_ALERTS_PER_TICK` | `1` |
 | `NVS_ROSTER_NAME` | from the hostname map (link, icarus, trinity); unset for other hosts |
 | `NVS_ROLE_RUNTIME` | `~/.claude/runtime` |
 | `NVS_KEY_HELPER` | `~/.local/bin/nexus-api-key.sh` (exec form) |
@@ -121,7 +196,7 @@ The resolver's unit context is checked for real at placement.
 
 ## Tests
 
-`bash scripts/supervisor/test-supervisor.sh` runs in about 8 s with bash and python3 only. It uses PATH shims
+`bash scripts/supervisor/test-supervisor.sh` runs in about 12 s with bash and python3 only. It uses PATH shims
 for systemctl, curl, lnotify, logger, `date +%s` and hostname, plus a stub resolver and a stub `operator_escalate.py`
 under a temp HOME. Nothing touches a real unit, the journal, the network, the rail, an inbox or the operator.
 CI runs it on ubuntu.
