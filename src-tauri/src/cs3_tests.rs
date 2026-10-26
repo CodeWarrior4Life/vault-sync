@@ -1387,3 +1387,137 @@ fn t_cs3_22_latched_flush_writes_nothing() {
         "custody lost: the 70 path must exit 74"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-1 follow-up: boot wiring tests (TKT-35f75318)
+// ---------------------------------------------------------------------------
+
+/// Wiring tests for the TKT-35f75318 boot call sites (`boot.rs`). Each drives the helper
+/// that `run_boot` / `spawn_push_pipeline` actually call, so breaking the
+/// wiring inside the helper turns these red (the leaf tests in
+/// `file_watcher` and `sse` cannot see the call site).
+mod boot_wiring {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::boot::{primary_sse_consumer, push_watcher_config};
+    use crate::file_watcher::{FileWatcher, FilterDecision, WatchEvent};
+    use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
+    use crate::ownership::RootSpec;
+    use crate::{redflag, state_io};
+    use tempfile::TempDir;
+
+    const ROUTE: &str = "harness-memory/Nexus";
+
+    fn spec(route: &str, path: &Path) -> RootSpec {
+        RootSpec {
+            key: 0,
+            path: path.to_path_buf(),
+            route: route.to_string(),
+            eff_sub: "dev-test".to_string(),
+        }
+    }
+
+    fn watcher_for(spec: &RootSpec, jdir: &TempDir, scope: &[&str]) -> FileWatcher {
+        let cfg = push_watcher_config(
+            spec,
+            scope.iter().map(|s| s.to_string()).collect(),
+            vec![],
+            !spec.route.is_empty(),
+        );
+        FileWatcher::new(
+            spec.path.clone(),
+            crate::journal_owner::test_owner(&state_io::StateDir::for_test(jdir.path())),
+            Arc::new(std::sync::Mutex::new(redflag::DeleteBurstDetector::new(
+                20,
+                Duration::from_secs(30),
+            ))),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+    }
+
+    fn modified(p: &str) -> WatchEvent {
+        WatchEvent::Modified {
+            path: p.to_string(),
+        }
+    }
+
+    /// W1: the push pipeline's watcher config carries the root's route, so a
+    /// local edit on a routed (managed) root is classified on its storage key
+    /// `<route>/<rel>` and allowed; the vault route keeps `None`.
+    #[test]
+    fn wiring_push_watcher_config_carries_route() {
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let routed = spec(ROUTE, dir.path());
+        let cfg = push_watcher_config(&routed, vec![], vec![], true);
+        assert_eq!(cfg.storage_prefix.as_deref(), Some(ROUTE));
+        let w = watcher_for(&routed, &jdir, &["harness-memory/"]);
+        let d = w.classify(&modified("t4-canary.md"));
+        assert!(
+            matches!(d, FilterDecision::Allow(_)),
+            "routed in-scope edit must be allowed through the boot watcher config, got {d:?}"
+        );
+
+        let vault = spec("", dir.path());
+        assert_eq!(
+            push_watcher_config(&vault, vec![], vec![], false).storage_prefix,
+            None
+        );
+        let jdir2 = TempDir::new().unwrap();
+        let w = watcher_for(&vault, &jdir2, &["02_Projects/"]);
+        assert!(matches!(
+            w.classify(&modified("02_Projects/x.md")),
+            FilterDecision::Allow(_)
+        ));
+    }
+
+    fn mat() -> Materializer {
+        Materializer::new(
+            std::env::temp_dir(),
+            None,
+            MaterializerMode::Disabled,
+            std::env::temp_dir(),
+            "wiring-test".to_string(),
+            MaterializerConfig::default(),
+        )
+    }
+
+    /// W2: the SSE consumer `run_boot` builds for the primary root carries
+    /// that root's route, so an inbound route-relative event inside a
+    /// storage-key scope root is applied (not a "defensive scope drop").
+    #[test]
+    fn wiring_primary_sse_consumer_carries_route() {
+        let dir = TempDir::new().unwrap();
+        // Primary (roots[0]) is routed; a second, bare root must not win.
+        let roots = vec![spec(ROUTE, dir.path()), spec("", dir.path())];
+        let c = primary_sse_consumer(
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+            vec!["harness-memory/".to_string()],
+            vec![],
+            mat(),
+            &roots,
+        )
+        .unwrap();
+        assert!(
+            c.event_in_scope("t4-canary.md"),
+            "routed primary root: in-scope event must be applied"
+        );
+        // Bare vault route: wire path == storage key, unchanged.
+        let c = primary_sse_consumer(
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+            vec!["02_Projects/".to_string()],
+            vec![],
+            mat(),
+            &[spec("", dir.path()), spec(ROUTE, dir.path())],
+        )
+        .unwrap();
+        assert!(c.event_in_scope("02_Projects/x.md"));
+        assert!(!c.event_in_scope("05_Personal/y.md"));
+    }
+}
