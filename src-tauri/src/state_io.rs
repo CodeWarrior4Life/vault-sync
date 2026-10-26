@@ -537,7 +537,8 @@ mod sys {
 
 /// Classify a Linux `statfs.f_type` magic. `Ok(name)` for the supported set
 /// (btrfs, ext4, xfs; tmpfs under `cfg(test)`), `Err(label)` otherwise.
-#[cfg_attr(not(unix), allow(dead_code))]
+// Read by observe_fs on Linux only; tests use it everywhere.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 pub(crate) fn classify_fs_magic(magic: u64) -> Result<&'static str, String> {
     match magic {
         0x9123_683E => Ok("btrfs"),
