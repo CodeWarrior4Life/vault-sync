@@ -243,6 +243,9 @@ pub enum StashError {
     Io(#[from] io::Error),
     #[error("invalid path: {0}")]
     InvalidPath(String),
+    /// CS-2 gate 4: the target resolves into a registered state dir.
+    #[error("{0}")]
+    ForeignStateWrite(String),
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +400,9 @@ impl ConflictStash {
         let parent = base_path
             .parent()
             .ok_or_else(|| StashError::InvalidPath(format!("{base_path:?} has no parent")))?;
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&base_path)
+            .map_err(|e| StashError::ForeignStateWrite(e.to_string()))?;
         fs::create_dir_all(parent)?;
 
         // Path-safety: ensure the resolved parent stays within vault_root.
@@ -486,6 +492,9 @@ impl ConflictStash {
             "ts": ts,
         });
         let manifest_path = self.vault_root.join(Self::MANIFEST_RELPATH);
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&manifest_path)
+            .map_err(|e| StashError::ForeignStateWrite(e.to_string()))?;
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)

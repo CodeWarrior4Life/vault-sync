@@ -341,6 +341,7 @@ pub(crate) mod seams {
         bootstrap_rec: Vec<String>,
         force_fs: Option<FsProbe>,
         after_leaf_open: Option<LeafHook>,
+        belt_ids: Option<Vec<(u64, u64)>>,
     }
 
     thread_local! {
@@ -358,6 +359,14 @@ pub(crate) mod seams {
     }
     pub(crate) fn force_fs(p: Option<FsProbe>) {
         S.with(|s| s.borrow_mut().force_fs = p);
+    }
+    /// T-CS2-11: the belt's registered id set for this thread (the process
+    /// registry stays empty in unit tests).
+    pub(crate) fn set_belt_ids(ids: Option<Vec<(u64, u64)>>) {
+        S.with(|s| s.borrow_mut().belt_ids = ids);
+    }
+    pub(crate) fn belt_ids() -> Option<Vec<(u64, u64)>> {
+        S.with(|s| s.borrow().belt_ids.clone())
     }
     pub(crate) fn forced_fs() -> Option<FsProbe> {
         S.with(|s| s.borrow().force_fs.clone())
@@ -1101,6 +1110,12 @@ impl StateDir {
         ))
     }
 
+    /// Test access to this dir's identity.
+    #[cfg(test)]
+    pub(crate) fn test_id(&self) -> (u64, u64) {
+        self.id
+    }
+
     /// Test access to this dir's latch.
     #[cfg(test)]
     pub(crate) fn test_latch(&self) -> &Latch {
@@ -1709,6 +1724,10 @@ pub struct ForeignStateWrite {
 /// id (the config dir included). Also refuses a lexical prefix of
 /// `<workspace>/state-v2/`. It does NOT refuse `.lattice-runtime/<sub>/shadow/`.
 pub fn refuse_state_target(target: &Path) -> Result<(), ForeignStateWrite> {
+    #[cfg(test)]
+    if let Some(ids) = seams::belt_ids() {
+        return refuse_state_target_in(target, &ids, None);
+    }
     refuse_state_target_in(
         target,
         &registry().ids(),

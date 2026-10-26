@@ -84,6 +84,9 @@ pub enum MaterializerError {
     Stash(#[from] StashError),
     #[error("integrity-check error: {0}")]
     Integrity(String),
+    /// CS-2 gate 4: the target resolves into a registered state dir.
+    #[error("{0}")]
+    ForeignStateWrite(String),
 }
 
 impl From<IntegrityError> for MaterializerError {
@@ -1221,6 +1224,10 @@ impl Materializer {
                                 let parent = target.parent().ok_or_else(|| {
                                     MaterializerError::PathTraversal(payload.path.clone())
                                 })?;
+                                // CS-2 gate 4: never into a state dir.
+                                crate::state_io::refuse_state_target(&target).map_err(|e| {
+                                    MaterializerError::ForeignStateWrite(e.to_string())
+                                })?;
                                 fs::create_dir_all(parent)?;
                                 let mut tmp = NamedTempFile::new_in(parent)?;
                                 tmp.write_all(&merged)?;
@@ -1367,6 +1374,10 @@ impl Materializer {
 
         // 7. Path-safety + parent dir.
         let canonical_root = self.canonical_root_for_mode();
+        // CS-2 gate 4: refuse a target that resolves into a state dir before
+        // any directory is created or byte written.
+        crate::state_io::refuse_state_target(&target)
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
             let canonical_parent = parent
@@ -1596,6 +1607,9 @@ impl Materializer {
         let parent = target
             .parent()
             .expect("vault-relative target always has a parent");
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&target)
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         fs::create_dir_all(parent)?;
         let mut tmp = NamedTempFile::new_in(parent)?;
         tmp.write_all(canonical_bytes)?;
@@ -1806,6 +1820,10 @@ impl Materializer {
         if let (Some(g), true) = (&self.echo_guard, record_echo) {
             g.record_delete(path);
         }
+        // CS-2 gate 4: neither end of the rename may resolve into state.
+        crate::state_io::refuse_state_target(&target)
+            .and_then(|_| crate::state_io::refuse_state_target(&renamed))
+            .map_err(|e| MaterializerError::ForeignStateWrite(e.to_string()))?;
         if let Err(e) = fs::rename(&target, &renamed) {
             if let (Some(g), true) = (&self.echo_guard, record_echo) {
                 g.unrecord_delete(path);
@@ -2272,6 +2290,26 @@ fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerE
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// CS-2 T-CS2-11: a well-formed payload for `path` (as the server sends it).
+#[cfg(test)]
+pub(crate) fn test_payload(path: &str, body: &str) -> NotePayload {
+    use sha2::{Digest, Sha256};
+    let fm = serde_json::json!({"title": "Test"});
+    let fm_yaml = serde_yaml::to_string(&fm).unwrap_or_default();
+    let serialized = format!("---\n{fm_yaml}---\n\n{body}");
+    NotePayload {
+        path: path.to_string(),
+        frontmatter: fm,
+        body: body.into(),
+        sha256: hex::encode(Sha256::digest(serialized.as_bytes())),
+        modified: Some("2026-05-27T00:00:00Z".into()),
+        file_mtime: None,
+        created: None,
+        change_seq: None,
+        enriched_body: Some(serialized),
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]

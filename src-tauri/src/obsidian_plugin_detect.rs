@@ -97,6 +97,11 @@ pub fn detect_and_disable(vault_root: &Path) -> DetectResult {
             return result;
         }
     };
+    // CS-2 gate 4: never into a state dir.
+    if let Err(e) = crate::state_io::refuse_state_target(&community_plugins_path) {
+        warn!("not writing community-plugins.json: {e}");
+        return result;
+    }
     if let Err(e) = fs::write(&community_plugins_path, serialized) {
         warn!("failed to write community-plugins.json: {e}");
         return result;

@@ -547,3 +547,95 @@ fn t_cs2_30_owners_never_follow_planted_symlinks() {
         assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL", "{f:?}");
     }
 }
+
+/// T-CS2-11 (gate 4, the run-time belt): an exempt vault writer asked to
+/// write under the registered sync-state dir (directly, through a vault
+/// symlink into it, through the shadow-mode target `../sync-state/x` without
+/// lexical normalization (C9), or under the config-scope dir) is refused and
+/// writes nothing, while a shadow-mode materialize under
+/// `.lattice-runtime/<sub>/shadow/` succeeds.
+#[cfg(unix)]
+#[test]
+fn t_cs2_11_run_time_belt() {
+    use crate::materializer::{
+        Materializer, MaterializerConfig, MaterializerError, MaterializerMode,
+    };
+    let ws = TempDir::new().unwrap();
+    let vaults = TempDir::new().unwrap();
+    let cfg = TempDir::new().unwrap();
+    let rt = ws.path().join(layout::RUNTIME_DIR_NAME).join("sub11");
+    let state = rt.join("sync-state");
+    let shadow = rt.join("shadow");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&shadow).unwrap();
+    std::fs::create_dir_all(vaults.path().join("Mainframe")).unwrap();
+    let sd = StateDir::for_test(&state);
+    let cd = StateDir::for_test_scoped(cfg.path(), Scope::ConfigDir);
+    seams::set_belt_ids(Some(vec![sd.test_id(), cd.test_id()]));
+
+    // Primitive cases.
+    assert!(refuse_state_target(&state.join("x")).is_err(), "direct");
+    let link = vaults.path().join("Mainframe").join("link");
+    std::os::unix::fs::symlink(&state, &link).unwrap();
+    assert!(
+        refuse_state_target(&link.join("evil.md")).is_err(),
+        "vault symlink"
+    );
+    assert!(
+        refuse_state_target(&shadow.join("../sync-state/x")).is_err(),
+        "shadow ../sync-state without lexical normalization"
+    );
+    assert!(
+        refuse_state_target(&cfg.path().join("x.json")).is_err(),
+        "config scope"
+    );
+    assert!(
+        refuse_state_target(&shadow.join("Mainframe/a.md")).is_ok(),
+        "shadow tree"
+    );
+    assert!(
+        refuse_state_target(&vaults.path().join("Mainframe/a.md")).is_ok(),
+        "vault"
+    );
+
+    // Through a real exempt writer: Live materialize via the vault symlink.
+    let live = Materializer::new(
+        vaults.path().to_path_buf(),
+        Some("shadow/".to_string()),
+        MaterializerMode::Live,
+        ws.path().to_path_buf(),
+        "sub11".to_string(),
+        MaterializerConfig {
+            device_id: "d".into(),
+            ..Default::default()
+        },
+    );
+    let body = "evil\n";
+    let p = crate::materializer::test_payload("Mainframe/link/evil.md", body);
+    let r = live.write(&p);
+    assert!(
+        matches!(r, Err(MaterializerError::ForeignStateWrite(_))),
+        "the belt must refuse the symlinked state target: {r:?}"
+    );
+    assert!(names(&state).is_empty(), "nothing written into state");
+
+    // Positive control: a shadow-mode materialize under .lattice-runtime/<sub>/shadow.
+    let sh = Materializer::new(
+        vaults.path().to_path_buf(),
+        Some("shadow/".to_string()),
+        MaterializerMode::Shadow,
+        ws.path().to_path_buf(),
+        "sub11".to_string(),
+        MaterializerConfig {
+            device_id: "d".into(),
+            ..Default::default()
+        },
+    );
+    let r = sh.write(&crate::materializer::test_payload(
+        "Mainframe/ok.md",
+        "ok\n",
+    ));
+    seams::set_belt_ids(None);
+    assert!(r.is_ok(), "shadow-mode write must pass the belt: {r:?}");
+    assert!(shadow.join("Mainframe/ok.md").exists());
+}
