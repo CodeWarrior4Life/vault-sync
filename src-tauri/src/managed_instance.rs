@@ -19,8 +19,10 @@
 //!   a managed instance at the vault's config (the exact mis-target the mode
 //!   exists to prevent).
 //! - **Exclusive advisory lock**: one daemon per canonical config dir,
-//!   enforced by a non-blocking exclusive lock on `<dir>/daemon.lock` held
-//!   for the process lifetime. A second process exits non-zero with a
+//!   enforced by an exclusive lock on `<dir>/daemon.lock` held for the
+//!   process lifetime. A held lock is retried for a bounded window (10 s,
+//!   Unit 1d) so a self-restart's successor outlives the predecessor's
+//!   teardown; after the window a second process exits non-zero with a
 //!   distinct error message.
 //! - **Plugin policy**: managed instances register NO single-instance plugin
 //!   (R12 — the lock above replaces it, keyed by config dir instead of
@@ -31,12 +33,23 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The environment variable that arms managed-instance mode.
 pub const ENV_CONFIG_DIR: &str = "NEXUS_SYNC_CONFIG_DIR";
 
 /// Basename of the per-config-dir exclusive lock file.
 pub const LOCK_FILENAME: &str = "daemon.lock";
+
+/// Total time [`acquire_daemon_lock`] keeps retrying a held lock before it
+/// gives up with [`LockError::Held`] (Unit 1d, TKT-3f0e423e). A self-restart
+/// (Tauri `restart`) spawns the successor BEFORE the predecessor exits, so the
+/// successor briefly meets the still-held lock; 10 s covers a slow teardown
+/// and stays well below the supervisor's 30 s `RestartSec`.
+pub const LOCK_RETRY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Sleep between lock attempts while the lock is held.
+pub const LOCK_RETRY_POLL: Duration = Duration::from_millis(250);
 
 /// True iff this process runs in managed-instance mode (env set + non-empty).
 pub fn is_managed_mode() -> bool {
@@ -99,14 +112,32 @@ pub enum LockError {
     },
 }
 
-/// Acquire the NON-BLOCKING exclusive advisory lock on
-/// `<canonical_config_dir>/daemon.lock`. `canonical_config_dir` MUST already
-/// be the output of [`resolve_config_dir`] / [`managed_config_dir`] — locking
-/// a non-canonical spelling would defeat the one-lock-per-dir invariant.
+/// Acquire the exclusive advisory lock on `<canonical_config_dir>/daemon.lock`,
+/// retrying a HELD lock for [`LOCK_RETRY_WINDOW`] (polling every
+/// [`LOCK_RETRY_POLL`]) before refusing with [`LockError::Held`].
+/// `canonical_config_dir` MUST already be the output of [`resolve_config_dir`]
+/// / [`managed_config_dir`] — locking a non-canonical spelling would defeat
+/// the one-lock-per-dir invariant.
 ///
 /// Uses std's file locking (flock(2) on Unix, LockFileEx on Windows — stable
 /// since Rust 1.89), so no new dependency is required.
 pub fn acquire_daemon_lock(canonical_config_dir: &Path) -> Result<DaemonLock, LockError> {
+    acquire_daemon_lock_with(canonical_config_dir, LOCK_RETRY_WINDOW, LOCK_RETRY_POLL)
+}
+
+/// [`acquire_daemon_lock`] with an explicit retry `window` and `poll`
+/// interval (the seam tests drive with small values).
+///
+/// - Lock held by another process (`TryLockError::WouldBlock`): sleep `poll`
+///   and retry until `window` has elapsed on the monotonic clock, then return
+///   [`LockError::Held`] (one final attempt is made at the deadline).
+/// - Open failure or `TryLockError::Error` (an I/O error): return
+///   [`LockError::Io`] IMMEDIATELY, with no retry.
+pub fn acquire_daemon_lock_with(
+    canonical_config_dir: &Path,
+    window: Duration,
+    poll: Duration,
+) -> Result<DaemonLock, LockError> {
     let path = canonical_config_dir.join(LOCK_FILENAME);
     let file = OpenOptions::new()
         .create(true)
@@ -118,12 +149,23 @@ pub fn acquire_daemon_lock(canonical_config_dir: &Path) -> Result<DaemonLock, Lo
             path: path.clone(),
             source,
         })?;
-    match file.try_lock() {
-        Ok(()) => Ok(DaemonLock { _file: file, path }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Held {
-            dir: canonical_config_dir.to_path_buf(),
-        }),
-        Err(std::fs::TryLockError::Error(source)) => Err(LockError::Io { path, source }),
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(DaemonLock { _file: file, path }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let elapsed = started.elapsed();
+                if elapsed >= window {
+                    return Err(LockError::Held {
+                        dir: canonical_config_dir.to_path_buf(),
+                    });
+                }
+                std::thread::sleep(poll.min(window - elapsed));
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(LockError::Io { path, source });
+            }
+        }
     }
 }
 
@@ -216,7 +258,191 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use tempfile::TempDir;
+
+    /// Small retry window for tests that expect a `Held` refusal.
+    const SHORT_WINDOW: Duration = Duration::from_millis(100);
+    const SHORT_POLL: Duration = Duration::from_millis(20);
+
+    /// Take the lock on `<dir>/daemon.lock` with an independent open +
+    /// `try_lock` (NOT through the code under test).
+    fn hold_lock_directly(dir: &Path) -> File {
+        let f = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILENAME))
+            .unwrap();
+        f.try_lock().expect("holder must take the free lock");
+        f
+    }
+
+    /// Run `acquire_daemon_lock_with` on a worker thread so a mutation that
+    /// never returns turns the test RED (timeout) instead of hanging it.
+    /// Returns (outcome, elapsed).
+    fn acquire_on_thread(
+        dir: &Path,
+        window: Duration,
+        poll: Duration,
+        bound: Duration,
+    ) -> (Result<DaemonLock, LockError>, Duration) {
+        let (tx, rx) = mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let r = acquire_daemon_lock_with(&dir, window, poll);
+            let _ = tx.send((r, t0.elapsed()));
+        });
+        rx.recv_timeout(bound)
+            .unwrap_or_else(|_| panic!("acquire did not return within {bound:?}"))
+    }
+
+    /// T-1d-1: a holder releases after 600 ms; the retrying acquire waits it
+    /// out and succeeds. Mutation that turns it red: window 0 (no retry).
+    #[test]
+    fn t1d1_retry_acquires_after_holder_releases() {
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        let held = hold_lock_directly(&canon);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            drop(held);
+        });
+        let t0 = Instant::now();
+        let got =
+            acquire_daemon_lock_with(&canon, Duration::from_secs(3), Duration::from_millis(50));
+        let elapsed = t0.elapsed();
+        holder.join().unwrap();
+        let lock = got.expect("retry must acquire once the holder releases");
+        assert_eq!(lock.path, canon.join(LOCK_FILENAME));
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "must have waited for the holder; elapsed {elapsed:?}"
+        );
+    }
+
+    /// T-1d-2: a holder that never releases yields `Held` once the window has
+    /// elapsed, and not much later. Mutation: retry forever (no deadline).
+    #[test]
+    fn t1d2_window_elapses_to_held_bounded() {
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        let _held = hold_lock_directly(&canon);
+        let (got, elapsed) = acquire_on_thread(
+            &canon,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+        );
+        match got {
+            Err(LockError::Held { dir: d }) => assert_eq!(d, canon),
+            other => panic!("expected Held after the window, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "must retry for the whole window; elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must stop at the window; elapsed {elapsed:?}"
+        );
+    }
+
+    /// T-1d-3: an I/O error (the lock path is a directory, so the open fails)
+    /// returns `Io` immediately with no retry. Mutation: retry on every error.
+    #[test]
+    fn t1d3_io_error_returns_immediately_without_retry() {
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        std::fs::create_dir(canon.join(LOCK_FILENAME)).unwrap();
+        let (got, elapsed) = acquire_on_thread(
+            &canon,
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        match got {
+            Err(LockError::Io { path, .. }) => assert_eq!(path, canon.join(LOCK_FILENAME)),
+            other => panic!("expected Io for an unopenable lock path, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "an I/O error must not be retried; elapsed {elapsed:?}"
+        );
+    }
+
+    const T1D5_CHILD_DIR_ENV: &str = "MI_T1D5_CHILD_DIR";
+    const T1D5_CHILD_READY_ENV: &str = "MI_T1D5_CHILD_READY";
+
+    /// T-1d-5 helper, NOT a test on its own: the predecessor process. The
+    /// parent re-executes this test binary filtered to this test with the
+    /// config dir in the environment; without it this returns immediately.
+    #[test]
+    #[ignore = "T-1d-5 second-process helper; spawned by t1d5_real_process_restart_overlap_is_waited_out"]
+    fn t1d5_child_process_holder() {
+        let Ok(dir) = std::env::var(T1D5_CHILD_DIR_ENV) else {
+            return;
+        };
+        let ready = std::env::var(T1D5_CHILD_READY_ENV).unwrap();
+        let lock = acquire_daemon_lock_with(Path::new(&dir), Duration::ZERO, SHORT_POLL)
+            .expect("child must take the free lock");
+        std::fs::write(&ready, b"held").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        // Exit while still holding, like a restarting daemon's `exit(0)`:
+        // the OS releases the lock at process exit.
+        std::mem::forget(lock);
+        std::process::exit(0);
+    }
+
+    /// T-1d-5: integration with a REAL second process. The child holds the
+    /// lock and exits after 1 s; the parent's `acquire_daemon_lock` (default
+    /// window) succeeds — the Tauri restart overlap. Mutation: window 0.
+    #[test]
+    fn t1d5_real_process_restart_overlap_is_waited_out() {
+        let dir = TempDir::new().unwrap();
+        let canon = resolve_config_dir(dir.path()).unwrap();
+        let ready = dir.path().join("child-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "managed_instance::tests::t1d5_child_process_holder",
+                "--ignored",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .env(T1D5_CHILD_DIR_ENV, &canon)
+            .env(T1D5_CHILD_READY_ENV, &ready)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn second process");
+
+        let wait_start = Instant::now();
+        while !ready.exists() {
+            if wait_start.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("child never signalled that it holds the lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Positive control: the child really holds the lock right now.
+        match acquire_daemon_lock_with(&canon, Duration::ZERO, SHORT_POLL) {
+            Err(LockError::Held { .. }) => {}
+            other => panic!("child must hold the lock before the parent's acquire, got {other:?}"),
+        }
+
+        let t0 = Instant::now();
+        let got = acquire_daemon_lock(&canon);
+        let elapsed = t0.elapsed();
+        let status = child.wait().expect("child wait");
+        assert!(status.success(), "child must exit cleanly: {status:?}");
+        got.expect("parent must acquire once the predecessor process exits");
+        assert!(
+            elapsed < LOCK_RETRY_WINDOW,
+            "must acquire inside the window; elapsed {elapsed:?}"
+        );
+    }
 
     #[test]
     fn resolve_creates_missing_dir_then_canonicalizes() {
@@ -255,7 +481,7 @@ mod tests {
 
         // And the lock actually excludes across the two spellings.
         let _held = acquire_daemon_lock(&via_real).expect("first acquisition succeeds");
-        match acquire_daemon_lock(&via_alias) {
+        match acquire_daemon_lock_with(&via_alias, SHORT_WINDOW, SHORT_POLL) {
             Err(LockError::Held { dir }) => assert_eq!(dir, via_real),
             other => panic!("expected Held via symlink spelling, got {other:?}"),
         }
@@ -267,7 +493,9 @@ mod tests {
         let canon = resolve_config_dir(dir.path()).unwrap();
 
         let first = acquire_daemon_lock(&canon).expect("first lock must succeed");
-        let second = acquire_daemon_lock(&canon);
+        // T-1d-4: a small retry window keeps the suite fast; the refusal is
+        // still the distinct `Held` once the window elapses.
+        let second = acquire_daemon_lock_with(&canon, SHORT_WINDOW, SHORT_POLL);
         match &second {
             Err(LockError::Held { dir: held_dir }) => {
                 assert_eq!(held_dir, &canon);
