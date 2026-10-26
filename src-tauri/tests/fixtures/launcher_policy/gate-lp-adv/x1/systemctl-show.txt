@@ -1,0 +1,7 @@
+LoadState=masked
+UnitFileState=masked
+Restart=
+RestartPreventExitStatus=
+SuccessExitStatus=
+
+FragmentPath=/dev/null

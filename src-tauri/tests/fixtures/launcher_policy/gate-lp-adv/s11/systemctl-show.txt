@@ -1,0 +1,7 @@
+LoadState=loaded
+UnitFileState=enabled
+Restart=no
+RestartPreventExitStatus=
+SuccessExitStatus=
+ExecStart={ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no }
+FragmentPath=/u1/vs-fx.service

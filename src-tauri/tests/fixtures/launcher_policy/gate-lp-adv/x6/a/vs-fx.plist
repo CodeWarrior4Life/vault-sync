@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>vs-fx</string>
+<key>ProgramArguments</key><array><string>/usr/bin/env</string><string>open</string><string>-a</string><string>X</string></array>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict></plist>
