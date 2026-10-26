@@ -7,6 +7,6 @@
 +pub struct CsPlant;
 +impl crate::durable_file::sealed::Sealed for CsPlant {}
 +
+ /// Unit CS-3 in-process tests (T-CS3-3..-22).
  #[cfg(test)]
- #[allow(clippy::disallowed_methods)]
- mod tests {
+ #[path = "cs3_tests.rs"]
