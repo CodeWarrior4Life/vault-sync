@@ -498,6 +498,39 @@ mod sys {
         (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
     }
 
+    /// Does the parent of the held directory (`openat(dir, "..")`) still list
+    /// an entry with inode `ino`? Read-only: one `readdir` of the parent.
+    pub(super) fn parent_lists_ino(dir: RawFd, ino: u64) -> io::Result<bool> {
+        let d = openat(dir, "..", O_DIR, 0)?;
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(d);
+        // SAFETY: fdopendir takes ownership of `fd` (closed by closedir).
+        let dp = unsafe { libc::fdopendir(fd) };
+        if dp.is_null() {
+            let e = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut found = false;
+        loop {
+            // SAFETY: `dp` is a live DIR*; readdir returns NULL at the end.
+            let ent = unsafe { libc::readdir(dp) };
+            if ent.is_null() {
+                break;
+            }
+            // SAFETY: `ent` is non-null.
+            let (d_ino, name) = unsafe { ((*ent).d_ino, CStr::from_ptr((*ent).d_name.as_ptr())) };
+            let name = name.to_bytes();
+            if name != b"." && name != b".." && d_ino == ino {
+                found = true;
+                break;
+            }
+        }
+        // SAFETY: `dp` came from fdopendir and is closed exactly once.
+        unsafe { libc::closedir(dp) };
+        Ok(found)
+    }
+
     /// Entry names of an open directory, from `readdir` on a fresh
     /// description (`openat(dir, ".")`): no file inside is opened.
     pub(super) fn read_dir_names(dir: RawFd) -> io::Result<Vec<String>> {
@@ -782,13 +815,21 @@ impl StateDir {
         })
     }
 
-    /// `fstat(dirfd).st_nlink > 0`: the held directory has not been unlinked
-    /// (§3.3a step 3). Windows: always `true`.
+    /// The held directory has not been unlinked (§3.3a step 3):
+    /// `fstat(dirfd).st_nlink > 0` AND its parent (reached through the held
+    /// fd's `..`) still lists the held inode. The second half exists because
+    /// APFS keeps `st_nlink > 0` on a removed directory that is still open
+    /// (MEASURED on the macOS CI legs); it is a read-only `readdir`. Any error
+    /// is returned (the caller keeps the valve latched). Windows: `true`.
     pub fn held_dir_linked(&self) -> io::Result<bool> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Ok(self.dir.metadata()?.nlink() > 0)
+            use std::os::unix::io::AsRawFd;
+            if self.dir.metadata()?.nlink() == 0 {
+                return Ok(false);
+            }
+            sys::parent_lists_ino(self.dir.as_raw_fd(), self.id.1)
         }
         #[cfg(not(unix))]
         {
