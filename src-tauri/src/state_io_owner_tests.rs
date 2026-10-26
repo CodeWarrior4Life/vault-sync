@@ -1075,3 +1075,196 @@ fn t_cs2_31_bind_mounted_state_dir_unlatches() {
         "{out:?}"
     );
 }
+
+/// The path an open fd currently names (diagnostics only).
+#[cfg(unix)]
+fn fd_path(f: &std::fs::File) -> String {
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<readlink: {e}>"))
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+        let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+        if rc == -1 {
+            return format!("<F_GETPATH: {}>", io::Error::last_os_error());
+        }
+        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = f;
+        "<unknown>".to_string()
+    }
+}
+
+/// §3.3a step 3, unlinked held dir: what `openat(held, "..")` does once the
+/// held dir is removed (recorded per OS in the output; CI runs this with
+/// --nocapture), and the valve stays latched either way. `parent_holds_leaf`
+/// is called directly so the Linux `st_nlink == 0` fast path cannot hide it.
+#[cfg(unix)]
+#[test]
+fn t_cs2_31_unlinked_held_dir_parent_probe() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    let fx = fixture();
+    let ws_meta = std::fs::metadata(fx.d.parent().unwrap()).unwrap();
+    let ws_id = (ws_meta.dev(), ws_meta.ino());
+    let mut det = latched_detector(&fx.sd);
+    fx.sd.seams.custody_disabled.store(true, Ordering::SeqCst);
+    std::fs::remove_dir_all(&fx.d).unwrap();
+    let fd = fx.sd.dir.as_raw_fd();
+    let nlink = fx.sd.dir.metadata().unwrap().nlink();
+    let obs = match sys::openat(fd, "..", sys::O_DIR, 0) {
+        Ok(p) => {
+            let m = p.metadata().unwrap();
+            let leaf = sys::fstatat_nofollow(p.as_raw_fd(), "sync-state");
+            format!(
+                "openat(held, \"..\") = Ok path={} same_as_original_parent={} fstatat(leaf)={}",
+                fd_path(&p),
+                (m.dev(), m.ino()) == ws_id,
+                match leaf {
+                    Ok(None) => "ENOENT".to_string(),
+                    Ok(Some(_)) => "FOUND".to_string(),
+                    Err(e) => format!("errno {:?}", e.raw_os_error()),
+                }
+            )
+        }
+        Err(e) => format!(
+            "openat(held, \"..\") = Err errno {:?} ({e})",
+            e.raw_os_error()
+        ),
+    };
+    println!(
+        "T-CS2-31 unlinked-held-dir probe [{} {}]: held st_nlink={nlink}; {obs}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let r = sys::parent_holds_leaf(fd, "sync-state", fx.sd.id);
+    assert!(
+        !matches!(r, Ok(true)),
+        "an unlinked held dir must not read as linked: {r:?}"
+    );
+    assert!(!matches!(fx.sd.held_dir_linked(), Ok(true)));
+    assert!(!det.poll_marker_resume(), "the valve must stay latched");
+    assert!(det.is_paused());
+}
+
+/// §3.3a step 3, leaf renamed within the SAME parent: the held (dev, ino)
+/// now sits under a new name. The canonical name is no longer the held dir,
+/// so the valve must stay latched: by step 3 alone (custody disabled), and
+/// by custody with exit 74 (custody on).
+#[cfg(unix)]
+#[test]
+fn t_cs2_31_leaf_renamed_in_same_parent_stays_latched() {
+    // Step 3 alone.
+    let fx = fixture();
+    let mut det = latched_detector(&fx.sd);
+    fx.sd.seams.custody_disabled.store(true, Ordering::SeqCst);
+    std::fs::remove_file(fx.d.join(StateFile::PauseMarker.name())).unwrap();
+    std::fs::rename(&fx.d, fx.d.with_file_name("sync-state.renamed")).unwrap();
+    assert!(!fx.sd.exists(StateFile::PauseMarker).unwrap());
+    assert!(
+        !fx.sd.held_dir_linked().unwrap(),
+        "renamed leaf is not linked under its name"
+    );
+    assert!(
+        !det.poll_marker_resume(),
+        "renamed leaf: step 3 must hold the latch"
+    );
+    assert!(det.is_paused());
+
+    // Custody on: exit 74.
+    let fx = fixture();
+    let mut det = latched_detector(&fx.sd);
+    std::fs::remove_file(fx.d.join(StateFile::PauseMarker.name())).unwrap();
+    std::fs::rename(&fx.d, fx.d.with_file_name("sync-state.renamed")).unwrap();
+    assert!(!det.poll_marker_resume());
+    assert!(det.is_paused());
+    assert!(
+        matches!(fx.exits().as_slice(), [(74, LossReason::CanonicalAbsent)]),
+        "{:?}",
+        fx.exits()
+    );
+}
+
+/// §3.3a step 3 on a btrfs subvolume root as the StateDir (st_dev differs
+/// per subvolume): `fstat` on the held dir equals `fstatat(parent, leaf)`,
+/// step 3 holds, and clearing the marker unlatches. Needs the `btrfs` CLI
+/// and a user-owned btrfs directory (`CS2_BTRFS_DIR`, default the crate's
+/// target dir); SKIPPED-LOUD otherwise.
+#[cfg(target_os = "linux")]
+#[test]
+fn t_cs2_31_btrfs_subvolume_state_dir() {
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+    use std::os::unix::io::AsRawFd;
+    let base = std::env::var_os("CS2_BTRFS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let _ = std::fs::create_dir_all(&base);
+    let Ok(tmp) = tempfile::Builder::new()
+        .prefix("cs2-btrfs-")
+        .tempdir_in(&base)
+    else {
+        eprintln!(
+            "SKIPPED-LOUD btrfs subvolume: cannot create a temp dir in {}",
+            base.display()
+        );
+        return;
+    };
+    let sub = tmp.path().join("state");
+    let out = std::process::Command::new("btrfs")
+        .args(["subvolume", "create"])
+        .arg(&sub)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "SKIPPED-LOUD btrfs subvolume: `btrfs subvolume create` failed in {} ({}); needs a user-owned btrfs dir",
+                base.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("SKIPPED-LOUD btrfs subvolume: btrfs CLI unavailable ({e})");
+            return;
+        }
+    }
+    let sd = StateDir::for_test(&sub);
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let pm = parent.metadata().unwrap();
+    let st = sys::fstatat_nofollow(parent.as_raw_fd(), "state")
+        .unwrap()
+        .unwrap();
+    #[allow(clippy::unnecessary_cast)]
+    let by_name = (st.st_dev as u64, st.st_ino as u64);
+    let d_ino = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name() == "state")
+        .map(|e| e.ino());
+    println!(
+        "T-CS2-31 btrfs subvolume: held (dev,ino)={:?} fstatat(parent,leaf)={by_name:?} parent dev={} readdir d_ino={d_ino:?}",
+        sd.id,
+        pm.dev()
+    );
+    assert_ne!(sd.id.0, pm.dev(), "a subvolume root has its own st_dev");
+    assert_eq!(by_name, sd.id, "fstat(held) == fstatat(parent, leaf)");
+    assert!(sd.held_dir_linked().unwrap());
+    let mut det = latched_detector(&sd);
+    std::fs::remove_file(sub.join(StateFile::PauseMarker.name())).unwrap();
+    assert!(det.poll_marker_resume(), "clearing the marker must resume");
+    // Best-effort cleanup: an empty subvolume can be rmdir'd by its owner.
+    for e in std::fs::read_dir(&sub).unwrap().flatten() {
+        let _ = std::fs::remove_file(e.path());
+    }
+    let _ = std::fs::remove_dir(&sub);
+}
