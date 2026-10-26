@@ -817,6 +817,17 @@ mod tests {
         std::fs::write(vault.join("notes/a.md"), b"hello").unwrap();
         let state = tmp.path().join("state");
         std::fs::create_dir(&state).unwrap();
+        // An inotify/FSEvents watch on the child's temp dir: a scratch dir
+        // created and removed again within the seed is still an event.
+        use notify::Watcher;
+        let (wtx, wrx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |r| {
+            let _ = wtx.send(r);
+        })
+        .unwrap();
+        watcher
+            .watch(&watched, notify::RecursiveMode::Recursive)
+            .unwrap();
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -838,10 +849,23 @@ mod tests {
             "scratch must record 0 appends: {stdout}"
         );
         m.assert_async().await;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let during: Vec<notify::Event> = wrx.try_iter().filter_map(Result::ok).collect();
+        assert!(
+            during.is_empty(),
+            "the D9 seed touched the temp dir: {during:?}"
+        );
         let created: Vec<_> = std::fs::read_dir(&watched).unwrap().collect();
         assert!(
             created.is_empty(),
-            "the D9 seed created entries in the temp dir: {created:?}"
+            "entries left in the temp dir: {created:?}"
         );
+        // Positive control: the watch does see a create.
+        std::fs::write(watched.join("probe"), b"x").unwrap();
+        let seen = wrx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(Result::ok);
+        assert!(seen.is_some(), "the temp-dir watch must observe a create");
     }
 }
