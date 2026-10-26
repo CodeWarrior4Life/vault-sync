@@ -1268,3 +1268,38 @@ fn t_cs2_31_btrfs_subvolume_state_dir() {
     }
     let _ = std::fs::remove_dir(&sub);
 }
+
+/// TKT-98d5f42d F2: a sync-state dir that is itself a symlink. Step 3 checks
+/// the leaf the held dir's REAL parent lists (from the resolved canonical
+/// path), so clearing the marker unlatches; bootstrap raises
+/// `state_dir_symlinked`.
+#[cfg(unix)]
+#[test]
+fn f2_symlinked_sync_state_dir_unlatches() {
+    let ws = TempDir::new().unwrap();
+    let target_parent = TempDir::new().unwrap();
+    let target = target_parent.path().join("real-state");
+    std::fs::create_dir(&target).unwrap();
+    let parent = ws.path().join(layout::RUNTIME_DIR_NAME).join("f2sub");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::os::unix::fs::symlink(&target, parent.join("sync-state")).unwrap();
+    let cfg = TempDir::new().unwrap();
+    let latch = Arc::new(Latch::new());
+    let reg =
+        bootstrap_with_latch(ws.path(), &["f2sub".into()], cfg.path(), latch.clone()).unwrap();
+    let sd = reg.get("f2sub").unwrap();
+    assert!(
+        crate::sync_health::state_events().contains(&StateHealthEvent::StateDirSymlinked {
+            sub: "f2sub".into()
+        })
+    );
+    assert!(
+        sd.held_dir_linked().unwrap(),
+        "a symlinked sync-state dir is linked"
+    );
+    let mut det = latched_detector(&sd);
+    std::fs::remove_file(target.join(StateFile::PauseMarker.name())).unwrap();
+    assert!(det.poll_marker_resume(), "clearing the marker must resume");
+    assert!(!det.is_paused());
+    assert!(latch.exits.lock().unwrap().is_empty());
+}

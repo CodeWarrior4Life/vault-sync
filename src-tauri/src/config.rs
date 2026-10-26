@@ -909,7 +909,7 @@ mod managed_mode_tests {
         assert_eq!(cfg_path, canon.join("config.toml"));
 
         // token_store: sibling of config.toml in the SAME managed dir.
-        let tok = crate::token_store::token_file_path("sub-managed");
+        let tok = crate::token_store::token_file_path("sub-managed").unwrap();
         assert_eq!(tok, canon.join("token-sub-managed.bin"));
 
         // reconciliation retry ledger: sibling of config.toml too. CS-2: it

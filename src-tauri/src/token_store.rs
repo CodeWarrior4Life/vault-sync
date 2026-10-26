@@ -115,6 +115,10 @@ pub enum TokenStoreError {
     /// any previous token file is byte-identical.
     #[error("token file not written (previous file untouched): {0}")]
     NotCommitted(std::io::Error),
+    /// TKT-98d5f42d F3: the subscriber id is not a safe file-name component
+    /// (`state_io::validate_sub`), so no token path is built from it.
+    #[error("invalid subscriber id: {0}")]
+    InvalidSubscriber(String),
 }
 
 impl From<NotCommitted> for TokenStoreError {
@@ -141,13 +145,17 @@ pub(crate) fn token_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub(crate) fn token_file_path(subscriber_id: &str) -> PathBuf {
+pub(crate) fn token_file_path(subscriber_id: &str) -> Result<PathBuf, TokenStoreError> {
+    // TKT-98d5f42d F3: the id becomes a file-name component, so it is
+    // validated first (non-empty, not `.`/`..`, only `[A-Za-z0-9._-]`); a
+    // `/` or `\` would otherwise escape the config dir. Fail closed.
+    crate::state_io::validate_sub(subscriber_id).map_err(TokenStoreError::InvalidSubscriber)?;
     // Sibling of config.toml — same directory, so cleanup is one rm -rf.
     // Managed-instance mode: rides default_config_path()'s NEXUS_SYNC_CONFIG_DIR
     // override, so per-instance tokens land in the per-instance config dir.
     let mut p = default_config_path();
     p.set_file_name(format!("token-{subscriber_id}.bin"));
-    p
+    Ok(p)
 }
 
 /// Write the token file atomically through `replace_atomic` (CS-1, gate C5):
@@ -167,7 +175,7 @@ pub fn store(subscriber_id: &str, token: &str) -> Result<TokenStored, TokenStore
     store_impl(
         subscriber_id,
         token,
-        &token_file_path(subscriber_id),
+        &token_file_path(subscriber_id)?,
         &OsKeyring,
         file_only_backend(),
     )
@@ -215,7 +223,7 @@ pub(crate) fn store_impl(
 pub fn load(subscriber_id: &str) -> Result<Option<String>, TokenStoreError> {
     load_impl(
         subscriber_id,
-        &token_file_path(subscriber_id),
+        &token_file_path(subscriber_id)?,
         &OsKeyring,
         file_only_backend(),
     )
@@ -277,7 +285,10 @@ fn load_impl(
 /// macOS Keychain prompt. A legacy keyring-only token is invisible here
 /// until the first `load()` migrates it to the file.
 pub fn has_persisted_token(subscriber_id: &str) -> bool {
-    has_persisted_token_at(subscriber_id, &token_file_path(subscriber_id))
+    match token_file_path(subscriber_id) {
+        Ok(p) => has_persisted_token_at(subscriber_id, &p),
+        Err(_) => false,
+    }
 }
 
 fn has_persisted_token_at(subscriber_id: &str, file_path: &Path) -> bool {
@@ -288,11 +299,18 @@ fn has_persisted_token_at(subscriber_id: &str, file_path: &Path) -> bool {
 /// but not propagated (this is called from the Unpair flow, not the hot path).
 #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn delete(subscriber_id: &str) {
+    // TKT-98d5f42d F3: fail closed BEFORE touching any backend.
+    let path = match token_file_path(subscriber_id) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("token delete refused: {e}");
+            return;
+        }
+    };
     cache_clear(subscriber_id);
     if let Err(e) = keyring::delete_token(subscriber_id) {
         warn!("keyring delete failed for {subscriber_id}: {e}");
     }
-    let path = token_file_path(subscriber_id);
     if path.exists() {
         if let Err(e) = fs::remove_file(&path) {
             warn!("token file delete failed for {subscriber_id}: {e}");
@@ -690,5 +708,50 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-token");
         cache_clear(sub);
+    }
+
+    /// TKT-98d5f42d F3: every path built from a subscriber id validates it
+    /// first and fails closed. `delete` with `../x` must not remove a file
+    /// outside the config dir; store/load/has_persisted_token refuse too.
+    #[test]
+    fn f3_subscriber_id_cannot_escape_the_config_dir() {
+        use crate::managed_instance::test_env::ScopedConfigDirEnv;
+        use crate::token_store::{
+            delete, has_persisted_token, load, store, token_file_path, TokenStoreError,
+        };
+        let base = tempfile::TempDir::new().unwrap();
+        let cfg = base.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let _env = ScopedConfigDirEnv::set(&cfg);
+        // A live escape: with a `token-` dir present, the id `/../../x` names
+        // <cfg>/token-/../../x.bin, i.e. <base>/x.bin OUTSIDE the config dir.
+        std::fs::create_dir_all(cfg.join("token-")).unwrap();
+        let victim = base.path().join("x.bin");
+        std::fs::write(&victim, b"victim").unwrap();
+        for bad in ["../x", "a/b", "a\\b", "", ".", "..", "/../../x"] {
+            assert!(
+                matches!(
+                    token_file_path(bad),
+                    Err(TokenStoreError::InvalidSubscriber(_))
+                ),
+                "{bad:?} must be refused"
+            );
+            assert!(matches!(
+                store(bad, "t"),
+                Err(TokenStoreError::InvalidSubscriber(_))
+            ));
+            assert!(matches!(
+                load(bad),
+                Err(TokenStoreError::InvalidSubscriber(_))
+            ));
+            assert!(!has_persisted_token(bad));
+            delete(bad);
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "delete escaped the config dir"
+        );
+        assert!(token_file_path("sub-ok_1.x").is_ok());
     }
 }
