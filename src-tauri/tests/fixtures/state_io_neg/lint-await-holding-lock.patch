@@ -1,0 +1,15 @@
+--- a/src/supervise.rs
++++ b/src/supervise.rs
+@@ -34,6 +34,12 @@
+ /// EX_SOFTWARE: a Required task ended unexpectedly (CS-3 D4).
+ pub const EXIT_TASK_ENDED: i32 = 70;
+ 
++pub async fn cs3_plant(m: &std::sync::Mutex<u32>) -> u32 {
++    let g = m.lock().unwrap();
++    tokio::task::yield_now().await;
++    *g
++}
++
+ /// A periodic task's tick. Tests in the daemon-subprocess harness shorten
+ /// every periodic tick with `CS3_FAST_TICK_MS`; production returns
+ /// `default` unchanged.
