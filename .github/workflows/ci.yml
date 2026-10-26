@@ -38,6 +38,10 @@ jobs:
       - name: nexus-vault-sync-supervisor tests (O5-2a)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/supervisor/test-supervisor.sh
+      # #29 gate C2: the Trinity install script's competing-route removal and one-supervised-pid receipt (shims, ~5 s).
+      - name: install-trinity-agent tests (#29 C2)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/launchd/test-install-trinity-agent.sh
       - run: cargo test --all-targets
         working-directory: src-tauri
       # CS-1 §4b / T-CS1-17: record which directory-durability branch fired

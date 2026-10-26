@@ -137,24 +137,17 @@ pub fn run() {
     // Exclusive advisory lock, fail-closed: one daemon per canonical config
     // dir, acquired BEFORE any pipeline starts and held for the process
     // lifetime (leaked on purpose — the daemon never re-enters run()). A
-    // second process against the same dir exits non-zero with the distinct
-    // "managed-instance lock held by another process" message.
+    // second process against the same dir, still refused after the 10 s
+    // retry window, exits 0 with the distinct lock-held line (TKT-a6e5c227:
+    // a supervisor must not relaunch a duplicate); an I/O error exits 1.
     if let Some(dir) = &managed_dir {
-        match managed_instance::acquire_daemon_lock(dir) {
-            Ok(lock) => {
-                tracing::info!(
-                    lock = %lock.path.display(),
-                    config_dir = %dir.display(),
-                    "managed-instance mode: config dir lock acquired"
-                );
-                Box::leak(Box::new(lock));
-            }
-            Err(e) => {
-                tracing::error!("{e}");
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
+        let lock = managed_instance::acquire_daemon_lock_or_exit(dir);
+        tracing::info!(
+            lock = %lock.path.display(),
+            config_dir = %dir.display(),
+            "managed-instance mode: config dir lock acquired"
+        );
+        Box::leak(Box::new(lock));
     }
 
     let mut builder = tauri::Builder::default();
@@ -258,6 +251,9 @@ pub fn run() {
             let sup = supervise::Supervisor::process(std::sync::Arc::new(boot::TauriHost(
                 app.handle().clone(),
             )));
+            // TKT-1c728ac4 follow-up 2: the tray's click-to-update reaches the
+            // supervisor here, so it restarts through `restart_once`.
+            app.manage(sup.clone());
 
             // S484: silent auto-update — checks on startup AND every 5 min,
             // using the pubkey + endpoints in tauri.conf.json. On a staged

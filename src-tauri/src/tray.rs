@@ -49,6 +49,34 @@ const TRAY_ICON_ANIM_BYTES: [&[u8]; 8] = [
 /// waiting for the 2s refresh poller.
 const TRAY_ICON_ID: &str = "main-tray";
 
+/// The click-to-update restart. TKT-1c728ac4 follow-up 2 (gate C1 on #29):
+/// once the process supervisor exists (it is managed in `run()`), the click
+/// goes through [`Supervisor::restart_once`], which takes the `exit_once`
+/// claim, makes the C9 custody re-check (custody lost: exit 74) and then
+/// leaves by [`crate::supervise::restart_via_host`]: under a supervisor
+/// (`VAULT_SYNC_SUPERVISED=1`) exit 70 for it to relaunch exactly one
+/// successor (TKT-a6e5c227), otherwise `app.restart()`. A click while an exit
+/// or restart is already claimed does nothing. With no supervisor yet (the
+/// tray is built before it), the same leave runs directly.
+///
+/// [`Supervisor::restart_once`]: crate::supervise::Supervisor::restart_once
+pub(crate) fn update_click_restart(
+    sup: Option<&crate::supervise::Supervisor>,
+    host: &dyn crate::supervise::Host,
+) {
+    match sup {
+        Some(s) => {
+            if !s.restart_once("tray_update") {
+                info!("tray: update click ignored: an exit or restart is already claimed");
+            }
+        }
+        None => {
+            crate::state_io::flush_logs_bounded();
+            crate::supervise::restart_via_host(host, crate::supervise::is_supervised());
+        }
+    }
+}
+
 /// Build the tray icon + menu, wire handlers to actual functionality, and
 /// spawn a background task that refreshes the visible status line every 2 s
 /// from the SharedTrayState that the SSE consumer writes to.
@@ -335,7 +363,10 @@ pub fn build_tray(app: &AppHandle, state: SharedTrayState) -> tauri::Result<()> 
                 let staged = st.read().ok().and_then(|s| s.update_available.clone());
                 if let Some(version) = staged {
                     info!("tray: user clicked update — restarting to apply v{version}");
-                    app.restart();
+                    let sup = app
+                        .try_state::<std::sync::Arc<crate::supervise::Supervisor>>()
+                        .map(|s| s.inner().clone());
+                    update_click_restart(sup.as_deref(), &crate::boot::TauriHost(app.clone()));
                 } else {
                     app.dialog()
                         .message("You're on the latest version. The daemon checks for updates every few minutes and will flag one here the moment it's available.")

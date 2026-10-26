@@ -31,8 +31,48 @@ use tokio::sync::watch;
 use crate::state_io::{ExitGate, CLAIM_RESTART};
 use crate::sync_health::{raise_state_event, StateHealthEvent};
 
-/// EX_SOFTWARE: a Required task ended unexpectedly (CS-3 D4).
+/// EX_SOFTWARE: a Required task ended unexpectedly (CS-3 D4). Also the exit
+/// of a restart request when the process runs under a supervisor
+/// (TKT-a6e5c227, [`restart_via_host`]).
 pub const EXIT_TASK_ENDED: i32 = 70;
+
+/// TKT-a6e5c227 ruling (b): the ONLY signal that a supervisor (the launchd
+/// agent on macOS, the systemd unit on Linux) owns this process and will
+/// relaunch it on a non-zero exit. The unit or plist sets it to exactly `1`.
+/// Nothing else (parent pid, TTY, launchd/systemd variables) is consulted.
+pub const ENV_SUPERVISED: &str = "VAULT_SYNC_SUPERVISED";
+
+/// `true` iff `value` (the raw value of [`ENV_SUPERVISED`]) is exactly `1`.
+/// Absent, empty or any other value (`0`, `true`, ` 1`) is unsupervised.
+pub fn supervised_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// This process's supervision, from [`ENV_SUPERVISED`].
+pub fn is_supervised() -> bool {
+    supervised_from_env_value(std::env::var_os(ENV_SUPERVISED).as_deref())
+}
+
+/// How every restart request leaves the process (the supervisor's
+/// [`Supervisor::restart_once`] leaver and the tray's click-to-update).
+///
+/// - Supervised: exit [`EXIT_TASK_ENDED`] (70) and let the supervisor
+///   relaunch exactly one successor. `app.restart()` is NOT called: under
+///   launchd it self-spawns a successor in the job's process group and then
+///   exits 0, which `KeepAlive {SuccessfulExit:false}` does not relaunch and
+///   which ends the job (TKT-a6e5c227).
+/// - Unsupervised (a manual run): `app.restart()`, unchanged.
+pub fn restart_via_host(host: &dyn Host, supervised: bool) {
+    if supervised {
+        tracing::warn!(
+            "supervise: restart requested under a supervisor ({ENV_SUPERVISED}=1); \
+             exiting {EXIT_TASK_ENDED} so the supervisor relaunches the daemon (no self-spawn)"
+        );
+        host.exit(EXIT_TASK_ENDED);
+    } else {
+        host.restart();
+    }
+}
 
 /// A periodic task's tick. Tests in the daemon-subprocess harness shorten
 /// every periodic tick with `CS3_FAST_TICK_MS`; production returns
@@ -157,6 +197,8 @@ pub struct Supervisor {
     live: watch::Sender<Liveness>,
     pre_exit: Mutex<Vec<PreExitFlush>>,
     notices: Mutex<HashSet<String>>,
+    /// TKT-a6e5c227: a restart leaves by exit 70 instead of `app.restart()`.
+    supervised: bool,
     #[cfg(test)]
     hooks: test_hooks::Hooks,
 }
@@ -188,7 +230,7 @@ impl Supervisor {
     /// The process supervisor: the process exit gate, and liveness published
     /// for `ownership_lost`. Call once per process.
     pub fn process(host: Arc<dyn Host>) -> Arc<Self> {
-        let sup = Self::with_gate(host, ExitGate::process());
+        let sup = Self::build(host, ExitGate::process(), is_supervised());
         if PROCESS_LIVE.set(sup.live.clone()).is_err() {
             tracing::error!("supervise: process supervisor already installed");
         }
@@ -196,7 +238,22 @@ impl Supervisor {
     }
 
     /// A supervisor on an explicit gate (in-process tests).
+    /// Unsupervised (a restart self-spawns through `app.restart()`).
     pub fn with_gate(host: Arc<dyn Host>, gate: ExitGate) -> Arc<Self> {
+        Self::build(host, gate, false)
+    }
+
+    /// A supervisor on an explicit gate with explicit supervision (tests).
+    #[cfg(test)]
+    pub fn with_gate_supervised(
+        host: Arc<dyn Host>,
+        gate: ExitGate,
+        supervised: bool,
+    ) -> Arc<Self> {
+        Self::build(host, gate, supervised)
+    }
+
+    fn build(host: Arc<dyn Host>, gate: ExitGate, supervised: bool) -> Arc<Self> {
         let (live, _rx) = watch::channel(Liveness::Live);
         Arc::new(Self {
             host,
@@ -204,6 +261,7 @@ impl Supervisor {
             live,
             pre_exit: Mutex::new(Vec::new()),
             notices: Mutex::new(HashSet::new()),
+            supervised,
             #[cfg(test)]
             hooks: test_hooks::Hooks::default(),
         })
@@ -428,7 +486,8 @@ impl Supervisor {
 
     /// The stall watchdog's PushStall/WatcherStale restart and the updater's
     /// staged-update restart: claim `exit_once`, then the C9 re-check, then
-    /// `app.restart()`. Returns false (and does nothing) when an exit or a
+    /// [`restart_via_host`] (`app.restart()`, or exit 70 when supervised;
+    /// TKT-a6e5c227). Returns false (and does nothing) when an exit or a
     /// restart is already claimed.
     pub fn restart_once(&self, who: &str) -> bool {
         if !self.gate.try_claim(CLAIM_RESTART) {
@@ -483,7 +542,7 @@ impl Supervisor {
         crate::state_io::flush_logs_bounded();
         match how {
             Leave::Exit(code) => self.host.exit(code),
-            Leave::Restart => self.host.restart(),
+            Leave::Restart => restart_via_host(&*self.host, self.supervised),
         }
     }
 
