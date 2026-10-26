@@ -1,0 +1,12 @@
+--- a/src/delete_ledger.rs
++++ b/src/delete_ledger.rs
+@@ -130,6 +130,9 @@
+         .map(|l| l.to_string())
+         .collect()
+ }
++
++#[allow(warnings)]
++pub fn cs2_plant() {}
+ 
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]

@@ -7,6 +7,8 @@
 //! v0.4.28 splits R1: raw-equal -> Noop (unchanged); normalized-equal but
 //! raw-unequal -> rewrite local to the server's exact canonical bytes through
 //! the existing persist machinery (echo-guarded, locked, atomic), no stash.
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 use tempfile::TempDir;

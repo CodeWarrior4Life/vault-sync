@@ -1,0 +1,81 @@
+# Unit CS-2 (TKT-23091e72) gate 2: the ONLY items allowed to carry an
+# `allow(clippy::disallowed_methods)` (gate 1, clippy.toml), one item path
+# plus a one-line reason each. tests/state_io_gate.rs fails on an unlisted
+# suppression, on a listed item that no longer exists (stale), and on ANY
+# lint-group suppression (`clippy::style`, `clippy::all`, `warnings`) outside
+# exactly `#[cfg(test)]` code (gate C4). Items under `#[cfg(test)]` and files
+# under src-tauri/tests/ need no listing.
+#
+# Item path syntax: `<module>` (a module-level `#![allow]`), `<module>::<fn>`,
+# `<module>::<SelfType>::<method>`; nested modules add a segment.
+
+[exemptions]
+"state_io" = "the sole state-I/O module (CS-2): openat/renameat/unlinkat/mkdirat on held directory fds"
+"durable_file" = "CS-1 write layer: PathAnchor pathname calls for config and token, and the single exempt Apple libc::fsync fallback (CS-1 §4b)"
+"token_store::write_token_file" = "writes through CS-1 replace_atomic over a PathAnchor; 0600 from creation (CS-1 C5, T-CS1-15); holds no direct fs:: call"
+"token_store::delete" = "removes the pairing token file on unpair; config dir, non-state"
+"materializer::atomic_persist" = "vault writer: NamedTempFile persist into the vault tree (both cfgs); callers run the gate-4 belt first"
+"materializer::restore_server_times" = "vault writer: sets server mtimes on a just-materialized vault file"
+"materializer::Materializer::write_with_change_seq" = "vault writer: live and shadow-mode materialize, incl. the long-path persist and the NamedTempFile sites; gate-4 belt first"
+"materializer::Materializer::write_aligned_bytes" = "vault writer: ack-materialize-back rewrite; gate-4 belt first"
+"materializer::Materializer::canonical_root_for_mode" = "creates the shadow-mode vault tree root (.lattice-runtime/<sub>/shadow), non-state (§2.3)"
+"materializer::Materializer::soft_delete" = "vault writer: soft-delete rename inside the vault; gate-4 belt first"
+"conflict_stash::ConflictStash::write_stash" = "vault writer: conflict stash sibling (NamedTempFile + persist); gate-4 belt first"
+"conflict_stash::ConflictStash::record_stash_manifest" = "vault writer: stash manifest append; gate-4 belt first"
+"obsidian_plugin_detect::detect_and_disable" = "rewrites the vault's .obsidian/community-plugins.json toggle; non-state"
+"managed_instance::resolve_config_dir" = "Unit 1d: creates the managed config dir before config load (CS-2 §3.2 step 5 relies on it)"
+"managed_instance::acquire_daemon_lock_with" = "Unit 1d: the managed daemon.lock in the config dir; non-state"
+"main::init_logging" = "creates the log directory; non-state"
+
+# Gate C7: every `.display(<one argument>)` call site outside state_io (a
+# DisplayPath turns back into a path string via to_string/format!). Keyed by
+# the enclosing item; the reason names the operator text it feeds.
+[display_sites]
+"push_journal::PushJournal::display" = "the journal's DisplayPath for the file_watcher storm-breaker ERROR"
+"delete_ledger::DeleteLedger::display" = "the ledger's DisplayPath for operator text"
+"redflag::DeleteBurstDetector::pause_marker_display" = "the marker path in the DELETE SUPPRESSED WARN (resume_by)"
+"redflag::DeleteBurstDetector::write_pause_marker" = "the `rm <path>` line inside the pause marker body"
+
+# Gate 3/C7: a confined state-file name literal that is NOT a state path.
+[allowed_literals]
+"config::apply_enrollment_bytes" = { literal = "last_event_id", reason = "the legacy TOML config key Config.last_event_id, not the state file" }
+
+# Gate C6: one line per direct dependency in Cargo.toml [dependencies] and
+# [target.*.dependencies]: does the crate write files, and if so where.
+[reviewed_deps]
+tauri = "writes the webview data dir and app caches under the platform app data dir; non-state"
+tauri-plugin-autostart = "writes the login-item / autostart entry (LaunchAgent plist, .desktop, registry); non-state"
+tauri-plugin-updater = "downloads the update bundle to a temp dir and replaces the app binary; non-state"
+tauri-plugin-store = "writes the plugin store under the app config dir; non-state"
+tauri-plugin-single-instance = "creates its single-instance socket / mutex; no state files"
+tauri-plugin-shell = "spawns processes; writes no files itself"
+tauri-plugin-dialog = "no file writes (returns user-chosen paths)"
+tauri-plugin-notification = "no file writes"
+reqwest = "no file writes"
+eventsource-client = "no file writes"
+keyring = "writes the OS credential store (Keychain, Secret Service, Credential Manager); non-state"
+yaml-rust2 = "no file writes"
+notify = "no file writes (inotify / FSEvents watches)"
+notify-debouncer-full = "no file writes"
+sha2 = "no file writes"
+tokio = "tokio::fs write APIs are gate-1 disallowed; no implicit writes"
+tokio-stream = "no file writes"
+tracing = "no file writes"
+tracing-subscriber = "no file writes (writes to the writer it is given)"
+tracing-appender = "writes rolling daemon logs under <data_local>/Nexus/logs (main::init_logging); non-state"
+tempfile = "temp file and dir APIs are gate-1 disallowed outside cfg(test)"
+serde = "no file writes"
+serde_json = "no file writes"
+thiserror = "no file writes"
+anyhow = "no file writes"
+futures = "no file writes"
+dirs = "no file writes (path lookups only)"
+toml = "no file writes"
+serde_yaml = "no file writes"
+hex = "no file writes"
+chrono = "no file writes"
+base64 = "no file writes"
+walkdir = "no file writes (directory walks only)"
+unicode-normalization = "no file writes"
+dunce = "no file writes (canonicalize only)"
+libc = "raw syscalls; the file-writing ones are gate-1 disallowed outside state_io and the durable_file Apple fallback"

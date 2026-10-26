@@ -1,3 +1,5 @@
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 /// T22 — SSE consumer tests
 ///
 /// Strategy: spin up a mockito server that serves a finite SSE body (one or more events then

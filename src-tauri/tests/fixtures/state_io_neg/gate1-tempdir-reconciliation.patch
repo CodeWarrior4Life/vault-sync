@@ -1,0 +1,13 @@
+--- a/src/reconciliation.rs
++++ b/src/reconciliation.rs
+@@ -535,6 +535,10 @@
+     }
+ }
+ 
++pub fn cs2_plant() {
++    let _ = tempfile::tempdir();
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

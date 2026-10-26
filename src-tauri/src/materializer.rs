@@ -244,6 +244,7 @@ pub enum AlignOutcome {
 /// is already byte-faithful, so a timestamp-set failure is logged, never fatal.
 /// `created`/`file_mtime` are unix-timestamp floats from the server payload;
 /// either may be absent (older server) — we set whatever we have.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 fn restore_server_times(target: &Path, payload: &NotePayload) {
     let to_systime = |ts: Option<f64>| -> Option<std::time::SystemTime> {
         ts.and_then(|t| {
@@ -664,7 +665,7 @@ impl Materializer {
         // Allow callers to override the trailing folder name via
         // shadow_subdir, but anchor it under <workspace>/.lattice-runtime/<slug>.
         self.workspace_root
-            .join(".lattice-runtime")
+            .join(crate::state_io::layout::RUNTIME_DIR_NAME)
             .join(&self.subscriber_slug)
             .join(&self.shadow_subdir)
     }
@@ -724,6 +725,7 @@ impl Materializer {
     /// is arbitrary-writer-wins under clock skew + ~15 concurrent writers) and
     /// names any conflict stash deterministically so concurrent writers across
     /// the fleet converge on ONE stash filename instead of spawning N copies.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_with_change_seq(
         &self,
         payload: &NotePayload,
@@ -1508,6 +1510,7 @@ impl Materializer {
     /// `canonical_sha` MUST be the sha256 hex of `canonical_bytes` (the caller
     /// verified it against the server's hash - unverified local
     /// canonicalization is banned, B2'b).
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_aligned_bytes(
         &self,
         rel_path: &str,
@@ -1625,6 +1628,7 @@ impl Materializer {
 
     /// Pick the canonical-root directory for the active mode.  Used by the
     /// path-traversal sanity check.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     fn canonical_root_for_mode(&self) -> PathBuf {
         let raw_root = match self.mode {
             MaterializerMode::Live => self.vaults_root.clone(),
@@ -1713,6 +1717,7 @@ impl Materializer {
     /// Soft-delete preserves the v0.2 contract (move to `<name>.deleted-<ts>`).
     /// In live mode it operates on the vault tree; in shadow mode on the
     /// runtime tree.  Disabled mode no-ops.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn soft_delete(&self, path: &str) -> Result<(), MaterializerError> {
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
@@ -2145,12 +2150,14 @@ fn serialize_with_frontmatter(payload: &NotePayload) -> String {
 /// `\\?\` via `dunce::simplified`'s inverse (we canonicalize through dunce on the
 /// target before the OS call). Code path is compiled only on Windows and must be
 /// re-verified on a booted Neo before Windows sync is re-enabled.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 #[cfg(not(windows))]
 fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
     tmp.persist(target).map_err(|e| e.error)?;
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 #[cfg(windows)]
 fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerError> {
     use std::os::windows::ffi::OsStrExt;
@@ -2267,6 +2274,7 @@ fn atomic_persist(tmp: NamedTempFile, target: &Path) -> Result<(), MaterializerE
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

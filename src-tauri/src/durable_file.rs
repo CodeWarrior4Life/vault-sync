@@ -21,6 +21,11 @@
 //! files this design creates. It is NEVER used for `config.toml`, which
 //! `Config::load_from` reads as raw TOML.
 
+// CS-2 gate 2: durable_file is exempt from gate 1 as a whole (it IS the
+// CS-1 write layer: PathAnchor pathname calls and the single Apple
+// `libc::fsync` fallback). Listed in state_io_exemptions.toml.
+#![allow(clippy::disallowed_methods)]
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -874,6 +879,7 @@ pub fn startup_maintenance(dirs: &[&Path]) {
 /// Test-only fault injection and observation points. All state is
 /// THREAD-LOCAL so parallel tests never see each other's faults.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod seams {
     use super::NotCommitted;
     use std::cell::RefCell;
@@ -1009,5 +1015,6 @@ pub(crate) mod seams {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 #[path = "durable_file_tests.rs"]
 mod tests;

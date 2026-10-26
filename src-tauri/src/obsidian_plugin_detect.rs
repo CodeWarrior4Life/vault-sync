@@ -43,6 +43,7 @@ pub struct DetectResult {
 /// each conflicting plugin currently enabled, remove it from the enabled
 /// list. Returns the list of plugins it disabled so the caller can surface
 /// a tray notification.
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn detect_and_disable(vault_root: &Path) -> DetectResult {
     let mut result = DetectResult::default();
     let obsidian_dir = vault_root.join(".obsidian");
@@ -121,6 +122,7 @@ pub fn summary_line(r: &DetectResult) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

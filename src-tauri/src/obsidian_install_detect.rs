@@ -125,6 +125,7 @@ pub fn find_known_vaults() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

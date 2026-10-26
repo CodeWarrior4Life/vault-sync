@@ -308,6 +308,7 @@ fn walk_conflicts(root: &Path, visit: &mut dyn FnMut(&Path)) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::Config;

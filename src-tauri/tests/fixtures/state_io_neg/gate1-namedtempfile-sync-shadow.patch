@@ -1,0 +1,13 @@
+--- a/src/sync_shadow.rs
++++ b/src/sync_shadow.rs
+@@ -602,6 +602,10 @@
+     }
+ }
+ 
++pub fn cs2_plant(p: &std::path::Path) {
++    let _ = tempfile::NamedTempFile::new_in(p);
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

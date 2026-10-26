@@ -381,6 +381,7 @@ pub fn default_config_path() -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -888,6 +889,7 @@ daemon_platform = "macos-aarch64"
 /// env lock (`managed_instance::test_env`) — `default_config_path()` reads the
 /// env at call time, so unserialized mutation would race parallel tests.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod managed_mode_tests {
     use super::*;
     use crate::managed_instance::test_env::ScopedConfigDirEnv;

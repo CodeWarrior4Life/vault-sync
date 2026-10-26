@@ -192,6 +192,7 @@ impl FlushHooks {
 /// Shared T-S1..T-S3 checks (Unit 1a §3), run against each of the three
 /// stores from their own test modules.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod flush_gen_checks {
     use super::FlushGen;
     use std::path::{Path, PathBuf};

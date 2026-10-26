@@ -181,6 +181,7 @@ pub fn spawn(api: Arc<ApiClient>, health: Arc<SyncHealth>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

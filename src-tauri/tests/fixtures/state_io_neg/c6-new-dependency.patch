@@ -1,0 +1,10 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -57,6 +57,7 @@
+ # / CreateFileW on a host without LongPathsEnabled). No-op canonicalization on
+ # non-Windows platforms, so it is safe to call unconditionally.
+ dunce = "1"
++once_cell = "1"
+ 
+ # CS-1 (TKT-23091e72): kill(pid, 0) liveness probe for the startup stale-temp
+ # sweep in durable_file. Already in the lock graph transitively; no new crate.

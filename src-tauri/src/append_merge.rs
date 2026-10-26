@@ -214,6 +214,7 @@ pub fn resolve(local: &[u8], server: &[u8], shadow_sha_hex: Option<&str>) -> App
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

@@ -384,6 +384,7 @@ impl ConflictStash {
     /// - Atomic tmp+rename (tempfile::NamedTempFile + persist).
     /// - Never overwrite an existing stash file — append `-2`, `-3`, ...
     /// - Path safety: parent dir's canonical path must stay within vault_root.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write_stash(
         &self,
         original_path: &str,
@@ -461,6 +462,7 @@ impl ConflictStash {
     /// Append one `{original, stash, device, lsn, ts}` mapping line to the
     /// manifest under `vault_root`. JSONL so concurrent writers append cleanly
     /// and a partial line never corrupts prior entries.
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     fn record_stash_manifest(
         &self,
         original_path: &str,
@@ -586,6 +588,7 @@ fn walk_dir(root: &Path, visit: &mut dyn FnMut(&Path)) -> Result<(), io::Error> 
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

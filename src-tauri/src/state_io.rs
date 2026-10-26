@@ -322,6 +322,7 @@ impl DirSeams {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod seams {
     use std::cell::RefCell;
     use std::path::Path;
@@ -1672,6 +1673,7 @@ pub fn spawn_custody_tick() {
 
 /// Test hooks reachable from other modules' tests (T-CS2-3).
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod test_hooks {
     use std::sync::Mutex;
 

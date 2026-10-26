@@ -224,7 +224,7 @@ pub fn is_junk_path(path: &str) -> bool {
         ".cody-tmp",
         "__pycache__",
         ".lattice-sync",
-        ".lattice-runtime",
+        crate::state_io::layout::RUNTIME_DIR_NAME,
     ];
     // Junk basenames (exact, case-sensitive).
     const JUNK_BASENAMES: &[&str] = &[".DS_Store", "Thumbs.db"];
@@ -258,6 +258,7 @@ pub fn is_junk_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

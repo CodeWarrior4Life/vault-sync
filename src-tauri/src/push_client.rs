@@ -1622,6 +1622,7 @@ fn strip_yaml_fields(fm_block: &str, fields: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::api_client::ApiClient;

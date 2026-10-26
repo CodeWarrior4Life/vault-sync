@@ -1,3 +1,5 @@
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 use mockito::Server;
 use vault_sync_daemon::api_client::{ApiClient, ApiError};
 

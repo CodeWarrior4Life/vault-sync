@@ -515,6 +515,7 @@ pub fn spawn_reconciliation_task(
 /// T-CS2-22 observation: the scratch-append count of the last D9 seed run
 /// on this thread, recorded when the seed returns.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod seed_test {
     use std::cell::Cell;
     use std::sync::Arc;
@@ -535,6 +536,7 @@ pub(crate) mod seed_test {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

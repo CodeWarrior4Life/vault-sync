@@ -1,3 +1,5 @@
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 use vault_sync_daemon::keyring::{delete_token, get_token, preflight, set_token};
 
 #[test]

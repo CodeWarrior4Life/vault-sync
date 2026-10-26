@@ -1,0 +1,13 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1501,6 +1501,10 @@
+     });
+ }
+ 
++pub fn cs2_plant() -> &'static str {
++    "sync-state"
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

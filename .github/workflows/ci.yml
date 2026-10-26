@@ -29,6 +29,11 @@ jobs:
         working-directory: src-tauri
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: src-tauri
+      # CS-2 (TKT-23091e72) gate self-test: every planted mutation in
+      # tests/fixtures/state_io_neg must make its gate fail.
+      - name: state_io gate negative controls (CS-2 §3.5)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/state_io_gate_negcontrol.sh
       - run: cargo test --all-targets
         working-directory: src-tauri
       # CS-1 §4b / T-CS1-17: record which directory-durability branch fired

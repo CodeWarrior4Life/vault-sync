@@ -488,6 +488,7 @@ pub fn state_events() -> Vec<StateHealthEvent> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

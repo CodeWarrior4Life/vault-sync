@@ -1,0 +1,16 @@
+--- a/src/sse.rs
++++ b/src/sse.rs
+@@ -427,6 +427,13 @@
+     }
+ }
+ 
++#[cfg(unix)]
++pub fn cs2_plant(f: &std::fs::File) {
++    use std::os::unix::io::AsRawFd;
++    // SAFETY: plant.
++    unsafe { libc::fsync(f.as_raw_fd()) };
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

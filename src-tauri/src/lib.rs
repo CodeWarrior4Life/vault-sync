@@ -1,3 +1,6 @@
+// CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
+// `cargo clippy` without `-D warnings` also fails (see clippy.toml).
+#![deny(clippy::disallowed_methods)]
 pub mod api_client;
 pub mod append_merge;
 pub mod base_seq_store;
@@ -1499,6 +1502,7 @@ fn spawn_redflag_monitor(gate: redflag::RedflagGate, tray_state: tray_state::Sha
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -1700,6 +1704,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod launch_gate_tests {
     use super::launch_decision;
 
@@ -1750,6 +1755,7 @@ mod launch_gate_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod restart_gate_tests {
     use super::should_restart_now;
 

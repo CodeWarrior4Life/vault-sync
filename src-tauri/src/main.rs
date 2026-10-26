@@ -1,3 +1,6 @@
+// CS-2 (TKT-23091e72) gate 1: deny path-based writers crate-wide, so a local
+// `cargo clippy` without `-D warnings` also fails (see clippy.toml).
+#![deny(clippy::disallowed_methods)]
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -59,6 +62,7 @@ fn debug_logging_opt_in() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 fn init_logging() {
     let log_dir: PathBuf = dirs::data_local_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(std::env::temp_dir))
@@ -353,6 +357,7 @@ async fn cli_set_mode(mode: String) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

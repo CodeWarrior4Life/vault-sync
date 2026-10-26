@@ -275,6 +275,7 @@ fn format_staleness(d: std::time::Duration) -> String {
 pub type SharedTrayState = Arc<RwLock<TrayState>>;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

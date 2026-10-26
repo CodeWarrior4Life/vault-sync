@@ -22,6 +22,8 @@
 //! still produces that state today. The D3 gate — that `shadow_hash_for_ack`
 //! now records `server_hash` on Accepted instead of the local raw sha — is
 //! `push_client::tests::test_ack_materialize_rewrite_then_shadow`.
+// CS-2 gate 2: integration tests may use path-based fs freely.
+#![allow(clippy::disallowed_methods)]
 
 use mockito::Server;
 use std::sync::Arc;

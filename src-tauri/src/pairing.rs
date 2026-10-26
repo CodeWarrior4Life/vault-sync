@@ -251,6 +251,7 @@ fn detect_platform() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::durable_file::seams;

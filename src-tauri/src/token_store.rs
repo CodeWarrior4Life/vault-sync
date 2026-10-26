@@ -286,6 +286,7 @@ fn has_persisted_token_at(subscriber_id: &str, file_path: &Path) -> bool {
 
 /// Remove a token from both backends. Best-effort on each; errors are logged
 /// but not propagated (this is called from the Unpair flow, not the hot path).
+#[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
 pub fn delete(subscriber_id: &str) {
     cache_clear(subscriber_id);
     if let Err(e) = keyring::delete_token(subscriber_id) {
@@ -300,6 +301,7 @@ pub fn delete(subscriber_id: &str) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         backend_is_file_only, cache_clear, cache_get, cache_put, has_persisted_token_at, load_impl,

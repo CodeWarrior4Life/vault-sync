@@ -338,6 +338,7 @@ pub fn spawn_pull_backfill_task_guarded(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::reconciliation::MapEnv;

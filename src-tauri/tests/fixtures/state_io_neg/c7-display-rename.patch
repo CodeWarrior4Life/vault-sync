@@ -1,0 +1,14 @@
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -307,6 +307,11 @@
+ // tests
+ // ---------------------------------------------------------------------------
+ 
++pub fn cs2_plant(sd: std::sync::Arc<crate::state_io::StateDir>) -> String {
++    let x = sd;
++    x.display(None).to_string()
++}
++
+ #[cfg(test)]
+ #[allow(clippy::disallowed_methods)]
+ mod tests {

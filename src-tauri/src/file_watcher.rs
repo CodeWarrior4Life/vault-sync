@@ -63,7 +63,7 @@ const HARDCODED_EXCLUDES: &[&str] = &[
     // `sync_roots` is empty the watcher roots at `vaults_root` (the PARENT of
     // the vault), so the daemon's own `.lattice-runtime` tree sits in scope and
     // was being enqueued as pushes (thousands of self-generated junk entries).
-    ".lattice-runtime",
+    crate::state_io::layout::RUNTIME_DIR_NAME,
     ".trash/",
     "._/", // S477: convention for organized machine-local trees
     // A node_modules/ under the vault must never sync — it inflated the push
@@ -1406,6 +1406,7 @@ fn rewrite_decision_path(d: FilterDecision, p: String) -> FilterDecision {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::push_journal::PushJournal;

@@ -1,0 +1,13 @@
+--- a/src/delete_ledger.rs
++++ b/src/delete_ledger.rs
+@@ -129,6 +129,10 @@
+         .filter(|l| !l.trim().is_empty())
+         .map(|l| l.to_string())
+         .collect()
++}
++
++pub fn cs2_plant(d: &str) {
++    let _ = std::fs::write(format!("{}/x", d), b"");
+ }
+ 
+ #[cfg(test)]

@@ -133,7 +133,7 @@ impl Default for VerifyRepairConfig {
             hardcoded_excludes: vec![
                 ".obsidian/".into(),
                 ".lattice-sync/".into(),
-                ".lattice-runtime".into(),
+                crate::state_io::layout::RUNTIME_DIR_NAME.into(),
                 ".trash/".into(),
                 "._/".into(),
                 "_archive/".into(),
@@ -1156,6 +1156,7 @@ fn hash_file(path: &Path) -> Result<(String, u64), std::io::Error> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::api_client::ApiClient;
