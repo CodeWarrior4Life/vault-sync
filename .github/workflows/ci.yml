@@ -3,12 +3,22 @@ on:
   pull_request:
   push:
     branches: [main]
+  # TKT-ebc0237d: a MANUAL run can force the apt mirror fallback, to prove that path. workflow_dispatch needs write
+  # access to the repo, and the switch is read only when the event IS workflow_dispatch, so a pull_request (from a
+  # fork or not) can never set it. OFF by default.
+  workflow_dispatch:
+    inputs:
+      apt_force_fallback:
+        description: "Force the apt fallback: primary mirror blackholed (192.0.2.1), apt cache bypassed"
+        type: boolean
+        default: false
 
 jobs:
   test:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest, macos-14, ubuntu-latest]
+        # TKT-ebc0237d: the Linux leg is pinned to ubuntu-24.04 (ubuntu-latest is migrating to 26.04).
+        os: [windows-latest, macos-latest, macos-14, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     # TKT-55d2b645 (PB-ADEB-TCS310): every leg here is a HOSTED runner. T-CS3-10 then judges its 100 ms sibling-stall
@@ -20,11 +30,95 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: 'clippy,rustfmt' }
+      # TKT-ebc0237d: every `matrix.os == '...'` guard must name a matrix entry. A guard that matches nothing skips
+      # its step SILENTLY (the CS-2 negcontrol, the supervisor tests). Guarded by runner.os, not by a matrix string,
+      # so this check runs on the Linux leg even if every matrix guard were wrong.
+      - name: Matrix guard sanity (TKT-ebc0237d)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          f=.github/workflows/ci.yml
+          matrix=$(sed -n 's/^ *os: \[\(.*\)\]$/\1/p' "$f" | tr -d ' ')
+          echo "matrix: $matrix"
+          bad=0
+          guards=$(grep -E "^[[:space:]]*if: matrix\.os == '" "$f" | sed "s/^[^=]*matrix\.os == '\([^']*\)'.*/\1/")
+          [ -n "$guards" ] || { echo "::error::no matrix.os guards found (parser broken?)"; exit 1; }
+          for g in $(printf '%s\n' "$guards" | sort -u); do
+            n=$(printf '%s\n' "$guards" | grep -cx -- "$g")
+            case ",$matrix," in
+              *",$g,"*) echo "guard matrix.os == '$g' ($n steps): matches a matrix entry" ;;
+              *) echo "::error::guard matrix.os == '$g' ($n steps) matches NO matrix entry: those steps never run"; bad=1 ;;
+            esac
+          done
+          [ "${{ matrix.os }}" = ubuntu-24.04 ] || { echo "::error::the Linux leg is ${{ matrix.os }}, not ubuntu-24.04"; bad=1; }
+          exit $bad
+      # TKT-ebc0237d: the apt step hung to the 25-min job timeout (MEASURED on this PR: the azure mirror served the
+      # 74.2 MB of .debs at ~20 KB/s while its indexes came at MB/s). A bound alone cannot fix a slow mirror, so the
+      # .debs are CACHED (first-party actions/cache restore/save), keyed on the runner image + the exact package list,
+      # and on a cold cache a slow azure mirror falls back to archive.ubuntu.com once.
+      - name: apt cache key (Linux)
+        id: aptkey
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          APT_PACKAGES: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev gnome-keyring
+        run: |
+          echo "APT_PACKAGES=$APT_PACKAGES" >> "$GITHUB_ENV"
+          h=$(printf '%s' "$APT_PACKAGES" | sha256sum | cut -c1-16)
+          echo "key=apt-debs-${ImageOS}-${ImageVersion}-${h}" >> "$GITHUB_OUTPUT"
+          echo "apt cache key: apt-debs-${ImageOS}-${ImageVersion}-${h}"
+      - name: Restore apt .deb cache (Linux)
+        id: aptcache
+        if: matrix.os == 'ubuntu-24.04' && !(github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
       - name: Install Linux deps
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev gnome-keyring
+        if: matrix.os == 'ubuntu-24.04'
+        # Worst case (cold cache, slow azure, fallback): update 90 + download 180 + fallback update 90 + download 360
+        # + install 180 = 900 s; 16 min covers it. A warm cache needs only the index update and the local install.
+        timeout-minutes: 16
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          CACHE_HIT: ${{ steps.aptcache.outputs.cache-hit }}
+          APT_FORCE_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback && 'true' || 'false' }}
+        run: |
+          set -u
+          C="$HOME/apt-debs"; mkdir -p "$C/partial"
+          apt_(){ sudo -E timeout "$1" apt-get -o Dir::Cache::Archives="$C" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "${@:2}"; }
+          # Point every apt source (the runner's mirror list and any direct URI) at $1.
+          set_mirror(){
+            for f in /etc/apt/apt-mirrors.txt; do [ -f "$f" ] && echo "$1/" | sudo tee "$f" >/dev/null; done
+            sudo sed -i -E "s#http://(azure\.archive\.ubuntu\.com|192\.0\.2\.1)/ubuntu#$1#g" \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          }
+          mirror=azure; t0=$(date +%s)
+          echo "apt: cache-hit=${CACHE_HIT:-false} force-fallback=$APT_FORCE_FALLBACK; $(find "$C" -maxdepth 1 -name '*.deb' | wc -l) .debs restored"
+          if [ "$APT_FORCE_FALLBACK" = true ]; then
+            echo "apt: FORCED FALLBACK (workflow_dispatch input): the primary attempt uses the unroutable http://192.0.2.1/ubuntu (TEST-NET-1)"
+            mirror=192.0.2.1; set_mirror "http://192.0.2.1/ubuntu"
+          fi
+          # Primary attempt: index update + download, each bounded.
+          if ! { apt_ 90 update && apt_ 180 install -y --download-only $APT_PACKAGES; }; then
+            echo "apt: the primary mirror ($mirror) was slow or failed after $(( $(date +%s) - t0 ))s; falling back to archive.ubuntu.com"
+            mirror=archive.ubuntu.com; set_mirror "http://archive.ubuntu.com/ubuntu"
+            echo "apt: sources now: $(cat /etc/apt/apt-mirrors.txt 2>/dev/null) $(grep -h '^URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null | sort -u | tr '\n' ' ')"
+            apt_ 90 update || { echo "apt: fallback index update failed"; exit 1; }
+            apt_ 360 install -y --download-only $APT_PACKAGES || { echo "apt: fallback download failed too"; exit 1; }
+          fi
+          t1=$(date +%s)
+          apt_ 180 install -y --no-download $APT_PACKAGES || exit 1
+          t2=$(date +%s)
+          sudo rm -rf "$C/partial" "$C/lock"; sudo chown -R "$(id -u):$(id -g)" "$C"
+          echo "apt: mirror=$mirror cache-hit=${CACHE_HIT:-false} download_phase=$((t1-t0))s install_phase=$((t2-t1))s total=$((t2-t0))s debs_now=$(find "$C" -maxdepth 1 -name '*.deb' | wc -l)"
+      - name: Save apt .deb cache (Linux)
+        if: matrix.os == 'ubuntu-24.04' && steps.aptcache.outputs.cache-hit != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback)
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
       - name: Start gnome-keyring (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           eval $(dbus-launch --sh-syntax)
           mkdir -p ~/.cache ~/.local/share/keyrings
@@ -37,15 +131,15 @@ jobs:
       # CS-2 (TKT-23091e72) gate self-test: every planted mutation in
       # tests/fixtures/state_io_neg must make its gate fail.
       - name: state_io gate negative controls (CS-2 §3.5)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: bash scripts/state_io_gate_negcontrol.sh
       # O5-2a: the host supervisor's inactive-unit alert + the unchanged not_receiving path (PATH shims, ~8 s).
       - name: nexus-vault-sync-supervisor tests (O5-2a)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: bash scripts/supervisor/test-supervisor.sh
       # #29 gate C2 + follow-up P1-P5: the Trinity install script (exact-path matching, reversible parking, never kills, receipt; shims).
       - name: install-trinity-agent tests (#29 C2)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: bash scripts/launchd/test-install-trinity-agent.sh
       - run: cargo test --all-targets
         working-directory: src-tauri
