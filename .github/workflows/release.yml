@@ -15,7 +15,7 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: windows-x86_64 }
           - { os: macos-latest,   target: x86_64-apple-darwin,    platform: darwin-x86_64 }
           - { os: macos-14,       target: aarch64-apple-darwin,   platform: darwin-aarch64 }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, platform: linux-x86_64 }
+          - { os: ubuntu-24.04,   target: x86_64-unknown-linux-gnu, platform: linux-x86_64 }  # TKT-ebc0237d: pinned (fixes the AppImage glibc baseline)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -26,11 +26,74 @@ jobs:
         with: { node-version: '20' }
       - uses: actions/setup-python@v5  # guarantees `python3` for the upload/verify scripts under bash on windows (S486)
         with: { python-version: '3.12' }
-      - name: Install Linux deps
-        if: matrix.os == 'ubuntu-latest'
+      # TKT-ebc0237d: the same apt hardening as ci.yml (PR #36): the azure mirror served the 74.2 MB of .debs at
+      # ~20 KB/s on 2026-10-26 (MEASURED), so the .debs are CACHED (first-party actions/cache restore/save) with
+      # ci.yml's EXACT key scheme, cache dir and package set (APT_PACKAGES, so a release run can reuse CI's warm cache
+      # from main), and on a cold cache a slow azure mirror falls back to archive.ubuntu.com once. The release still
+      # INSTALLS only its own list (APT_INSTALL, unchanged: no gnome-keyring).
+      - name: apt cache key (Linux)
+        id: aptkey
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          APT_PACKAGES: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev gnome-keyring
+          APT_INSTALL: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev
+          echo "APT_PACKAGES=$APT_PACKAGES" >> "$GITHUB_ENV"
+          echo "APT_INSTALL=$APT_INSTALL" >> "$GITHUB_ENV"
+          h=$(printf '%s' "$APT_PACKAGES" | sha256sum | cut -c1-16)
+          echo "key=apt-debs-${ImageOS}-${ImageVersion}-${h}" >> "$GITHUB_OUTPUT"
+          echo "apt cache key: apt-debs-${ImageOS}-${ImageVersion}-${h}"
+      - name: Restore apt .deb cache (Linux)
+        id: aptcache
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-24.04'
+        # Worst case (cold cache, slow azure, fallback): update 90 + download 180 + fallback update 90 + download 360
+        # + install 180 = 900 s; 16 min covers it. A warm cache needs only the index update and the local install.
+        timeout-minutes: 16
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          CACHE_HIT: ${{ steps.aptcache.outputs.cache-hit }}
+          APT_FORCE_FALLBACK: 'false'   # release.yml has no workflow_dispatch: the forced-fallback switch exists only in ci.yml
+        run: |
+          set -u
+          C="$HOME/apt-debs"; mkdir -p "$C/partial"
+          apt_(){ sudo -E timeout "$1" apt-get -o Dir::Cache::Archives="$C" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "${@:2}"; }
+          # Point every apt source (the runner's mirror list and any direct URI) at $1.
+          set_mirror(){
+            for f in /etc/apt/apt-mirrors.txt; do [ -f "$f" ] && echo "$1/" | sudo tee "$f" >/dev/null; done
+            sudo sed -i -E "s#http://(azure\.archive\.ubuntu\.com|192\.0\.2\.1)/ubuntu#$1#g" \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          }
+          mirror=azure; t0=$(date +%s)
+          echo "apt: cache-hit=${CACHE_HIT:-false} force-fallback=$APT_FORCE_FALLBACK; $(find "$C" -maxdepth 1 -name '*.deb' | wc -l) .debs restored"
+          if [ "$APT_FORCE_FALLBACK" = true ]; then
+            echo "apt: FORCED FALLBACK (workflow_dispatch input): the primary attempt uses the unroutable http://192.0.2.1/ubuntu (TEST-NET-1)"
+            mirror=192.0.2.1; set_mirror "http://192.0.2.1/ubuntu"
+          fi
+          # Primary attempt: index update + download, each bounded.
+          if ! { apt_ 90 update && apt_ 180 install -y --download-only $APT_PACKAGES; }; then
+            echo "apt: the primary mirror ($mirror) was slow or failed after $(( $(date +%s) - t0 ))s; falling back to archive.ubuntu.com"
+            mirror=archive.ubuntu.com; set_mirror "http://archive.ubuntu.com/ubuntu"
+            echo "apt: sources now: $(cat /etc/apt/apt-mirrors.txt 2>/dev/null) $(grep -h '^URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null | sort -u | tr '\n' ' ')"
+            apt_ 90 update || { echo "apt: fallback index update failed"; exit 1; }
+            apt_ 360 install -y --download-only $APT_PACKAGES || { echo "apt: fallback download failed too"; exit 1; }
+          fi
+          t1=$(date +%s)
+          apt_ 180 install -y --no-download $APT_INSTALL || exit 1
+          t2=$(date +%s)
+          sudo rm -rf "$C/partial" "$C/lock"; sudo chown -R "$(id -u):$(id -g)" "$C"
+          echo "apt: mirror=$mirror cache-hit=${CACHE_HIT:-false} download_phase=$((t1-t0))s install_phase=$((t2-t1))s total=$((t2-t0))s debs_now=$(find "$C" -maxdepth 1 -name '*.deb' | wc -l)"
+      - name: Save apt .deb cache (Linux)
+        if: matrix.os == 'ubuntu-24.04' && steps.aptcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
       - run: npm ci
       - name: Build Tauri app
         env:
