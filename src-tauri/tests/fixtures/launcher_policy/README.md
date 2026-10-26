@@ -11,8 +11,12 @@ each fixture under a temp root and substitutes that root.
 `systemctl --user show`, not from unit files. Each systemd fixture therefore
 carries `systemctl-show.txt`: the `systemctl --user show -p LoadState
 -p UnitFileState -p Restart -p RestartPreventExitStatus -p SuccessExitStatus
--p ExecStart -p FragmentPath` output that unit set produces (x1: the `/dev/null`
+-p ExecStart -p FragmentPath -p ActiveState -p MainPID -p Environment` output that unit set produces (gate L1: the stubs that pass the load checks carry `ActiveState=active` and a `MainPID`) (x1: the `/dev/null`
 symlink in the first dir masks the unit). Fixture mode passes it with
 `--systemd-show`, so CI needs no live units. The unit files are kept as the
 record of what each stub represents. In the stubs, `/opt/x/daemon` is the
 daemon's path, and the tests pass `--daemon /opt/x/daemon`.
+
+launchd runs in the tests pass `--launchctl-print` (and optionally
+`--launchctl-disabled`) stubs for the live agent state (gate L1). An empty
+print stub means the agent is not loaded.
