@@ -2,15 +2,24 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   PROPOSED Trinity LaunchAgent for the vault-sync daemon (TKT-a6e5c227).
-  A documented artifact only: nothing installs it. Release-time install and
-  canary are per the PR body. The path assumes the bundle installed by
-  install.sh (/Applications/Nexus Vault Sync.app, executable vault-sync-daemon).
+  Installed ONLY by install-trinity-agent.sh (beside this file) at release,
+  under its own GO; nothing installs it automatically. The path assumes the
+  bundle installed by install.sh (/Applications/Nexus Vault Sync.app,
+  executable vault-sync-daemon).
 
   - ProgramArguments: the daemon binary directly (never `open`, never a
     wrapper; verify-launcher-policy.sh code 13), plus the silent flag.
   - KeepAlive SuccessfulExit=false: relaunch on any non-zero exit
     (70 a Required task ended or a supervised restart, 74 custody lost);
-    exit 0 (tray quit, lock held by another live instance) is not relaunched.
+    exit 0 (tray quit) is not relaunched.
+  - Exclusivity. The VAULT (non-managed) instance is guarded by the
+    tauri single-instance SOCKET, not by a file lock: whichever copy starts
+    first wins, and a later copy exits 0. A Finder, Login Items or
+    open-at-login copy started first would therefore make this agent's copy
+    exit 0 and leave the daemon unsupervised. install-trinity-agent.sh
+    removes those other launch routes, then requires a receipt: ONE daemon
+    pid, parent launchd, VAULT_SYNC_SUPERVISED=1. (The flock(2) config-dir
+    lock guards MANAGED instances only.)
   - VAULT_SYNC_SUPERVISED=1: a daemon restart (tray update click, updater,
     stall watchdog) exits 70 for launchd to relaunch instead of self-spawning.
 -->
