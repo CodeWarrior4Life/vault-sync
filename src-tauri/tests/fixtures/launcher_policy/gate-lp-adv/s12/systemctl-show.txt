@@ -1,0 +1,7 @@
+LoadState=loaded
+UnitFileState=enabled
+Restart=always
+RestartPreventExitStatus=70 78
+SuccessExitStatus=
+ExecStart={ path=/opt/x/daemon ; argv[]=/opt/x/daemon --silent ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+FragmentPath=/u1/vs-fx.service

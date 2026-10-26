@@ -1,0 +1,1 @@
+<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>vs-fx</string><key>Disabled</key><true/><key>ProgramArguments</key><array><string>/opt/x/daemon</string></array><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>
