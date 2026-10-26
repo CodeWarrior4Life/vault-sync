@@ -131,7 +131,7 @@ impl SseConsumer {
     /// no create_dir_all). Failure is logged and swallowed — losing one
     /// event's persistence is not worth crashing the SSE loop. The next
     /// event will re-persist over the same file.
-    fn persist_last_event_id(&self, id: &str) {
+    pub(crate) fn persist_last_event_id(&self, id: &str) {
         let Some(sd) = &self.state_dir else {
             return;
         };

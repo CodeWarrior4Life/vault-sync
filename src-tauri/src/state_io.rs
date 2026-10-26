@@ -1102,7 +1102,6 @@ impl StateDir {
 
     /// Test access to this dir's latch.
     #[cfg(test)]
-    #[allow(dead_code)] // used by the owner tests (CS-2 commits c, d)
     pub(crate) fn test_latch(&self) -> &Latch {
         &self.latch
     }
@@ -1753,3 +1752,7 @@ pub(crate) fn refuse_state_target_in(
 #[cfg(test)]
 #[path = "state_io_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "state_io_owner_tests.rs"]
+mod owner_tests;

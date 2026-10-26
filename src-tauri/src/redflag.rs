@@ -236,9 +236,24 @@ impl DeleteBurstDetector {
         let Some(sd) = self.pause_marker.clone() else {
             return false;
         };
-        // Through the held dir fd (fstatat, NOFOLLOW). Any Err keeps the
-        // valve latched.
-        if sd.exists(StateFile::PauseMarker).unwrap_or(true) {
+        // CS-2 §3.3a (gate C3): the dirfd alone does not make this reader
+        // safe. An `rm -rf` of the state dir unlinks the marker INSIDE the
+        // held inode, so `exists` truthfully returns Ok(false); read alone
+        // that would unlatch and replay every suppressed delete. Unlatch
+        // ONLY when all three hold, evaluated in THIS order (custody before
+        // the marker read would open a window in which the dir is replaced
+        // between the two reads):
+        //   1. the marker is absent (fstatat on the held dir, NOFOLLOW);
+        //   2. THEN custody holds (a failure takes the exit-74 path);
+        //   3. THEN the held directory has not been unlinked (st_nlink > 0).
+        // Any Err, and any false at step 2 or 3, keeps the valve latched.
+        if !matches!(sd.exists(StateFile::PauseMarker), Ok(false)) {
+            return false;
+        }
+        if sd.custody_or_lost().is_err() {
+            return false;
+        }
+        if !matches!(sd.held_dir_linked(), Ok(true)) {
             return false;
         }
         self.events.clear();
