@@ -3,6 +3,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # TKT-ebc0237d: a MANUAL run can force the apt mirror fallback, to prove that path. workflow_dispatch needs write
+  # access to the repo, and the switch is read only when the event IS workflow_dispatch, so a pull_request (from a
+  # fork or not) can never set it. OFF by default.
+  workflow_dispatch:
+    inputs:
+      apt_force_fallback:
+        description: "Force the apt fallback: primary mirror blackholed (192.0.2.1), apt cache bypassed"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -27,7 +36,7 @@ jobs:
           matrix=$(sed -n 's/^ *os: \[\(.*\)\]$/\1/p' "$f" | tr -d ' ')
           echo "matrix: $matrix"
           bad=0
-          guards=$(grep -E "^[[:space:]]*if: matrix\.os == '" "$f" | sed "s/.*== '\([^']*\)'.*/\1/")
+          guards=$(grep -E "^[[:space:]]*if: matrix\.os == '" "$f" | sed "s/^[^=]*matrix\.os == '\([^']*\)'.*/\1/")
           [ -n "$guards" ] || { echo "::error::no matrix.os guards found (parser broken?)"; exit 1; }
           for g in $(printf '%s\n' "$guards" | sort -u); do
             n=$(printf '%s\n' "$guards" | grep -cx -- "$g")
@@ -54,7 +63,7 @@ jobs:
           echo "apt cache key: apt-debs-${ImageOS}-${ImageVersion}-${h}"
       - name: Restore apt .deb cache (Linux)
         id: aptcache
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'ubuntu-24.04' && !(github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback)
         uses: actions/cache/restore@v4
         with:
           path: ~/apt-debs
@@ -67,20 +76,29 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
           CACHE_HIT: ${{ steps.aptcache.outputs.cache-hit }}
+          APT_FORCE_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback && 'true' || 'false' }}
         run: |
           set -u
           C="$HOME/apt-debs"; mkdir -p "$C/partial"
           apt_(){ sudo -E timeout "$1" apt-get -o Dir::Cache::Archives="$C" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "${@:2}"; }
-          mirror=azure; t0=$(date +%s)
-          echo "apt: cache-hit=${CACHE_HIT:-false}; $(find "$C" -maxdepth 1 -name '*.deb' | wc -l) .debs restored"
-          apt_ 90 update || { echo "apt: index update failed"; exit 1; }
-          if ! apt_ 180 install -y --download-only $APT_PACKAGES; then
-            echo "apt: the azure mirror was slow or failed after $(( $(date +%s) - t0 ))s; falling back to archive.ubuntu.com"
-            mirror=archive.ubuntu.com
-            for f in /etc/apt/apt-mirrors.txt; do [ -f "$f" ] && echo "http://archive.ubuntu.com/ubuntu/" | sudo tee "$f" >/dev/null; done
-            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' \
+          # Point every apt source (the runner's mirror list and any direct URI) at $1.
+          set_mirror(){
+            for f in /etc/apt/apt-mirrors.txt; do [ -f "$f" ] && echo "$1/" | sudo tee "$f" >/dev/null; done
+            sudo sed -i -E "s#http://(azure\.archive\.ubuntu\.com|192\.0\.2\.1)/ubuntu#$1#g" \
               /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
-            apt_ 90 update || exit 1
+          }
+          mirror=azure; t0=$(date +%s)
+          echo "apt: cache-hit=${CACHE_HIT:-false} force-fallback=$APT_FORCE_FALLBACK; $(find "$C" -maxdepth 1 -name '*.deb' | wc -l) .debs restored"
+          if [ "$APT_FORCE_FALLBACK" = true ]; then
+            echo "apt: FORCED FALLBACK (workflow_dispatch input): the primary attempt uses the unroutable http://192.0.2.1/ubuntu (TEST-NET-1)"
+            mirror=192.0.2.1; set_mirror "http://192.0.2.1/ubuntu"
+          fi
+          # Primary attempt: index update + download, each bounded.
+          if ! { apt_ 90 update && apt_ 180 install -y --download-only $APT_PACKAGES; }; then
+            echo "apt: the primary mirror ($mirror) was slow or failed after $(( $(date +%s) - t0 ))s; falling back to archive.ubuntu.com"
+            mirror=archive.ubuntu.com; set_mirror "http://archive.ubuntu.com/ubuntu"
+            echo "apt: sources now: $(cat /etc/apt/apt-mirrors.txt 2>/dev/null) $(grep -h '^URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null | sort -u | tr '\n' ' ')"
+            apt_ 90 update || { echo "apt: fallback index update failed"; exit 1; }
             apt_ 360 install -y --download-only $APT_PACKAGES || { echo "apt: fallback download failed too"; exit 1; }
           fi
           t1=$(date +%s)
@@ -89,7 +107,7 @@ jobs:
           sudo rm -rf "$C/partial" "$C/lock"; sudo chown -R "$(id -u):$(id -g)" "$C"
           echo "apt: mirror=$mirror cache-hit=${CACHE_HIT:-false} download_phase=$((t1-t0))s install_phase=$((t2-t1))s total=$((t2-t0))s debs_now=$(find "$C" -maxdepth 1 -name '*.deb' | wc -l)"
       - name: Save apt .deb cache (Linux)
-        if: matrix.os == 'ubuntu-24.04' && steps.aptcache.outputs.cache-hit != 'true'
+        if: matrix.os == 'ubuntu-24.04' && steps.aptcache.outputs.cache-hit != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.apt_force_fallback)
         uses: actions/cache/save@v4
         with:
           path: ~/apt-debs
