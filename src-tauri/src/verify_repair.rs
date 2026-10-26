@@ -1179,8 +1179,7 @@ mod tests {
 
     async fn make_journal() -> (TempDir, Arc<Mutex<PushJournal>>) {
         let dir = TempDir::new().unwrap();
-        let p = dir.path().join("push_journal.jsonl");
-        let j = PushJournal::open(&p).unwrap();
+        let j = PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap();
         (dir, Arc::new(Mutex::new(j)))
     }
 

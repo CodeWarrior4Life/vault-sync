@@ -134,6 +134,9 @@ pub enum SkipReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureReason {
+    /// CS-2 §3.3: the push gate found a state dir out of custody. Nothing
+    /// was sent; the event stays journaled (the process is exiting 74).
+    StateOwnershipLost,
     NetworkExhausted {
         last_error: String,
     },
@@ -737,6 +740,12 @@ impl PushClient {
 
         let mut last_err: Option<String> = None;
         for attempt in 0..self.config.max_retry_attempts {
+            // CS-2 §3.3 push gate: custody of every registered state dir,
+            // immediately before the ONE call that sends a push or delete.
+            // A lost custody sends nothing (the process exits 74).
+            if crate::state_io::custody_all().is_err() {
+                return PushOutcome::Failed(FailureReason::StateOwnershipLost);
+            }
             match self.api.push(&req).await {
                 Ok(resp) => {
                     // D2 trigger (v0.4.28, B2'): the server ACCEPTED but its
@@ -1653,8 +1662,7 @@ mod tests {
 
     fn make_journal_with(events: Vec<PushEvent>) -> (TempDir, Arc<Mutex<PushJournal>>) {
         let dir = TempDir::new().unwrap();
-        let p: PathBuf = dir.path().join("push_journal.jsonl");
-        let mut j = PushJournal::open(&p).unwrap();
+        let mut j = PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap();
         for e in events {
             j.append(e).unwrap();
         }
@@ -1670,6 +1678,106 @@ mod tests {
             config_for_test(),
             PathBuf::from("/nonexistent-vault-root"),
         )
+    }
+
+    const TCS2_3_CHILD: &str = "CS2_T3_CHILD";
+
+    /// T-CS2-3 helper, NOT a test on its own: the "daemon" subprocess. It
+    /// bootstraps the real state_io registry, journals 3 edits, and drains
+    /// them through the real push path; with `CS2_T3_RENAME=1` a hook renames
+    /// the state dir just before the push gate. Without the env var it
+    /// returns immediately.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "T-CS2-3 subprocess helper; spawned by t_cs2_3_exit_74_with_zero_pushes"]
+    async fn t_cs2_3_child_daemon() {
+        let Ok(url) = std::env::var(TCS2_3_CHILD) else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+        let ws = PathBuf::from(std::env::var("CS2_T3_WS").unwrap());
+        let cfg = ws.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let reg = crate::state_io::bootstrap(&ws, &["sub-t3".to_string()], &cfg).unwrap();
+        let reg = crate::state_io::install(reg, &ws);
+        let sd = reg.get("sub-t3").unwrap();
+        let mut j = PushJournal::open(&sd).unwrap();
+        for i in 0..3 {
+            j.append(evt(&format!("notes/{i}.md"), b"body\n")).unwrap();
+        }
+        let journal = Arc::new(Mutex::new(j));
+        if std::env::var("CS2_T3_RENAME").as_deref() == Ok("1") {
+            let leaf = PathBuf::from(sd.display(None).to_string());
+            crate::state_io::test_hooks::set_before_push_gate(Some(Box::new(move || {
+                let _ = std::fs::rename(&leaf, leaf.with_file_name("sync-state.moved"));
+            })));
+        }
+        let client = make_client(&url, journal).await;
+        let outcomes = client.drain_once().await;
+        println!("CHILD_NO_EXIT outcomes={}", outcomes.len());
+    }
+
+    /// T-CS2-3 (T-S2): a daemon subprocess with 3 journaled edits; the state
+    /// dir is renamed just before the push gate: the process exits 74, the
+    /// mock receives 0 pushes, and exactly one ERROR line and one
+    /// `ownership_lost` SyncHealth event are emitted. Positive control: the
+    /// same subprocess without the rename pushes and exits 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t_cs2_3_exit_74_with_zero_pushes() {
+        async fn run(rename: bool, expect_pushes: usize) -> std::process::Output {
+            let mut srv = Server::new_async().await;
+            let m = srv
+                .mock("POST", "/api/sync/push")
+                .with_status(200)
+                .with_body(accepted_body(&sha256_hex(b"body\n")))
+                .expect(expect_pushes)
+                .create_async()
+                .await;
+            let ws = TempDir::new().unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "push_client::tests::t_cs2_3_child_daemon",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(TCS2_3_CHILD, srv.url())
+                .env("CS2_T3_WS", ws.path())
+                .env("CS2_T3_RENAME", if rename { "1" } else { "0" })
+                .env("STATE_IO_REAL_EXIT", "1")
+                .output()
+                .unwrap();
+            m.assert_async().await;
+            out
+        }
+        // Positive control: no rename, the three edits are pushed.
+        let ctl = run(false, 3).await;
+        assert_eq!(ctl.status.code(), Some(0), "control child failed: {ctl:?}");
+        assert!(String::from_utf8_lossy(&ctl.stdout).contains("CHILD_NO_EXIT outcomes=3"));
+
+        let out = run(true, 0).await;
+        assert_eq!(out.status.code(), Some(74), "exit 74 expected: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        let errors: Vec<&str> = err.lines().filter(|l| l.contains(" ERROR ")).collect();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|l| l.contains("OWNERSHIP LOST"))
+                .count(),
+            1,
+            "{err}"
+        );
+        assert_eq!(
+            err.matches("sync_health_event=\"ownership_lost\"").count()
+                + err.matches("sync_health_event=ownership_lost").count(),
+            1,
+            "{err}"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD_NO_EXIT"));
     }
 
     async fn make_client_with_root(
@@ -2451,7 +2559,10 @@ mod tests {
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
             journal: Arc::new(Mutex::new(
-                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+                PushJournal::open(&crate::state_io::StateDir::for_test(
+                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
+                ))
+                .unwrap(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2481,7 +2592,10 @@ mod tests {
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
             journal: Arc::new(Mutex::new(
-                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+                PushJournal::open(&crate::state_io::StateDir::for_test(
+                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
+                ))
+                .unwrap(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2507,7 +2621,10 @@ mod tests {
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
             journal: Arc::new(Mutex::new(
-                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+                PushJournal::open(&crate::state_io::StateDir::for_test(
+                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
+                ))
+                .unwrap(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -2532,7 +2649,10 @@ mod tests {
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
             journal: Arc::new(Mutex::new(
-                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+                PushJournal::open(&crate::state_io::StateDir::for_test(
+                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
+                ))
+                .unwrap(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -3320,7 +3440,10 @@ mod tests {
         let client = PushClient {
             api: Arc::new(ApiClient::new("http://127.0.0.1:1", "x").unwrap()),
             journal: Arc::new(Mutex::new(
-                PushJournal::open(&TempDir::new().unwrap().path().join("j.jsonl")).unwrap(),
+                PushJournal::open(&crate::state_io::StateDir::for_test(
+                    Box::leak(Box::new(TempDir::new().unwrap())).path(),
+                ))
+                .unwrap(),
             )),
             device_id: "d".into(),
             config: cfg,
@@ -4221,7 +4344,10 @@ mod tests {
         let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
         let rr = crate::read_receipt::ReadReceiptStore::load(sdir.path().join("read_receipt.json"));
         let mat_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            PushJournal::open(journal_path).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(
+                journal_path.parent().unwrap(),
+            ))
+            .unwrap(),
         ));
         let mat = Materializer::new(
             vault.path().to_path_buf(),

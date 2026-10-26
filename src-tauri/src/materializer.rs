@@ -3521,7 +3521,7 @@ mod tests {
         let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())
@@ -4596,7 +4596,7 @@ mod tests {
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())
@@ -5138,7 +5138,7 @@ mod tests {
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
-            PushJournal::open(&jdir.path().join("push_journal.jsonl")).unwrap(),
+            PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
         ));
         let m = m
             .with_shadow_store(shadow.clone())

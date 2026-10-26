@@ -1409,8 +1409,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_journal(dir: &TempDir) -> Arc<Mutex<PushJournal>> {
-        let p = dir.path().join("sync-state").join("push_journal.jsonl");
-        Arc::new(Mutex::new(PushJournal::open(&p).unwrap()))
+        Arc::new(Mutex::new(
+            PushJournal::open(&crate::state_io::StateDir::for_test(dir.path())).unwrap(),
+        ))
     }
 
     fn make_burst() -> Arc<Mutex<DeleteBurstDetector>> {

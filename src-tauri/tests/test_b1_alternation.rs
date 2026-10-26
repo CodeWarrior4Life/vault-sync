@@ -209,8 +209,16 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
         .await;
 
     let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
-    let journal_path = jdir.path().join("push_journal.jsonl");
-    let journal = Arc::new(Mutex::new(PushJournal::open(&journal_path).unwrap()));
+    // CS-2: the journal lives in a bootstrapped StateDir (the public API).
+    let cfg_dir = tempfile::TempDir::new().unwrap();
+    let reg = vault_sync_daemon::state_io::bootstrap(
+        jdir.path(),
+        &["sub-b1-vr".to_string()],
+        cfg_dir.path(),
+    )
+    .unwrap();
+    let sd = reg.get("sub-b1-vr").unwrap();
+    let journal = Arc::new(Mutex::new(PushJournal::open(&sd).unwrap()));
     let mat = Materializer::new(
         vault.path().to_path_buf(),
         Some("shadow/".into()),

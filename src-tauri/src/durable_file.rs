@@ -934,6 +934,10 @@ pub(crate) mod seams {
     pub(crate) fn crash_at(p: Point) {
         STATE.with(|s| s.borrow_mut().crash_at = Some(p));
     }
+    /// Disarm a `crash_at` (CS-2: the journal arms it per rewrite).
+    pub(crate) fn clear_crash_at() {
+        STATE.with(|s| s.borrow_mut().crash_at = None);
+    }
     pub(crate) fn set_hook(h: Hook) {
         STATE.with(|s| s.borrow_mut().hook = Some(h));
     }
