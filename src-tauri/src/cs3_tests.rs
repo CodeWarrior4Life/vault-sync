@@ -468,9 +468,13 @@ async fn t_cs3_6_race_through_one_owner() {
     let reappeared = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
     // 10k appends through the one owner on the Linux leg (the spec's count);
-    // fewer where every append is an F_FULLFSYNC / FlushFileBuffers.
+    // fewer where every append is an F_FULLFSYNC / FlushFileBuffers (on the
+    // Windows runner 1000 starved concurrent subprocess tests past their
+    // 5 s timeout).
     const N: usize = if cfg!(target_os = "linux") {
         5000
+    } else if cfg!(windows) {
+        250
     } else {
         1000
     };
