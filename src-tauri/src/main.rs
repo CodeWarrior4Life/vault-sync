@@ -320,6 +320,13 @@ async fn cli_pair(
     .map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&success).map_err(|e| e.to_string())?;
     println!("{json}");
+    // CS-1: one-line warning on uncertain durability; still exit 0.
+    if success.durability == vault_sync_daemon::pairing::Durability::Uncertain {
+        eprintln!(
+            "warning: {}",
+            vault_sync_daemon::pairing::UNCERTAIN_DURABILITY_WARNING
+        );
+    }
     Ok(())
 }
 

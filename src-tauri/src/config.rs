@@ -1,3 +1,4 @@
+use crate::durable_file::{replace_atomic, Commit, NotCommitted, PathAnchor};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,40 @@ pub enum ConfigError {
          (or restore `vault_name = \"{child}\"`), then restart the daemon."
     )]
     MisRooted { root: String, child: String },
+    /// CS-1: an atomic config replace failed before its commit point; the
+    /// previous config file is byte-identical.
+    #[error("config not written (previous config untouched): {0}")]
+    NotCommitted(std::io::Error),
+}
+
+impl From<NotCommitted> for ConfigError {
+    fn from(e: NotCommitted) -> Self {
+        ConfigError::NotCommitted(e.0)
+    }
+}
+
+/// CS-1: write `bytes` to the config path through the atomic replace. The
+/// config is written RAW (never framed): `Config::load_from` parses TOML.
+fn write_config_bytes(path: &Path, bytes: &[u8]) -> Result<Commit, ConfigError> {
+    let (anchor, name) = PathAnchor::split(path).map_err(ConfigError::NotCommitted)?;
+    Ok(replace_atomic(&anchor, &name, bytes)?)
+}
+
+/// CS-1 §4: the daemon's startup config load. Before the first load it runs
+/// the best-effort startup maintenance (dead-pid temp sweep + directory fsync)
+/// on the config dir and the token dir. This narrows the window after an
+/// `Uncertain` write; it does not prove durability.
+pub fn load_at_startup(path: &Path) -> Result<Config, ConfigError> {
+    let token_dir = crate::token_store::token_dir();
+    load_at_startup_with(path, &token_dir)
+}
+
+/// [`load_at_startup`] with the token dir injected (tests root it in a temp
+/// dir so they never sweep the real config dir).
+fn load_at_startup_with(path: &Path, token_dir: &Path) -> Result<Config, ConfigError> {
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::durable_file::startup_maintenance(&[config_dir, token_dir]);
+    Config::load_from(path)
 }
 
 /// B1 (Nexus Sync): an independent sync root — one directory tree whose
@@ -186,6 +221,8 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
+        #[cfg(test)]
+        crate::durable_file::seams::record_event(format!("config_load:{}", path.display()));
         if !path.exists() {
             return Err(ConfigError::NotFound);
         }
@@ -199,13 +236,12 @@ impl Config {
     /// model — `vault_name`, unknown/future fields. Never use it to rewrite
     /// a user's existing on-disk config; enrollment goes through
     /// `apply_enrollment`, which merges into the existing file.
-    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    ///
+    /// CS-1: written through `replace_atomic` (atomic, 0600, dir-fsynced);
+    /// the returned [`Commit`] says whether durability was established.
+    pub fn save_to(&self, path: &Path) -> Result<Commit, ConfigError> {
         let s = toml::to_string_pretty(self)?;
-        fs::write(path, s)?;
-        Ok(())
+        write_config_bytes(path, s.as_bytes())
     }
 }
 
@@ -264,7 +300,18 @@ pub struct EnrollmentFields {
 /// echo loop). This path goes through an untyped `toml::Table` instead, so
 /// the save is structurally incapable of touching keys enrollment does not
 /// own.
-pub fn apply_enrollment(path: &Path, fields: &EnrollmentFields) -> Result<(), ConfigError> {
+///
+/// CS-1: written through `replace_atomic`; see [`Commit`].
+pub fn apply_enrollment(path: &Path, fields: &EnrollmentFields) -> Result<Commit, ConfigError> {
+    apply_enrollment_bytes(path, fields).map(|(commit, _)| commit)
+}
+
+/// [`apply_enrollment`] that also returns the exact bytes it committed, so
+/// `pair_inner` can read them back after an `Uncertain` outcome (CS-1 §4).
+pub(crate) fn apply_enrollment_bytes(
+    path: &Path,
+    fields: &EnrollmentFields,
+) -> Result<(Commit, Vec<u8>), ConfigError> {
     let mut table: toml::Table = match fs::read_to_string(path) {
         Ok(s) => toml::from_str(&s)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
@@ -301,12 +348,9 @@ pub fn apply_enrollment(path: &Path, fields: &EnrollmentFields) -> Result<(), Co
         fields.daemon_platform.clone().into(),
     );
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let s = toml::to_string_pretty(&table)?;
-    fs::write(path, s)?;
-    Ok(())
+    let commit = write_config_bytes(path, s.as_bytes())?;
+    Ok((commit, s.into_bytes()))
 }
 
 /// Returns the config path. This is the ONLY config-path resolution in the
@@ -554,7 +598,7 @@ future_unknown_key = "must-survive"
         )
         .unwrap();
 
-        apply_enrollment(
+        let _commit = apply_enrollment(
             &path,
             &EnrollmentFields {
                 nexus_url: "https://new.example.com".into(),
@@ -606,7 +650,7 @@ future_unknown_key = "must-survive"
     fn apply_enrollment_creates_fresh_config() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("nested").join("config.toml");
-        apply_enrollment(
+        let _commit = apply_enrollment(
             &path,
             &EnrollmentFields {
                 nexus_url: "https://nexus.example.com".into(),
@@ -647,7 +691,7 @@ last_event_id = "evt-99"
         };
 
         fs::write(&path, base).unwrap();
-        apply_enrollment(&path, &fields("sub-same")).unwrap();
+        let _commit = apply_enrollment(&path, &fields("sub-same")).unwrap();
         let table: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             table.get("last_event_id").and_then(|v| v.as_str()),
@@ -656,7 +700,7 @@ last_event_id = "evt-99"
         );
 
         fs::write(&path, base).unwrap();
-        apply_enrollment(&path, &fields("sub-DIFFERENT")).unwrap();
+        let _commit = apply_enrollment(&path, &fields("sub-DIFFERENT")).unwrap();
         let table: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
             table.get("last_event_id").is_none(),
@@ -682,7 +726,7 @@ daemon_platform = "linux-x86_64"
 "#,
         )
         .unwrap();
-        apply_enrollment(
+        let _commit = apply_enrollment(
             &path,
             &EnrollmentFields {
                 nexus_url: "https://nexus.example.com".into(),
@@ -965,6 +1009,84 @@ mod managed_mode_tests {
             "alternate config-path derivations found — every consumer must route \
              through config::default_config_path():\n{}",
             offenders.join("\n")
+        );
+    }
+
+    fn enroll_fields(sub: &str) -> EnrollmentFields {
+        EnrollmentFields {
+            nexus_url: "https://nexus.example.com".into(),
+            subscriber_id: sub.into(),
+            vaults_root: PathBuf::from("/Users/test/Vaults"),
+            daemon_version: "0.4.41".into(),
+            daemon_platform: "linux-x86_64".into(),
+        }
+    }
+
+    /// T-CS1-4 (config half): a config written through `replace_atomic` (both
+    /// `apply_enrollment` and `save_to`) is RAW TOML that `Config::load_from`
+    /// parses on a cold load. Mutation: frame the config.
+    #[test]
+    fn t_cs1_4_config_written_atomically_cold_loads() {
+        crate::durable_file::seams::reset();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let (_commit, written) = apply_enrollment_bytes(&path, &enroll_fields("sub-cs1")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), written, "exact bytes, unframed");
+        let cfg = Config::load_from(&path).expect("cold load of an enrollment write");
+        assert_eq!(cfg.subscriber_id, "sub-cs1");
+
+        let path2 = dir.path().join("saved.toml");
+        let _commit = cfg.save_to(&path2).unwrap();
+        let back = Config::load_from(&path2).expect("cold load of a save_to write");
+        assert_eq!(back, cfg);
+        assert_eq!(
+            crate::durable_file::seams::calls(),
+            vec!["config.toml".to_string(), "saved.toml".to_string()],
+            "both writers go through replace_atomic"
+        );
+    }
+
+    /// CS-1: a failed config replace is `ConfigError::NotCommitted` and the
+    /// previous config is byte-identical.
+    #[test]
+    fn apply_enrollment_rename_failure_is_not_committed() {
+        crate::durable_file::seams::reset();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "nexus_url = \"https://old\"\n").unwrap();
+        let before = fs::read(&path).unwrap();
+        crate::durable_file::seams::fail_rename(5);
+        let r = apply_enrollment(&path, &enroll_fields("sub-x"));
+        assert!(matches!(r, Err(ConfigError::NotCommitted(_))), "got {r:?}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// T-CS1-9: the startup config-dir and token-dir fsync runs BEFORE the
+    /// first config load (the seam records the order).
+    /// Mutation: drop the startup fsync.
+    #[test]
+    fn t_cs1_9_startup_dir_fsync_precedes_first_config_load() {
+        crate::durable_file::seams::reset();
+        let cfg_dir = tempfile::TempDir::new().unwrap();
+        let tok_dir = tempfile::TempDir::new().unwrap();
+        let path = cfg_dir.path().join("config.toml");
+        let _commit = apply_enrollment(&path, &enroll_fields("sub-start")).unwrap();
+        crate::durable_file::seams::reset();
+
+        let cfg = load_at_startup_with(&path, tok_dir.path()).unwrap();
+        assert_eq!(cfg.subscriber_id, "sub-start");
+        let ev = crate::durable_file::seams::events();
+        let pos = |want: String| {
+            ev.iter()
+                .position(|e| *e == want)
+                .unwrap_or_else(|| panic!("missing event {want:?} in {ev:?}"))
+        };
+        let load = pos(format!("config_load:{}", path.display()));
+        let f_cfg = pos(format!("startup_fsync:{}", cfg_dir.path().display()));
+        let f_tok = pos(format!("startup_fsync:{}", tok_dir.path().display()));
+        assert!(
+            f_cfg < load && f_tok < load,
+            "fsyncs must precede the load: {ev:?}"
         );
     }
 }

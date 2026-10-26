@@ -7,6 +7,7 @@ pub mod commands_vaults;
 pub mod config;
 pub mod conflict_stash;
 pub mod delete_ledger;
+pub mod durable_file;
 pub mod echo_guard;
 pub mod file_watcher;
 pub mod heartbeat;
@@ -204,7 +205,10 @@ pub fn run() {
                 // watches the entire vaults_root and the wizard surfaces
                 // that scope so users can see what's actually being
                 // synced.
-                let (sub, url, vault_dir) = match config::Config::load_from(&cfg_path) {
+                // CS-1 §4: the first config load runs the best-effort startup
+                // maintenance (dead-pid temp sweep + dir fsync) on the config
+                // and token dirs first.
+                let (sub, url, vault_dir) = match config::load_at_startup(&cfg_path) {
                     Ok(c) => (c.subscriber_id, c.nexus_url, c.vaults_root.clone()),
                     Err(_) => (String::new(), String::new(), std::path::PathBuf::new()),
                 };

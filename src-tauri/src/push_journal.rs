@@ -322,64 +322,6 @@ fn open_lock_file(lock_path: &Path) -> io::Result<File> {
     o.open(lock_path)
 }
 
-/// Fsync a directory so a rename that just completed inside it is durable
-/// (J3, S1). C5: unix only. On Windows opening a directory as a file fails
-/// with access denied, and NTFS journals rename metadata, so it is skipped.
-/// `ENOTSUP` / `EINVAL` (filesystems that refuse fsync on a directory fd) are
-/// logged at DEBUG and tolerated; any other error is propagated.
-#[cfg(unix)]
-pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
-    let d = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    match File::open(d).and_then(|f| f.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(e) if dir_fsync_tolerable(&e) => {
-            tracing::debug!(dir = %d.display(), error = %e, "directory fsync unsupported here; tolerated");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// C5: no directory fsync on non-unix targets (see the unix variant).
-#[cfg(not(unix))]
-pub(crate) fn fsync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn dir_fsync_tolerable(e: &io::Error) -> bool {
-    // EINVAL maps to InvalidInput. ENOTSUP / EOPNOTSUPP are matched by raw
-    // value because std does not give them a stable ErrorKind.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const ENOTSUP: &[i32] = &[95];
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    const ENOTSUP: &[i32] = &[45, 102];
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    const ENOTSUP: &[i32] = &[];
-    matches!(
-        e.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-    ) || e.raw_os_error().is_some_and(|c| ENOTSUP.contains(&c))
-}
-
 /// Proof that the journal lock is held. Only [`PushJournal::with_lock`]
 /// constructs it, so every `*_locked` body (which takes `&Locked`) is
 /// structurally reachable only from inside the lock (C1).
@@ -922,7 +864,7 @@ impl PushJournal {
         }
         #[cfg(test)]
         self.faults.crash_point(CrashPoint::Renamed)?;
-        fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
+        crate::durable_file::fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
         #[cfg(test)]
         self.faults.crash_point(CrashPoint::DirSynced)?;
         self.total_bytes

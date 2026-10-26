@@ -1,7 +1,10 @@
 use crate::api_client::{ApiClient, ApiError, HealthSnapshot};
-use crate::config::{apply_enrollment, default_config_path, Config, ConfigError, EnrollmentFields};
+use crate::config::{
+    apply_enrollment_bytes, default_config_path, Config, ConfigError, EnrollmentFields,
+};
+use crate::durable_file::Commit;
 use crate::keyring::KeyringError;
-use crate::token_store::{self, TokenStoreError};
+use crate::token_store::{self, TokenStoreError, TokenStored};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -16,7 +19,40 @@ pub enum PairingError {
     Api(#[from] ApiError),
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
+    /// CS-1 (C2): after a config write whose durability was uncertain, the
+    /// bytes read back differ from the bytes written. Never retried.
+    #[error(
+        "config read-back mismatch at {path}: the file on disk is not what pairing wrote \
+         (durability was uncertain); not retrying — re-run pairing"
+    )]
+    ReadBackMismatch { path: String },
+    /// CS-1 (C2): the read-back after an uncertain config write failed.
+    #[error("config read-back failed after an uncertain write: {0}")]
+    ReadBack(std::io::Error),
 }
+
+/// CS-1: durability of the pairing's persisted state (config + token file),
+/// the WEAKER of the two replace outcomes. A read-back never upgrades it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    Durable,
+    Uncertain,
+}
+
+impl From<Commit> for Durability {
+    fn from(c: Commit) -> Self {
+        match c {
+            Commit::Durable => Durability::Durable,
+            Commit::CommittedDurabilityUncertain => Durability::Uncertain,
+        }
+    }
+}
+
+/// CS-1: the one-line warning the CLI prints and the wizard shows when the
+/// pairing's durability is `Uncertain`.
+pub const UNCERTAIN_DURABILITY_WARNING: &str = "Paired, but the system could not confirm the \
+    settings were flushed to disk; if this machine loses power soon, pair again.";
 
 #[derive(Debug, Deserialize)]
 pub struct PairingInput {
@@ -40,6 +76,11 @@ pub struct PairingSuccess {
     pub subscriber_id: String,
     pub scope_roots: Vec<String>,
     pub materializer_mode: String,
+    /// CS-1: the weaker of the config and token-file replace outcomes.
+    pub durability: Durability,
+    /// CS-1: [`UNCERTAIN_DURABILITY_WARNING`] when `durability` is
+    /// `Uncertain`, for the wizard to display; `None` otherwise.
+    pub durability_warning: Option<String>,
 }
 
 /// Extracted for unit testability — no Tauri runtime context required.
@@ -47,13 +88,26 @@ pub async fn pair_inner(
     input: PairingInput,
     config_path: PathBuf,
 ) -> Result<PairingSuccess, PairingError> {
+    pair_inner_with(input, config_path, token_store::store).await
+}
+
+/// [`pair_inner`] with the token persistence injected (tests pass a writer
+/// rooted in a temp dir so they never touch the real config dir).
+pub(crate) async fn pair_inner_with<F>(
+    input: PairingInput,
+    config_path: PathBuf,
+    store_token: F,
+) -> Result<PairingSuccess, PairingError>
+where
+    F: Fn(&str, &str) -> Result<TokenStored, TokenStoreError>,
+{
     // v0.1.4: skip keyring preflight here — token_store::store handles
     // keyring failure transparently by falling back to a 0600 file. Pairing
     // succeeds on Linux-no-secret-service and SSH-installed-Mac alike.
     let client = ApiClient::new(&input.nexus_url, &input.token)?;
     let snap: HealthSnapshot = client.health().await?;
-    let backend = token_store::store(&snap.subscriber_id, &input.token)?;
-    tracing::info!("token persisted via {backend} backend");
+    let token = store_token(&snap.subscriber_id, &input.token)?;
+    tracing::info!("token persisted via {} backend", token.backend);
     // P0 2026-08-05: MERGE — never overwrite — the on-disk config.
     // Enrollment owns exactly the fields in `EnrollmentFields` (plus the
     // last_event_id cursor); everything else (`vault_name`, `[[sync_roots]]`,
@@ -61,7 +115,11 @@ pub async fn pair_inner(
     // typed `Config` (which has no `vault_name` field) over the file,
     // silently dropping the field and mis-rooting the daemon at
     // `vaults_root` itself on the next load.
-    apply_enrollment(
+    //
+    // CS-1: exactly ONE atomic replace. On `Uncertain` the bytes are read
+    // back and compared; a mismatch is an error and is NEVER retried, and an
+    // equal read-back does NOT upgrade the outcome (C2).
+    let (config_commit, written) = apply_enrollment_bytes(
         &config_path,
         &EnrollmentFields {
             nexus_url: input.nexus_url,
@@ -71,6 +129,18 @@ pub async fn pair_inner(
             daemon_platform: detect_platform(),
         },
     )?;
+    if config_commit == Commit::CommittedDurabilityUncertain {
+        let back = std::fs::read(&config_path).map_err(PairingError::ReadBack)?;
+        if back != written {
+            return Err(PairingError::ReadBackMismatch {
+                path: config_path.display().to_string(),
+            });
+        }
+    }
+    let durability = Durability::from(config_commit.weaker(token.commit));
+    if durability == Durability::Uncertain {
+        tracing::warn!("{UNCERTAIN_DURABILITY_WARNING}");
+    }
 
     // v0.3.2: if the wizard sent a mode preference, push it to the server
     // via the subscriber self-PATCH endpoint. Failure here is non-fatal --
@@ -92,6 +162,9 @@ pub async fn pair_inner(
         subscriber_id: snap.subscriber_id,
         scope_roots: snap.scope_roots,
         materializer_mode: final_mode,
+        durability,
+        durability_warning: (durability == Durability::Uncertain)
+            .then(|| UNCERTAIN_DURABILITY_WARNING.to_string()),
     })
 }
 
@@ -175,4 +248,162 @@ fn detect_platform() -> String {
         (o, a) => Box::leak(format!("{o}-{a}").into_boxed_str()),
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durable_file::seams;
+    use crate::token_store::KeyringOps;
+    use std::path::Path;
+
+    struct NoKeyring;
+    impl KeyringOps for NoKeyring {
+        fn get(&self, _s: &str) -> Result<Option<String>, KeyringError> {
+            panic!("keyring must not be touched")
+        }
+        fn set(&self, _s: &str, _t: &str) -> Result<(), KeyringError> {
+            panic!("keyring must not be touched")
+        }
+    }
+
+    async fn health_server(sub: &str) -> mockito::ServerGuard {
+        let mut srv = mockito::Server::new_async().await;
+        srv.mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"subscriber_id":"{sub}","scope_roots":["notes/"],"scope_excludes":[],"materializer_mode":"shadow","shadow_path":null}}"#
+            ))
+            .create_async()
+            .await;
+        srv
+    }
+
+    /// Run `pair_inner_with`, writing the token under `tok_dir` (file-only).
+    async fn pair_in(
+        url: &str,
+        cfg_path: &Path,
+        tok_dir: &Path,
+    ) -> Result<PairingSuccess, PairingError> {
+        let input = PairingInput {
+            nexus_url: url.to_string(),
+            token: "vsk_cs1".to_string(),
+            vaults_root: PathBuf::from("/tmp/vaults-cs1"),
+            materializer_mode: None,
+        };
+        let tok_dir = tok_dir.to_path_buf();
+        pair_inner_with(input, cfg_path.to_path_buf(), move |sub, tok| {
+            let p = tok_dir.join(format!("token-{sub}.bin"));
+            token_store::store_impl(sub, tok, &p, &NoKeyring, true)
+        })
+        .await
+    }
+
+    fn config_calls() -> usize {
+        seams::calls()
+            .iter()
+            .filter(|c| *c == "settings.toml")
+            .count()
+    }
+
+    /// Positive control: with no injected fault the pairing is `Durable` on
+    /// unix (and `Uncertain` on Windows, which cannot prove durability).
+    #[tokio::test]
+    async fn pair_without_faults_reports_platform_durability() {
+        seams::reset();
+        let srv = health_server("sub-cs1-ok").await;
+        let d = tempfile::TempDir::new().unwrap();
+        let cfg = d.path().join("cfg").join("settings.toml");
+        let r = pair_in(&srv.url(), &cfg, &d.path().join("tok"))
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            assert_eq!(r.durability, Durability::Durable);
+            assert!(r.durability_warning.is_none());
+        }
+        #[cfg(not(unix))]
+        assert_eq!(r.durability, Durability::Uncertain);
+        assert_eq!(config_calls(), 1);
+    }
+
+    /// T-CS1-8: an injected `CommittedDurabilityUncertain` on the config write
+    /// gives `durability: Uncertain` after a byte-equal read-back (no upgrade)
+    /// and exactly ONE config `replace_atomic` (no retry).
+    /// Mutation: retry the write on `Uncertain`.
+    #[tokio::test]
+    async fn t_cs1_8_uncertain_config_write_is_reported_and_never_retried() {
+        seams::reset();
+        let srv = health_server("sub-cs1-8").await;
+        let d = tempfile::TempDir::new().unwrap();
+        let cfg_dir = d.path().join("cfg");
+        let cfg = cfg_dir.join("settings.toml");
+        seams::fail_dir_fsync(Some(cfg_dir.clone()), 5); // EIO on the config dir only
+        let r = pair_in(&srv.url(), &cfg, &d.path().join("tok"))
+            .await
+            .unwrap();
+        assert_eq!(r.durability, Durability::Uncertain);
+        assert_eq!(
+            r.durability_warning.as_deref(),
+            Some(UNCERTAIN_DURABILITY_WARNING)
+        );
+        assert_eq!(
+            config_calls(),
+            1,
+            "exactly one config replace: {:?}",
+            seams::calls()
+        );
+        Config::load_from(&cfg).expect("committed config loads");
+    }
+
+    /// T-CS1-8 (C5 half): an uncertain TOKEN write makes the pairing
+    /// `Uncertain` even when the config write is durable (weaker of the two).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uncertain_token_write_makes_pairing_uncertain() {
+        seams::reset();
+        let srv = health_server("sub-cs1-tok").await;
+        let d = tempfile::TempDir::new().unwrap();
+        let tok_dir = d.path().join("tok");
+        seams::fail_dir_fsync(Some(tok_dir.clone()), 5);
+        let r = pair_in(
+            &srv.url(),
+            &d.path().join("cfg").join("settings.toml"),
+            &tok_dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.durability, Durability::Uncertain);
+    }
+
+    /// T-CS1-14 (C2): a MISMATCHED read-back after an uncertain config write
+    /// returns an error after exactly ONE write.
+    /// Mutation: upgrade to `Durable`, or retry, on mismatch.
+    #[tokio::test]
+    async fn t_cs1_14_mismatched_read_back_is_an_error_after_one_write() {
+        seams::reset();
+        let srv = health_server("sub-cs1-14").await;
+        let d = tempfile::TempDir::new().unwrap();
+        let cfg_dir = d.path().join("cfg");
+        let cfg = cfg_dir.join("settings.toml");
+        seams::fail_dir_fsync(Some(cfg_dir.clone()), 5);
+        seams::set_hook(Box::new(|p, path| {
+            if p == seams::Point::AfterRename
+                && path.file_name().and_then(|n| n.to_str()) == Some("settings.toml")
+            {
+                std::fs::write(path, b"tampered = true\n").unwrap();
+            }
+        }));
+        let r = pair_in(&srv.url(), &cfg, &d.path().join("tok")).await;
+        assert!(
+            matches!(r, Err(PairingError::ReadBackMismatch { .. })),
+            "mismatch must be an error, got {r:?}"
+        );
+        assert_eq!(
+            config_calls(),
+            1,
+            "no retry on mismatch: {:?}",
+            seams::calls()
+        );
+    }
 }

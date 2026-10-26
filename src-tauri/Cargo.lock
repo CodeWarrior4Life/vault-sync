@@ -5643,6 +5643,7 @@ dependencies = [
  "futures",
  "hex",
  "keyring",
+ "libc",
  "mockito",
  "notify",
  "notify-debouncer-full",

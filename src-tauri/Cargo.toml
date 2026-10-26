@@ -58,6 +58,11 @@ unicode-normalization = "0.1"
 # non-Windows platforms, so it is safe to call unconditionally.
 dunce = "1"
 
+# CS-1 (TKT-23091e72): kill(pid, 0) liveness probe for the startup stale-temp
+# sweep in durable_file. Already in the lock graph transitively; no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 mockito = "1"
 rstest = "0.23"
