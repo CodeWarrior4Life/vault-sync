@@ -38,19 +38,62 @@ jobs:
           done
           [ "${{ matrix.os }}" = ubuntu-24.04 ] || { echo "::error::the Linux leg is ${{ matrix.os }}, not ubuntu-24.04"; bad=1; }
           exit $bad
-      # TKT-ebc0237d: the apt step hung to the 25-min job timeout 4x (no DEBIAN_FRONTEND, no step bound). Now:
-      # non-interactive, an 8-min step bound, each apt call bounded at 300 s, and one in-step retry.
+      # TKT-ebc0237d: the apt step hung to the 25-min job timeout (MEASURED on this PR: the azure mirror served the
+      # 74.2 MB of .debs at ~20 KB/s while its indexes came at MB/s). A bound alone cannot fix a slow mirror, so the
+      # .debs are CACHED (first-party actions/cache restore/save), keyed on the runner image + the exact package list,
+      # and on a cold cache a slow azure mirror falls back to archive.ubuntu.com once.
+      - name: apt cache key (Linux)
+        id: aptkey
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          APT_PACKAGES: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev gnome-keyring
+        run: |
+          echo "APT_PACKAGES=$APT_PACKAGES" >> "$GITHUB_ENV"
+          h=$(printf '%s' "$APT_PACKAGES" | sha256sum | cut -c1-16)
+          echo "key=apt-debs-${ImageOS}-${ImageVersion}-${h}" >> "$GITHUB_OUTPUT"
+          echo "apt cache key: apt-debs-${ImageOS}-${ImageVersion}-${h}"
+      - name: Restore apt .deb cache (Linux)
+        id: aptcache
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-24.04'
-        timeout-minutes: 8
+        # Worst case (cold cache, slow azure, fallback): update 90 + download 180 + fallback update 90 + download 360
+        # + install 180 = 900 s; 16 min covers it. A warm cache needs only the index update and the local install.
+        timeout-minutes: 16
         env:
           DEBIAN_FRONTEND: noninteractive
+          CACHE_HIT: ${{ steps.aptcache.outputs.cache-hit }}
         run: |
-          for i in 1 2; do
-            sudo -E timeout 300 apt-get update && sudo -E timeout 300 apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev gnome-keyring && exit 0
-            echo "apt attempt $i failed/hung; retrying"; sleep 15
-          done
-          exit 1
+          set -u
+          C="$HOME/apt-debs"; mkdir -p "$C/partial"
+          apt_(){ sudo -E timeout "$1" apt-get -o Dir::Cache::Archives="$C" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "${@:2}"; }
+          mirror=azure; t0=$(date +%s)
+          echo "apt: cache-hit=${CACHE_HIT:-false}; $(find "$C" -maxdepth 1 -name '*.deb' | wc -l) .debs restored"
+          apt_ 90 update || { echo "apt: index update failed"; exit 1; }
+          if ! apt_ 180 install -y --download-only $APT_PACKAGES; then
+            echo "apt: the azure mirror was slow or failed after $(( $(date +%s) - t0 ))s; falling back to archive.ubuntu.com"
+            mirror=archive.ubuntu.com
+            for f in /etc/apt/apt-mirrors.txt; do [ -f "$f" ] && echo "http://archive.ubuntu.com/ubuntu/" | sudo tee "$f" >/dev/null; done
+            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            apt_ 90 update || exit 1
+            apt_ 360 install -y --download-only $APT_PACKAGES || { echo "apt: fallback download failed too"; exit 1; }
+          fi
+          t1=$(date +%s)
+          apt_ 180 install -y --no-download $APT_PACKAGES || exit 1
+          t2=$(date +%s)
+          sudo rm -rf "$C/partial" "$C/lock"; sudo chown -R "$(id -u):$(id -g)" "$C"
+          echo "apt: mirror=$mirror cache-hit=${CACHE_HIT:-false} download_phase=$((t1-t0))s install_phase=$((t2-t1))s total=$((t2-t0))s debs_now=$(find "$C" -maxdepth 1 -name '*.deb' | wc -l)"
+      - name: Save apt .deb cache (Linux)
+        if: matrix.os == 'ubuntu-24.04' && steps.aptcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.aptkey.outputs.key }}
       - name: Start gnome-keyring (Linux)
         if: matrix.os == 'ubuntu-24.04'
         run: |
