@@ -32,8 +32,8 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,11 +64,270 @@ pub fn canonical_sync_path(s: &str) -> String {
     s.nfc().collect::<String>().replace('\\', "/")
 }
 
+/// Unit 1a S1/S2 (TKT-b25fce06): generation-tracked durable flush, shared
+/// identically by [`ShadowStore`], `BaseSeqStore` and `ReadReceiptStore`.
+///
+/// * `mut_gen` is bumped by every mutation AFTER the map change and while the
+///   map mutex is still held (call [`FlushGen::bump`] inside the lock).
+/// * `flushed_gen` is the generation last durably written.
+/// * `flush_lock` is taken BEFORE the snapshot and held through write, temp
+///   `sync_all`, persist (rename), directory fsync and `fetch_max` (C2), so an
+///   older snapshot can never finish last and rename over a newer one.
+///   Mutations never take it, so they are not blocked by flush I/O.
+pub(crate) struct FlushGen {
+    mut_gen: AtomicU64,
+    flushed_gen: AtomicU64,
+    flush_lock: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) hooks: FlushHooks,
+}
+
+/// Test-only fault and interleaving points for [`FlushGen::flush_durable`].
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FlushHooks {
+    /// One-shot callback run right after the snapshot is taken (T-S1, T-S3).
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Make the temp-file `sync_all` fail (T-S2).
+    pub(crate) fail_sync: AtomicBool,
+}
+
+impl FlushGen {
+    /// `migrated` = the load-time migration changed the map, which counts as
+    /// one mutation (it used to set `dirty`).
+    pub(crate) fn new(migrated: bool) -> Self {
+        FlushGen {
+            mut_gen: AtomicU64::new(u64::from(migrated)),
+            flushed_gen: AtomicU64::new(0),
+            flush_lock: Mutex::new(()),
+            #[cfg(test)]
+            hooks: FlushHooks::default(),
+        }
+    }
+
+    /// Record one mutation. MUST be called with the map mutex held, after the
+    /// map change.
+    pub(crate) fn bump(&self) {
+        self.mut_gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current mutation generation. Read it under the map mutex when taking
+    /// a snapshot so the generation and the snapshot agree.
+    pub(crate) fn current(&self) -> u64 {
+        self.mut_gen.load(Ordering::SeqCst)
+    }
+
+    /// True iff a mutation has not yet been durably flushed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.mut_gen.load(Ordering::SeqCst) != self.flushed_gen.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flushed(&self) -> u64 {
+        self.flushed_gen.load(Ordering::SeqCst)
+    }
+
+    /// Durably persist a snapshot to `dest` (tmp in the destination dir,
+    /// `sync_all`, rename, dir fsync). `snapshot` must lock the map, read
+    /// [`Self::current`] and clone the map under that lock, and return both.
+    /// No-op (`Ok`) when nothing changed since the last durable flush.
+    pub(crate) fn flush_durable<T, F>(&self, dest: &Path, snapshot: F) -> std::io::Result<()>
+    where
+        T: serde::Serialize,
+        F: FnOnce() -> (u64, T),
+    {
+        // Fast path: nothing unflushed. A mutation racing this read lands
+        // after this call and is picked up by the next flush.
+        if !self.is_dirty() {
+            return Ok(());
+        }
+        // C2: held from BEFORE the snapshot through the fetch_max below.
+        let _flush = self.flush_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (g, snap) = snapshot();
+        #[cfg(test)]
+        self.hooks.run_after_snapshot();
+        if g == self.flushed_gen.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&snap).map_err(std::io::Error::other)?;
+
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&parent)?;
+        // Atomic tmp+rename, anchored in the destination dir so the rename is
+        // same-filesystem (no cross-device EXDEV). The temp is unlinked on
+        // drop if anything below fails before persist.
+        let mut tmp = NamedTempFile::new_in(&parent)?;
+        tmp.write_all(&bytes)?;
+        tmp.flush()?;
+        self.sync_tmp(tmp.as_file())?;
+        tmp.persist(dest).map_err(|e| e.error)?;
+        crate::push_journal::fsync_dir(&parent)?;
+
+        // S2: only the generation that was actually written is marked
+        // flushed. A mutation after the snapshot has mut_gen > g, so the next
+        // flush still writes it.
+        self.flushed_gen.fetch_max(g, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Temp-file `sync_all` (S1), with a test fault point.
+    fn sync_tmp(&self, f: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.hooks.fail_sync.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected sync_all failure"));
+        }
+        f.sync_all()
+    }
+}
+
+#[cfg(test)]
+impl FlushHooks {
+    fn run_after_snapshot(&self) {
+        let hook = self.after_snapshot.lock().unwrap().take();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+}
+
+/// Shared T-S1..T-S3 checks (Unit 1a §3), run against each of the three
+/// stores from their own test modules.
+#[cfg(test)]
+pub(crate) mod flush_gen_checks {
+    use super::FlushGen;
+    use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// A store under test. `put(i)` records entry `i`; `has(i)` checks it.
+    pub(crate) trait GenStore: Send + Sync + 'static {
+        fn load_at(path: PathBuf) -> Arc<Self>;
+        fn put(&self, i: u32);
+        fn has(&self, i: u32) -> bool;
+        fn flush_now(&self) -> std::io::Result<()>;
+        fn gen(&self) -> &FlushGen;
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// T-S1: a mutation landing between the snapshot and the generation
+    /// update is persisted by the NEXT flush.
+    pub(crate) fn t_s1<S: GenStore>() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store.json");
+        let s = S::load_at(path.clone());
+        s.put(1);
+        let s2 = Arc::clone(&s);
+        *s.gen().hooks.after_snapshot.lock().unwrap() = Some(Box::new(move || s2.put(2)));
+        s.flush_now().unwrap();
+        assert!(
+            s.gen().is_dirty(),
+            "the post-snapshot mutation must leave the store dirty"
+        );
+        s.flush_now().unwrap();
+        let reloaded = S::load_at(path);
+        assert!(reloaded.has(1), "entry 1 persisted");
+        assert!(
+            reloaded.has(2),
+            "the mutation injected after the snapshot must be persisted by the next flush"
+        );
+    }
+
+    /// T-S2: an injected temp `sync_all` error propagates, writes nothing,
+    /// leaves no temp file and leaves the generation unflushed.
+    pub(crate) fn t_s2<S: GenStore>() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store.json");
+        let s = S::load_at(path.clone());
+        s.put(1);
+        s.gen()
+            .hooks
+            .fail_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.flush_now().is_err(), "sync_all failure must propagate");
+        assert!(s.gen().is_dirty(), "generation must stay unflushed");
+        assert_eq!(s.gen().flushed(), 0);
+        assert!(!path.exists(), "nothing may be persisted");
+        assert!(
+            dir_entries(dir.path()).is_empty(),
+            "temp file must be removed: {:?}",
+            dir_entries(dir.path())
+        );
+        s.gen()
+            .hooks
+            .fail_sync
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        s.flush_now().unwrap();
+        assert!(S::load_at(path).has(1));
+    }
+
+    /// T-S3 (C2): flush A snapshots, a mutation lands, flush B is started and
+    /// given every chance to snapshot and finish before A continues. The
+    /// NEWER snapshot must end up on disk and `flushed_gen` must equal B's
+    /// generation.
+    pub(crate) fn t_s3<S: GenStore>() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store.json");
+        let s = S::load_at(path.clone());
+        s.put(1);
+        let s2 = Arc::clone(&s);
+        let b_slot: Arc<Mutex<Option<JoinHandle<std::io::Result<()>>>>> =
+            Arc::new(Mutex::new(None));
+        let b_slot2 = Arc::clone(&b_slot);
+        *s.gen().hooks.after_snapshot.lock().unwrap() = Some(Box::new(move || {
+            // A has snapshotted. A mutation lands, then flush B runs.
+            s2.put(2);
+            let (tx, rx) = mpsc::channel();
+            let s3 = Arc::clone(&s2);
+            let h = std::thread::spawn(move || {
+                let r = s3.flush_now();
+                let _ = tx.send(());
+                r
+            });
+            // If flush_lock does not span A's snapshot..commit, B snapshots,
+            // writes and finishes inside this window, before A resumes.
+            let _ = rx.recv_timeout(Duration::from_millis(500));
+            *b_slot2.lock().unwrap() = Some(h);
+        }));
+        s.flush_now().unwrap(); // flush A
+        let b = b_slot.lock().unwrap().take().expect("flush B was started");
+        b.join().unwrap().unwrap();
+        let reloaded = S::load_at(path);
+        assert!(reloaded.has(1));
+        assert!(
+            reloaded.has(2),
+            "the NEWER snapshot (with entry 2) must be on disk, not A's older one"
+        );
+        assert_eq!(
+            s.gen().flushed(),
+            s.gen().current(),
+            "flushed_gen must equal B's generation"
+        );
+        assert!(!s.gen().is_dirty());
+    }
+}
+
 /// Persistent per-file shadow-hash store: path → last-synced server hash.
 pub struct ShadowStore {
     inner: Mutex<HashMap<String, String>>,
     path: PathBuf,
-    dirty: AtomicBool,
+    /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
+    gen: FlushGen,
     /// B2' (TKT-86ae42a3, 2026-07-18 conflict storm): the vault folder names
     /// (sync-root basenames, NFC) whose prefix must be STRIPPED off keys.
     /// Before v0.4.28 every pipeline keyed this store with vaults-root-relative
@@ -243,13 +502,13 @@ impl ShadowStore {
         Arc::new(ShadowStore {
             inner: Mutex::new(map),
             path,
-            dirty: AtomicBool::new(migrated),
+            gen: FlushGen::new(migrated),
             vault_folders,
             vault_scope_suspect: AtomicBool::new(suspect.is_some()),
         })
     }
 
-    /// Upsert `path -> server_hash`. No I/O, sets the dirty flag so the next
+    /// Upsert `path -> server_hash`. No I/O, bumps the mutation generation so the next
     /// `flush()` persists it. D8 (S511): the key is normalized to NFC canonical
     /// form so record/get are normalization-invariant, regardless of which OS
     /// (NFD macOS vs verbatim ext4/NTFS) produced the path.
@@ -257,20 +516,20 @@ impl ShadowStore {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             m.insert(key, server_hash.to_string());
-            self.dirty.store(true, Ordering::Relaxed);
+            self.gen.bump();
         }
     }
 
     /// R5 / F-B3.3 (TKT-989ad5f2): drop the recorded hash for `path`. Used on a
     /// terminal 409+404 (the server has no row) so the stale shadow does not
     /// keep re-arming a CAS-conflict push against a row that no longer exists.
-    /// Sets the dirty flag so the next `flush()` persists the removal. No-op if
+    /// Bumps the mutation generation so the next `flush()` persists the removal. No-op if
     /// the key was absent. Key normalized to NFC like `record`/`get`.
     pub fn remove(&self, path: &str) {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.inner.lock() {
             if m.remove(&key).is_some() {
-                self.dirty.store(true, Ordering::Relaxed);
+                self.gen.bump();
             }
         }
     }
@@ -305,40 +564,19 @@ impl ShadowStore {
         self.vault_scope_suspect.load(Ordering::Relaxed)
     }
 
-    /// Persist the full map to `self.path` via atomic tmp+rename. No-op (and
-    /// `Ok`) when not dirty. Creates parent dirs as needed. Clears the dirty
-    /// flag on success.
+    /// Persist the full map to `self.path` durably (tmp in the destination
+    /// dir, `sync_all`, rename, dir fsync). No-op (and `Ok`) when nothing
+    /// changed since the last durable flush. Creates parent dirs as needed.
+    /// A mutation that lands after the snapshot stays unflushed and is written
+    /// by the next flush (Unit 1a S2); see [`FlushGen`].
     pub fn flush(&self) -> std::io::Result<()> {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        // Snapshot under the lock, then write outside it.
-        let snapshot: HashMap<String, String> = match self.inner.lock() {
-            Ok(m) => m.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Atomic tmp+rename, anchored in the destination dir so the rename is
-        // same-filesystem (no cross-device EXDEV).
-        let parent = self
-            .path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut tmp = NamedTempFile::new_in(&parent)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.persist(&self.path).map_err(|e| e.error)?;
-
-        // Only clear dirty AFTER a successful persist. A concurrent record()
-        // between the snapshot and here re-sets dirty (we read it again next
-        // flush), so we never lose a write.
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(())
+        self.gen.flush_durable(&self.path, || {
+            let m = match self.inner.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (self.gen.current(), m.clone())
+        })
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
@@ -624,5 +862,57 @@ mod tests {
         // Same file, vault_folders configured -> prefix strips, not suspect.
         let ok = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
         assert!(!ok.vault_scope_suspect());
+    }
+
+    // ---- Unit 1a (TKT-b25fce06) §3: T-S1..T-S3 for ShadowStore ----
+
+    impl super::flush_gen_checks::GenStore for ShadowStore {
+        fn load_at(path: PathBuf) -> Arc<Self> {
+            ShadowStore::load(path)
+        }
+        fn put(&self, i: u32) {
+            self.record(&format!("n/{i}.md"), &format!("h{i}"));
+        }
+        fn has(&self, i: u32) -> bool {
+            self.get(&format!("n/{i}.md")) == Some(format!("h{i}"))
+        }
+        fn flush_now(&self) -> std::io::Result<()> {
+            self.flush()
+        }
+        fn gen(&self) -> &FlushGen {
+            &self.gen
+        }
+    }
+
+    #[test]
+    fn ts1_shadow_mutation_after_snapshot_is_persisted_by_next_flush() {
+        super::flush_gen_checks::t_s1::<ShadowStore>();
+    }
+
+    #[test]
+    fn ts2_shadow_sync_error_propagates_and_stays_unflushed() {
+        super::flush_gen_checks::t_s2::<ShadowStore>();
+    }
+
+    #[test]
+    fn ts3_shadow_concurrent_flushes_leave_newer_snapshot() {
+        super::flush_gen_checks::t_s3::<ShadowStore>();
+    }
+
+    /// The load-time migration counts as a mutation (it used to set dirty).
+    #[test]
+    fn shadow_migration_bumps_generation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shadow.json");
+        let mut m = HashMap::new();
+        m.insert("Mainframe/x.md".to_string(), "h".to_string());
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let store = ShadowStore::load_with_vault_folders(path.clone(), vec!["Mainframe".into()]);
+        assert!(store.gen.is_dirty());
+        store.flush().unwrap();
+        assert!(!store.gen.is_dirty());
+        let raw: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(raw.contains_key("x.md"));
     }
 }

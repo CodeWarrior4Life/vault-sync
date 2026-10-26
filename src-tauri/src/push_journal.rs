@@ -5,12 +5,14 @@
 //! `<workspace>/.lattice-runtime/<slug>/sync-state/push_journal.jsonl`
 //! (caller decides; this module accepts a `PathBuf` to the journal file).
 //!
-//! Concurrency: this module is **NOT** internally locked across processes.
-//! It assumes the daemon is single-instance — enforced by R12
-//! (tauri_plugin_single_instance). All methods take `&mut self`, so the
-//! Rust borrow checker enforces single-thread mutation within the process.
-//! If we ever drop the single-instance guarantee, we MUST add an `flock`
-//! around the file handle.
+//! Concurrency (Unit 1a, TKT-b25fce06): every operation that touches the
+//! file takes an exclusive `File::lock` (flock / LockFileEx) on the sibling
+//! `push_journal.lock`, held from the read through the rename. Each handle
+//! opens its OWN lock fd, so separate handles in one process exclude each
+//! other exactly as separate processes do. The lock file is mode 0600, holds
+//! no data and is never deleted, renamed or compacted. Appends `sync_data`
+//! before reporting success; rewrites use a unique `create_new` temp,
+//! `sync_all`, rename, then a directory fsync (unix).
 //!
 //! **File is the single source of truth (v0.3 stale-state fix).** The daemon
 //! constructs THREE separate `PushJournal` handles on the SAME file
@@ -36,6 +38,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -280,19 +283,175 @@ pub enum JournalError {
     CapacityExceeded { current: u64, max: u64 },
 }
 
+/// Unit 1a (TKT-b25fce06): a lock wait longer than this logs at ERROR with the
+/// operation name. Lock holders do bounded synchronous file I/O only, so a
+/// multi-second wait means a wedged holder (or a caller blocking an async
+/// runtime thread on a contended journal).
+const LOCK_WAIT_ALARM: Duration = Duration::from_secs(5);
+
+/// Feeds the unique rewrite temp name (J2): strictly increasing within the
+/// process, so two rewrites never pick the same `<nanos>` even when the clock
+/// reads equal. `<pid>` separates processes.
+static TMP_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread identity for the C1 re-entrancy guard (0 = no holder).
+static NEXT_THREAD_TAG: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static THREAD_TAG: u64 = NEXT_THREAD_TAG.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sibling lock-file path for a journal: `push_journal.jsonl` ->
+/// `push_journal.lock` (C6). Derived from the journal's own name so two
+/// journals in one directory never share a lock.
+fn lock_path_for(journal: &Path) -> PathBuf {
+    journal.with_extension("lock")
+}
+
+/// Open (creating if needed, mode 0600 on unix) this handle's OWN lock fd.
+/// C3: every handle opens its own description; it is never `try_clone`d,
+/// because a clone shares the open file description and therefore the flock.
+/// C6: the lock file holds no data and is never truncated, renamed or deleted.
+fn open_lock_file(lock_path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(lock_path)
+}
+
+/// Fsync a directory so a rename that just completed inside it is durable
+/// (J3, S1). C5: unix only. On Windows opening a directory as a file fails
+/// with access denied, and NTFS journals rename metadata, so it is skipped.
+/// `ENOTSUP` / `EINVAL` (filesystems that refuse fsync on a directory fd) are
+/// logged at DEBUG and tolerated; any other error is propagated.
+#[cfg(unix)]
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    let d = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    match File::open(d).and_then(|f| f.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e) if dir_fsync_tolerable(&e) => {
+            tracing::debug!(dir = %d.display(), error = %e, "directory fsync unsupported here; tolerated");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// C5: no directory fsync on non-unix targets (see the unix variant).
+#[cfg(not(unix))]
+pub(crate) fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn dir_fsync_tolerable(e: &io::Error) -> bool {
+    // EINVAL maps to InvalidInput. ENOTSUP / EOPNOTSUPP are matched by raw
+    // value because std does not give them a stable ErrorKind.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const ENOTSUP: &[i32] = &[95];
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    const ENOTSUP: &[i32] = &[45, 102];
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    const ENOTSUP: &[i32] = &[];
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) || e.raw_os_error().is_some_and(|c| ENOTSUP.contains(&c))
+}
+
+/// Proof that the journal lock is held. Only [`PushJournal::with_lock`]
+/// constructs it, so every `*_locked` body (which takes `&Locked`) is
+/// structurally reachable only from inside the lock (C1).
+struct Locked(());
+
+/// Test-only fault injection and observation points (Unit 1a §3).
+#[cfg(test)]
+#[derive(Default)]
+struct JournalFaults {
+    fail_rewrite_sync: std::sync::atomic::AtomicBool,
+    fail_append_sync: std::sync::atomic::AtomicBool,
+    crash_at: std::sync::Mutex<Option<CrashPoint>>,
+    lock_acquisitions: AtomicU64,
+    tmp_names: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+/// T-J6 crash-injection points inside `rewrite_locked`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashPoint {
+    TempWritten,
+    TempSynced,
+    /// After the rename, before the directory fsync.
+    Renamed,
+    DirSynced,
+}
+
+#[cfg(test)]
+const SIMULATED_CRASH: &str = "SIMULATED_CRASH";
+
+#[cfg(test)]
+impl JournalFaults {
+    /// Stop dead at `p` when armed, WITHOUT any cleanup, the way a crash would.
+    fn crash_point(&self, p: CrashPoint) -> Result<(), JournalError> {
+        if *self.crash_at.lock().unwrap() == Some(p) {
+            return Err(JournalError::Corruption(format!(
+                "{SIMULATED_CRASH} at {p:?}"
+            )));
+        }
+        Ok(())
+    }
+    fn is_simulated_crash(e: &JournalError) -> bool {
+        matches!(e, JournalError::Corruption(m) if m.starts_with(SIMULATED_CRASH))
+    }
+}
+
 /// File-authoritative journal handle. Holds NO cached event list — `drain`
 /// and `ack` re-read the on-disk file every call so any number of handles on
-/// the same path converge on the same state (v0.3 stale-state fix). The only
-/// retained state is `path`, the capacity cap, and a `total_bytes` projection
-/// kept loosely in sync for the capacity guard (re-measured from disk on every
-/// op that reads the file, so a stale projection self-heals).
+/// the same path converge on the same state (v0.3 stale-state fix).
+///
+/// Unit 1a (TKT-b25fce06): every operation that touches the file runs under
+/// an exclusive `flock`/`LockFileEx` on the sibling `push_journal.lock`, held
+/// from the read through the rename. Each handle opens its OWN lock fd (C3),
+/// so the four production handles in one process exclude each other exactly
+/// as two processes do.
 pub struct PushJournal {
     path: PathBuf,
-    /// Current file size in bytes. Updated on append (projection) and
-    /// re-measured authoritatively on every read/rewrite.
-    total_bytes: u64,
+    /// Current file size in bytes: a projection, re-measured from disk inside
+    /// the lock before every capacity decision (J5) and after every rewrite.
+    total_bytes: AtomicU64,
     /// Capacity guard in bytes (default 100 MB per spec §4.2).
     max_bytes: u64,
+    /// C3: this handle's own lock fd. Never `try_clone`d.
+    lock_file: File,
+    /// Serializes threads that share ONE handle by reference (a shared open
+    /// file description would not exclude them via flock).
+    local: std::sync::Mutex<()>,
+    /// C1 re-entrancy guard: tag of the thread currently inside `with_lock`
+    /// on this handle, or 0.
+    holder: AtomicU64,
+    #[cfg(test)]
+    faults: JournalFaults,
 }
 
 const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -315,24 +474,99 @@ impl PushJournal {
         // Touch the file so subsequent appends always succeed.
         let _ = OpenOptions::new().create(true).append(true).open(path)?;
 
+        let lock_file = open_lock_file(&lock_path_for(path))?;
+        let j = Self {
+            path: path.to_path_buf(),
+            total_bytes: AtomicU64::new(0),
+            max_bytes,
+            lock_file,
+            local: std::sync::Mutex::new(()),
+            holder: AtomicU64::new(0),
+            #[cfg(test)]
+            faults: JournalFaults::default(),
+        };
+
         // Validate the file is readable + scannable now (surfaces IO errors at
         // open time) and seed the byte projection. We do NOT cache events.
-        let _ = Self::read_live_from(path)?;
-        let total_bytes = std::fs::metadata(path)?.len();
+        j.with_lock("open", |j, l| {
+            let _ = j.read_live_from_locked(l)?;
+            j.refresh_total_bytes_locked(l)?;
+            Ok(())
+        })?;
+        Ok(j)
+    }
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            total_bytes,
-            max_bytes,
-        })
+    /// Run `f` holding this handle's exclusive journal lock. ONLY the
+    /// outermost public methods call this (C1); bodies are `*_locked` fns.
+    /// Re-entry on the same handle from the same thread panics in debug
+    /// builds and returns an error in release builds (Windows `LockFileEx`
+    /// would deadlock on a nested acquire; unix flock would silently hide it).
+    fn with_lock<R>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&Self, &Locked) -> Result<R, JournalError>,
+    ) -> Result<R, JournalError> {
+        let me = THREAD_TAG.with(|t| *t);
+        if self.holder.load(Ordering::SeqCst) == me {
+            let msg = format!("push_journal: re-entrant lock acquisition in `{op}` (Unit 1a C1)");
+            if cfg!(debug_assertions) {
+                panic!("{msg}");
+            }
+            return Err(JournalError::Io(io::Error::other(msg)));
+        }
+
+        struct Held<'a> {
+            j: &'a PushJournal,
+            flocked: bool,
+            _local: std::sync::MutexGuard<'a, ()>,
+        }
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.j.holder.store(0, Ordering::SeqCst);
+                if self.flocked {
+                    let _ = self.j.lock_file.unlock();
+                }
+            }
+        }
+
+        let started = Instant::now();
+        let local = self.local.lock().unwrap_or_else(|p| p.into_inner());
+        self.holder.store(me, Ordering::SeqCst);
+        let mut held = Held {
+            j: self,
+            flocked: false,
+            _local: local,
+        };
+        self.lock_file.lock()?;
+        held.flocked = true;
+        let waited = started.elapsed();
+        if waited > LOCK_WAIT_ALARM {
+            tracing::error!(
+                op,
+                waited_ms = waited.as_millis() as u64,
+                "push_journal: lock wait exceeded 5 s"
+            );
+        }
+        #[cfg(test)]
+        self.faults.lock_acquisitions.fetch_add(1, Ordering::SeqCst);
+
+        f(self, &Locked(()))
+    }
+
+    /// Re-read the on-disk size into the projection (J5). Lock held.
+    fn refresh_total_bytes_locked(&self, _l: &Locked) -> Result<u64, JournalError> {
+        let n = std::fs::metadata(&self.path)?.len();
+        self.total_bytes.store(n, Ordering::SeqCst);
+        Ok(n)
     }
 
     /// Re-read the on-disk journal and return all live (parseable, current
     /// schema) events in append order. This is the authoritative read — every
     /// `drain` / `ack` calls it so separate handles converge. Applies the
     /// same corrupt-tail / forward-compat tolerance as the original scan.
-    fn read_live_from(path: &Path) -> Result<Vec<PushEvent>, JournalError> {
-        let file = File::open(path)?;
+    /// Lock held.
+    fn read_live_from_locked(&self, _l: &Locked) -> Result<Vec<PushEvent>, JournalError> {
+        let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
 
         let mut entries: Vec<PushEvent> = Vec::new();
@@ -416,44 +650,60 @@ impl PushJournal {
         Ok(entries)
     }
 
-    /// Atomically append one event. Open append+create, write line+\n, flush, close.
+    /// Atomically append one event. Open append+create, write line+\n,
+    /// `sync_data`, close.
     ///
-    /// Back-compat shim — delegates to `append_batch`. Preserves the original
-    /// hard-error-on-capacity contract: a single append that would exceed the
-    /// cap returns `CapacityExceeded` and writes nothing (because
-    /// `append_batch` writes "what fits" and here nothing fits → 0 written).
+    /// Preserves the original hard-error-on-capacity contract: a single append
+    /// that would exceed the cap returns `CapacityExceeded` and writes nothing.
+    /// The capacity check and the write happen under ONE lock acquisition.
     pub fn append(&mut self, evt: PushEvent) -> Result<(), JournalError> {
-        // Pre-check so a single over-cap append errors (matching the old
-        // contract) rather than silently writing 0 events. Re-measure from
-        // disk first (see append_batch) so the check reflects the real shared
-        // file size, not a stale-high per-handle projection.
         let mut line = serde_json::to_string(&evt)?;
         line.push('\n');
-        self.total_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        if self.total_bytes.saturating_add(line.len() as u64) > self.max_bytes {
-            return Err(JournalError::CapacityExceeded {
-                current: self.total_bytes,
-                max: self.max_bytes,
-            });
-        }
-        let written = self.append_batch(vec![evt])?;
-        debug_assert_eq!(written, 1);
-        Ok(())
+        self.with_lock("append", move |j, l| {
+            // Re-measure from disk (J5) so the check reflects the real shared
+            // file size, not a stale per-handle projection.
+            let current = match j.refresh_total_bytes_locked(l) {
+                Ok(n) => n,
+                Err(JournalError::Io(e)) if e.kind() == io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e),
+            };
+            if current.saturating_add(line.len() as u64) > j.max_bytes {
+                return Err(JournalError::CapacityExceeded {
+                    current,
+                    max: j.max_bytes,
+                });
+            }
+            let written = j.append_batch_locked(l, vec![evt])?;
+            debug_assert_eq!(written, 1);
+            Ok(())
+        })
     }
 
-    /// Append N events in ONE file open/flush/close cycle.
+    /// Append N events in ONE file open/write/sync/close cycle.
     ///
     /// Opens the journal once, serializes each event to one jsonl line, writes
-    /// them all, flushes once, closes. Returns the number of events actually
-    /// appended.
+    /// them all, then `sync_data` once (J4). Returns the number of events
+    /// appended; returns `Ok(n)` only after the sync succeeded. A sync error
+    /// is returned as `Err` (callers treat `Err` as "not written").
     ///
     /// Capacity policy (graceful degradation): events are written one at a
-    /// time against the running `total_bytes` projection. The moment the NEXT
-    /// event would push the file past `max_bytes`, writing stops — already
-    /// written events stay durable, the rest are dropped, and a warning is
-    /// logged. A huge first-sync therefore degrades to "write what fits"
-    /// instead of erroring the whole batch.
+    /// time against the running size, re-measured from disk inside the lock
+    /// first (J5). The moment the NEXT event would push the file past
+    /// `max_bytes`, writing stops — already written events stay, the rest are
+    /// dropped, and a warning is logged. A huge first-sync therefore degrades
+    /// to "write what fits" instead of erroring the whole batch.
     pub fn append_batch(&mut self, events: Vec<PushEvent>) -> Result<usize, JournalError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        self.with_lock("append_batch", move |j, l| j.append_batch_locked(l, events))
+    }
+
+    fn append_batch_locked(
+        &self,
+        _l: &Locked,
+        events: Vec<PushEvent>,
+    ) -> Result<usize, JournalError> {
         if events.is_empty() {
             return Ok(0);
         }
@@ -463,44 +713,53 @@ impl PushJournal {
             .append(true)
             .open(&self.path)?;
 
-        // Refresh the byte projection from disk before the capacity check.
-        // `total_bytes` is a PER-HANDLE projection and other handles
-        // (push_client drain+ack → rewrite()) SHRINK the shared file. An
-        // append-only handle (file_watcher) never drains, so without this
-        // refresh its projection only ever climbs — once it touches the cap it
-        // can NEVER append again, even after the journal has been fully drained
-        // to 0 bytes, hot-spinning on CapacityExceeded against an empty file.
-        // (S490 runaway: on-disk journal 0 bytes, projection stuck at ~100MB,
-        // 500k+ capacity-exceeded warnings, all new events dropped.) Mirrors
-        // the disk re-read that `drain()` and `rewrite()` already do.
-        self.total_bytes = f.metadata().map(|m| m.len()).unwrap_or(self.total_bytes);
+        // J5 (and the S490 runaway fix): the capacity decision uses the size
+        // re-read from disk INSIDE the lock, never the per-handle projection,
+        // which is stale whenever another handle appended or rewrote.
+        let mut total = f.metadata()?.len();
+        self.total_bytes.store(total, Ordering::SeqCst);
 
-        let total = events.len();
+        let count = events.len();
         let mut written = 0usize;
         for evt in events {
             let mut line = serde_json::to_string(&evt)?;
             line.push('\n');
             let added = line.len() as u64;
 
-            if self.total_bytes.saturating_add(added) > self.max_bytes {
+            if total.saturating_add(added) > self.max_bytes {
                 tracing::warn!(
                     "push_journal: append_batch hit capacity (current={} max={}); wrote {}/{} events, dropping remainder",
-                    self.total_bytes,
+                    total,
                     self.max_bytes,
                     written,
-                    total
+                    count
                 );
                 break;
             }
 
             f.write_all(line.as_bytes())?;
-            self.total_bytes = self.total_bytes.saturating_add(added);
+            total = total.saturating_add(added);
             written += 1;
         }
 
         f.flush()?;
+        self.total_bytes.store(total, Ordering::SeqCst);
+        if written > 0 {
+            // J4: durable before we report it written.
+            self.sync_appended(&f)?;
+        }
         drop(f);
         Ok(written)
+    }
+
+    /// `sync_data` on the appended journal (J4), with a test fault point.
+    fn sync_appended(&self, f: &File) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.faults.fail_append_sync.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected sync_data failure").into());
+        }
+        f.sync_data()?;
+        Ok(())
     }
 
     /// Read up to `n` live events from the head of the file, without removing
@@ -509,31 +768,35 @@ impl PushJournal {
     /// Returns events paired with cursors (wrapping each event's stable `id`)
     /// that the caller hands back to `ack` / `nack`.
     pub fn drain(&mut self, n: usize) -> Result<Vec<(PushEvent, JournalCursor)>, JournalError> {
-        let live = Self::read_live_from(&self.path)?;
-        // Keep the byte projection honest for the capacity guard.
-        self.total_bytes = std::fs::metadata(&self.path)?.len();
-        let out = live
-            .into_iter()
-            .take(n)
-            .map(|evt| {
-                let cur = JournalCursor(evt.id.clone());
-                (evt, cur)
-            })
-            .collect();
-        Ok(out)
+        self.with_lock("drain", |j, l| {
+            let live = j.read_live_from_locked(l)?;
+            // Keep the byte projection honest for the capacity guard.
+            j.refresh_total_bytes_locked(l)?;
+            Ok(live
+                .into_iter()
+                .take(n)
+                .map(|evt| {
+                    let cur = JournalCursor(evt.id.clone());
+                    (evt, cur)
+                })
+                .collect())
+        })
     }
 
     /// Ack a single event by its cursor (event id) — removes the matching line
-    /// from the file. Convenience wrapper over `ack_batch`.
+    /// from the file. Shares the `ack_batch` body; takes the lock ONCE (C1).
     pub fn ack(&mut self, cursor: JournalCursor) -> Result<(), JournalError> {
-        self.ack_batch(std::iter::once(cursor))
+        let ack_ids: std::collections::HashSet<String> = std::iter::once(cursor.0).collect();
+        self.with_lock("ack", |j, l| j.ack_batch_locked(l, &ack_ids))
     }
 
     /// Ack a batch of events by cursor (event id). Re-reads the file, drops
     /// every entry whose `id` is in the ack set, and atomically rewrites the
-    /// file (tmp + rename). Idempotent: acking an id not present is a no-op.
-    /// Because identity is the on-disk `id` (not an in-memory index), this is
-    /// correct across separate handles and crashes.
+    /// file (tmp + fsync + rename + dir fsync), all under one lock hold so an
+    /// append from any handle cannot land in the replaced inode (J1).
+    /// Idempotent: acking an id not present is a no-op. Because identity is
+    /// the on-disk `id` (not an in-memory index), this is correct across
+    /// separate handles and crashes.
     pub fn ack_batch<I>(&mut self, cursors: I) -> Result<(), JournalError>
     where
         I: IntoIterator<Item = JournalCursor>,
@@ -543,13 +806,23 @@ impl PushJournal {
         if ack_ids.is_empty() {
             return Ok(());
         }
+        self.with_lock("ack_batch", |j, l| j.ack_batch_locked(l, &ack_ids))
+    }
 
-        let live = Self::read_live_from(&self.path)?;
+    fn ack_batch_locked(
+        &self,
+        l: &Locked,
+        ack_ids: &std::collections::HashSet<String>,
+    ) -> Result<(), JournalError> {
+        if ack_ids.is_empty() {
+            return Ok(());
+        }
+        let live = self.read_live_from_locked(l)?;
         let remaining: Vec<PushEvent> = live
             .into_iter()
             .filter(|evt| !ack_ids.contains(&evt.id))
             .collect();
-        self.rewrite(&remaining)
+        self.rewrite_locked(l, &remaining)
     }
 
     /// Keep the event for a later retry. No-op on the on-disk file — the event
@@ -561,41 +834,109 @@ impl PushJournal {
 
     /// Number of live events currently on disk. Re-reads the file.
     pub fn len(&self) -> usize {
-        Self::read_live_from(&self.path)
-            .map(|v| v.len())
+        self.with_lock("len", |j, l| Ok(j.read_live_from_locked(l)?.len()))
             .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.with_lock("is_empty", |j, l| {
+            Ok(j.read_live_from_locked(l)?.is_empty())
+        })
+        .unwrap_or(true)
     }
 
     /// Total on-disk size in bytes (projection; refreshed on every read op).
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes
+        self.total_bytes.load(Ordering::SeqCst)
     }
 
-    /// Atomically rewrite the file to contain exactly `events` (tmp + rename),
-    /// then refresh the byte projection.
-    fn rewrite(&mut self, events: &[PushEvent]) -> Result<(), JournalError> {
-        let tmp_path = self.path.with_extension("jsonl.tmp");
-        {
-            let mut tmp = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp_path)?;
+    /// Unique temp path for one rewrite (J2):
+    /// `push_journal.jsonl.tmp-<pid>-<nanos>`, opened with `create_new`.
+    fn unique_tmp_path(&self) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Plain CAS loop: `fetch_update` is deprecated on newer stable
+        // (renamed `try_update`), which does not exist on older toolchains.
+        let mut prev = TMP_NANOS.load(Ordering::SeqCst);
+        loop {
+            let next = now.max(prev.saturating_add(1));
+            match TMP_NANOS.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+        let nanos = now.max(prev.saturating_add(1));
+        let base = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "push_journal.jsonl".to_string());
+        self.path
+            .with_file_name(format!("{base}.tmp-{}-{nanos}", std::process::id()))
+    }
+
+    /// Atomically and durably rewrite the file to contain exactly `events`,
+    /// then refresh the byte projection. Lock held (C1).
+    ///
+    /// J2: a unique `create_new` temp; on any error before the rename it is
+    /// unlinked. J3: the temp's `sync_all` error is propagated, and after the
+    /// rename the directory is fsynced (unix, C5).
+    fn rewrite_locked(&self, _l: &Locked, events: &[PushEvent]) -> Result<(), JournalError> {
+        let tmp_path = self.unique_tmp_path();
+        #[cfg(test)]
+        self.faults.tmp_names.lock().unwrap().push(tmp_path.clone());
+        let mut tmp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let staged: Result<(), JournalError> = (|| {
             for evt in events {
                 let mut line = serde_json::to_string(evt)?;
                 line.push('\n');
                 tmp.write_all(line.as_bytes())?;
             }
             tmp.flush()?;
-            // Best-effort fsync — ignore platforms that don't support it.
-            let _ = tmp.sync_all();
+            #[cfg(test)]
+            self.faults.crash_point(CrashPoint::TempWritten)?;
+            self.sync_rewrite_tmp(&tmp)?;
+            #[cfg(test)]
+            self.faults.crash_point(CrashPoint::TempSynced)?;
+            Ok(())
+        })();
+        drop(tmp);
+        if let Err(e) = staged {
+            #[cfg(test)]
+            let crashed = JournalFaults::is_simulated_crash(&e);
+            #[cfg(not(test))]
+            let crashed = false;
+            if !crashed {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            return Err(e);
         }
-        std::fs::rename(&tmp_path, &self.path)?;
-        self.total_bytes = std::fs::metadata(&self.path)?.len();
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        #[cfg(test)]
+        self.faults.crash_point(CrashPoint::Renamed)?;
+        fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
+        #[cfg(test)]
+        self.faults.crash_point(CrashPoint::DirSynced)?;
+        self.total_bytes
+            .store(std::fs::metadata(&self.path)?.len(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `sync_all` on the rewrite temp file (J3), with a test fault point.
+    fn sync_rewrite_tmp(&self, tmp: &File) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.faults.fail_rewrite_sync.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected sync_all failure").into());
+        }
+        tmp.sync_all()?;
         Ok(())
     }
 
@@ -612,8 +953,13 @@ impl PushJournal {
     /// of the SAME path; the kept (latest) entry supersedes the earlier ones,
     /// content is read at drain time (entries are lazy), and push is
     /// content-hash-idempotent server-side. A no-op when nothing is redundant.
+    /// The read, filter and rewrite happen under one lock hold (J1).
     pub fn compact(&mut self) -> Result<(usize, usize), JournalError> {
-        let live = Self::read_live_from(&self.path)?;
+        self.with_lock("compact", |j, l| j.compact_locked(l))
+    }
+
+    fn compact_locked(&self, l: &Locked) -> Result<(usize, usize), JournalError> {
+        let live = self.read_live_from_locked(l)?;
         let before = live.len();
         // Index of the LAST occurrence of each path.
         let mut last_idx: std::collections::HashMap<&str, usize> =
@@ -629,7 +975,7 @@ impl PushJournal {
                 .enumerate()
                 .filter_map(|(i, e)| keep.contains(&i).then_some(e))
                 .collect();
-            self.rewrite(&compacted)?;
+            self.rewrite_locked(l, &compacted)?;
         }
         Ok((before, after))
     }
@@ -1094,11 +1440,9 @@ mod tests {
         assert_eq!(j.len(), 2);
     }
 
-    /// concurrent_safety_documented: this module is single-instance only.
-    /// All methods take `&mut self`. R12 (tauri_plugin_single_instance)
-    /// guarantees only one process holds the journal file at a time. No
-    /// cross-process flock is used. If that invariant ever breaks, this
-    /// test exists to remind us to add one.
+    /// concurrent_safety_documented: historically a reminder that no flock
+    /// was used. Unit 1a (TKT-b25fce06) added the per-handle flock on
+    /// `push_journal.lock`; the race coverage now lives in the `tj*` tests.
     #[test]
     fn concurrent_safety_documented() {
         // No runtime assertion — the doc comment IS the invariant.
@@ -1155,5 +1499,480 @@ mod tests {
         assert!(!paths.contains(&acked_evt.path.as_str()));
         assert!(paths.contains(&"notes/0.md"));
         assert!(paths.contains(&"notes/2.md"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit 1a (TKT-b25fce06) §3: T-J1..T-J8
+    // -----------------------------------------------------------------------
+
+    fn lazy_evt(path: &str) -> PushEvent {
+        let mut e = evt(path, PushAction::Modify);
+        e.content_bytes = None;
+        e
+    }
+
+    fn ids_on_disk(p: &Path) -> Vec<String> {
+        let j = PushJournal::open(p).unwrap();
+        j.with_lock("test", |j, l| j.read_live_from_locked(l))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    fn tmp_files_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect()
+    }
+
+    const TJ1_CHILD_ENV: &str = "PJ_TJ1_CHILD_JOURNAL";
+
+    /// T-J1 helper, NOT a test on its own: the second OS process. The parent
+    /// test re-executes this test binary filtered to this test with the
+    /// journal path in the environment; without it this returns immediately.
+    #[test]
+    #[ignore = "T-J1 second-process helper; spawned by tj1_no_appended_event_lost_under_concurrent_ack_and_compact"]
+    fn tj1_child_process_appender() {
+        let Ok(p) = std::env::var(TJ1_CHILD_ENV) else {
+            return;
+        };
+        let n: usize = std::env::var("PJ_TJ1_CHILD_N").unwrap().parse().unwrap();
+        let out = std::env::var("PJ_TJ1_CHILD_OUT").unwrap();
+        let mut j = PushJournal::open(Path::new(&p)).unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut e = lazy_evt(&format!("child/{i}.md"));
+            e.id = format!("child-{}", new_event_id());
+            ids.push(e.id.clone());
+            j.append(e).unwrap();
+        }
+        std::fs::write(out, ids.join("\n")).unwrap();
+    }
+
+    /// T-J1: 10,000 append iterations from FOUR independently opened handles
+    /// in one process (C3) plus a second OS process, racing `ack_batch` AND
+    /// `compact`. Every appended event is either acked or still on disk.
+    #[test]
+    fn tj1_no_appended_event_lost_under_concurrent_ack_and_compact() {
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        const TRACKED: usize = 4_000; // appender thread
+        const CHILD: usize = 3_000; // second process
+        const DUPS: usize = 3_000; // duplicate-path appends that compact collapses
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+
+        // Four independently opened handles (each with its own lock fd).
+        let mut appender = PushJournal::open(&p).unwrap();
+        let mut duper = PushJournal::open(&p).unwrap();
+        let mut acker = PushJournal::open(&p).unwrap();
+        let mut compactor = PushJournal::open(&p).unwrap();
+
+        let child_out = dir.path().join("child_ids.txt");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "push_journal::tests::tj1_child_process_appender",
+                "--ignored",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .env(TJ1_CHILD_ENV, &p)
+            .env("PJ_TJ1_CHILD_N", CHILD.to_string())
+            .env("PJ_TJ1_CHILD_OUT", &child_out)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn second process");
+
+        let appending_done = Arc::new(AtomicBool::new(false));
+        let acked: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let t_append = std::thread::spawn(move || {
+            let mut ids = Vec::with_capacity(TRACKED);
+            for i in 0..TRACKED {
+                let e = lazy_evt(&format!("tracked/{i}.md"));
+                ids.push(e.id.clone());
+                appender.append(e).unwrap();
+            }
+            ids
+        });
+        let t_dup = std::thread::spawn(move || {
+            for i in 0..DUPS {
+                duper
+                    .append(lazy_evt(&format!("dup/{}.md", i % 7)))
+                    .unwrap();
+            }
+        });
+        let done_a = Arc::clone(&appending_done);
+        let acked_a = Arc::clone(&acked);
+        let t_ack = std::thread::spawn(move || {
+            let mut rounds = 0usize;
+            while !done_a.load(Ordering::SeqCst) {
+                // Never ack the `dup/` events: they must survive for `compact` to
+                // collapse, otherwise a fast acker (observed on Windows CI) drains
+                // them first and the compactor never actually rewrites, so the
+                // positive control below cannot prove both rewriters raced.
+                let batch: Vec<_> = acker
+                    .drain(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(e, _)| !e.path.starts_with("dup/"))
+                    .take(32)
+                    .collect();
+                if batch.is_empty() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let ids: Vec<String> = batch.iter().map(|(e, _)| e.id.clone()).collect();
+                acker.ack_batch(batch.into_iter().map(|(_, c)| c)).unwrap();
+                acked_a.lock().unwrap().extend(ids);
+                rounds += 1;
+            }
+            rounds
+        });
+        let done_c = Arc::clone(&appending_done);
+        let t_compact = std::thread::spawn(move || {
+            let mut rewrites = 0usize;
+            while !done_c.load(Ordering::SeqCst) {
+                let (b, a) = compactor.compact().unwrap();
+                if a < b {
+                    rewrites += 1;
+                }
+                std::thread::yield_now();
+            }
+            rewrites
+        });
+
+        let tracked_ids = t_append.join().unwrap();
+        t_dup.join().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "second process failed: {status}");
+        appending_done.store(true, Ordering::SeqCst);
+        let ack_rounds = t_ack.join().unwrap();
+        let compact_rewrites = t_compact.join().unwrap();
+
+        let child_ids: Vec<String> = std::fs::read_to_string(&child_out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(child_ids.len(), CHILD);
+
+        let on_disk: HashSet<String> = ids_on_disk(&p).into_iter().collect();
+        let acked = acked.lock().unwrap();
+        let lost: Vec<&String> = tracked_ids
+            .iter()
+            .chain(child_ids.iter())
+            .filter(|id| !acked.contains(*id) && !on_disk.contains(*id))
+            .collect();
+        eprintln!(
+            "tj1: ack_rounds={ack_rounds} compact_rewrites={compact_rewrites} acked={} on_disk={} lost={}",
+            acked.len(),
+            on_disk.len(),
+            lost.len()
+        );
+        assert!(
+            ack_rounds > 0 && compact_rewrites > 0,
+            "both rewriters must have raced"
+        );
+        assert!(
+            lost.is_empty(),
+            "{} appended events lost (first: {:?})",
+            lost.len(),
+            lost.first()
+        );
+        assert!(tmp_files_in(p.parent().unwrap()).is_empty());
+    }
+
+    /// T-J2: parallel rewriters never share a temp file name and leave no
+    /// temp file behind, on success or on error.
+    #[test]
+    fn tj2_rewriters_use_unique_temp_and_leave_none_behind() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let mut seed = PushJournal::open(&p).unwrap();
+        for i in 0..20 {
+            seed.append(lazy_evt(&format!("d/{}.md", i % 3))).unwrap();
+        }
+        let workers: Vec<_> = (0..2)
+            .map(|w| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let mut j = PushJournal::open(&p).unwrap();
+                    for i in 0..40 {
+                        // Re-add duplicates so every compact really rewrites.
+                        j.append(lazy_evt(&format!("d/{}.md", i % 3))).unwrap();
+                        j.append(lazy_evt(&format!("d/{}.md", i % 3))).unwrap();
+                        j.compact().unwrap();
+                        let ids: Vec<_> = j.drain(1).unwrap().into_iter().map(|(_, c)| c).collect();
+                        j.ack_batch(ids).unwrap();
+                    }
+                    let names = j.faults.tmp_names.lock().unwrap().clone();
+                    (w, names)
+                })
+            })
+            .collect();
+        let mut all = Vec::new();
+        for h in workers {
+            let (_, names) = h.join().unwrap();
+            all.extend(names);
+        }
+        let pid = std::process::id().to_string();
+        for n in &all {
+            let s = n.file_name().unwrap().to_string_lossy();
+            assert!(
+                s.starts_with("push_journal.jsonl.tmp-") && s.contains(&pid),
+                "unexpected temp name {s}"
+            );
+        }
+        let uniq: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "two rewrites shared a temp file name"
+        );
+        assert!(all.len() >= 80);
+        assert!(
+            tmp_files_in(p.parent().unwrap()).is_empty(),
+            "temp left on success"
+        );
+
+        // Error path: an injected sync failure must unlink the temp.
+        seed.append(lazy_evt("d/0.md")).unwrap();
+        seed.append(lazy_evt("d/0.md")).unwrap();
+        seed.faults.fail_rewrite_sync.store(true, Ordering::SeqCst);
+        assert!(seed.compact().is_err());
+        assert!(
+            tmp_files_in(p.parent().unwrap()).is_empty(),
+            "temp left on error"
+        );
+    }
+
+    /// T-J3: an injected `sync_all` error in rewrite returns `Err`, leaves the
+    /// old journal byte-identical, and unlinks the temp.
+    #[test]
+    fn tj3_rewrite_sync_error_propagates_and_keeps_old_journal() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let mut j = PushJournal::open(&p).unwrap();
+        for i in 0..4 {
+            j.append(lazy_evt(&format!("n/{i}.md"))).unwrap();
+        }
+        let before = std::fs::read(&p).unwrap();
+        let cur = j.drain(1).unwrap().remove(0).1;
+        j.faults.fail_rewrite_sync.store(true, Ordering::SeqCst);
+        let r = j.ack(cur);
+        assert!(r.is_err(), "sync_all failure must propagate, got {r:?}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "old journal must be intact"
+        );
+        assert!(
+            tmp_files_in(p.parent().unwrap()).is_empty(),
+            "temp must be unlinked"
+        );
+        assert_eq!(j.len(), 4);
+    }
+
+    /// T-J4: an injected `sync_data` error in append_batch returns `Err`,
+    /// never `Ok(n)`.
+    #[test]
+    fn tj4_append_sync_error_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let mut j = PushJournal::open(&p).unwrap();
+        j.faults.fail_append_sync.store(true, Ordering::SeqCst);
+        let r = j.append_batch(vec![lazy_evt("a.md"), lazy_evt("b.md")]);
+        assert!(
+            r.is_err(),
+            "append_batch must not return Ok(n) on sync failure: {r:?}"
+        );
+        assert!(j.append(lazy_evt("c.md")).is_err());
+        j.faults.fail_append_sync.store(false, Ordering::SeqCst);
+        assert_eq!(j.append_batch(vec![lazy_evt("d.md")]).unwrap(), 1);
+    }
+
+    /// T-J5: handle A appends past half capacity; handle B (opened earlier,
+    /// projection 0) must decide capacity on the FRESH size.
+    #[test]
+    fn tj5_capacity_decision_uses_fresh_size_across_handles() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let probe = serde_json::to_string(&lazy_evt("cap/00.md")).unwrap().len() as u64 + 1;
+        let cap = probe * 10 + 5;
+        let mut b = PushJournal::open_with_capacity(&p, cap).unwrap();
+        assert_eq!(b.total_bytes(), 0);
+        let mut a = PushJournal::open_with_capacity(&p, cap).unwrap();
+        for i in 0..6 {
+            a.append(lazy_evt(&format!("cap/a{i}.md"))).unwrap();
+        }
+        assert!(
+            std::fs::metadata(&p).unwrap().len() * 2 > cap,
+            "A is past half"
+        );
+        let batch: Vec<_> = (0..6).map(|i| lazy_evt(&format!("cap/b{i}.md"))).collect();
+        let written = b.append_batch(batch).unwrap();
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert!(size <= cap, "capacity overrun: size={size} cap={cap}");
+        assert!(
+            written < 6,
+            "B must not believe the journal is empty (wrote {written})"
+        );
+    }
+
+    /// T-J6: crash-injection points inside rewrite. After a "restart"
+    /// (dropping the handle and reopening), the journal holds exactly the old
+    /// or exactly the new full set, never a partial one.
+    #[test]
+    fn tj6_crash_points_leave_old_or_new_full_set() {
+        for (point, expect_new) in [
+            (CrashPoint::TempWritten, false),
+            (CrashPoint::TempSynced, false),
+            (CrashPoint::Renamed, true),
+            (CrashPoint::DirSynced, true),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let p = journal_path(&dir);
+            let mut j = PushJournal::open(&p).unwrap();
+            for i in 0..6 {
+                j.append(lazy_evt(&format!("c/{i}.md"))).unwrap();
+            }
+            let batch = j.drain(10).unwrap();
+            let old: Vec<String> = batch.iter().map(|(e, _)| e.id.clone()).collect();
+            let new: Vec<String> = old[2..].to_vec();
+            *j.faults.crash_at.lock().unwrap() = Some(point);
+            let r = j.ack_batch(batch.into_iter().take(2).map(|(_, c)| c));
+            assert!(r.is_err(), "{point:?}: crash must surface");
+            drop(j); // "crash"
+            let after = ids_on_disk(&p);
+            assert!(
+                after == old || after == new,
+                "{point:?}: partial journal after restart: {after:?}"
+            );
+            assert_eq!(after == new, expect_new, "{point:?}");
+            // The journal stays fully usable after the restart.
+            let mut j2 = PushJournal::open(&p).unwrap();
+            j2.append(lazy_evt("c/after.md")).unwrap();
+            assert_eq!(j2.len(), after.len() + 1);
+        }
+    }
+
+    /// T-J7 (C4): single-`append` latency bench. Not run by default; run with
+    ///   cargo test --lib -- --ignored tj7 --nocapture
+    /// `PJ_BENCH_DIR` picks the filesystem (default: the current dir, which
+    /// under cargo test is the crate dir on the real disk, not tmpfs).
+    #[test]
+    #[ignore = "bench: cargo test --lib -- --ignored tj7 --nocapture"]
+    fn tj7_bench_single_append_latency() {
+        let base = std::env::var_os("PJ_BENCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let n: usize = std::env::var("PJ_BENCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
+        let dir = tempfile::Builder::new()
+            .prefix("pj-bench-")
+            .tempdir_in(&base)
+            .unwrap();
+        let p = dir.path().join("push_journal.jsonl");
+        let mut j = PushJournal::open(&p).unwrap();
+        for i in 0..20 {
+            j.append(evt(&format!("warm/{i}.md"), PushAction::Modify))
+                .unwrap();
+        }
+        let mut lat: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Watcher-path shape: an embedded small body.
+            let e = evt(&format!("bench/{i}.md"), PushAction::Modify);
+            let t = Instant::now();
+            j.append(e).unwrap();
+            lat.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
+        let mean = lat.iter().sum::<f64>() / lat.len() as f64;
+        println!(
+            "T-J7 append latency over {n} appends in {}: p50={:.3} ms p99={:.3} ms max={:.3} ms mean={:.3} ms",
+            base.display(),
+            pct(0.50),
+            pct(0.99),
+            lat[lat.len() - 1],
+            mean
+        );
+    }
+
+    /// T-J8 (C1): `ack()` (sharing the `ack_batch` body) takes the lock
+    /// exactly once; entering `with_lock` while held trips the re-entrancy
+    /// guard (panic in debug, error in release); the handle stays usable.
+    #[test]
+    fn tj8_ack_locks_once_and_reentry_trips_guard() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let mut j = PushJournal::open(&p).unwrap();
+        for i in 0..3 {
+            j.append(lazy_evt(&format!("r/{i}.md"))).unwrap();
+        }
+        let cur = j.drain(1).unwrap().remove(0).1;
+        let before = j.faults.lock_acquisitions.load(Ordering::SeqCst);
+        j.ack(cur).unwrap();
+        let after = j.faults.lock_acquisitions.load(Ordering::SeqCst);
+        assert_eq!(
+            after - before,
+            1,
+            "ack must take the journal lock exactly once"
+        );
+
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            j.with_lock("outer", |jj, _| jj.with_lock("inner", |_, _| Ok(())))
+        }));
+        if cfg!(debug_assertions) {
+            assert!(r.is_err(), "debug build: re-entry must panic");
+        } else {
+            assert!(
+                matches!(r, Ok(Err(_))),
+                "release build: re-entry must error"
+            );
+        }
+        // The guard released the flock and the flag on unwind.
+        assert_eq!(j.len(), 2);
+        let mut other = PushJournal::open(&p).unwrap();
+        other.append(lazy_evt("r/x.md")).unwrap();
+        assert_eq!(j.len(), 3);
+    }
+
+    /// C6: the lock file is a 0600 sibling that survives rewrites.
+    #[test]
+    fn lock_file_is_0600_sibling_and_never_removed() {
+        let dir = TempDir::new().unwrap();
+        let p = journal_path(&dir);
+        let mut j = PushJournal::open(&p).unwrap();
+        let lp = p.parent().unwrap().join("push_journal.lock");
+        assert!(lp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&lp).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        j.append(lazy_evt("a.md")).unwrap();
+        j.append(lazy_evt("a.md")).unwrap();
+        j.compact().unwrap();
+        let c = j.drain(1).unwrap().remove(0).1;
+        j.ack(c).unwrap();
+        assert!(lp.exists(), "lock file must survive rewrites");
+        assert_eq!(
+            std::fs::metadata(&lp).unwrap().len(),
+            0,
+            "lock file holds no data"
+        );
     }
 }
