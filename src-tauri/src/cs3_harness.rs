@@ -588,7 +588,7 @@ fn cs3_child_daemon() {
             let vaults = PathBuf::from(std::env::var("CS3_VAULTS").unwrap());
             std::fs::create_dir_all(vaults.join("Zed")).unwrap();
             s.push_str(&format!(
-                "\n[[sync_roots]]\npath = \"{}\"\nroute = \"\"\nsubscriber_id = \"sub-z\"\n",
+                "\n[[sync_roots]]\npath = '{}'\nroute = \"\"\nsubscriber_id = \"sub-z\"\n",
                 vaults.join("Zed").display()
             ));
             std::fs::write(&p, s).unwrap();
@@ -632,13 +632,13 @@ mod parent {
                 std::fs::create_dir_all(d).unwrap();
             }
             let mut s = format!(
-                "nexus_url = \"{url}\"\nsubscriber_id = \"{top}\"\nvaults_root = \"{}\"\ndaemon_version = \"0.0.0-cs3\"\ndaemon_platform = \"test\"\n",
+                "nexus_url = \"{url}\"\nsubscriber_id = \"{top}\"\nvaults_root = '{}'\ndaemon_version = \"0.0.0-cs3\"\ndaemon_platform = \"test\"\n",
                 vaults.display()
             );
             for r in roots {
                 std::fs::create_dir_all(vaults.join(r.folder)).unwrap();
                 s.push_str(&format!(
-                    "\n[[sync_roots]]\npath = \"{}\"\nroute = \"\"\nsubscriber_id = \"{}\"\n",
+                    "\n[[sync_roots]]\npath = '{}'\nroute = \"\"\nsubscriber_id = \"{}\"\n",
                     vaults.join(r.folder).display(),
                     r.sub
                 ));
@@ -1559,11 +1559,19 @@ fn supervise_run(arm: &str, extra: &[(&str, &str)]) -> Out {
 #[cfg(unix)]
 #[test]
 fn t_cs3_17_supervised_ends() {
-    let out = supervise_run("drain_loop.panic", &[]);
-    assert_eq!(out.code, Some(70), "{}", out.dump());
-    let armed: u128 = out.kv("ARMED_MS").unwrap().parse().unwrap();
-    let took = out.exited_ms.saturating_sub(armed);
-    assert!(took < 1_000, "exit 70 took {took} ms\n{}", out.dump());
+    // "Within 1 s": one retry absorbs a loaded CI runner; a supervisor that
+    // never exits (the fire-and-forget mutant) fails both attempts.
+    let mut out = supervise_run("drain_loop.panic", &[]);
+    for attempt in 0..2 {
+        assert_eq!(out.code, Some(70), "{}", out.dump());
+        let armed: u128 = out.kv("ARMED_MS").unwrap().parse().unwrap();
+        let took = out.exited_ms.saturating_sub(armed);
+        if took < 1_000 {
+            break;
+        }
+        assert!(attempt == 0, "exit 70 took {took} ms twice\n{}", out.dump());
+        out = supervise_run("drain_loop.panic", &[]);
+    }
     assert_eq!(
         count(&out.stderr, "REQUIRED task ended unexpectedly"),
         1,

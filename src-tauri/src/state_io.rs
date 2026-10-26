@@ -283,6 +283,7 @@ impl ExitGate {
 
     /// Test gate bound to a test `StateDir`'s own latch.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))] // used by unix-only tests
     pub(crate) fn for_dir(sd: &StateDir) -> Self {
         ExitGate(sd.latch.clone())
     }
