@@ -38,6 +38,12 @@ jobs:
         working-directory: src-tauri
       # CS-1 §4b / T-CS1-17: record which directory-durability branch fired
       # (F_FULLFSYNC success or the fsync fallback) on the macOS legs.
+      # CS-2 §3.3a step 3: record what openat(held, "..") does once the held
+      # dir is unlinked, per OS (the test asserts the valve stays latched).
+      - name: Record unlinked-held-dir probe (T-CS2-31)
+        if: runner.os != 'Windows'
+        run: cargo test --lib t_cs2_31_unlinked_held_dir_parent_probe -- --nocapture
+        working-directory: src-tauri
       - name: Record macOS directory-sync branch (T-CS1-17)
         if: runner.os == 'macOS'
         run: cargo test --lib t_cs1_17_real_filesystem_branch_is_recorded -- --nocapture
