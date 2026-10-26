@@ -1,0 +1,18 @@
+[package]
+name = "dir_lease_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "dir_lease_spike"
+path = "src/main.rs"
+
+[dependencies]
+libc = "=0.2.186"
+
+[profile.release]
+debug = false
+
+# Throwaway spike: standalone, joins no workspace.
+[workspace]
