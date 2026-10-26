@@ -44,12 +44,25 @@ KEY_HELPER="${NVS_KEY_HELPER:-$HOME/.local/bin/nexus-api-key.sh}"
 ESCALATE="${NVS_ESCALATE:-$HOME/.claude/scripts/operator_escalate.py}"
 ESCALATE_SEVERITY="${NVS_ESCALATE_SEVERITY:-critical}"
 TICK_RC=0                                     # 3 = no arranger resolved, or the page was undeliverable, this tick
+# N1 (#31 follow-up): at most one RAISE (page) per unit per NVS_RAISE_COOLDOWN_SECS, ACROSS episodes: a unit that flaps
+# inactive/active does not re-raise every episode. The clock (unit.<u>.last_raise) survives recovery.
+RAISE_COOLDOWN_SECS="${NVS_RAISE_COOLDOWN_SECS:-3600}"
+# N2 (#31 follow-up): the tick is bounded so a hung notify call cannot hold the deaf path below past its 180 s
+# confirmation gap. Every external call in this block has its own timeout, at most NVS_MAX_ALERTS_PER_TICK paging
+# alerts run per tick (the rest wait for the next tick, logged), and the service carries TimeoutStartSec=55 (see
+# systemd/*/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf). Worst case here: 5 + 15 + 15 = 35 s.
+LNOTIFY_TIMEOUT="${NVS_LNOTIFY_TIMEOUT:-5}"
+PAGE_TIMEOUT="${NVS_PAGE_TIMEOUT:-15}"        # the whole resolve + page child (each curl inside: NVS_CURL_MAX_TIME)
+ESCALATE_TIMEOUT="${NVS_ESCALATE_TIMEOUT:-15}"
+MAX_ALERTS_PER_TICK="${NVS_MAX_ALERTS_PER_TICK:-1}"
+export NVS_CURL_MAX_TIME="${NVS_CURL_MAX_TIME:-6}"
+ALERTS_THIS_TICK=0
 escalate_op(){  # $1 unit  $2 subject  $3 body
   local out rc
   if [ ! -f "$ESCALATE" ]; then
     log "ESCALATE MISSING ($ESCALATE) — operator NOT paged for unit=$1: $2"; return 1
   fi
-  out=$(timeout 180 python3 "$ESCALATE" --subject "$2" --body "$3" --severity "$ESCALATE_SEVERITY" 2>&1); rc=$?
+  out=$(timeout "$ESCALATE_TIMEOUT" python3 "$ESCALATE" --subject "$2" --body "$3" --severity "$ESCALATE_SEVERITY" 2>&1); rc=$?
   log "ESCALATE rc=$rc severity=$ESCALATE_SEVERITY unit=$1 subject=$2"
   [ "$rc" = 0 ] || printf '%s\n' "$out" | tail -3 >> "$ST/escalate.err"
   return "$rc"
@@ -66,12 +79,13 @@ key = os.environ.get("NEXUS_API_KEY") or ""          # injected by the resolver'
 
 def curl(path, body=None):
     """GET/POST base+path; the bearer goes to curl on STDIN (-K -), never argv. Returns (http_code, body)."""
-    argv = ["curl", "-sS", "-m", "25", "-A", "curl/8.7.1", "-K", "-", "-w", "\n%{http_code}", base + path]
+    argv = ["curl", "-sS", "-m", os.environ.get("NVS_CURL_MAX_TIME", "6"), "-A", "curl/8.7.1", "-K", "-",
+            "-w", "\n%{http_code}", base + path]
     if body is not None:
         argv[1:1] = ["-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(body)]
     try:
         r = subprocess.run(argv, input='header = "Authorization: Bearer %s"\n' % key, capture_output=True,
-                           text=True, errors="replace", timeout=40)
+                           text=True, errors="replace", timeout=int(os.environ.get("NVS_CURL_MAX_TIME", "6")) + 2)
     except (OSError, subprocess.SubprocessError) as e:
         return "000", str(e)
     out, _, code = r.stdout.rpartition("\n")
@@ -172,14 +186,20 @@ else:
     print("RESULT UNDELIVERABLE %s %s http=%s" % (csid, src, code))
 PY
 )
-  "${helper[@]}" python3 -c "$py" "$PAGE_OVERRIDE" "$ROLE_RUNTIME" "$ROSTER_NAME" "$NEXUS_BASE" "$HOST_SHORT" "$1" "$2" "$3" 2>&1
+  timeout "$PAGE_TIMEOUT" "${helper[@]}" python3 -c "$py" "$PAGE_OVERRIDE" "$ROLE_RUNTIME" "$ROSTER_NAME" "$NEXUS_BASE" "$HOST_SHORT" "$1" "$2" "$3" 2>&1
 }
-unit_alert(){  # $1 unit  $2 raised|recovered  $3 one-line detail  -> sets PAGE_OK=1 when the page was delivered
+unit_alert(){  # $1 unit  $2 raised|recovered|suppressed  $3 one-line detail  -> PAGE_OK=1 when a page was delivered
   local u="$1" kind="$2" detail="$3" ev out res st csid
   PAGE_OK=0
-  [ "$kind" = recovered ] && ev=unit.recovered || ev=unit.stopped
+  [ "$kind" = raised ] && ev=unit.stopped || ev=unit.recovered
+  [ "$kind" = suppressed ] && ev=unit.stopped
   local ikey="nexus-vault-sync.unit-inactive:${HOST_SHORT}:${u}"
   local msg="[nexus-vault-sync-supervisor@${HOST_SHORT}] ${u}: ${detail}"
+  # N1: a recovery, or a raise held by the cross-episode cooldown, is a NOTICE only: no page, never an escalate.
+  if [ "$kind" != raised ]; then
+    notify_notice "$u" "$kind" "$ev" "$ikey" "$msg"
+    return 0
+  fi
   # (1) the P0-tier page to the host arranger, target resolved now.
   out=$(page_arranger "$u" "$kind" "$msg")
   while IFS= read -r line; do case "$line" in "LOG "*) log "${line#LOG }" ;; esac; done <<< "$out"
@@ -194,27 +214,32 @@ unit_alert(){  # $1 unit  $2 raised|recovered  $3 one-line detail  -> sets PAGE_
 page to the host arranger FAILED (${st:-UNDELIVERABLE}): $(printf '%s' "$res" | cut -d' ' -f5-)" ;;
   esac
   # (2) lnotify NOTICE: the durable record of every alert (vault-note route + ledger; never the nexus_nudge surface).
-  if [ -x "$LNOTIFY" ] && printf '%s' "$msg" | "$LNOTIFY" legacy --principal "${HOST_SHORT}.nexus-vault-sync-supervisor@lattice" \
-       --app nexus-vault-sync --venture lattice --event-type "$ev" --claim notice --identity-key "$ikey" \
-       --subject "$u" --sender nexus-vault-sync-supervisor --caused-by "$u" >/dev/null 2>>"$ST/lnotify.err"; then
-    log "ALERT-NOTIFY-OK kind=$kind unit=$u ikey=$ikey"
-  else
-    log "ALERT-NOTIFY-FAILED kind=$kind unit=$u ikey=$ikey (lnotify=$LNOTIFY; see $ST/lnotify.err)"
-  fi
-  # (3) operator_escalate when the arranger could not be reached (O52 condition a).
+  notify_notice "$u" "$kind" "$ev" "$ikey" "$msg"
+  # (3) operator_escalate when the arranger could not be reached (O52 condition a). Raises only.
   if [ "$PAGE_OK" = 0 ]; then
-    escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: ${kind^^}, arranger page FAILED" "$msg"
-    [ "$kind" = raised ] && echo "$NOW" > "$ST/unit.$u.escalated"
+    escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: INACTIVE, arranger page FAILED" "$msg"
+    echo "$NOW" > "$ST/unit.$u.escalated"
+  fi
+}
+notify_notice(){  # $1 unit  $2 kind  $3 event type  $4 identity key  $5 message   (bounded by NVS_LNOTIFY_TIMEOUT)
+  if [ -x "$LNOTIFY" ] && printf '%s' "$5" | timeout "$LNOTIFY_TIMEOUT" "$LNOTIFY" legacy \
+       --principal "${HOST_SHORT}.nexus-vault-sync-supervisor@lattice" \
+       --app nexus-vault-sync --venture lattice --event-type "$3" --claim notice --identity-key "$4" \
+       --subject "$1" --sender nexus-vault-sync-supervisor --caused-by "$1" >/dev/null 2>>"$ST/lnotify.err"; then
+    log "ALERT-NOTIFY-OK kind=$2 unit=$1 ikey=$4"
+  else
+    log "ALERT-NOTIFY-FAILED kind=$2 unit=$1 ikey=$4 (lnotify=$LNOTIFY, timeout ${LNOTIFY_TIMEOUT}s; see $ST/lnotify.err)"
   fi
 }
 check_inactive_units(){
-  local u load act f_since f_alert f_paged f_esc since dur last
+  local u load act f_since f_alert f_paged f_esc f_raise since dur last
   for u in $WATCH_UNITS; do
     f_since="$ST/unit.$u.inactive_since"; f_alert="$ST/unit.$u.last_alert"
+    f_raise="$ST/unit.$u.last_raise"          # N1: survives recovery (cross-episode raise cooldown)
     f_paged="$ST/unit.$u.paged_at"; f_esc="$ST/unit.$u.escalated"
     load=$(systemctl --user show -p LoadState --value "$u" 2>/dev/null)
     case "$load" in
-      not-found) rm -f "$f_since" "$f_alert" "$f_paged" "$f_esc"; continue ;;   # not on this host: skipped
+      not-found) rm -f "$f_since" "$f_alert" "$f_paged" "$f_esc" "$f_raise"; continue ;;   # not on this host: skipped
       "") log "unit $u: systemctl unreadable — inconclusive, no change"; continue ;;
     esac
     act=$(systemctl --user is-active "$u" 2>/dev/null)
@@ -237,13 +262,31 @@ check_inactive_units(){
         [ "$dur" -ge "$INACTIVE_SECS" ] || continue
         # O52 condition (b): still inactive ESCALATE_SECS after a DELIVERED page -> operator_escalate, once per episode.
         if [ -f "$f_paged" ] && [ ! -f "$f_esc" ] && [ $((NOW-$(cat "$f_paged"))) -ge "$ESCALATE_SECS" ]; then
+          if [ "$ALERTS_THIS_TICK" -ge "$MAX_ALERTS_PER_TICK" ]; then
+            log "unit $u: escalate deferred to the next tick (per-tick alert cap $MAX_ALERTS_PER_TICK reached)"; continue
+          fi
+          ALERTS_THIS_TICK=$((ALERTS_THIS_TICK+1))
           echo "$NOW" > "$f_esc"
           escalate_op "$u" "[nexus-vault-sync] $u on $HOST_SHORT: STILL INACTIVE ${dur}s after a delivered arranger page" \
             "[nexus-vault-sync-supervisor@${HOST_SHORT}] ${u} NOT ACTIVE ($act) for ${dur}s since $(date -u -d "@$since" +%FT%TZ); the host arranger was paged $((NOW-$(cat "$f_paged")))s ago and the unit is still down."
         fi
         last=$(cat "$f_alert" 2>/dev/null || echo 0)
         [ $((NOW-last)) -ge "$REALERT_SECS" ] || continue
-        echo "$NOW" > "$f_alert"
+        # N1: the cross-episode raise cooldown. A raise held by it is recorded once per episode as a NOTICE only.
+        last=$(cat "$f_raise" 2>/dev/null || echo 0)
+        if [ $((NOW-last)) -lt "$RAISE_COOLDOWN_SECS" ]; then
+          if [ ! -f "$f_alert" ]; then
+            echo "$NOW" > "$f_alert"
+            log "unit $u INACTIVE ${dur}s: raise held by the cross-episode cooldown (last raise $((NOW-last))s ago < ${RAISE_COOLDOWN_SECS}s) — notice only"
+            unit_alert "$u" suppressed "NOT ACTIVE ($act) for ${dur}s; a raise for this unit was paged $((NOW-last))s ago (flapping), so this episode is recorded as a notice only (cooldown ${RAISE_COOLDOWN_SECS}s)."
+          fi
+          continue
+        fi
+        if [ "$ALERTS_THIS_TICK" -ge "$MAX_ALERTS_PER_TICK" ]; then
+          log "unit $u: alert deferred to the next tick (per-tick alert cap $MAX_ALERTS_PER_TICK reached)"; continue
+        fi
+        ALERTS_THIS_TICK=$((ALERTS_THIS_TICK+1))
+        echo "$NOW" > "$f_alert"; echo "$NOW" > "$f_raise"
         log "unit $u INACTIVE ${dur}s (>= ${INACTIVE_SECS}s; state=$act) — alerting"
         unit_alert "$u" raised "NOT ACTIVE ($act) for ${dur}s since $(date -u -d "@$since" +%FT%TZ) (threshold ${INACTIVE_SECS}s). Alert only: nothing was restarted. Re-alert at most every ${REALERT_SECS}s."
         [ "$PAGE_OK" = 1 ] && [ ! -f "$f_paged" ] && echo "$NOW" > "$f_paged" ;;

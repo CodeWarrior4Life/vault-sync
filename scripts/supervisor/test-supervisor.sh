@@ -170,11 +170,12 @@ check "60 min after the alert: one re-alert (notice 2, page 2), no second escala
 # --- 3. recovery ---------------------------------------------------------------------------------------------
 setunit "$D" $U1 loaded active
 tick "$D" $((T0+5000))
-check "recovery: one more notice and page" test "$(nlog "$D")/$(npage "$D")" = 3/3
+check "recovery: one more notice, NO page (N1: a recovery is a notice only)" test "$(nlog "$D")/$(npage "$D")" = 3/2
 check "recovery: unit.recovered on the SAME identity key" \
   grep -q -- "--event-type unit.recovered --claim notice --identity-key nexus-vault-sync.unit-inactive:testhost:$U1" "$D/ctl/lnotify.log"
-check "recovery: page reason says RECOVERED" test "$(pagefield "$D" 2 '"RECOVERED" in d["body"]["reason"]')" = True
-check "recovery: state cleared" bash -c "! ls '$(st "$D")' | grep -q '^unit\.$U1\.'"
+check "recovery: the notice says RECOVERED" grep -q "MSG .*$U1: RECOVERED" "$D/ctl/lnotify.log"
+check "recovery: episode state cleared; only the cross-episode raise clock remains" \
+  test "$(ls "$(st "$D")" | grep "^unit\.$U1\." | tr '\n' ' ')" = "unit.$U1.last_raise "
 tick "$D" $((T0+5060))
 check "after recovery: no further emits" test "$(nlog "$D")/$(nesc "$D")" = 3/1
 D=$(newbox early); setunit "$D" $U1 loaded inactive
@@ -196,10 +197,10 @@ D=$(newbox rot); setunit "$D" $U1 loaded inactive
 tick "$D" $T0; tick "$D" $((T0+900))
 check "rotation: the first alert pages the original arranger" test "$(lastpage "$D")" = "$CSID"
 release "$D" "$CSID"; marker "$D" "$CSID2" 2026-10-26T12:00:00+00:00
-tick "$D" $((T0+900+3600))
+tick "$D" $((T0+900+1800)); tick "$D" $((T0+900+3600))
 check "rotation: the re-alert pages the NEW arranger (nothing pinned)" test "$(lastpage "$D")" = "$CSID2"
 marker "$D" "$CSID3" 2026-10-26T11:00:00+00:00
-setunit "$D" $U1 loaded active; tick "$D" $((T0+9000))
+tick "$D" $((T0+900+7200))
 check "two live markers: pages the newest claimed_at" test "$(lastpage "$D")" = "$CSID2"
 check "two live markers: logged loudly" grep -q 'LOUD: 2 live arranger role markers' "$(st "$D")/log"
 
@@ -263,7 +264,7 @@ D=$(newbox ovr); setunit "$D" $U1 loaded inactive
 OVR=$CSID3 tick "$D" $T0; OVR=$CSID3 tick "$D" $((T0+900))
 check "override: pages the override csid, not the marker" test "$(lastpage "$D")" = "$CSID3"
 check "override: logged as an override" grep -q 'OVERRIDE in force' "$(st "$D")/log"
-OVR=0f6e3c2a tick "$D" $((T0+900+3600))
+OVR=$CSID3 tick "$D" $((T0+900+1800)); OVR=0f6e3c2a tick "$D" $((T0+900+3600))
 check "override that is not a full uuid: refused (logged), exit 3" \
   bash -c "grep -q 'override is not a full session uuid' '$(st "$D")/log' && [ \"\$(cat '$D/ctl/rc')\" = 3 ]"
 
@@ -277,6 +278,58 @@ done
 check "unit context (env -i HOME/PATH/XDG_RUNTIME_DIR only): page delivered, exit 0" test "$(npage "$D")/$(rc "$D")" = 1/0
 check "unit context: the key came from the default-path resolver in exec form" \
   bash -c "grep -q 'Authorization: Bearer $NKEY' '$D/ctl/page.stdin.0' && tr '\\0' ' ' < '$D/ctl/keyhelper.argv' | grep -q '^exec -- '"
+
+# --- 9. N1: the raise cooldown persists ACROSS episodes; a recovery is never escalated -----------------------
+D=$(newbox flap); setunit "$D" $U1 loaded inactive
+tick "$D" $T0; tick "$D" $((T0+900))
+check "flap: first episode raises (1 page)" test "$(npage "$D")" = 1
+setunit "$D" $U1 loaded active; tick "$D" $((T0+1000))
+setunit "$D" $U1 loaded inactive; tick "$D" $((T0+1100)); tick "$D" $((T0+2000))
+check "flap: a second episode inside 60 min does NOT re-raise (no page)" test "$(npage "$D")" = 1
+check "flap: the held raise is recorded once as a notice" grep -q "raise held by the cross-episode cooldown" "$(st "$D")/log"
+tick "$D" $((T0+2060)); tick "$D" $((T0+2900))
+check "flap: still one notice for the held episode (no repeat per tick)" \
+  test "$(grep -c 'was paged .*s ago (flapping)' "$D/ctl/lnotify.log")" = 1
+check "flap: the held episode is never escalated" test "$(nesc "$D")" = 0
+setunit "$D" $U1 loaded active; tick "$D" $((T0+3000))
+setunit "$D" $U1 loaded inactive; tick "$D" $((T0+3600)); tick "$D" $((T0+4500))
+check "flap: an episode after the 60-min cooldown raises again" test "$(npage "$D")" = 2
+D=$(newbox recesc); setunit "$D" $U1 loaded inactive; echo 503 > "$D/ctl/page.code"
+tick "$D" $T0; tick "$D" $((T0+900))
+check "undeliverable raise escalates once" test "$(nesc "$D")" = 1
+setunit "$D" $U1 loaded active; tick "$D" $((T0+1200))
+check "recovery after an undeliverable raise: notice only, no page attempt, NO escalate" \
+  test "$(nesc "$D")/$(npage "$D")/$(grep -c '^ARGV.*unit.recovered' "$D/ctl/lnotify.log")" = 1/1/1
+
+# --- 10. N2: the tick is bounded ------------------------------------------------------------------------------
+D=$(newbox hang); setunit "$D" $U1 loaded inactive; health "$D" not_receiving
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$D/bin/lnotify"
+start=$(date +%s)
+EXTRA_ENV="NVS_LNOTIFY_TIMEOUT=1" tick "$D" $T0; EXTRA_ENV="NVS_LNOTIFY_TIMEOUT=1" tick "$D" $((T0+900))
+el=$(( $(date +%s) - start ))
+check "a hung lnotify is cut at its timeout (two ticks in ${el}s < 10s)" test "$el" -lt 10
+check "a hung lnotify: logged as NOTIFY-FAILED" grep -q 'ALERT-NOTIFY-FAILED kind=raised' "$(st "$D")/log"
+check "a hung lnotify: the deaf path still ran that tick" test "$(cat "$(st "$D")/last_confirmed" 2>/dev/null)" = $((T0+900))
+D=$(newbox hangpage); setunit "$D" $U1 loaded inactive; health "$D" not_receiving
+printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *coord/emit*) sleep 30 ;; esac; done\ncat "%s/ctl/health.json"\n' "$D" > "$D/bin/curl"
+EXTRA_ENV="NVS_PAGE_TIMEOUT=2" tick "$D" $T0
+start=$(date +%s)
+EXTRA_ENV="NVS_PAGE_TIMEOUT=2" tick "$D" $((T0+900))
+el=$(( $(date +%s) - start ))
+# The outer NVS_PAGE_TIMEOUT (2 s here) must cut it, not only the inner per-curl bound (NVS_CURL_MAX_TIME 6 s + 2).
+check "a hung page is cut at NVS_PAGE_TIMEOUT (${el}s < 6s), escalated, exit 3" \
+  bash -c "[ $el -lt 6 ] && [ \"\$(wc -l < '$D/ctl/escalate.log')\" = 1 ] && [ \"\$(cat '$D/ctl/rc')\" = 3 ]"
+check "a hung page: the deaf path still ran that tick" test "$(cat "$(st "$D")/last_confirmed" 2>/dev/null)" = $((T0+900))
+D=$(newbox cap); setunit "$D" $U1 loaded inactive; setunit "$D" $U2 loaded inactive
+tick "$D" $T0; tick "$D" $((T0+900))
+check "per-tick cap: two units crossing in one tick -> one page this tick" test "$(npage "$D")" = 1
+check "per-tick cap: the deferral is logged" grep -q 'alert deferred to the next tick (per-tick alert cap 1 reached)' "$(st "$D")/log"
+tick "$D" $((T0+960))
+check "per-tick cap: the deferred unit pages on the next tick" test "$(npage "$D")" = 2
+check "the shipped drop-ins bound the tick: TimeoutStartSec=55 on link and icarus" \
+  bash -c "grep -qx 'TimeoutStartSec=55' '$HERE/systemd/link/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf' && grep -qx 'TimeoutStartSec=55' '$HERE/systemd/icarus/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf'"
+check "the per-call budget fits the bound: lnotify+page+escalate defaults (5+15+15) + deaf fetch (10) < 55" \
+  bash -c "grep -q 'NVS_LNOTIFY_TIMEOUT:-5' '$SUP' && grep -q 'NVS_PAGE_TIMEOUT:-15' '$SUP' && grep -q 'NVS_ESCALATE_TIMEOUT:-15' '$SUP' && grep -q 'NVS_MAX_ALERTS_PER_TICK:-1' '$SUP' && [ \$((5+15+15+10)) -lt 55 ]"
 
 # --- 8. the not_receiving path is unchanged: differential run vs the pinned imported original ----------------
 diffrun(){  # $1 label  $2 unit state for U1

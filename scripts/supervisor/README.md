@@ -49,11 +49,25 @@ The check is **alert only**. It never starts, stops or restarts a unit, and it n
 | `LoadState=not-found` (not on this host; icarus has no `-memory`) | skipped; stale state cleared |
 | `systemctl` unreadable | inconclusive: no change |
 | not active (`inactive`, `failed`, masked, ...) | `unit.<u>.inactive_since` written at the first such tick |
-| not active for `>= NVS_INACTIVE_SECS` (900) | ALERT: a P0-tier page to the host arranger, plus the lnotify notice; at most once per `NVS_REALERT_SECS` (3600) |
+| not active for `>= NVS_INACTIVE_SECS` (900) | ALERT (a RAISE): a P0-tier page to the host arranger, plus the lnotify notice; at most once per `NVS_REALERT_SECS` (3600) within an episode |
+| a raise inside `NVS_RAISE_COOLDOWN_SECS` (3600) of this unit's previous raise, even across a recovery (flapping) | held: recorded ONCE per episode as a notice only. No page, no escalate. The `unit.<u>.last_raise` clock survives recovery. |
 | page undeliverable or no arranger resolves | `operator_escalate` at once; the notice body says the page FAILED; **this tick exits 3** (after the deaf path has run) |
 | still not active `NVS_ESCALATE_SECS` (1800) after a DELIVERED page | `operator_escalate`, **once per episode** |
-| active again after an alert | one "recovered" page and notice (same identity key); state cleared |
+| active again after an alert | one "recovered" **notice** (same identity key). A recovery is never paged and never escalated. Episode state is cleared; `last_raise` stays. |
 | active again before the threshold | logged only |
+
+### The tick is bounded (N2)
+
+The deaf path below re-opens its not_receiving window when two confirmations are more than 180 s apart, so a hung
+notify call must never hold a tick. Three bounds apply:
+
+- **Every external call has its own timeout.** lnotify `NVS_LNOTIFY_TIMEOUT` (5 s). The resolve and page child
+  `NVS_PAGE_TIMEOUT` (15 s), with each curl inside it at `NVS_CURL_MAX_TIME` (6 s). `operator_escalate`
+  `NVS_ESCALATE_TIMEOUT` (15 s).
+- **At most `NVS_MAX_ALERTS_PER_TICK` (1) paging alerts per tick.** A raise or escalate beyond that is deferred to
+  the next tick and logged. Notices (recovery, held raise) are not capped; each is bounded at 5 s.
+- **The unit carries `TimeoutStartSec=55`** (`systemd/*/nexus-vault-sync-supervisor.service.d/20-tick-bound.conf`).
+  That is under the 60 s timer period and above the worst case of 5 + 15 + 15 s, plus the 10 s health fetch.
 
 ### The page target: resolved at send time, never pinned
 
@@ -75,6 +89,21 @@ each send:
    - **An unknown host with no override has no name fallback.** A constant `pitboss` would page link's seat from
      icarus.
 3. **Neither resolves: FAIL LOUD.** `operator_escalate` fires, the notice still fires, and the tick exits 3.
+
+**Stale role markers (N3).** A released marker is moved to `~/.claude/backups/role-markers/` by `pb-role-marker.py`
+and is never read. A marker can still linger in `runtime/` when its seat died without a release: a crash, or a
+manual edit. Nothing here can tell that a csid is dead, because the marker is a flag, not a liveness proof. So:
+
+- **Validation** rejects only malformed markers: a non-uuid filename, a path escaping the runtime dir, or content
+  naming another csid.
+- **Newest `claimed_at` wins** when more than one valid marker is live, and the choice is logged LOUD. A successor's
+  marker (`handover` or `claim`) is newer than a lingering predecessor's, so the live seat wins.
+- **If the only marker left is a dead seat's**, the page goes to that dead inbox. The conductor accepts it (2xx), so
+  the script cannot see the failure. The backstop is escalate (b): still inactive 30 min after a "delivered" page,
+  `operator_escalate` fires once.
+
+So a stale-only marker costs at most 30 min before the operator hears. The fix for a stale marker is
+`pb-role-marker.py release <csid> --force --reason ...`; this script never deletes markers.
 
 `NVS_PAGE_CSID` is an explicit **override for tests and emergencies only**. It is validated, logged as an override,
 and must never be set in a shipped unit or drop-in.
@@ -102,6 +131,9 @@ and must never be set in a shipped unit or drop-in.
 |---|---|
 | `NVS_WATCH_UNITS` | `nexus-vault-sync.service nexus-vault-sync-memory.service` |
 | `NVS_INACTIVE_SECS` / `NVS_REALERT_SECS` / `NVS_ESCALATE_SECS` | `900` / `3600` / `1800` |
+| `NVS_RAISE_COOLDOWN_SECS` | `3600` (cross-episode) |
+| `NVS_LNOTIFY_TIMEOUT` / `NVS_PAGE_TIMEOUT` / `NVS_ESCALATE_TIMEOUT` / `NVS_CURL_MAX_TIME` | `5` / `15` / `15` / `6` |
+| `NVS_MAX_ALERTS_PER_TICK` | `1` |
 | `NVS_ROSTER_NAME` | from the hostname map (link, icarus, trinity); unset for other hosts |
 | `NVS_ROLE_RUNTIME` | `~/.claude/runtime` |
 | `NVS_KEY_HELPER` | `~/.local/bin/nexus-api-key.sh` (exec form) |
@@ -121,7 +153,7 @@ The resolver's unit context is checked for real at placement.
 
 ## Tests
 
-`bash scripts/supervisor/test-supervisor.sh` runs in about 8 s with bash and python3 only. It uses PATH shims
+`bash scripts/supervisor/test-supervisor.sh` runs in about 12 s with bash and python3 only. It uses PATH shims
 for systemctl, curl, lnotify, logger, `date +%s` and hostname, plus a stub resolver and a stub `operator_escalate.py`
 under a temp HOME. Nothing touches a real unit, the journal, the network, the rail, an inbox or the operator.
 CI runs it on ubuntu.
