@@ -395,10 +395,18 @@ fn t_e9f4_transient_empty_read_does_not_raise() {
     for _ in 0..3 {
         w.tick();
     }
-    assert!(w.raised().is_empty(), "transient empty read raised {:?}", w.raised());
+    assert!(
+        w.raised().is_empty(),
+        "transient empty read raised {:?}",
+        w.raised()
+    );
     std::fs::write(&fx.cfg_path, b"").unwrap(); // now it STAYS empty
     w.tick();
-    assert!(w.raised().is_empty(), "first empty read must be unsettled: {:?}", w.raised());
+    assert!(
+        w.raised().is_empty(),
+        "first empty read must be unsettled: {:?}",
+        w.raised()
+    );
     w.tick();
     assert_eq!(w.raised().len(), 1, "{:?}", w.raised());
     assert!(
