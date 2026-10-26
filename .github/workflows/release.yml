@@ -130,6 +130,13 @@ jobs:
           NEXUS_CI_TOKEN: ${{ secrets.NEXUS_CI_TOKEN }}
         run: ./scripts/verify-nexus-release.sh ${{ matrix.platform }} ${{ github.ref_name }}
       - name: Promote on Nexus (go live → auto-update)
+        # Placement gate (2026-10-26): promotion makes this release the updater's
+        # /latest, i.e. every auto-updating vault daemon on every host moves to it.
+        # That is fleet-wide placement, which needs its own decision, so it is
+        # OPT-IN: set the repo variable VAULT_SYNC_AUTOPROMOTE=true to promote from
+        # the tag run. Default (unset): the release is built, staged and verified
+        # only; promote later per platform with scripts/promote-nexus.sh.
+        if: ${{ vars.VAULT_SYNC_AUTOPROMOTE == 'true' }}
         # v0.4.13 (S493): flip the just-verified release to is_current=TRUE so
         # the updater /latest endpoint actually serves it. WITHOUT this the
         # upload stays STAGED (S484 gate) and NO daemon auto-updates — the fleet
