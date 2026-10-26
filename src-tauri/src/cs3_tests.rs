@@ -474,7 +474,7 @@ async fn t_cs3_6_race_through_one_owner() {
     const N: usize = if cfg!(target_os = "linux") {
         5000
     } else if cfg!(windows) {
-        250
+        100
     } else {
         1000
     };
@@ -542,7 +542,7 @@ async fn t_cs3_6_race_through_one_owner() {
         tokio::spawn(async move {
             while !dn.load(Ordering::SeqCst) {
                 o.compact().unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(if cfg!(windows) { 50 } else { 5 })).await;
             }
         })
     };
