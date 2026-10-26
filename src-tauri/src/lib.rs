@@ -251,6 +251,9 @@ pub fn run() {
             let sup = supervise::Supervisor::process(std::sync::Arc::new(boot::TauriHost(
                 app.handle().clone(),
             )));
+            // TKT-1c728ac4 follow-up 2: the tray's click-to-update reaches the
+            // supervisor here, so it restarts through `restart_once`.
+            app.manage(sup.clone());
 
             // S484: silent auto-update — checks on startup AND every 5 min,
             // using the pubkey + endpoints in tauri.conf.json. On a staged

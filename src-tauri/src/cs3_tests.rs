@@ -1588,7 +1588,8 @@ impl Host for ExitingHost {
 /// Helper, NOT a test on its own: the process supervisor built the
 /// production way (`Supervisor::process`, which reads
 /// `VAULT_SYNC_SUPERVISED`), then a `restart_once`; or, with
-/// `CS3_A6_MODE=tray`, the tray's click-to-update restart.
+/// `CS3_A6_MODE=tray` / `tray-early`, the tray's click-to-update restart with
+/// and without the process supervisor.
 #[test]
 #[ignore = "TKT-a6e5c227 helper; spawned by a6_process_restart_honours_supervised_env"]
 fn a6_child_process_restart() {
@@ -1598,10 +1599,17 @@ fn a6_child_process_restart() {
     let host = Arc::new(ExitingHost {
         marker: PathBuf::from(marker),
     });
-    if std::env::var(A6_MODE_ENV).as_deref() == Ok("tray") {
-        crate::tray::update_click_restart(&*host);
-    } else {
-        Supervisor::process(host).restart_once("a6_child");
+    match std::env::var(A6_MODE_ENV).as_deref() {
+        // The tray click as wired in `run()`: the process supervisor exists.
+        Ok("tray") => {
+            let sup = Supervisor::process(host.clone());
+            crate::tray::update_click_restart(Some(&sup), &*host);
+        }
+        // A click before the supervisor exists: the direct leave.
+        Ok("tray-early") => crate::tray::update_click_restart(None, &*host),
+        _ => {
+            Supervisor::process(host).restart_once("a6_child");
+        }
     }
     std::thread::sleep(Duration::from_secs(5));
     std::process::exit(99);
@@ -1614,7 +1622,7 @@ fn a6_child_process_restart() {
 /// `restart()` directly (each red on its `1` case).
 #[test]
 fn a6_process_restart_honours_supervised_env() {
-    for mode in ["supervisor", "tray"] {
+    for mode in ["supervisor", "tray", "tray-early"] {
         let run = |env: Option<&str>| {
             let d = TempDir::new().unwrap();
             let marker = d.path().join("successor");
@@ -1640,5 +1648,66 @@ fn a6_process_restart_honours_supervised_env() {
         assert_eq!(run(Some("1")), (Some(70), false), "{mode}: supervised");
         assert_eq!(run(None), (Some(0), true), "{mode}: env absent");
         assert_eq!(run(Some("yes")), (Some(0), true), "{mode}: env garbage");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #29 gate C1 (TKT-1c728ac4 follow-up 2): the tray click goes through restart_once
+// ---------------------------------------------------------------------------
+
+/// The click takes the `exit_once` claim like every other leaver: one
+/// restart, and a second click (or any later leaver) finds the claim taken
+/// and does nothing. Mutation: the click bypasses `restart_once` (red: two
+/// restarts, and the later `restart_once` is not refused).
+#[test]
+fn c1_tray_click_goes_through_restart_once() {
+    let host = Arc::new(RecordingHost::default());
+    let sup = Supervisor::with_gate(host.clone(), ExitGate::detached());
+    crate::tray::update_click_restart(Some(&sup), &*host);
+    assert_eq!(host.restarts.load(Ordering::SeqCst), 1);
+    crate::tray::update_click_restart(Some(&sup), &*host);
+    assert_eq!(
+        host.restarts.load(Ordering::SeqCst),
+        1,
+        "a second click must find the claim taken"
+    );
+    assert!(host.exits().is_empty(), "{:?}", host.exits());
+    assert!(
+        !sup.restart_once("later"),
+        "the click must have claimed exit_once"
+    );
+}
+
+/// Custody is lost while the tray click is leaving (after its claim, right
+/// before the C9 re-check): the click exits 74, never 70 and never a
+/// restart, supervised or not. Mutation: the click bypasses `restart_once`
+/// (red: a restart / exit 70 instead of 74).
+#[cfg(unix)] // custody is a no-op on Windows (NG-3)
+#[test]
+fn c1_tray_click_custody_lost_exits_74() {
+    for supervised in [false, true] {
+        let base = TempDir::new().unwrap();
+        let d = base.path().join("sync-dir");
+        std::fs::create_dir_all(&d).unwrap();
+        let sd = StateDir::for_test(&d);
+        let shadow = ShadowStore::load(&sd);
+        shadow.record("a.md", &"a".repeat(64));
+        let host = Arc::new(RecordingHost::default());
+        let sup =
+            Supervisor::with_gate_supervised(host.clone(), ExitGate::for_dir(&sd), supervised);
+        let (d2, sh2) = (d.clone(), shadow.clone());
+        sup.set_before_recheck(Some(Box::new(move |_who| {
+            std::fs::rename(&d2, d2.with_extension("moved")).unwrap();
+            std::fs::create_dir_all(&d2).unwrap();
+            let _ = sh2.flush();
+        })));
+        crate::tray::update_click_restart(Some(&sup), &*host);
+        assert!(sd.test_latch().is_set(), "custody loss did not latch");
+        assert_eq!(
+            host.exits(),
+            vec![crate::state_io::EXIT_OWNERSHIP_LOST],
+            "supervised={supervised}: custody lost on the tray path must exit 74"
+        );
+        assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
     }
 }
