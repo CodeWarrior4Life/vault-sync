@@ -498,37 +498,20 @@ mod sys {
         (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
     }
 
-    /// Does the parent of the held directory (`openat(dir, "..")`) still list
-    /// an entry with inode `ino`? Read-only: one `readdir` of the parent.
-    pub(super) fn parent_lists_ino(dir: RawFd, ino: u64) -> io::Result<bool> {
-        let d = openat(dir, "..", O_DIR, 0)?;
-        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(d);
-        // SAFETY: fdopendir takes ownership of `fd` (closed by closedir).
-        let dp = unsafe { libc::fdopendir(fd) };
-        if dp.is_null() {
-            let e = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so `fd` is still ours to close.
-            unsafe { libc::close(fd) };
-            return Err(e);
+    /// Does the parent of the held directory (`openat(dir, "..")`) still
+    /// hold the held directory under `leaf`? `fstatat(parent, leaf,
+    /// AT_SYMLINK_NOFOLLOW)` and compare `(st_dev, st_ino)` with `id`. A stat
+    /// BY NAME crosses into a mount, so a bind-mounted state dir matches
+    /// (a `readdir` `d_ino` is the underlying mountpoint inode and would
+    /// not). Read-only. ENOENT or a different identity is `Ok(false)`.
+    pub(super) fn parent_holds_leaf(dir: RawFd, leaf: &str, id: (u64, u64)) -> io::Result<bool> {
+        use std::os::unix::io::AsRawFd;
+        let parent = openat(dir, "..", O_DIR, 0)?;
+        match fstatat_nofollow(parent.as_raw_fd(), leaf)? {
+            None => Ok(false),
+            #[allow(clippy::unnecessary_cast)]
+            Some(st) => Ok((st.st_dev as u64, st.st_ino as u64) == id),
         }
-        let mut found = false;
-        loop {
-            // SAFETY: `dp` is a live DIR*; readdir returns NULL at the end.
-            let ent = unsafe { libc::readdir(dp) };
-            if ent.is_null() {
-                break;
-            }
-            // SAFETY: `ent` is non-null.
-            let (d_ino, name) = unsafe { ((*ent).d_ino, CStr::from_ptr((*ent).d_name.as_ptr())) };
-            let name = name.to_bytes();
-            if name != b"." && name != b".." && d_ino == ino {
-                found = true;
-                break;
-            }
-        }
-        // SAFETY: `dp` came from fdopendir and is closed exactly once.
-        unsafe { libc::closedir(dp) };
-        Ok(found)
     }
 
     /// Entry names of an open directory, from `readdir` on a fresh
@@ -816,10 +799,14 @@ impl StateDir {
     }
 
     /// The held directory has not been unlinked (§3.3a step 3):
-    /// `fstat(dirfd).st_nlink > 0` AND its parent (reached through the held
-    /// fd's `..`) still lists the held inode. The second half exists because
-    /// APFS keeps `st_nlink > 0` on a removed directory that is still open
-    /// (MEASURED on the macOS CI legs); it is a read-only `readdir`. Any error
+    /// `fstat(dirfd).st_nlink > 0` (fast path) AND its parent, reached
+    /// through the held fd's `..`, still holds it under its leaf name
+    /// (`fstatat(parent, leaf, NOFOLLOW)` equals the held `(dev, ino)`). The
+    /// second half exists because APFS keeps `st_nlink > 0` on a removed
+    /// directory that is still open (MEASURED on the macOS CI legs); it
+    /// stats by NAME so a bind-mounted state dir matches (a `readdir` d_ino
+    /// is the underlying mountpoint inode, MEASURED on link). The leaf name
+    /// comes from the held canonical path; nothing is re-resolved. Any error
     /// is returned (the caller keeps the valve latched). Windows: `true`.
     pub fn held_dir_linked(&self) -> io::Result<bool> {
         #[cfg(unix)]
@@ -829,7 +816,15 @@ impl StateDir {
             if self.dir.metadata()?.nlink() == 0 {
                 return Ok(false);
             }
-            sys::parent_lists_ino(self.dir.as_raw_fd(), self.id.1)
+            let leaf = self
+                .canon
+                .0
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "held dir has no leaf name")
+                })?;
+            sys::parent_holds_leaf(self.dir.as_raw_fd(), leaf, self.id)
         }
         #[cfg(not(unix))]
         {

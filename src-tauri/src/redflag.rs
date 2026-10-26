@@ -245,7 +245,10 @@ impl DeleteBurstDetector {
         // between the two reads):
         //   1. the marker is absent (fstatat on the held dir, NOFOLLOW);
         //   2. THEN custody holds (a failure takes the exit-74 path);
-        //   3. THEN the held directory has not been unlinked (st_nlink > 0).
+        //   3. THEN the held directory has not been unlinked: st_nlink > 0
+        //      AND its parent still holds it under its leaf name (same
+        //      dev/ino by name; APFS keeps st_nlink > 0 on a removed dir,
+        //      and a by-name stat matches a bind-mounted dir).
         // Any Err, and any false at step 2 or 3, keeps the valve latched.
         if !matches!(sd.exists(StateFile::PauseMarker), Ok(false)) {
             return false;

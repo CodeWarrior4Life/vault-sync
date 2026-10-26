@@ -330,25 +330,48 @@ fn t_cs2_31_delete_valve_unlatch_order() {
     assert!(det.is_paused());
     assert_eq!(det.grace_remaining(), 0);
 
-    // Case B: unlink the marker INSIDE the held dir, rename the held dir away
-    // and recreate an empty one: exists=Ok(false), st_nlink>0, so only
-    // custody (Replaced) can hold the latch, and it exits 74.
-    let fx = fixture();
-    let mut det = latched_detector(&fx.sd);
-    std::fs::remove_file(fx.d.join(StateFile::PauseMarker.name())).unwrap();
-    fx.move_and_recreate();
-    assert!(!fx.sd.exists(StateFile::PauseMarker).unwrap());
-    assert!(fx.sd.held_dir_linked().unwrap());
+    // Case B: unlink the marker INSIDE the held dir, then rename the held
+    // dir's PARENT away and recreate an empty parent/leaf at the canonical
+    // path. The held dir stays linked under its leaf name in the moved
+    // parent, so exists=Ok(false) and step 3 holds (st_nlink>0, the parent
+    // still holds the leaf): only custody (Replaced) can keep the latch,
+    // and it exits 74.
+    let base = TempDir::new().unwrap();
+    let parent = base.path().join("p");
+    let leafdir = parent.join("sync-state");
+    std::fs::create_dir_all(&leafdir).unwrap();
+    let sd = StateDir::for_test(&leafdir);
+    let mut det = latched_detector(&sd);
+    std::fs::remove_file(leafdir.join(StateFile::PauseMarker.name())).unwrap();
+    std::fs::rename(&parent, base.path().join("p.moved")).unwrap();
+    std::fs::create_dir_all(&leafdir).unwrap();
+    assert!(!sd.exists(StateFile::PauseMarker).unwrap());
+    assert!(sd.held_dir_linked().unwrap(), "step 3 must hold in case B");
     assert!(
         !det.poll_marker_resume(),
         "case B: custody must hold the latch"
     );
     assert!(det.is_paused());
+    let exits = sd.test_latch().exits.lock().unwrap().clone();
     assert!(
-        matches!(fx.exits().as_slice(), [(74, LossReason::Replaced { .. })]),
-        "{:?}",
-        fx.exits()
+        matches!(exits.as_slice(), [(74, LossReason::Replaced { .. })]),
+        "{exits:?}"
     );
+
+    // Case C (step 3, by-name half): rename the held LEAF away and recreate
+    // it, with custody disabled: the parent no longer holds the held inode
+    // under its leaf name, so step 3 alone keeps the latch.
+    let fx = fixture();
+    let mut det = latched_detector(&fx.sd);
+    fx.sd.seams.custody_disabled.store(true, Ordering::SeqCst);
+    std::fs::remove_file(fx.d.join(StateFile::PauseMarker.name())).unwrap();
+    fx.move_and_recreate();
+    assert!(!fx.sd.held_dir_linked().unwrap());
+    assert!(
+        !det.poll_marker_resume(),
+        "case C: step 3 must hold the latch"
+    );
+    assert!(det.is_paused());
 
     // Positive control: the operator removes the marker for real (custody
     // and the held dir intact): the valve unlatches with a grace window.
@@ -1004,6 +1027,51 @@ fn t_cs2_7_over_mount_exits_74() {
     assert!(out.status.success(), "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("T7_OK"),
+        "{out:?}"
+    );
+}
+
+/// Bind-mounted state dir child (runs inside `unshare -rm`).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "bind-mount valve child; spawned by t_cs2_31_bind_mounted_state_dir_unlatches"]
+fn t_cs2_31_bind_child() {
+    if std::env::var_os("CS2_UNSHARE_CHILD").is_none() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    let ws = tmp.path().join("ws");
+    let state = ws.join("state");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    bind(&src, &state);
+    let sd = StateDir::for_test(&state);
+    assert!(
+        sd.held_dir_linked().unwrap(),
+        "a bind-mounted dir is linked"
+    );
+    let mut det = latched_detector(&sd);
+    std::fs::remove_file(state.join(StateFile::PauseMarker.name())).unwrap();
+    assert!(det.poll_marker_resume(), "clearing the marker must resume");
+    assert!(!det.is_paused());
+    assert!(sd.test_latch().exits.lock().unwrap().is_empty());
+    println!("BIND_OK");
+}
+
+/// §3.3a step 3 on a bind-mounted state dir: with the valve latched,
+/// removing the marker unlatches it (a `readdir` d_ino of the parent is the
+/// underlying mountpoint inode, MEASURED on link, so a d_ino match would
+/// latch it permanently). SKIPPED-LOUD where unshare is unavailable.
+#[cfg(target_os = "linux")]
+#[test]
+fn t_cs2_31_bind_mounted_state_dir_unlatches() {
+    let Some(out) = run_in_unshare("t_cs2_31_bind_child") else {
+        return;
+    };
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("BIND_OK"),
         "{out:?}"
     );
 }
