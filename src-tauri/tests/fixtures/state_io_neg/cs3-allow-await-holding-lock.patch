@@ -1,12 +1,12 @@
 --- a/src/supervise.rs
 +++ b/src/supervise.rs
-@@ -34,6 +34,9 @@
- /// EX_SOFTWARE: a Required task ended unexpectedly (CS-3 D4).
+@@ -36,6 +36,9 @@
+ /// (TKT-a6e5c227, [`restart_via_host`]).
  pub const EXIT_TASK_ENDED: i32 = 70;
  
 +#[allow(clippy::await_holding_lock)]
 +pub async fn cs3_plant() {}
 +
- /// A periodic task's tick. Tests in the daemon-subprocess harness shorten
- /// every periodic tick with `CS3_FAST_TICK_MS`; production returns
- /// `default` unchanged.
+ /// TKT-a6e5c227 ruling (b): the ONLY signal that a supervisor (the launchd
+ /// agent on macOS, the systemd unit on Linux) owns this process and will
+ /// relaunch it on a non-zero exit. The unit or plist sets it to exactly `1`.
