@@ -1613,7 +1613,17 @@ mod tests {
         let t_ack = std::thread::spawn(move || {
             let mut rounds = 0usize;
             while !done_a.load(Ordering::SeqCst) {
-                let batch = acker.drain(32).unwrap();
+                // Never ack the `dup/` events: they must survive for `compact` to
+                // collapse, otherwise a fast acker (observed on Windows CI) drains
+                // them first and the compactor never actually rewrites, so the
+                // positive control below cannot prove both rewriters raced.
+                let batch: Vec<_> = acker
+                    .drain(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(e, _)| !e.path.starts_with("dup/"))
+                    .take(32)
+                    .collect();
                 if batch.is_empty() {
                     std::thread::yield_now();
                     continue;
