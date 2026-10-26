@@ -60,13 +60,13 @@ pub struct SseConsumer {
     api: ApiClient,
     materializer: Materializer,
     tray_state: Option<SharedTrayState>,
-    /// S477 v0.3.8 (A): disk path where `last_event_id` is persisted after
-    /// every successful SSE event. Loaded on daemon startup; written on
-    /// each event with non-empty `ev.id`. Closes the catchup-on-restart
-    /// gap that silently drops every event emitted while the daemon was
-    /// down. Atomic write (tmp + rename) to avoid mid-write corruption.
-    /// `None` => no persistence (back-compat for unit tests).
-    last_event_id_path: Option<std::path::PathBuf>,
+    /// S477 v0.3.8 (A): where `last_event_id` is persisted after every
+    /// successful SSE event. Loaded on daemon startup; written on each event
+    /// with non-empty `ev.id`. Closes the catchup-on-restart gap that
+    /// silently drops every event emitted while the daemon was down.
+    /// CS-2 (W12): the held state dir (`StateFile::LastEventId`), written
+    /// with an atomic replace. `None` => no persistence (unit tests).
+    state_dir: Option<std::sync::Arc<crate::state_io::StateDir>>,
     /// TKT-fc62ea8a: max silence tolerated on the stream before the session
     /// is force-reconnected. See [`LIVENESS_WINDOW`].
     liveness_window: std::time::Duration,
@@ -102,7 +102,7 @@ impl SseConsumer {
             api,
             materializer,
             tray_state: None,
-            last_event_id_path: None,
+            state_dir: None,
             liveness_window: LIVENESS_WINDOW,
         })
     }
@@ -120,48 +120,35 @@ impl SseConsumer {
         self
     }
 
-    /// S477 v0.3.8 (A): wire the on-disk persistence path for last_event_id.
-    /// Caller (lib.rs spawn_sse_consumer) computes the path under the
-    /// workspace runtime dir + subscriber_id so per-subscriber persistence
-    /// is namespaced cleanly.
-    pub fn with_last_event_id_path(mut self, p: std::path::PathBuf) -> Self {
-        self.last_event_id_path = Some(p);
+    /// S477 v0.3.8 (A) / CS-2: persist last_event_id in the subscriber's
+    /// held state dir (namespaced per subscriber by the bootstrap).
+    pub fn with_state_dir(mut self, sd: &std::sync::Arc<crate::state_io::StateDir>) -> Self {
+        self.state_dir = Some(std::sync::Arc::clone(sd));
         self
     }
 
-    /// Atomic-write the given id to disk (tmp + rename). Failure is logged
-    /// and swallowed — losing one event's persistence is not worth crashing
-    /// the SSE loop. The next event will re-persist over the same file.
+    /// W12 (CS-2): atomic replace through the held dir (CS-1 unique temp,
+    /// no create_dir_all). Failure is logged and swallowed — losing one
+    /// event's persistence is not worth crashing the SSE loop. The next
+    /// event will re-persist over the same file.
     fn persist_last_event_id(&self, id: &str) {
-        let Some(path) = &self.last_event_id_path else {
+        let Some(sd) = &self.state_dir else {
             return;
         };
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(error = %e, "last_event_id: create_dir_all failed");
-            return;
-        }
-        let tmp = parent.join(format!(".last_event_id.tmp.{}", std::process::id()));
-        if let Err(e) = std::fs::write(&tmp, id.as_bytes()) {
-            warn!(error = %e, "last_event_id: tmp write failed");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            warn!(error = %e, "last_event_id: rename failed");
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = sd.replace_atomic(crate::state_io::StateFile::LastEventId, id.as_bytes()) {
+            warn!(error = %e, "last_event_id: persist failed");
         }
     }
 
-    /// S477 v0.3.8 (A): read the persisted last_event_id from disk. Caller
-    /// uses this on daemon startup to resume from the right point so the
-    /// server's catchup-on-reconnect replays only events emitted while
-    /// the daemon was down (per sync_routes_p1.py event_stream catchup).
-    /// Returns None if the file is absent, empty, or unreadable — any of
-    /// which is "first run" semantics.
-    pub fn load_last_event_id(path: &std::path::Path) -> Option<String> {
-        let s = std::fs::read_to_string(path).ok()?;
+    /// S477 v0.3.8 (A): read the persisted last_event_id (through the held
+    /// dir fd). Caller uses this on daemon startup to resume from the right
+    /// point so the server's catchup-on-reconnect replays only events
+    /// emitted while the daemon was down (per sync_routes_p1.py
+    /// event_stream catchup). Returns None if the file is absent, empty, or
+    /// unreadable — any of which is "first run" semantics.
+    pub fn load_last_event_id(sd: &crate::state_io::StateDir) -> Option<String> {
+        let bytes = sd.read(crate::state_io::StateFile::LastEventId).ok()??;
+        let s = String::from_utf8(bytes).ok()?;
         let trimmed = s.trim().to_string();
         if trimmed.is_empty() {
             None
@@ -441,6 +428,7 @@ impl SseConsumer {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
@@ -557,5 +545,34 @@ mod tests {
             !matches!(out, Err(SseError::TimedOut)),
             "keep-alives inside the window must not trip the watchdog, got {out:?}"
         );
+    }
+
+    /// CS-2 (W12): last_event_id persists through the held state dir with an
+    /// atomic replace (0600, no fixed-name temp left behind) and loads back.
+    #[tokio::test]
+    async fn last_event_id_round_trips_through_state_dir() {
+        let (addr, _srv) = spawn_silent_sse_server("").await;
+        let (_v, _w, c) = test_consumer(addr, Duration::from_millis(300));
+        let d = tempfile::TempDir::new().unwrap();
+        let sd = crate::state_io::StateDir::for_test(d.path());
+        let c = c.with_state_dir(&sd);
+        assert_eq!(SseConsumer::load_last_event_id(&sd), None);
+        c.persist_last_event_id("42-7");
+        c.persist_last_event_id("43-1");
+        assert_eq!(
+            SseConsumer::load_last_event_id(&sd).as_deref(),
+            Some("43-1")
+        );
+        let names: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["last_event_id".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(d.path().join("last_event_id")).unwrap();
+            assert_eq!(m.permissions().mode() & 0o777, 0o600);
+        }
     }
 }

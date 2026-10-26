@@ -941,25 +941,19 @@ fn spawn_sse_consumer(
             })
             .collect();
 
-        // S477 v0.3.8 (A): per-subscriber on-disk path for last_event_id
-        // persistence. Lives alongside the push_journal under the workspace
-        // runtime dir, namespaced by subscriber_id so multi-subscriber
-        // hosts don't collide.
-        let last_event_id_path = commands::resolve_workspace_root()
-            .join(".lattice-runtime")
-            .join(&cfg.subscriber_id)
-            .join("sync-state")
-            .join("last_event_id");
+        // S477 v0.3.8 (A) / CS-2 (W12): last_event_id is persisted in the
+        // subscriber's held state dir beside the push journal, namespaced by
+        // subscriber_id so multi-subscriber hosts don't collide.
         // Load on startup so catchup-on-reconnect actually fires server-side.
         // The Config.last_event_id field is preserved as a back-compat
         // fallback (older daemons may have populated it via the legacy code
         // path); disk-persisted value takes precedence.
         let resumed_id =
-            sse::SseConsumer::load_last_event_id(&last_event_id_path).or(cfg.last_event_id.clone());
+            sse::SseConsumer::load_last_event_id(&state_dir).or(cfg.last_event_id.clone());
         if let Some(rid) = &resumed_id {
             tracing::info!(
                 last_event_id = %rid,
-                path = %last_event_id_path.display(),
+                file = state_io::StateFile::LastEventId.name(),
                 "resuming SSE from persisted last_event_id"
             );
         }
@@ -971,9 +965,7 @@ fn spawn_sse_consumer(
             snap.scope_excludes,
             materializer,
         ) {
-            Ok(c) => c
-                .with_tray_state(tray_state)
-                .with_last_event_id_path(last_event_id_path),
+            Ok(c) => c.with_tray_state(tray_state).with_state_dir(&state_dir),
             Err(e) => {
                 tracing::error!("sse consumer init failed: {e}");
                 return;
