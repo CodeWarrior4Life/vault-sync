@@ -724,8 +724,13 @@ mod tests {
             body.contains("TO RESUME"),
             "marker must tell the operator how to clear it, got: {body}"
         );
+        // CS-2: the marker names the held dir's CANONICAL path (on Windows
+        // the temp dir may be spelled with 8.3 short names).
+        let canonical = dunce::canonicalize(dir.path())
+            .unwrap()
+            .join("delete-burst-PAUSED");
         assert!(
-            body.contains(&marker.display().to_string()),
+            body.contains(&canonical.display().to_string()),
             "marker must name its own path so the rm is copy-pasteable"
         );
     }
