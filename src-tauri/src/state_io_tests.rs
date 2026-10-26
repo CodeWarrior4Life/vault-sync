@@ -639,20 +639,33 @@ fn t_cs2_30_write_side_fifo_never_blocks() {
             matches!(r, Ok(Err(_))),
             "{f:?}: a FIFO at the name must error promptly, got {r:?}"
         );
-        // Positive control: a regular file at the name is opened normally
-        // (blocking mode restored after the check).
+        // Positive control: a regular file at the name is opened normally,
+        // and an fd from the EXISTING-name path (the one that opens with
+        // O_NONBLOCK) has O_NONBLOCK cleared again. The first open below
+        // goes through the create path, so the assertion is made on a
+        // SECOND open of the now-existing name.
         std::fs::remove_file(d.path().join(f.name())).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let nonblock = |fd: std::os::unix::io::RawFd| {
+            // SAFETY: fcntl(F_GETFL) on an open fd.
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_ne!(fl, -1);
+            fl & libc::O_NONBLOCK != 0
+        };
         if f == StateFile::PushJournalLock {
-            let l = sd.open_lock(f).unwrap();
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: fcntl on an open fd.
-            let fl = unsafe { libc::fcntl(l.as_raw_fd(), libc::F_GETFL) };
-            assert_eq!(fl & libc::O_NONBLOCK, 0, "O_NONBLOCK must be cleared");
+            let _created = sd.open_lock(f).unwrap();
+            let existing = sd.open_lock(f).unwrap();
+            assert!(
+                !nonblock(existing.as_raw_fd()),
+                "{f:?}: O_NONBLOCK must be cleared on the existing-name open"
+            );
         } else {
             let _c = sd.append(f, b"a\n").unwrap();
-            let _c = sd.append(f, b"b\n").unwrap();
-            let mut a = sd.open_append(f).unwrap();
-            let _ = &mut a;
+            let a = sd.open_append(f).unwrap();
+            assert!(
+                !nonblock(a.file.as_raw_fd()),
+                "{f:?}: O_NONBLOCK must be cleared on the existing-name open"
+            );
         }
     }
 }

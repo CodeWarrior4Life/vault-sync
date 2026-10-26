@@ -828,6 +828,13 @@ mod tests {
         watcher
             .watch(&watched, notify::RecursiveMode::Recursive)
             .unwrap();
+        // macOS FSEvents can deliver the watched dir's OWN creation (it was
+        // made just before the watch) after a delay: let it arrive and drop
+        // it before the child runs, and below count only events INSIDE it.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = wrx.try_iter().count();
+        // FSEvents reports canonical paths (/private/var/... on macOS).
+        let watched_canon = dunce::canonicalize(&watched).unwrap();
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -850,7 +857,17 @@ mod tests {
         );
         m.assert_async().await;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let during: Vec<notify::Event> = wrx.try_iter().filter_map(Result::ok).collect();
+        let during: Vec<notify::Event> = wrx
+            .try_iter()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.paths.iter().any(|p| {
+                    [&watched, &watched_canon]
+                        .iter()
+                        .any(|w| p.starts_with(w) && p != *w)
+                })
+            })
+            .collect();
         assert!(
             during.is_empty(),
             "the D9 seed touched the temp dir: {during:?}"
@@ -862,10 +879,20 @@ mod tests {
         );
         // Positive control: the watch does see a create.
         std::fs::write(watched.join("probe"), b"x").unwrap();
-        let seen = wrx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .ok()
-            .and_then(Result::ok);
-        assert!(seen.is_some(), "the temp-dir watch must observe a create");
+        let probe = watched.join("probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = false;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match wrx.recv_timeout(left) {
+                Ok(Ok(e)) if e.paths.iter().any(|p| p.ends_with("probe")) => {
+                    seen = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = probe;
+        assert!(seen, "the temp-dir watch must observe a create inside it");
     }
 }
