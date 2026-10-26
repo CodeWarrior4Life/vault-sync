@@ -34,6 +34,10 @@ jobs:
       - name: state_io gate negative controls (CS-2 §3.5)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/state_io_gate_negcontrol.sh
+      # O5-2a: the host supervisor's inactive-unit alert + the unchanged not_receiving path (PATH shims, ~8 s).
+      - name: nexus-vault-sync-supervisor tests (O5-2a)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/supervisor/test-supervisor.sh
       # #29 gate C2 + follow-up P1-P5: the Trinity install script (exact-path matching, reversible parking, never kills, receipt; shims).
       - name: install-trinity-agent tests (#29 C2)
         if: matrix.os == 'ubuntu-latest'
