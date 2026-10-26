@@ -100,6 +100,28 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --target ${{ matrix.target }}
+      # TKT-940d5263: the macOS updater bundle is "<product>.app.tar.gz" (+ .sig) on BOTH darwin targets, so
+      # it was missing from the GH release (no glob) and its .sig collided across the two darwin jobs. Stage
+      # arch-named copies OUTSIDE the bundle dir: upload-to-nexus.sh discovers its artifact with
+      # `find ... -name '*.sig' | head -1` inside bundle/, so nothing may be added there.
+      - name: Stage arch-named macOS updater bundles for the GH release
+        if: startsWith(matrix.platform, 'darwin-')
+        shell: bash
+        env:
+          BUNDLE_DIR: src-tauri/target/${{ matrix.target }}/release/bundle/macos
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-gh
+          n=0
+          for f in "$BUNDLE_DIR"/*.app.tar.gz "$BUNDLE_DIR"/*.app.tar.gz.sig; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            cp "$f" "dist-gh/${b/.app.tar.gz/_${PLATFORM}.app.tar.gz}"
+            n=$((n+1))
+          done
+          [ "$n" -eq 2 ] || { echo "::error::expected 1 .app.tar.gz + 1 .sig in $BUNDLE_DIR, staged $n"; exit 1; }
+          ls -l dist-gh
       - name: Upload to GH Release
         uses: softprops/action-gh-release@v2
         with:
@@ -108,7 +130,9 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*-setup.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe.sig
+            dist-gh/*
       - name: Upload to Nexus (stage)
         continue-on-error: true
         shell: bash  # windows-latest defaults to pwsh, which can't run the .sh uploader → nothing staged (S486)
