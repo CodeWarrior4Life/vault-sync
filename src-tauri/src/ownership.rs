@@ -205,6 +205,9 @@ pub struct ConfigWatch {
     raised_for: Option<String>,
     /// Events this watch raised, in order (observation).
     raised: Vec<StateHealthEvent>,
+    /// The previous tick read an EMPTY file (TKT-e9f45912): a truncate-then-write
+    /// writer is briefly empty, so one empty read is unsettled, not a change.
+    empty_seen: bool,
 }
 
 impl ConfigWatch {
@@ -214,6 +217,7 @@ impl ConfigWatch {
             tray,
             raised_for: None,
             raised: Vec::new(),
+            empty_seen: false,
         }
     }
 
@@ -224,6 +228,17 @@ impl ConfigWatch {
         let disk = hash_config_file(self.snapshot.cfg_path());
         let same = matches!(&disk, DiskConfig::Hash(h) if h == self.snapshot.config_sha256());
         let snapshot_sha8 = self.snapshot.sha8();
+        // TKT-e9f45912: an EMPTY read that does not match the snapshot is
+        // unsettled the first time (a non-atomic writer mid-write: macOS CI
+        // saw disk_sha8=e3b0c442, the sha256 of no bytes, for ~200 ms). Raise
+        // nothing and re-read next tick; a file still empty then is real.
+        let empty: [u8; 32] = Sha256::digest(b"").into();
+        let is_empty = matches!(&disk, DiskConfig::Hash(h) if *h == empty);
+        if !same && is_empty && !self.empty_seen {
+            self.empty_seen = true;
+            return;
+        }
+        self.empty_seen = is_empty;
         if same {
             if self.raised_for.take().is_some() {
                 self.set_tray(false);

@@ -377,6 +377,37 @@ fn t_cs3_4_raised_once_per_distinct_hash_and_cleared() {
     assert!(Arc::ptr_eq(fx.handles.snapshot(), &fx.snapshot));
 }
 
+/// TKT-e9f45912: a truncate-then-write is briefly EMPTY. One empty read is
+/// unsettled (no event) and the next tick sees the finished bytes; a file that
+/// STAYS empty for a second tick is real and is raised (disk_sha8 e3b0c442).
+/// Mutation: drop the empty-read settle -> the transient read raises a spurious
+/// config_pending_restart (the t_cs3_4 macOS flake, CI runs 40365874594 and
+/// 40375833002).
+#[test]
+fn t_e9f4_transient_empty_read_does_not_raise() {
+    let fx = one_root("http://127.0.0.1:1");
+    let original = std::fs::read(&fx.cfg_path).unwrap();
+    let mut w = ConfigWatch::new(fx.snapshot.clone(), None);
+    w.tick();
+    std::fs::write(&fx.cfg_path, b"").unwrap(); // the writer has truncated
+    w.tick(); // ONE empty read
+    std::fs::write(&fx.cfg_path, &original).unwrap(); // the writer finishes
+    for _ in 0..3 {
+        w.tick();
+    }
+    assert!(w.raised().is_empty(), "transient empty read raised {:?}", w.raised());
+    std::fs::write(&fx.cfg_path, b"").unwrap(); // now it STAYS empty
+    w.tick();
+    assert!(w.raised().is_empty(), "first empty read must be unsettled: {:?}", w.raised());
+    w.tick();
+    assert_eq!(w.raised().len(), 1, "{:?}", w.raised());
+    assert!(
+        matches!(w.raised().last(), Some(StateHealthEvent::ConfigPendingRestart { disk_sha8, .. }) if disk_sha8 == "e3b0c442"),
+        "{:?}",
+        w.raised()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-CS3-5: one owner per journal file per process, never released
 // ---------------------------------------------------------------------------

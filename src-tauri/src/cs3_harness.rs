@@ -282,7 +282,7 @@ async fn child_main(scenario: String) {
             let original = std::fs::read(&cfg).unwrap();
             let mut changed = original.clone();
             changed.extend_from_slice(b"# operator edit\n");
-            std::fs::write(&cfg, &changed).unwrap();
+            write_atomic(&cfg, &changed); // TKT-e9f45912: never expose a truncated config.toml
             tokio::time::sleep(Duration::from_millis(2_000)).await;
             let root = h.snapshot().roots()[0].path.clone();
             std::fs::write(
@@ -296,7 +296,7 @@ async fn child_main(scenario: String) {
             )
             .await;
             println!("PUSHED={sent}");
-            std::fs::write(&cfg, &original).unwrap();
+            write_atomic(&cfg, &original);
             tokio::time::sleep(Duration::from_millis(1_500)).await;
             let sha8 = c.snapshot.sha8();
             let mine = |e: &StateHealthEvent| match e {
