@@ -490,6 +490,22 @@ mod sys {
         }
     }
 
+    /// Clear `O_NONBLOCK` on an open fd (`fcntl(F_GETFL/F_SETFL)`).
+    pub(super) fn clear_nonblock(f: &File) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        // SAFETY: fcntl on an fd owned by `f` for the duration of the call.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn is_reg(st: &libc::stat) -> bool {
         (st.st_mode & libc::S_IFMT) == libc::S_IFREG
     }
@@ -1050,9 +1066,14 @@ impl StateDir {
             } | libc::O_NOFOLLOW
                 | libc::O_CLOEXEC;
             for _ in 0..3 {
-                match sys::openat(fd, name, base, 0) {
+                // TKT-98d5f42d F1: open an EXISTING name with O_NONBLOCK so a
+                // FIFO planted there cannot block the open (a write-only
+                // FIFO open with no reader fails ENXIO instead); S_ISREG is
+                // checked, then O_NONBLOCK is cleared for normal I/O.
+                match sys::openat(fd, name, base | libc::O_NONBLOCK, 0) {
                     Ok(file) => {
                         ensure_regular(&file, name).map_err(NotCommitted)?;
+                        sys::clear_nonblock(&file).map_err(NotCommitted)?;
                         return Ok((file, false));
                     }
                     Err(e) if sys::errno_is(&e, libc::ENOENT) => {}

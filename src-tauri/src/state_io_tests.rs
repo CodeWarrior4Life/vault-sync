@@ -604,3 +604,55 @@ fn t_cs2_19_store_flush_uncertain_mapping() {
     custody_tick(std::slice::from_ref(&sd));
     assert!(!sd.dir_sync_pending(), "custody tick re-synced and cleared");
 }
+
+/// TKT-98d5f42d F1 (write side of T-CS2-30): a FIFO planted at a state name
+/// makes every write-side open (append, open_append, the lock open) error
+/// within 1 s instead of blocking forever before the S_ISREG check; a
+/// regression fails on the timeout rather than hanging the suite.
+#[cfg(unix)]
+#[test]
+fn t_cs2_30_write_side_fifo_never_blocks() {
+    for f in [
+        StateFile::DeleteLedger,
+        StateFile::PushJournal,
+        StateFile::PushJournalLock,
+    ] {
+        let d = TempDir::new().unwrap();
+        let sd = StateDir::for_test(d.path());
+        let fifo = sys_cstr(&d.path().join(f.name()));
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sd2 = sd.clone();
+        std::thread::spawn(move || {
+            let r = if f == StateFile::PushJournalLock {
+                sd2.open_lock(f).map(|_| ()).map_err(|e| e.to_string())
+            } else {
+                sd2.append(f, b"x\n")
+                    .map(|_| ())
+                    .map_err(|e| e.0.to_string())
+            };
+            let _ = tx.send(r);
+        });
+        let r = rx.recv_timeout(Duration::from_secs(1));
+        assert!(
+            matches!(r, Ok(Err(_))),
+            "{f:?}: a FIFO at the name must error promptly, got {r:?}"
+        );
+        // Positive control: a regular file at the name is opened normally
+        // (blocking mode restored after the check).
+        std::fs::remove_file(d.path().join(f.name())).unwrap();
+        if f == StateFile::PushJournalLock {
+            let l = sd.open_lock(f).unwrap();
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: fcntl on an open fd.
+            let fl = unsafe { libc::fcntl(l.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(fl & libc::O_NONBLOCK, 0, "O_NONBLOCK must be cleared");
+        } else {
+            let _c = sd.append(f, b"a\n").unwrap();
+            let _c = sd.append(f, b"b\n").unwrap();
+            let mut a = sd.open_append(f).unwrap();
+            let _ = &mut a;
+        }
+    }
+}
