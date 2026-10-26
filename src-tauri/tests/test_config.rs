@@ -22,7 +22,7 @@ fn save_then_load_round_trips() {
             subscriber_id: "test-sid".to_string(),
         }],
     };
-    cfg.save_to(&path).unwrap();
+    let _commit = cfg.save_to(&path).unwrap();
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(loaded, cfg);
 }
@@ -47,7 +47,7 @@ fn path_handles_unicode_filenames() {
         last_event_id: None,
         sync_roots: vec![],
     };
-    cfg.save_to(&path).unwrap();
+    let _commit = cfg.save_to(&path).unwrap();
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(loaded.subscriber_id, "sid-😀");
 }

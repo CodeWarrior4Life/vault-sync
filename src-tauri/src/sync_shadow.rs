@@ -167,7 +167,7 @@ impl FlushGen {
         tmp.flush()?;
         self.sync_tmp(tmp.as_file())?;
         tmp.persist(dest).map_err(|e| e.error)?;
-        crate::push_journal::fsync_dir(&parent)?;
+        crate::durable_file::fsync_dir(&parent)?;
 
         // S2: only the generation that was actually written is marked
         // flushed. A mutation after the snapshot has mut_gen > g, so the next

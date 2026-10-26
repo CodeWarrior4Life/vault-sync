@@ -304,6 +304,10 @@ form.addEventListener("submit", async (e) => {
         vaultsRoot,
         mode: result.materializer_mode || mode,
       });
+      // CS-1: same one-line text the CLI prints when durability is uncertain.
+      if (result.durability_warning) {
+        showStatus(result.durability_warning, true);
+      }
     }
   } catch (err) {
     showStatus("Pairing failed: " + err, true);

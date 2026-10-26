@@ -31,3 +31,9 @@ jobs:
         working-directory: src-tauri
       - run: cargo test --all-targets
         working-directory: src-tauri
+      # CS-1 §4b / T-CS1-17: record which directory-durability branch fired
+      # (F_FULLFSYNC success or the fsync fallback) on the macOS legs.
+      - name: Record macOS directory-sync branch (T-CS1-17)
+        if: runner.os == 'macOS'
+        run: cargo test --lib t_cs1_17_real_filesystem_branch_is_recorded -- --nocapture
+        working-directory: src-tauri

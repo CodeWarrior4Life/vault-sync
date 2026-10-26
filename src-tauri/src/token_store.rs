@@ -26,6 +26,7 @@
 //! auto-updates with ZERO Keychain prompts.
 
 use crate::config::default_config_path;
+use crate::durable_file::{replace_atomic, Commit, NotCommitted, PathAnchor};
 use crate::keyring;
 use std::collections::HashMap;
 use std::fs;
@@ -110,6 +111,34 @@ pub enum TokenStoreError {
     Io(#[from] std::io::Error),
     #[error("keyring error: {0}")]
     Keyring(#[from] keyring::KeyringError),
+    /// CS-1: the atomic token-file replace failed before its commit point;
+    /// any previous token file is byte-identical.
+    #[error("token file not written (previous file untouched): {0}")]
+    NotCommitted(std::io::Error),
+}
+
+impl From<NotCommitted> for TokenStoreError {
+    fn from(e: NotCommitted) -> Self {
+        TokenStoreError::NotCommitted(e.0)
+    }
+}
+
+/// Outcome of [`store`]: which backend(s) hold the token, and the durability
+/// of the authoritative file write.
+#[must_use = "carries the token file's durability outcome"]
+#[derive(Debug, Clone, Copy)]
+pub struct TokenStored {
+    pub backend: &'static str,
+    pub commit: Commit,
+}
+
+/// The directory token files live in (the config dir). CS-1 startup
+/// maintenance sweeps and fsyncs it.
+pub(crate) fn token_dir() -> PathBuf {
+    let p = default_config_path();
+    p.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub(crate) fn token_file_path(subscriber_id: &str) -> PathBuf {
@@ -121,20 +150,12 @@ pub(crate) fn token_file_path(subscriber_id: &str) -> PathBuf {
     p
 }
 
-/// Write the token file with 0600 perms (unix), creating parent dirs.
-fn write_token_file(path: &Path, token: &str) -> Result<(), TokenStoreError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, token.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(path, perms)?;
-    }
-    Ok(())
+/// Write the token file atomically through `replace_atomic` (CS-1, gate C5):
+/// the temp is created 0600 in a single open, so the token never exists at
+/// umask permissions, and a failed write leaves any previous file intact.
+fn write_token_file(path: &Path, token: &str) -> Result<Commit, TokenStoreError> {
+    let (anchor, name) = PathAnchor::split(path).map_err(TokenStoreError::NotCommitted)?;
+    Ok(replace_atomic(&anchor, &name, token.as_bytes())?)
 }
 
 /// Persist a token. v0.4.29: the 0600 file is ALWAYS written (it is the
@@ -142,7 +163,7 @@ fn write_token_file(path: &Path, token: &str) -> Result<(), TokenStoreError> {
 /// without a Keychain prompt); the keyring write is best-effort
 /// defense-in-depth, skipped entirely under `VAULT_SYNC_TOKEN_BACKEND=file`.
 /// Returns the backend(s) that persisted the token, for log/tray-status.
-pub fn store(subscriber_id: &str, token: &str) -> Result<&'static str, TokenStoreError> {
+pub fn store(subscriber_id: &str, token: &str) -> Result<TokenStored, TokenStoreError> {
     store_impl(
         subscriber_id,
         token,
@@ -152,33 +173,37 @@ pub fn store(subscriber_id: &str, token: &str) -> Result<&'static str, TokenStor
     )
 }
 
-fn store_impl(
+pub(crate) fn store_impl(
     subscriber_id: &str,
     token: &str,
     file_path: &Path,
     keyring: &dyn KeyringOps,
     file_only: bool,
-) -> Result<&'static str, TokenStoreError> {
+) -> Result<TokenStored, TokenStoreError> {
     // Keep the process cache in step with the new token regardless of backend,
     // so an in-process load() after a re-pair returns the fresh value.
     cache_put(subscriber_id, token);
     // The file write is UNCONDITIONAL and authoritative: if it fails, store()
     // fails (a keyring-only token would re-arm the auto-update prompt).
-    write_token_file(file_path, token)?;
+    let commit = write_token_file(file_path, token)?;
     if file_only {
         debug!("token persisted to file (keyring skipped: {TOKEN_BACKEND_ENV}=file)");
-        return Ok("file");
+        return Ok(TokenStored {
+            backend: "file",
+            commit,
+        });
     }
-    match keyring.set(subscriber_id, token) {
+    let backend = match keyring.set(subscriber_id, token) {
         Ok(()) => {
             debug!("token persisted to file + OS keyring");
-            Ok("file+keyring")
+            "file+keyring"
         }
         Err(e) => {
             warn!("OS keyring write failed ({e}); token persisted to file only");
-            Ok("file")
+            "file"
         }
-    }
+    };
+    Ok(TokenStored { backend, commit })
 }
 
 /// Load a token. v0.4.29 order: cache → FILE → keyring. The keyring is a
@@ -230,7 +255,7 @@ fn load_impl(
             // file-first. Best-effort — a shim failure must not break a
             // successful load.
             match write_token_file(file_path, &t) {
-                Ok(()) => debug!("migrated legacy keyring token to file backend"),
+                Ok(_commit) => debug!("migrated legacy keyring token to file backend"),
                 Err(e) => warn!("keyring→file migration shim failed ({e}); load still Ok"),
             }
             Ok(Some(t))
@@ -383,7 +408,9 @@ mod tests {
         let sub = "tok-store-file-always";
         let path = tmp_token_path(&dir, sub);
         let kr = FakeKeyring::empty();
-        let backend = store_impl(sub, "bearer-abc", &path, &kr, false).unwrap();
+        let backend = store_impl(sub, "bearer-abc", &path, &kr, false)
+            .unwrap()
+            .backend;
         assert!(
             path.exists(),
             "file must be written even on keyring success"
@@ -405,7 +432,9 @@ mod tests {
         let sub = "tok-store-keyring-fails";
         let path = tmp_token_path(&dir, sub);
         let kr = FakeKeyring::failing_set();
-        let backend = store_impl(sub, "bearer-def", &path, &kr, false).unwrap();
+        let backend = store_impl(sub, "bearer-def", &path, &kr, false)
+            .unwrap()
+            .backend;
         assert!(path.exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "bearer-def");
         assert_eq!(backend, "file");
@@ -418,7 +447,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let sub = "tok-store-file-only";
         let path = tmp_token_path(&dir, sub);
-        let backend = store_impl(sub, "bearer-ghi", &path, &PanicKeyring, true).unwrap();
+        let backend = store_impl(sub, "bearer-ghi", &path, &PanicKeyring, true)
+            .unwrap()
+            .backend;
         assert!(path.exists());
         assert_mode_0600(&path);
         assert_eq!(backend, "file");
@@ -579,6 +610,83 @@ mod tests {
         cache_put(sub, "old");
         cache_put(sub, "new");
         assert_eq!(cache_get(sub).as_deref(), Some("new"));
+        cache_clear(sub);
+    }
+
+    /// T-CS1-15 (gate C5): `write_token_file` goes through `replace_atomic`,
+    /// and the token file never exists at a mode other than 0600 (observed by
+    /// a hook at every step between the temp create and the rename). A legacy
+    /// 0644 file is replaced by a 0600 one.
+    /// Mutation: restore `fs::write` + chmod.
+    #[test]
+    fn t_cs1_15_token_file_goes_through_replace_atomic_and_is_always_0600() {
+        use crate::durable_file::seams;
+        seams::reset();
+        let dir = tempfile::TempDir::new().unwrap();
+        let sub = "test-cs1-15-sub";
+        let path = tmp_token_path(&dir, sub);
+        let target = path.clone();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let observed2 = observed.clone();
+        seams::set_hook(Box::new(move |_p, temp_or_target| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for f in [temp_or_target, target.as_path()] {
+                    if let Ok(m) = std::fs::metadata(f) {
+                        assert_eq!(
+                            m.permissions().mode() & 0o777,
+                            0o600,
+                            "{} at a non-0600 mode",
+                            f.display()
+                        );
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = (temp_or_target, &target);
+            observed2.set(observed2.get() + 1);
+        }));
+        let stored = store_impl(sub, "bearer-cs1", &path, &PanicKeyring, true).unwrap();
+        assert_eq!(stored.backend, "file");
+        assert!(observed.get() >= 4, "hook ran at every step");
+        assert_eq!(seams::calls(), vec![format!("token-{sub}.bin")]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bearer-cs1");
+        assert_mode_0600(&path);
+
+        // A legacy 0644 file is replaced atomically by a 0600 one.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            seams::reset();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _s = store_impl(sub, "bearer-cs1-rotated", &path, &PanicKeyring, true).unwrap();
+            assert_mode_0600(&path);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "bearer-cs1-rotated"
+            );
+        }
+        cache_clear(sub);
+    }
+
+    /// CS-1: a failed token replace is an error and leaves the previous token
+    /// file byte-identical.
+    #[test]
+    fn token_rename_failure_leaves_previous_token() {
+        use crate::durable_file::seams;
+        seams::reset();
+        let dir = tempfile::TempDir::new().unwrap();
+        let sub = "test-cs1-tok-fail";
+        let path = tmp_token_path(&dir, sub);
+        let _s = store_impl(sub, "old-token", &path, &PanicKeyring, true).unwrap();
+        seams::fail_rename(5);
+        let r = store_impl(sub, "new-token", &path, &PanicKeyring, true);
+        assert!(
+            matches!(r, Err(super::TokenStoreError::NotCommitted(_))),
+            "got {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-token");
         cache_clear(sub);
     }
 }
