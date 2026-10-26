@@ -464,7 +464,11 @@ fn lc_case(t: &Path, print: &str, disabled: Option<&str>) -> (i32, String) {
 #[test]
 fn t_cs3_24_l1_launchd_booted_out() {
     let t = tempfile::TempDir::new().unwrap();
-    expect("booted out", lc_case(t.path(), "", None), 10);
+    let (rc, out) = lc_case(t.path(), "", None);
+    assert_eq!(rc, 10, "{out}");
+    // The loaded check itself must be what refused (the PID check alone
+    // would also give 10 for an empty print).
+    assert!(out.contains("found no loaded agent"), "{out}");
 }
 
 /// L1 launchd: `launchctl print-disabled` listing the label as disabled
