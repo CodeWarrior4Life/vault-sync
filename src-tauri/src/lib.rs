@@ -752,18 +752,26 @@ fn spawn_sse_consumer(
         // path-shape cutover orphaned the entire pre-0.4.28 sync history and
         // every dormant-but-divergent note fell to R5 conflict — the
         // 07-15..07-18 conflict-file storm.
+        // CS-2: the stores, last_event_id and the compensating journal live
+        // in the primary subscriber's held state dir (bootstrapped in
+        // `.setup()`). NotBootstrapped stops sync with the existing notice.
+        let state_dir = match state_io::registry().get(&cfg.subscriber_id) {
+            Ok(sd) => sd,
+            Err(e) => {
+                tracing::error!("sync not started: {e}");
+                notify_user(
+                    &app,
+                    "Vault Sync push failed to start",
+                    &format!("state directory unavailable: {e}"),
+                );
+                return;
+            }
+        };
         let vault_folders: Vec<String> = watch_roots
             .iter()
             .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
-        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("shadow_hashes.json"),
-            vault_folders,
-        );
+        let shadow = sync_shadow::ShadowStore::load_with_vault_folders(&state_dir, vault_folders);
         sync_shadow::ShadowStore::spawn_periodic_flush(shadow.clone());
         // R7b daemon leg (THESEUS AR-002, TKT-166e1c07): the per-note
         // observed-base_seq store, keyed IDENTICALLY to the shadow store (same
@@ -773,11 +781,7 @@ fn spawn_sse_consumer(
         // after byte-verify (R3). Empty/missing => unknown lineage => fail-closed
         // (R4). Wired into BOTH the materializer (pull leg) and the push_client.
         let base_seq = base_seq_store::BaseSeqStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("base_seq.json"),
+            &state_dir,
             watch_roots
                 .iter()
                 .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -792,11 +796,7 @@ fn spawn_sse_consumer(
         // is the verified-recovery leg that lets a divergent, baseline-absent note
         // escape the certified deadlock without ever forging an in-sync baseline.
         let read_receipt = read_receipt::ReadReceiptStore::load_with_vault_folders(
-            commands::resolve_workspace_root()
-                .join(".lattice-runtime")
-                .join(&cfg.subscriber_id)
-                .join("sync-state")
-                .join("read_receipt.json"),
+            &state_dir,
             watch_roots
                 .iter()
                 .filter_map(|(root, _)| root.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -840,11 +840,7 @@ fn spawn_sse_consumer(
         let compensating_journal: Option<
             std::sync::Arc<std::sync::Mutex<push_journal::PushJournal>>,
         > = {
-            match state_io::registry()
-                .get(&cfg.subscriber_id)
-                .map_err(|e| e.to_string())
-                .and_then(|sd| push_journal::PushJournal::open(&sd).map_err(|e| e.to_string()))
-            {
+            match push_journal::PushJournal::open(&state_dir) {
                 Ok(j) => Some(std::sync::Arc::new(std::sync::Mutex::new(j))),
                 Err(e) => {
                     tracing::warn!(error = %e, "R1: compensating-push journal open failed; anti-strip ARM 1 will preserve local but not enqueue (converges next reconcile pass)");

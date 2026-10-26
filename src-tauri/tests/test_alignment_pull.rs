@@ -40,7 +40,16 @@ fn fixture() -> Fixture {
     let ws = TempDir::new().unwrap();
     let shadow_dir = TempDir::new().unwrap();
     std::fs::create_dir_all(vaults.path().join(VAULT)).unwrap();
-    let shadow = ShadowStore::load(shadow_dir.path().join("shadow.json"));
+    let shadow = ShadowStore::load(
+        &vault_sync_daemon::state_io::bootstrap(
+            shadow_dir.path(),
+            &["itest".to_string()],
+            shadow_dir.path(),
+        )
+        .unwrap()
+        .get("itest")
+        .unwrap(),
+    );
     let echo = Arc::new(EchoGuard::new());
     let mat = Materializer::new(
         vaults.path().to_path_buf(),

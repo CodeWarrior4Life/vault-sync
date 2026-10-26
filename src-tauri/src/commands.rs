@@ -16,7 +16,7 @@ use crate::api_client::ApiClient;
 use crate::config;
 use crate::conflict_stash::parse_conflict_filename;
 use crate::push_journal::PushJournal;
-use crate::state_io::{StateDir, StateFile};
+use crate::state_io::StateDir;
 use crate::token_store;
 use crate::verify_repair::{VerifyRepair, VerifyRepairConfig, VerifyRepairReport};
 
@@ -69,9 +69,7 @@ pub(crate) fn build_verify_repair(
     // backstop (which is wired with a materializer). This avoids constructing a
     // materializer here without the server health snapshot (mode/shadow_path),
     // which could write to the wrong place.
-    // TEMPORARY within the CS-2 commit series (stores move next commit).
-    let shadow_path = PathBuf::from(sd.display(Some(StateFile::Shadow)).to_string());
-    let shadow = crate::sync_shadow::ShadowStore::load(shadow_path);
+    let shadow = crate::sync_shadow::ShadowStore::load(sd);
 
     let vr = VerifyRepair::new(
         vault_root,

@@ -1072,6 +1072,19 @@ impl StateDir {
         Self::for_test_scoped(dir, Scope::SyncState)
     }
 
+    /// Test helper for code that used to take a state-file PATH: hold the
+    /// directory containing `p` (created if missing). The file name in `p`
+    /// is ignored; the `StateFile` name is fixed.
+    #[cfg(test)]
+    pub fn for_test_file(p: &Path) -> Arc<StateDir> {
+        let d = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(d).expect("for_test_file: create dir");
+        Self::for_test(d)
+    }
+
     /// Test constructor with an explicit scope.
     #[cfg(test)]
     pub fn for_test_scoped(dir: &Path, scope: Scope) -> Arc<StateDir> {

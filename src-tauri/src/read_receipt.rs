@@ -43,7 +43,6 @@
 //! `base_seq: null` and takes the refetch/merge path on the server's 409).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use crate::state_io::{Commit, NotCommitted, StateDir, StateFile};
 use crate::sync_shadow::{canonical_sync_path, FlushGen};
 
 /// Periodic flush cadence, matching the shadow / base_seq stores.
@@ -101,7 +101,8 @@ pub fn verify_receipt(
 /// Durable per-note verified-receipt store: `path -> Receipt`.
 pub struct ReadReceiptStore {
     inner: Mutex<HashMap<String, Receipt>>,
-    path: PathBuf,
+    /// CS-2: the held state dir; the file is `StateFile::ReadReceipt`.
+    sd: Arc<StateDir>,
     /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
     gen: FlushGen,
     /// Sync-root basenames whose leading `<vault_folder>/` prefix is stripped
@@ -113,8 +114,8 @@ pub struct ReadReceiptStore {
 impl ReadReceiptStore {
     /// Load with NO vault-folder awareness (tests / callers passing canonical
     /// sync-root-relative keys).
-    pub fn load(path: PathBuf) -> Arc<ReadReceiptStore> {
-        Self::load_with_vault_folders(path, Vec::new())
+    pub fn load(sd: &Arc<StateDir>) -> Arc<ReadReceiptStore> {
+        Self::load_with_vault_folders(sd, Vec::new())
     }
 
     fn canon_key(&self, path: &str) -> String {
@@ -131,25 +132,25 @@ impl ReadReceiptStore {
     /// logs a `warn!` (never panics). Empty means "no authorised baselines yet"
     /// for every note, the fail-closed default.
     pub fn load_with_vault_folders(
-        path: PathBuf,
+        sd: &Arc<StateDir>,
         vault_folders: Vec<String>,
     ) -> Arc<ReadReceiptStore> {
-        let raw = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<HashMap<String, Receipt>>(&bytes) {
+        let raw = match sd.read(StateFile::ReadReceipt) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<HashMap<String, Receipt>>(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
-                        path = %path.display(),
+                        file = StateFile::ReadReceipt.name(),
                         error = %e,
                         "read-receipt store: corrupt JSON, starting EMPTY (fail-closed: refetch/merge)"
                     );
                     HashMap::new()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Ok(None) => HashMap::new(),
             Err(e) => {
                 warn!(
-                    path = %path.display(),
+                    file = StateFile::ReadReceipt.name(),
                     error = %e,
                     "read-receipt store: read failed, starting EMPTY (fail-closed)"
                 );
@@ -180,13 +181,13 @@ impl ReadReceiptStore {
         }
         if migrated {
             warn!(
-                path = %path.display(),
+                file = StateFile::ReadReceipt.name(),
                 "read-receipt store: migrated keys to canonical form (NFC + vault-prefix strip)"
             );
         }
         Arc::new(ReadReceiptStore {
             inner: Mutex::new(map),
-            path,
+            sd: Arc::clone(sd),
             gen: FlushGen::new(migrated),
             vault_folders,
         })
@@ -235,14 +236,15 @@ impl ReadReceiptStore {
     /// rename, dir fsync). No-op (and `Ok`) when nothing changed since the
     /// last durable flush. A mutation that lands after the snapshot stays
     /// unflushed and is written by the next flush (Unit 1a S2).
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.gen.flush_durable(&self.path, || {
-            let m = match self.inner.lock() {
-                Ok(m) => m,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            (self.gen.current(), m.clone())
-        })
+    pub fn flush(&self) -> Result<Commit, NotCommitted> {
+        self.gen
+            .flush_durable(&self.sd, StateFile::ReadReceipt, || {
+                let m = match self.inner.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                (self.gen.current(), m.clone())
+            })
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
@@ -261,14 +263,19 @@ impl ReadReceiptStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
+    /// CS-2: a fresh directory per test holding the store's fixed file.
     fn tmp_path(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("receipt_test_{}_{}.json", std::process::id(), name));
-        let _ = std::fs::remove_file(&p);
-        p
+        let d = tempfile::Builder::new()
+            .prefix(&format!("readreceipt_test_{name}_"))
+            .tempdir()
+            .unwrap()
+            .keep();
+        d.join(crate::state_io::StateFile::ReadReceipt.name())
     }
 
     fn sha_of(s: &str) -> String {
@@ -319,13 +326,14 @@ mod tests {
         let path = tmp_path("roundtrip");
         let sha = sha_of("body");
         {
-            let s = ReadReceiptStore::load(path.clone());
+            let s =
+                ReadReceiptStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
             let r = verify_receipt(b"body", &sha, None, Some(99)).unwrap();
             s.record_verified("01_Notes/x.md", r);
             assert_eq!(s.get("01_Notes/x.md").unwrap().revision_seq, 99);
-            s.flush().unwrap();
+            let _c = s.flush().unwrap();
         }
-        let s2 = ReadReceiptStore::load(path.clone());
+        let s2 = ReadReceiptStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         let got = s2.get("01_Notes/x.md").expect("survives restart");
         assert_eq!(got.revision_seq, 99);
         assert_eq!(got.body_sha, sha);
@@ -334,8 +342,10 @@ mod tests {
 
     #[test]
     fn keys_are_vault_prefix_invariant() {
-        let s =
-            ReadReceiptStore::load_with_vault_folders(tmp_path("prefix"), vec!["Mainframe".into()]);
+        let s = ReadReceiptStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&tmp_path("prefix")),
+            vec!["Mainframe".into()],
+        );
         let sha = sha_of("b");
         s.record_verified(
             "Mainframe/01_Notes/x.md",
@@ -348,7 +358,7 @@ mod tests {
     fn corrupt_file_loads_empty_not_panic() {
         let path = tmp_path("corrupt");
         std::fs::write(&path, b"{not valid json").unwrap();
-        let s = ReadReceiptStore::load(path.clone());
+        let s = ReadReceiptStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         assert!(s.is_empty());
         assert_eq!(s.get("anything.md"), None);
         let _ = std::fs::remove_file(&path);
@@ -358,7 +368,7 @@ mod tests {
 
     impl crate::sync_shadow::flush_gen_checks::GenStore for ReadReceiptStore {
         fn load_at(path: PathBuf) -> Arc<Self> {
-            ReadReceiptStore::load(path)
+            ReadReceiptStore::load(&crate::state_io::StateDir::for_test_file(&path))
         }
         fn put(&self, i: u32) {
             self.record_verified(
@@ -376,7 +386,8 @@ mod tests {
                     body_sha: sha_of(&format!("b{i}")),
                 })
         }
-        fn flush_now(&self) -> std::io::Result<()> {
+        const FILE: crate::state_io::StateFile = crate::state_io::StateFile::ReadReceipt;
+        fn flush_now(&self) -> Result<crate::state_io::Commit, crate::state_io::NotCommitted> {
             self.flush()
         }
         fn gen(&self) -> &FlushGen {

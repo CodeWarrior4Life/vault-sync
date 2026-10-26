@@ -31,14 +31,13 @@
 //! coupling to any single write path.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tempfile::NamedTempFile;
 use tracing::warn;
+
+use crate::state_io::{Commit, NotCommitted, StateDir, StateFile};
 use unicode_normalization::UnicodeNormalization;
 
 /// Periodic flush cadence for [`ShadowStore::spawn_periodic_flush`].
@@ -129,11 +128,24 @@ impl FlushGen {
         self.flushed_gen.load(Ordering::SeqCst)
     }
 
-    /// Durably persist a snapshot to `dest` (tmp in the destination dir,
-    /// `sync_all`, rename, dir fsync). `snapshot` must lock the map, read
-    /// [`Self::current`] and clone the map under that lock, and return both.
-    /// No-op (`Ok`) when nothing changed since the last durable flush.
-    pub(crate) fn flush_durable<T, F>(&self, dest: &Path, snapshot: F) -> std::io::Result<()>
+    /// Durably persist a snapshot as `file` in the held state dir (W5-W7,
+    /// CS-2): `StateDir::replace_atomic`, i.e. CS-1 `durable_file` over the
+    /// StateDir anchor (unique 0600 temp, `sync_all`, `renameat`, dir sync).
+    /// `snapshot` must lock the map, read [`Self::current`] and clone the map
+    /// under that lock, and return both. No-op (`Ok(Durable)`) when nothing
+    /// changed since the last durable flush.
+    ///
+    /// Outcome mapping (CS-2 §3.4): `Durable` and
+    /// `CommittedDurabilityUncertain` both mean the bytes are visible, so
+    /// both advance `flushed_gen` (the StateDir sets `dir_sync_pending` and
+    /// raises `durable_write_uncertain` on the latter); `NotCommitted` keeps
+    /// the 1a behaviour (generation stays, the next tick retries).
+    pub(crate) fn flush_durable<T, F>(
+        &self,
+        sd: &StateDir,
+        file: StateFile,
+        snapshot: F,
+    ) -> Result<Commit, NotCommitted>
     where
         T: serde::Serialize,
         F: FnOnce() -> (u64, T),
@@ -141,7 +153,7 @@ impl FlushGen {
         // Fast path: nothing unflushed. A mutation racing this read lands
         // after this call and is picked up by the next flush.
         if !self.is_dirty() {
-            return Ok(());
+            return Ok(Commit::Durable);
         }
         // C2: held from BEFORE the snapshot through the fetch_max below.
         let _flush = self.flush_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -149,40 +161,21 @@ impl FlushGen {
         #[cfg(test)]
         self.hooks.run_after_snapshot();
         if g == self.flushed_gen.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(Commit::Durable);
         }
-        let bytes = serde_json::to_vec(&snap).map_err(std::io::Error::other)?;
-
-        let parent = dest
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        std::fs::create_dir_all(&parent)?;
-        // Atomic tmp+rename, anchored in the destination dir so the rename is
-        // same-filesystem (no cross-device EXDEV). The temp is unlinked on
-        // drop if anything below fails before persist.
-        let mut tmp = NamedTempFile::new_in(&parent)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        self.sync_tmp(tmp.as_file())?;
-        tmp.persist(dest).map_err(|e| e.error)?;
-        crate::durable_file::fsync_dir(&parent)?;
-
+        let bytes =
+            serde_json::to_vec(&snap).map_err(|e| NotCommitted(std::io::Error::other(e)))?;
+        // T-S2 fault point: the temp `sync_all` now runs inside durable_file.
+        #[cfg(test)]
+        if self.hooks.fail_sync.load(Ordering::SeqCst) {
+            crate::durable_file::seams::fail_sync_all(5);
+        }
+        let c = sd.replace_atomic(file, &bytes)?;
         // S2: only the generation that was actually written is marked
         // flushed. A mutation after the snapshot has mut_gen > g, so the next
         // flush still writes it.
         self.flushed_gen.fetch_max(g, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Temp-file `sync_all` (S1), with a test fault point.
-    fn sync_tmp(&self, f: &std::fs::File) -> std::io::Result<()> {
-        #[cfg(test)]
-        if self.hooks.fail_sync.load(Ordering::SeqCst) {
-            return Err(std::io::Error::other("injected sync_all failure"));
-        }
-        f.sync_all()
+        Ok(c)
     }
 }
 
@@ -212,8 +205,10 @@ pub(crate) mod flush_gen_checks {
         fn load_at(path: PathBuf) -> Arc<Self>;
         fn put(&self, i: u32);
         fn has(&self, i: u32) -> bool;
-        fn flush_now(&self) -> std::io::Result<()>;
+        fn flush_now(&self) -> Result<crate::state_io::Commit, crate::state_io::NotCommitted>;
         fn gen(&self) -> &FlushGen;
+        /// The store's fixed state file (CS-2).
+        const FILE: crate::state_io::StateFile;
     }
 
     fn dir_entries(dir: &Path) -> Vec<String> {
@@ -229,17 +224,17 @@ pub(crate) mod flush_gen_checks {
     /// update is persisted by the NEXT flush.
     pub(crate) fn t_s1<S: GenStore>() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("store.json");
+        let path = dir.path().join(S::FILE.name());
         let s = S::load_at(path.clone());
         s.put(1);
         let s2 = Arc::clone(&s);
         *s.gen().hooks.after_snapshot.lock().unwrap() = Some(Box::new(move || s2.put(2)));
-        s.flush_now().unwrap();
+        let _c = s.flush_now().unwrap();
         assert!(
             s.gen().is_dirty(),
             "the post-snapshot mutation must leave the store dirty"
         );
-        s.flush_now().unwrap();
+        let _c = s.flush_now().unwrap();
         let reloaded = S::load_at(path);
         assert!(reloaded.has(1), "entry 1 persisted");
         assert!(
@@ -252,7 +247,7 @@ pub(crate) mod flush_gen_checks {
     /// leaves no temp file and leaves the generation unflushed.
     pub(crate) fn t_s2<S: GenStore>() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("store.json");
+        let path = dir.path().join(S::FILE.name());
         let s = S::load_at(path.clone());
         s.put(1);
         s.gen()
@@ -272,7 +267,7 @@ pub(crate) mod flush_gen_checks {
             .hooks
             .fail_sync
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        s.flush_now().unwrap();
+        let _c = s.flush_now().unwrap();
         assert!(S::load_at(path).has(1));
     }
 
@@ -282,12 +277,12 @@ pub(crate) mod flush_gen_checks {
     /// generation.
     pub(crate) fn t_s3<S: GenStore>() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("store.json");
+        let path = dir.path().join(S::FILE.name());
         let s = S::load_at(path.clone());
         s.put(1);
         let s2 = Arc::clone(&s);
-        let b_slot: Arc<Mutex<Option<JoinHandle<std::io::Result<()>>>>> =
-            Arc::new(Mutex::new(None));
+        type FlushJoin = JoinHandle<Result<(), crate::state_io::NotCommitted>>;
+        let b_slot: Arc<Mutex<Option<FlushJoin>>> = Arc::new(Mutex::new(None));
         let b_slot2 = Arc::clone(&b_slot);
         *s.gen().hooks.after_snapshot.lock().unwrap() = Some(Box::new(move || {
             // A has snapshotted. A mutation lands, then flush B runs.
@@ -295,7 +290,7 @@ pub(crate) mod flush_gen_checks {
             let (tx, rx) = mpsc::channel();
             let s3 = Arc::clone(&s2);
             let h = std::thread::spawn(move || {
-                let r = s3.flush_now();
+                let r = s3.flush_now().map(|_| ());
                 let _ = tx.send(());
                 r
             });
@@ -304,7 +299,7 @@ pub(crate) mod flush_gen_checks {
             let _ = rx.recv_timeout(Duration::from_millis(500));
             *b_slot2.lock().unwrap() = Some(h);
         }));
-        s.flush_now().unwrap(); // flush A
+        let _c = s.flush_now().unwrap(); // flush A
         let b = b_slot.lock().unwrap().take().expect("flush B was started");
         b.join().unwrap().unwrap();
         let reloaded = S::load_at(path);
@@ -325,7 +320,8 @@ pub(crate) mod flush_gen_checks {
 /// Persistent per-file shadow-hash store: path → last-synced server hash.
 pub struct ShadowStore {
     inner: Mutex<HashMap<String, String>>,
-    path: PathBuf,
+    /// CS-2: the held state dir; the file is `StateFile::Shadow`.
+    sd: Arc<StateDir>,
     /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
     gen: FlushGen,
     /// B2' (TKT-86ae42a3, 2026-07-18 conflict storm): the vault folder names
@@ -376,8 +372,8 @@ pub fn detect_vault_scope_suspect<'a>(
 impl ShadowStore {
     /// Load the store from `path` with NO vault-folder awareness (tests /
     /// callers that already pass canonical sync-root-relative keys).
-    pub fn load(path: PathBuf) -> Arc<ShadowStore> {
-        Self::load_with_vault_folders(path, Vec::new())
+    pub fn load(sd: &Arc<StateDir>) -> Arc<ShadowStore> {
+        Self::load_with_vault_folders(sd, Vec::new())
     }
 
     /// Canonicalize a key: NFC + slash-fold (D8), then strip a leading
@@ -409,23 +405,26 @@ impl ShadowStore {
     /// the D8 NFC migration below — without it, the B2 path-shape cutover
     /// orphans the entire prior sync history and every dormant-but-divergent
     /// note falls to R5 conflict (the 07-15..07-18 conflict storm).
-    pub fn load_with_vault_folders(path: PathBuf, vault_folders: Vec<String>) -> Arc<ShadowStore> {
-        let raw = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+    pub fn load_with_vault_folders(
+        sd: &Arc<StateDir>,
+        vault_folders: Vec<String>,
+    ) -> Arc<ShadowStore> {
+        let raw = match sd.read(StateFile::Shadow) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
-                        path = %path.display(),
+                        file = StateFile::Shadow.name(),
                         error = %e,
                         "shadow store: corrupt JSON, starting EMPTY (degrades to pull-on-drift)"
                     );
                     HashMap::new()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Ok(None) => HashMap::new(),
             Err(e) => {
                 warn!(
-                    path = %path.display(),
+                    file = StateFile::Shadow.name(),
                     error = %e,
                     "shadow store: read failed, starting EMPTY"
                 );
@@ -481,7 +480,7 @@ impl ShadowStore {
         }
         if migrated {
             warn!(
-                path = %path.display(),
+                file = StateFile::Shadow.name(),
                 legacy_count,
                 "shadow store: migrated keys to canonical form (NFC, S511 D8 + vault-prefix strip, B2' TKT-86ae42a3)"
             );
@@ -492,7 +491,7 @@ impl ShadowStore {
         let suspect = detect_vault_scope_suspect(&vault_folders, map.keys().map(|s| s.as_str()));
         if let Some(prefixed_keys) = suspect {
             warn!(
-                path = %path.display(),
+                file = StateFile::Shadow.name(),
                 prefixed_keys,
                 "shadow store: vault_folders resolved EMPTY but the store holds vault-prefixed keys \
                  (config vault_name is likely missing). REFUSING migrations/pushes downstream (park) \
@@ -501,7 +500,7 @@ impl ShadowStore {
         }
         Arc::new(ShadowStore {
             inner: Mutex::new(map),
-            path,
+            sd: Arc::clone(sd),
             gen: FlushGen::new(migrated),
             vault_folders,
             vault_scope_suspect: AtomicBool::new(suspect.is_some()),
@@ -569,14 +568,20 @@ impl ShadowStore {
     /// changed since the last durable flush. Creates parent dirs as needed.
     /// A mutation that lands after the snapshot stays unflushed and is written
     /// by the next flush (Unit 1a S2); see [`FlushGen`].
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.gen.flush_durable(&self.path, || {
+    pub fn flush(&self) -> Result<Commit, NotCommitted> {
+        self.gen.flush_durable(&self.sd, StateFile::Shadow, || {
             let m = match self.inner.lock() {
                 Ok(m) => m,
                 Err(poisoned) => poisoned.into_inner(),
             };
             (self.gen.current(), m.clone())
         })
+    }
+
+    /// Test access to the flush generations (T-CS2-19).
+    #[cfg(test)]
+    pub(crate) fn test_gen(&self) -> &FlushGen {
+        &self.gen
     }
 
     /// Spawn a background loop that flushes every 30s for the process lifetime.
@@ -597,22 +602,26 @@ impl ShadowStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
     fn load_empty_when_file_missing() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("does-not-exist.json");
-        let store = ShadowStore::load(p);
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&p));
         assert_eq!(store.get("anything.md"), None);
     }
 
     #[test]
     fn record_then_get() {
         let dir = TempDir::new().unwrap();
-        let store = ShadowStore::load(dir.path().join("shadow.json"));
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         store.record("notes/a.md", "hash-aaa");
         assert_eq!(store.get("notes/a.md"), Some("hash-aaa".to_string()));
         // upsert overwrites
@@ -624,15 +633,15 @@ mod tests {
     #[test]
     fn persist_then_reload_round_trip() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("sub").join("shadow.json"); // parent dir created
+        let path = dir.path().join("sub").join("shadow_hashes.json"); // parent dir created
         {
-            let store = ShadowStore::load(path.clone());
+            let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
             store.record("notes/a.md", "h-a");
             store.record("notes/b.md", "h-b");
-            store.flush().unwrap();
+            let _c = store.flush().unwrap();
         }
         // Fresh load sees the persisted entries.
-        let reloaded = ShadowStore::load(path);
+        let reloaded = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path));
         assert_eq!(reloaded.get("notes/a.md"), Some("h-a".to_string()));
         assert_eq!(reloaded.get("notes/b.md"), Some("h-b".to_string()));
     }
@@ -640,9 +649,9 @@ mod tests {
     #[test]
     fn corrupt_file_loads_empty_no_panic() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         std::fs::write(&path, b"{{not json").unwrap();
-        let store = ShadowStore::load(path);
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path));
         assert_eq!(store.get("notes/a.md"), None);
         // still usable after a corrupt load
         store.record("notes/a.md", "recovered");
@@ -652,8 +661,8 @@ mod tests {
     #[test]
     fn flush_is_noop_when_not_dirty() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
-        let store = ShadowStore::load(path.clone());
+        let path = dir.path().join("shadow_hashes.json");
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         // Fresh load is not dirty → flush writes nothing and is Ok.
         assert!(store.flush().is_ok());
         assert!(!path.exists(), "non-dirty flush must NOT create the file");
@@ -662,14 +671,14 @@ mod tests {
     #[test]
     fn flush_clears_dirty_then_second_flush_is_noop() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
-        let store = ShadowStore::load(path.clone());
+        let path = dir.path().join("shadow_hashes.json");
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         store.record("a.md", "h");
-        store.flush().unwrap();
+        let _c = store.flush().unwrap();
         assert!(path.exists());
         // Remove the file; a second (non-dirty) flush must NOT recreate it.
         std::fs::remove_file(&path).unwrap();
-        store.flush().unwrap();
+        let _c = store.flush().unwrap();
         assert!(
             !path.exists(),
             "second flush after a clean flush must be a no-op"
@@ -707,7 +716,9 @@ mod tests {
     #[test]
     fn shadow_record_get_normalization_invariant() {
         let dir = TempDir::new().unwrap();
-        let store = ShadowStore::load(dir.path().join("shadow.json"));
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let nfd = "Notes/Cafe\u{0301}.md".nfd().collect::<String>();
         let nfc = "Notes/Cafe\u{0301}.md".nfc().collect::<String>();
         store.record(&nfd, "hash-nfd");
@@ -728,7 +739,7 @@ mod tests {
     #[test]
     fn load_migrates_vault_prefixed_keys_to_sync_root_relative() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let mut m = HashMap::new();
         m.insert(
             "Mainframe/01_Notes/legacy.md".to_string(),
@@ -737,7 +748,10 @@ mod tests {
         m.insert("01_Notes/current.md".to_string(), "h-current".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
 
-        let store = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        let store = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&path),
+            vec!["Mainframe".into()],
+        );
         assert_eq!(
             store.get("01_Notes/legacy.md"),
             Some("h-legacy".to_string()),
@@ -754,13 +768,16 @@ mod tests {
     #[test]
     fn vault_prefix_migration_current_value_wins_on_collision() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let mut m = HashMap::new();
         m.insert("Mainframe/x.md".to_string(), "h-legacy".to_string());
         m.insert("x.md".to_string(), "h-current".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
 
-        let store = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        let store = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&path),
+            vec!["Mainframe".into()],
+        );
         assert_eq!(store.get("x.md"), Some("h-current".to_string()));
         assert_eq!(
             store.get("Mainframe/x.md"),
@@ -774,7 +791,7 @@ mod tests {
     fn record_get_invariant_across_vault_prefix_shapes() {
         let dir = TempDir::new().unwrap();
         let store = ShadowStore::load_with_vault_folders(
-            dir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&dir.path().join("shadow_hashes.json")),
             vec!["Mainframe".into()],
         );
         store.record("Mainframe/01_Notes/y.md", "h1");
@@ -788,11 +805,11 @@ mod tests {
     #[test]
     fn plain_load_leaves_prefixed_keys_untouched() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let mut m = HashMap::new();
         m.insert("Mainframe/x.md".to_string(), "h".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
-        let store = ShadowStore::load(path);
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path));
         assert_eq!(store.get("Mainframe/x.md"), Some("h".to_string()));
         assert_eq!(store.get("x.md"), None);
     }
@@ -802,7 +819,7 @@ mod tests {
     #[test]
     fn load_migrates_nfd_keys_to_nfc() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let nfd = "Notes/Cafe\u{0301}.md".nfd().collect::<String>();
         let nfc = "Notes/Cafe\u{0301}.md".nfc().collect::<String>();
         // Hand-write a store file with a decomposed key (simulating a
@@ -811,7 +828,7 @@ mod tests {
         m.insert(nfd.clone(), "h".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
 
-        let store = ShadowStore::load(path);
+        let store = ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path));
         // The NFC lookup hits the migrated key.
         assert_eq!(store.get(&nfc), Some("h".to_string()));
     }
@@ -850,17 +867,23 @@ mod tests {
     #[test]
     fn shadow_store_flags_and_clears_suspect_scope() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let mut m = HashMap::new();
         m.insert("Mainframe/01_Notes/x.md".to_string(), "h".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
 
         // Empty vault_folders + prefixed key -> suspect.
-        let suspect = ShadowStore::load_with_vault_folders(path.clone(), vec![]);
+        let suspect = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&path.clone()),
+            vec![],
+        );
         assert!(suspect.vault_scope_suspect());
 
         // Same file, vault_folders configured -> prefix strips, not suspect.
-        let ok = ShadowStore::load_with_vault_folders(path, vec!["Mainframe".into()]);
+        let ok = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&path),
+            vec!["Mainframe".into()],
+        );
         assert!(!ok.vault_scope_suspect());
     }
 
@@ -868,7 +891,7 @@ mod tests {
 
     impl super::flush_gen_checks::GenStore for ShadowStore {
         fn load_at(path: PathBuf) -> Arc<Self> {
-            ShadowStore::load(path)
+            ShadowStore::load(&crate::state_io::StateDir::for_test_file(&path))
         }
         fn put(&self, i: u32) {
             self.record(&format!("n/{i}.md"), &format!("h{i}"));
@@ -876,7 +899,8 @@ mod tests {
         fn has(&self, i: u32) -> bool {
             self.get(&format!("n/{i}.md")) == Some(format!("h{i}"))
         }
-        fn flush_now(&self) -> std::io::Result<()> {
+        const FILE: crate::state_io::StateFile = crate::state_io::StateFile::Shadow;
+        fn flush_now(&self) -> Result<crate::state_io::Commit, crate::state_io::NotCommitted> {
             self.flush()
         }
         fn gen(&self) -> &FlushGen {
@@ -903,13 +927,16 @@ mod tests {
     #[test]
     fn shadow_migration_bumps_generation() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("shadow.json");
+        let path = dir.path().join("shadow_hashes.json");
         let mut m = HashMap::new();
         m.insert("Mainframe/x.md".to_string(), "h".to_string());
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
-        let store = ShadowStore::load_with_vault_folders(path.clone(), vec!["Mainframe".into()]);
+        let store = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&path.clone()),
+            vec!["Mainframe".into()],
+        );
         assert!(store.gen.is_dirty());
-        store.flush().unwrap();
+        let _c = store.flush().unwrap();
         assert!(!store.gen.is_dirty());
         let raw: HashMap<String, String> =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

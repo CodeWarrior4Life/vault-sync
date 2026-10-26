@@ -1576,7 +1576,9 @@ mod tests {
         let (vr, journal, _jd) =
             make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/a.md", "deadbeef"); // last-synced server hash == current server hash
         let vr = vr.with_shadow(shadow);
         let report = vr.run().await.unwrap();
@@ -1679,7 +1681,9 @@ mod tests {
         // with each server hash so they classify as genuine local edits (push),
         // exercising the modify_paths_sample cap (fix/reconcile-server-wins-shadow).
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let mut diff_entries = Vec::new();
         for i in 0..60 {
             let rel = format!("notes/f{i:03}.md");

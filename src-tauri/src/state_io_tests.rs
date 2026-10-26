@@ -564,3 +564,41 @@ fn state_anchor_round_trip_through_durable_file() {
     let _c = sd.remove(StateFile::Shadow).unwrap();
     assert_eq!(sd.read(StateFile::Shadow).unwrap(), None);
 }
+
+/// T-CS2-19 (store outcome mapping): an injected directory-sync error on a
+/// store flush returns `CommittedDurabilityUncertain`, advances
+/// `flushed_gen` to the written generation, sets `dir_sync_pending`, and the
+/// next custody tick re-syncs and clears it.
+#[cfg(unix)]
+#[test]
+fn t_cs2_19_store_flush_uncertain_mapping() {
+    crate::durable_file::seams::reset();
+    let d = TempDir::new().unwrap();
+    let sd = StateDir::for_test(d.path());
+    let store = crate::sync_shadow::ShadowStore::load(&sd);
+    store.record("a.md", "h1");
+    let gen = store.test_gen();
+    let written = gen.current();
+    // EIO from the directory sync, after the rename (the commit point).
+    crate::durable_file::seams::fail_dir_fsync(None, 5);
+    let c = store.flush().unwrap();
+    assert_eq!(c, Commit::CommittedDurabilityUncertain);
+    assert_eq!(
+        gen.flushed(),
+        written,
+        "flushed_gen advances: bytes are visible"
+    );
+    assert!(!gen.is_dirty());
+    assert!(sd.dir_sync_pending(), "dir_sync_pending set");
+    assert!(crate::sync_health::state_events().contains(
+        &StateHealthEvent::DurableWriteUncertain {
+            file: StateFile::Shadow.name().into()
+        }
+    ));
+    // The bytes are on disk.
+    let reloaded = crate::sync_shadow::ShadowStore::load(&sd);
+    assert_eq!(reloaded.get("a.md").as_deref(), Some("h1"));
+    // Next custody tick re-syncs and clears.
+    custody_tick(std::slice::from_ref(&sd));
+    assert!(!sd.dir_sync_pending(), "custody tick re-synced and cleared");
+}

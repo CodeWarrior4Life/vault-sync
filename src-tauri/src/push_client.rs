@@ -1822,7 +1822,9 @@ mod tests {
         let vault = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let enq: Arc<StdMutex<HashMap<String, String>>> = Arc::new(StdMutex::new(HashMap::new()));
         let mat = Materializer::new(
             vault.path().to_path_buf(),
@@ -2018,7 +2020,9 @@ mod tests {
         // No materializer wired (default PushClient::new) but a shadow store
         // IS attached, so the fallback arm's (non-)recording is observable.
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let vault = TempDir::new().unwrap();
         let abs = vault.path().join(rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
@@ -2947,7 +2951,9 @@ mod tests {
         let (_d, journal) = make_journal_with(vec![fw_evt]);
 
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/edited.md", &server_hash);
         let client = make_client(&srv.url(), journal.clone())
             .await
@@ -2996,7 +3002,9 @@ mod tests {
 
         // Shadow store present but EMPTY (no entry for this path).
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let client = make_client(&srv.url(), journal.clone())
             .await
             .with_shadow_store(shadow);
@@ -3047,7 +3055,9 @@ mod tests {
         let (_d, journal) = make_journal_with(vec![fw_evt]);
 
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/deleted.md", &server_hash);
         let client = make_client(&srv.url(), journal.clone())
             .await
@@ -3628,8 +3638,12 @@ mod tests {
         let vault = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
-        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
+        );
         let mat = Materializer::new(
             vault.path().to_path_buf(),
             None,
@@ -3816,9 +3830,15 @@ mod tests {
         let vault = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
-        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
-        let rr = crate::read_receipt::ReadReceiptStore::load(sdir.path().join("read_receipt.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
+        );
+        let rr = crate::read_receipt::ReadReceiptStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("read_receipt.json")),
+        );
         let mat = Materializer::new(
             vault.path().to_path_buf(),
             None,
@@ -4186,11 +4206,14 @@ mod tests {
 
         // Craft a suspect shadow: empty vault_folders + a vault-prefixed key.
         let sdir = TempDir::new().unwrap();
-        let spath = sdir.path().join("shadow.json");
+        let spath = sdir.path().join("shadow_hashes.json");
         let mut map = std::collections::HashMap::new();
         map.insert("Mainframe/01_Notes/x.md".to_string(), "h".to_string());
         std::fs::write(&spath, serde_json::to_vec(&map).unwrap()).unwrap();
-        let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
+        let shadow = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&spath),
+            vec![],
+        );
         assert!(shadow.vault_scope_suspect());
 
         let (_d, journal) = make_journal_with(vec![evt("01_Notes/x.md", b"edit\n")]);
@@ -4340,9 +4363,15 @@ mod tests {
         let vault = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
-        let bs = crate::base_seq_store::BaseSeqStore::load(sdir.path().join("base_seq.json"));
-        let rr = crate::read_receipt::ReadReceiptStore::load(sdir.path().join("read_receipt.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
+        );
+        let rr = crate::read_receipt::ReadReceiptStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("read_receipt.json")),
+        );
         let mat_journal = std::sync::Arc::new(std::sync::Mutex::new(
             PushJournal::open(&crate::state_io::StateDir::for_test(
                 journal_path.parent().unwrap(),

@@ -2756,12 +2756,12 @@ mod tests {
 
         // Pre-B2 shadow file: legacy vault-prefixed key, value == the CURRENT
         // server hash (server unchanged since we last synced).
-        let shadow_file = ws_tmp.path().join("shadow.json");
+        let shadow_file = ws_tmp.path().join("shadow_hashes.json");
         let mut legacy = std::collections::HashMap::new();
         legacy.insert("Mainframe/01_Notes/storm.md".to_string(), p.sha256.clone());
         std::fs::write(&shadow_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
         let shadow = crate::sync_shadow::ShadowStore::load_with_vault_folders(
-            shadow_file,
+            &crate::state_io::StateDir::for_test_file(&shadow_file),
             vec!["Mainframe".into()],
         );
 
@@ -3054,7 +3054,9 @@ mod tests {
     ) {
         use crate::sync_shadow::ShadowStore;
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let (vaults, ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let wire = format!("{VAULT}/01_Inbox/foo.md");
@@ -3161,7 +3163,9 @@ mod tests {
     fn delete_leg_stash_uses_base_seq_when_known() {
         let (vaults, _ws, _s, m, shadow, wire, target) = mk_delete_leg();
         let bdir = TempDir::new().unwrap();
-        let bs = crate::base_seq_store::BaseSeqStore::load(bdir.path().join("base_seq.json"));
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&bdir.path().join("base_seq.json")),
+        );
         bs.record_adopted(&wire, 7);
         let m = m.with_base_seq_store(bs);
         shadow.record(&wire, &sha256_hex("server v1"));
@@ -3262,7 +3266,9 @@ mod tests {
     fn successful_write_records_shadow_hash() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload("01_Inbox/foo.md", "hello");
@@ -3280,7 +3286,9 @@ mod tests {
     fn integrity_failed_write_does_not_record_shadow() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_vaults, _ws, m_base) = mk(MaterializerMode::Live, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload_with_bad_sha("01_Inbox/foo.md", "hello");
@@ -3299,7 +3307,9 @@ mod tests {
     fn b1_shadow_mode_write_does_not_record_baseline() {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(dir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &dir.path().join("shadow_hashes.json"),
+        ));
         let (_v, _ws, m_base) = mk(MaterializerMode::Shadow, default_cfg());
         let m = m_base.with_shadow_store(shadow.clone());
         let p = payload("01_Inbox/foo.md", "hello");
@@ -3499,7 +3509,9 @@ mod tests {
     ) -> (TempDir, TempDir, Materializer, Arc<ShadowStore>) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let m = m.with_shadow_store(shadow.clone());
         (v, w, m, shadow)
     }
@@ -3518,7 +3530,9 @@ mod tests {
     ) {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let journal = Arc::new(Mutex::new(
             PushJournal::open(&crate::state_io::StateDir::for_test(jdir.path())).unwrap(),
@@ -4022,9 +4036,11 @@ mod tests {
     #[tokio::test]
     async fn records_observed_base_seq_only_from_server_change_seq() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
 
@@ -4067,9 +4083,11 @@ mod tests {
     #[tokio::test]
     async fn noop_identical_records_base_seq_r4() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
         let (_vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -4112,9 +4130,11 @@ mod tests {
     #[tokio::test]
     async fn preserve_local_edit_never_records_base_seq_r2() {
         let sdir = TempDir::new().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec!["Mainframe".to_string()],
         );
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
@@ -4250,11 +4270,11 @@ mod tests {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec![VAULT.to_string()],
         );
         let m = m
@@ -4472,12 +4492,15 @@ mod tests {
     fn r1_scope_suspect_shadow_mints_no_conflict_copy() {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
         let sdir = TempDir::new().unwrap();
-        let spath = sdir.path().join("shadow.json");
+        let spath = sdir.path().join("shadow_hashes.json");
         // A store holding vault-prefixed keys, loaded with EMPTY vault_folders.
         let mut seed = std::collections::HashMap::new();
         seed.insert(format!("{VAULT}/01_Notes/other.md"), "deadbeef".to_string());
         std::fs::write(&spath, serde_json::to_vec(&seed).unwrap()).unwrap();
-        let shadow = ShadowStore::load_with_vault_folders(spath, vec![]);
+        let shadow = ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&spath),
+            vec![],
+        );
         assert!(
             shadow.vault_scope_suspect(),
             "fixture must reproduce the suspect state"
@@ -4587,11 +4610,11 @@ mod tests {
         let (v, w, m) = mk(mode, default_cfg());
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let bs = crate::base_seq_store::BaseSeqStore::load_with_vault_folders(
-            sdir.path().join("base_seq.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));
@@ -5133,7 +5156,7 @@ mod tests {
         let (vaults, _ws, m) = mk(MaterializerMode::Live, cfg);
         let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
         let shadow = ShadowStore::load_with_vault_folders(
-            sdir.path().join("shadow.json"),
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
             vec![VAULT.to_string()],
         );
         let jdir = Box::leak(Box::new(TempDir::new().unwrap()));

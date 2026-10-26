@@ -701,7 +701,9 @@ mod tests {
     #[tokio::test]
     async fn d9_seed_is_noop_when_shadow_non_empty() {
         let sdir = tempfile::tempdir().unwrap();
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
         shadow.record("notes/already-known.md", "h");
         assert!(!shadow.is_empty());
 
@@ -785,7 +787,9 @@ mod tests {
         };
         let vault = PathBuf::from(std::env::var("CS2_T22_VAULT").unwrap());
         let sdir = PathBuf::from(std::env::var("CS2_T22_STATE").unwrap());
-        let shadow = crate::sync_shadow::ShadowStore::load(sdir.join("shadow.json"));
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.join("shadow_hashes.json")),
+        );
         let api = Arc::new(ApiClient::new(&url, "vsk_test").unwrap());
         let _n = seed_shadow_from_server_if_empty(vault, api, "dev-test".into(), shadow).await;
         let appends = seed_test::LAST_SCRATCH_APPENDS.with(|c| c.get());

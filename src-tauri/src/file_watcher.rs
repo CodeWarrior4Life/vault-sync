@@ -1618,7 +1618,9 @@ mod tests {
         use crate::sync_shadow::ShadowStore;
         let dir = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let w = make_watcher(&dir, vec![], vec![]).with_shadow_store(shadow.clone());
 
         let rel = "01_Notes/note.md";
@@ -1670,7 +1672,9 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let sdir = TempDir::new().unwrap();
-        let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
         let enq: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let w = make_watcher(&dir, vec![], vec![])
             .with_shadow_store(shadow.clone())

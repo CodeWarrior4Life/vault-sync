@@ -52,7 +52,12 @@ fn test_b1_alternation_regression() {
     let ws = TempDir::new().unwrap();
     let sdir = TempDir::new().unwrap();
     std::fs::create_dir_all(vaults.path().join(VAULT)).unwrap();
-    let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+    let shadow = ShadowStore::load(
+        &vault_sync_daemon::state_io::bootstrap(sdir.path(), &["itest".to_string()], sdir.path())
+            .unwrap()
+            .get("itest")
+            .unwrap(),
+    );
     let echo = Arc::new(EchoGuard::new());
     let mat = Materializer::new(
         vaults.path().to_path_buf(),
@@ -173,7 +178,12 @@ async fn test_b1_alternation_verify_repair_run_zero_pushes() {
     // LOCAL raw sha, matching what the old (pre-D3-fix) Accepted arm used to
     // record. This is what makes decide_direction choose Pull over Push for
     // a "drift" delta instead of Noop.
-    let shadow = ShadowStore::load(sdir.path().join("shadow.json"));
+    let shadow = ShadowStore::load(
+        &vault_sync_daemon::state_io::bootstrap(sdir.path(), &["itest".to_string()], sdir.path())
+            .unwrap()
+            .get("itest")
+            .unwrap(),
+    );
     shadow.record(rel, &local_raw_sha);
 
     let mut srv = Server::new_async().await;

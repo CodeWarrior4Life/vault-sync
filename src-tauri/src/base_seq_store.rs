@@ -67,12 +67,12 @@
 //! re-earns Adopted on its next byte-verified materialize / accepted push.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracing::warn;
 
+use crate::state_io::{Commit, NotCommitted, StateDir, StateFile};
 use crate::sync_shadow::{canonical_sync_path, FlushGen};
 
 /// Periodic flush cadence, matching the shadow store.
@@ -114,7 +114,8 @@ enum RawSeqEntry {
 /// with the provenance that earned it.
 pub struct BaseSeqStore {
     inner: Mutex<HashMap<String, SeqEntry>>,
-    path: PathBuf,
+    /// CS-2: the held state dir; the file is `StateFile::BaseSeq`.
+    sd: Arc<StateDir>,
     /// Unit 1a S1/S2: mutation / durable-flush generations (replaces `dirty`).
     gen: FlushGen,
     /// Sync-root basenames whose leading `<vault_folder>/` prefix is stripped
@@ -125,8 +126,8 @@ pub struct BaseSeqStore {
 impl BaseSeqStore {
     /// Load with NO vault-folder awareness (tests / callers passing canonical
     /// sync-root-relative keys).
-    pub fn load(path: PathBuf) -> Arc<BaseSeqStore> {
-        Self::load_with_vault_folders(path, Vec::new())
+    pub fn load(sd: &Arc<StateDir>) -> Arc<BaseSeqStore> {
+        Self::load_with_vault_folders(sd, Vec::new())
     }
 
     /// Canonicalize a key: NFC + slash-fold, then strip a leading
@@ -150,10 +151,14 @@ impl BaseSeqStore {
     /// Legacy BARE-SEQ values (pre-provenance daemons) load as `Observed` —
     /// the safe, non-preserve-enabling default (module docs, "Persistence") —
     /// and are persisted in the tagged form on the next flush.
-    pub fn load_with_vault_folders(path: PathBuf, vault_folders: Vec<String>) -> Arc<BaseSeqStore> {
+    pub fn load_with_vault_folders(
+        sd: &Arc<StateDir>,
+        vault_folders: Vec<String>,
+    ) -> Arc<BaseSeqStore> {
         let mut value_migrated = false;
-        let raw: HashMap<String, SeqEntry> = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<HashMap<String, RawSeqEntry>>(&bytes) {
+        let raw: HashMap<String, SeqEntry> = match sd.read(StateFile::BaseSeq) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<HashMap<String, RawSeqEntry>>(&bytes)
+            {
                 Ok(m) => m
                     .into_iter()
                     .map(|(k, v)| {
@@ -172,17 +177,17 @@ impl BaseSeqStore {
                     .collect(),
                 Err(e) => {
                     warn!(
-                        path = %path.display(),
+                        file = StateFile::BaseSeq.name(),
                         error = %e,
                         "base_seq store: corrupt JSON, starting EMPTY (fail-closed: refetch/merge)"
                     );
                     HashMap::new()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Ok(None) => HashMap::new(),
             Err(e) => {
                 warn!(
-                    path = %path.display(),
+                    file = StateFile::BaseSeq.name(),
                     error = %e,
                     "base_seq store: read failed, starting EMPTY (fail-closed)"
                 );
@@ -219,19 +224,19 @@ impl BaseSeqStore {
         }
         if migrated {
             warn!(
-                path = %path.display(),
+                file = StateFile::BaseSeq.name(),
                 "base_seq store: migrated keys to canonical form (NFC + vault-prefix strip)"
             );
         }
         if value_migrated {
             warn!(
-                path = %path.display(),
+                file = StateFile::BaseSeq.name(),
                 "base_seq store: legacy bare-seq entries loaded as prov=observed (safe default: wire declaration intact, causal-preserve arm disabled until re-earned as adopted)"
             );
         }
         Arc::new(BaseSeqStore {
             inner: Mutex::new(map),
-            path,
+            sd: Arc::clone(sd),
             gen: FlushGen::new(migrated || value_migrated),
             vault_folders,
         })
@@ -329,8 +334,8 @@ impl BaseSeqStore {
     /// rename, dir fsync). No-op (and `Ok`) when nothing changed since the
     /// last durable flush. A mutation that lands after the snapshot stays
     /// unflushed and is written by the next flush (Unit 1a S2).
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.gen.flush_durable(&self.path, || {
+    pub fn flush(&self) -> Result<Commit, NotCommitted> {
+        self.gen.flush_durable(&self.sd, StateFile::BaseSeq, || {
             let m = match self.inner.lock() {
                 Ok(m) => m,
                 Err(poisoned) => poisoned.into_inner(),
@@ -356,21 +361,28 @@ impl BaseSeqStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
+    /// CS-2: a fresh directory per test holding the store's fixed file.
     fn tmp_path(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("baseseq_test_{}_{}.json", std::process::id(), name));
-        let _ = std::fs::remove_file(&p);
-        p
+        let d = tempfile::Builder::new()
+            .prefix(&format!("baseseq_test_{name}_"))
+            .tempdir()
+            .unwrap()
+            .keep();
+        d.join(crate::state_io::StateFile::BaseSeq.name())
     }
 
     #[test]
     fn get_returns_none_for_unknown_lineage() {
         // R4: an unrecorded note yields None (fail-closed), never a fabricated
         // or defaulted seq.
-        let s = BaseSeqStore::load(tmp_path("unknown"));
+        let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&tmp_path(
+            "unknown",
+        )));
         assert_eq!(s.get("01_Notes/x.md"), None);
     }
 
@@ -378,13 +390,13 @@ mod tests {
     fn record_then_get_roundtrips_and_persists() {
         let path = tmp_path("roundtrip");
         {
-            let s = BaseSeqStore::load(path.clone());
+            let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
             s.record_adopted("01_Notes/x.md", 4242);
             assert_eq!(s.get("01_Notes/x.md"), Some(4242));
-            s.flush().unwrap();
+            let _c = s.flush().unwrap();
         }
         // Reload from disk: the seq AND its provenance survive a restart.
-        let s2 = BaseSeqStore::load(path.clone());
+        let s2 = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         assert_eq!(s2.get("01_Notes/x.md"), Some(4242));
         assert_eq!(s2.get_adopted("01_Notes/x.md"), Some(4242));
         let _ = std::fs::remove_file(&path);
@@ -397,7 +409,7 @@ mod tests {
     fn observed_provenance_feeds_wire_but_not_causal_gate() {
         let path = tmp_path("observed");
         {
-            let s = BaseSeqStore::load(path.clone());
+            let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
             s.record_observed("01_Notes/x.md", 77);
             assert_eq!(s.get("01_Notes/x.md"), Some(77), "wire declaration intact");
             assert_eq!(
@@ -405,10 +417,10 @@ mod tests {
                 None,
                 "a receipt-earned seq must not enable the preserve arm"
             );
-            s.flush().unwrap();
+            let _c = s.flush().unwrap();
         }
         // Provenance survives a restart too.
-        let s2 = BaseSeqStore::load(path.clone());
+        let s2 = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         assert_eq!(s2.get("01_Notes/x.md"), Some(77));
         assert_eq!(s2.get_adopted("01_Notes/x.md"), None);
         let _ = std::fs::remove_file(&path);
@@ -425,13 +437,13 @@ mod tests {
         let path = tmp_path("legacy");
         std::fs::write(&path, br#"{"01_Notes/x.md": 91, "01_Notes/y.md": 12}"#).unwrap();
         {
-            let s = BaseSeqStore::load(path.clone());
+            let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
             assert_eq!(s.get("01_Notes/x.md"), Some(91));
             assert_eq!(s.get("01_Notes/y.md"), Some(12));
             assert_eq!(s.get_adopted("01_Notes/x.md"), None);
             assert_eq!(s.get_adopted("01_Notes/y.md"), None);
             // The load marked the store dirty; flush writes the tagged form.
-            s.flush().unwrap();
+            let _c = s.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
         let txt = String::from_utf8(bytes).unwrap();
@@ -439,7 +451,7 @@ mod tests {
             txt.contains("\"prov\":\"observed\""),
             "flush must persist the tagged form, got: {txt}"
         );
-        let s2 = BaseSeqStore::load(path.clone());
+        let s2 = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         assert_eq!(s2.get("01_Notes/x.md"), Some(91));
         assert_eq!(s2.get_adopted("01_Notes/x.md"), None);
         let _ = std::fs::remove_file(&path);
@@ -450,7 +462,9 @@ mod tests {
     /// adoption proves nothing about the newer version's ancestry).
     #[test]
     fn observed_same_seq_keeps_adopted_different_seq_replaces() {
-        let s = BaseSeqStore::load(tmp_path("keep_adopted"));
+        let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&tmp_path(
+            "keep_adopted",
+        )));
         s.record_adopted("a.md", 100);
         s.record_observed("a.md", 100);
         assert_eq!(
@@ -472,7 +486,7 @@ mod tests {
         // A legacy `<vault>/`-prefixed key and a sync-root-relative key hit the
         // SAME entry, identical to the shadow store's keying.
         let s = BaseSeqStore::load_with_vault_folders(
-            tmp_path("prefix"),
+            &crate::state_io::StateDir::for_test_file(&tmp_path("prefix")),
             vec!["Mainframe".to_string()],
         );
         s.record_adopted("Mainframe/01_Notes/x.md", 7);
@@ -483,7 +497,7 @@ mod tests {
     fn corrupt_file_loads_empty_not_panic() {
         let path = tmp_path("corrupt");
         std::fs::write(&path, b"{not valid json").unwrap();
-        let s = BaseSeqStore::load(path.clone());
+        let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path.clone()));
         assert!(s.is_empty());
         assert_eq!(s.get("anything.md"), None);
         let _ = std::fs::remove_file(&path);
@@ -491,7 +505,9 @@ mod tests {
 
     #[test]
     fn remove_drops_lineage() {
-        let s = BaseSeqStore::load(tmp_path("remove"));
+        let s = BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&tmp_path(
+            "remove",
+        )));
         s.record_adopted("a.md", 9);
         assert_eq!(s.get("a.md"), Some(9));
         s.remove("a.md");
@@ -502,7 +518,7 @@ mod tests {
 
     impl crate::sync_shadow::flush_gen_checks::GenStore for BaseSeqStore {
         fn load_at(path: PathBuf) -> Arc<Self> {
-            BaseSeqStore::load(path)
+            BaseSeqStore::load(&crate::state_io::StateDir::for_test_file(&path))
         }
         fn put(&self, i: u32) {
             self.record_adopted(&format!("n/{i}.md"), i64::from(i) + 1000);
@@ -510,7 +526,8 @@ mod tests {
         fn has(&self, i: u32) -> bool {
             self.get_adopted(&format!("n/{i}.md")) == Some(i64::from(i) + 1000)
         }
-        fn flush_now(&self) -> std::io::Result<()> {
+        const FILE: crate::state_io::StateFile = crate::state_io::StateFile::BaseSeq;
+        fn flush_now(&self) -> Result<crate::state_io::Commit, crate::state_io::NotCommitted> {
             self.flush()
         }
         fn gen(&self) -> &FlushGen {
