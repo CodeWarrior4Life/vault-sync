@@ -40,6 +40,36 @@ case "\$*" in
 esac
 EOF
   printf '#!/usr/bin/env bash\necho "$*" >> "%s/osascript.calls"\n' "$c" > "$b/osascript"
+  # plutil (macOS) modelled with plistlib: -lint and -extract KEYPATH raw -o - FILE (comments are not keys).
+  cat > "$b/plutil" <<'EOF'
+#!/usr/bin/env python3
+import plistlib, sys
+a = sys.argv[1:]
+def load(f):
+    with open(f, "rb") as fh:
+        return plistlib.load(fh)
+if a[0] == "-lint":
+    try:
+        load(a[-1]); print(a[-1] + ": OK"); sys.exit(0)
+    except Exception:
+        sys.exit(1)
+if a[0] == "-extract":
+    try:
+        v = load(a[-1])
+        for k in a[1].split("."):
+            v = v[int(k)] if isinstance(v, list) else v[k]
+    except Exception:
+        sys.exit(1)
+    print(v if not isinstance(v, bool) else str(v).lower()); sys.exit(0)
+sys.exit(2)
+EOF
+  # mv: a real mv, except that a source whose basename is listed in ctl/mvfail is NOT moved (rc 0, like mv -n skipping)
+  cat > "$b/mv" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in -*) ;; *) src="\$a"; break ;; esac; done
+[ -f "$c/mvfail" ] && grep -qxF "\$(basename "\$src")" "$c/mvfail" && exit 0
+exec /usr/bin/mv "\$@"
+EOF
   cat > "$b/testkill" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$c/kill.calls"; grep -v "^\$2 " "$c/procs" > "$c/procs.n"; mv "$c/procs.n" "$c/procs"
@@ -70,6 +100,10 @@ decoys(){
     '<key>EnvironmentVariables</key><dict><key>NEXUS_SYNC_CONFIG_DIR</key><string>/Users/u/.config/mem</string></dict>'
   agent "$1" "memory.plist" "com.lattice.vaultsync-memory2" "$(s "$MEM" --silent)"
   agent "$1" "other.plist" "com.example.other" "$(s /usr/local/bin/other)"
+  # P1-a decoys: a commented-out Program key naming the main binary; a plist that does not parse.
+  agent "$1" "commented.plist" "com.example.commented" "$(s /usr/local/bin/other)" \
+    "<!-- <key>Program</key><string>$MAIN</string> -->"
+  printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>broken</string><key>Program</key><string>%s</string>\n' "$MAIN" > "$1/agents/broken.plist"
 }
 
 # 1. P1: exact-path matching; decoys are never parked
@@ -78,13 +112,38 @@ inst "$D" --memory-binary "$MEM"
 check "install with decoys: receipt OK, exit 0" bash -c "[ \$(cat '$D/rc') = 0 ] && grep -q 'RECEIPT OK: one vault-mode daemon pid=777' '$D/out'"
 check "P1: the exact-match competing agent is booted out and parked" \
   bash -c "grep -qx 'bootout gui/501/Nexus Vault Sync' '$D/ctl/launchctl.calls' && [ -f '$D/agents.vault-sync-parked/Nexus Vault Sync.plist' ]"
-for f in old.bak killer wrapper managed memory other; do
+for f in old.bak killer wrapper managed memory other commented broken; do
   check "P1: decoy $f.plist is NOT parked" bash -c "[ -f '$D/agents/$f.plist' ] && [ ! -f '$D/agents.vault-sync-parked/$f.plist' ]"
 done
 check "P1: no decoy label was booted out" bash -c "! grep -qE 'example|vaultsync-memory' '$D/ctl/launchctl.calls'"
 check "P1: the managed instance is logged as not parked" grep -q 'not parking .*managed.plist: a managed instance' "$D/out"
+check "P1-a: the unparseable plist is skipped and logged" grep -q 'skipping .*broken.plist: plutil cannot parse it' "$D/out"
+check "P1-a: a commented-out <key>Program</key> naming the main binary is NOT a match" \
+  bash -c "[ -f '$D/agents/commented.plist' ] && ! grep -q 'commented' '$D/ctl/launchctl.calls'"
+
+# P1-b: an EMPTY NEXUS_SYNC_CONFIG_DIR is not a managed instance (agent parked; process counted); not-anchored names neither
+D=$(box emptycfg)
+agent "$D" "emptycfg.plist" "com.example.emptycfg" "$(s "$MAIN")" \
+  '<key>EnvironmentVariables</key><dict><key>NEXUS_SYNC_CONFIG_DIR</key><string></string></dict>'
+inst "$D"
+check "P1-b: an agent with an EMPTY NEXUS_SYNC_CONFIG_DIR competes (parked)" test -f "$D/agents.vault-sync-parked/emptycfg.plist"
+D=$(box emptyenv); printf '777 %s --silent\n888 %s\n' "$MAIN" "$MAIN" > "$D/ctl/after_bootstrap"
+echo "NEXUS_SYNC_CONFIG_DIR=" > "$D/ctl/env.888"; inst "$D"
+check "P1-b: a process with an EMPTY NEXUS_SYNC_CONFIG_DIR is counted (two copies: exit 20)" test "$(rc "$D")" = 20
+D=$(box unanchored); printf '777 %s --silent\n889 %s\n' "$MAIN" "$MAIN" > "$D/ctl/after_bootstrap"
+echo "X_NEXUS_SYNC_CONFIG_DIR=/x" > "$D/ctl/env.889"; inst "$D"
+check "P1-b: X_NEXUS_SYNC_CONFIG_DIR=… is not the managed marker (counted: exit 20)" test "$(rc "$D")" = 20
+D=$(box mgdok); printf '777 %s --silent\n890 %s\n' "$MAIN" "$MAIN" > "$D/ctl/after_bootstrap"
+echo "HOME=/u NEXUS_SYNC_CONFIG_DIR=/Users/u/.config/mem" > "$D/ctl/env.890"; inst "$D"
+check "P1-b: a NON-EMPTY NEXUS_SYNC_CONFIG_DIR after another env entry excludes the process (receipt OK)" test "$(rc "$D")" = 0
+
+# P1-c: the memory binary may not be the main binary
+D=$(box samebin); decoys "$D"; inst "$D" --memory-binary "$MAIN"
+check "P1-c: --memory-binary == --main-binary is refused (exit 2) before anything changes" \
+  bash -c "[ \$(cat '$D/rc') = 2 ] && grep -q 'REFUSED: --memory-binary equals --main-binary' '$D/out' && [ ! -f '$D/ctl/launchctl.calls' ]"
 
 # 2. P2: process detection by exact full path, not pgrep -x (the 16-char-truncated name)
+D="$T/full"   # back to the full install box (the P1-b/P1-c boxes above replaced D)
 check "P2: pgrep was never used" test ! -f "$D/ctl/pgrep.calls"
 check "P2: the truncated comm fixture really is truncated (16 chars, not vault-sync-daemon)" \
   bash -c "PATH='$D/bin:/usr/bin:/bin' ps -axo comm= | grep -qx 'vault-sync-daemo' && ! PATH='$D/bin:/usr/bin:/bin' ps -axo comm= | grep -qx 'vault-sync-daemon'"
@@ -118,6 +177,16 @@ mv "$D/agents/Nexus Vault Sync.plist" "$D/agents.vault-sync-parked/Nexus Vault S
 inst "$D" --restore "$M"
 check "P3: --restore never clobbers an existing original: exit 25" \
   bash -c "[ \$(cat '$D/rc') = 25 ] && [ -f '$D/agents.vault-sync-parked/Nexus Vault Sync.plist' ] && [ ! -s '$D/agents/Nexus Vault Sync.plist' ]"
+# P3: the second park fails -> exit 26, and the FIRST park's restore commands are printed before exiting
+D=$(box secondfail)
+agent "$D" "a-first.plist" "com.example.first" "$(s "$MAIN")"
+agent "$D" "b-second.plist" "com.example.second" "$(s "$MAIN" --silent)"
+echo b-second.plist > "$D/ctl/mvfail"; inst "$D"
+check "P3: a park whose mv -n does not move: exit 26" test "$(rc "$D")" = 26
+check "P3: the first park's restore commands are still printed" \
+  bash -c "grep -q \"or by hand: mv -n '$D/agents.vault-sync-parked/a-first.plist' '$D/agents/a-first.plist'\" '$D/out' && grep -q -- '--restore' '$D/out'"
+check "P3: the manifest holds the first park only" \
+  bash -c "M=\$(ls '$D'/agents.vault-sync-parked/manifest-*.tsv); grep -q a-first.plist \"\$M\" && ! grep -q b-second.plist \"\$M\""
 D=$(box clobber); decoys "$D"; mkdir -p "$D/agents.vault-sync-parked"; echo keep > "$D/agents.vault-sync-parked/Nexus Vault Sync.plist"
 inst "$D"
 check "P3: an already-parked file of the same name is never clobbered: exit 2" \

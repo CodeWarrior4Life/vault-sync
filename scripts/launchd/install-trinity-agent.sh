@@ -14,8 +14,10 @@
 #   --memory-binary the MANAGED (memory) instance's binary, if it is a different file (default: none). Agents and
 #                   processes of the memory instance are NEVER parked or counted: it is a separate, supervised daemon.
 #   A LaunchAgent competes only if its Program, or else its ProgramArguments[0], EQUALS the main binary and its
-#   EnvironmentVariables do not set NEXUS_SYNC_CONFIG_DIR (that would be a managed instance). A `.app.bak` path, a
-#   `pkill -x vault-sync-daemon` agent or a wrapper that merely mentions the app is not a match.
+#   EnvironmentVariables do not set a NON-EMPTY NEXUS_SYNC_CONFIG_DIR (that would be a managed instance). Values are
+#   read with `plutil -extract … raw`; a plist plutil cannot parse is skipped. A `.app.bak` path, a `pkill -x
+#   vault-sync-daemon` agent, a wrapper that merely mentions the app, or a commented-out <key>Program</key> is not a
+#   match. --memory-binary must differ from --main-binary (refused otherwise).
 #   A running copy is a process whose full command line starts with the main binary path, and whose environment
 #   (ps -E) does not carry NEXUS_SYNC_CONFIG_DIR. `pgrep -x` is NOT used: macOS truncates the process name to 16
 #   characters (MAXCOMLEN) and `vault-sync-daemon` is 17, so `pgrep -x vault-sync-daemon` can miss it. The ps-based
@@ -43,7 +45,8 @@
 # exit:  0 receipt OK (or dry run / restore done) | 2 usage, not macOS, missing plist | 20 more than one daemon pid |
 #        21 the daemon's parent is not launchd, or it is not this job's pid | 22 VAULT_SYNC_SUPERVISED=1 not in the
 #        job's environment | 23 no daemon running | 24 a vault-mode copy is still running (quit it, then rerun) |
-#        25 a restore could not put a plist back (the original path exists, or the parked file is missing)
+#        25 a restore could not put a plist back (the original path exists, or the parked file is missing) |
+#        26 a park move did not happen (the restore commands for everything parked so far are printed first)
 set -uo pipefail
 LABEL=com.lattice.vaultsync-daemon
 APP_NAME="Nexus Vault Sync"
@@ -72,46 +75,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "$(uname -s)" = Darwin ] || { echo "install-trinity-agent: macOS only" >&2; exit 2; }
+# P1-c: the memory instance's binary must be a DIFFERENT file from the main binary, or the exclusion rules collapse.
+if [ -n "$MEM_BIN" ] && [ "$MEM_BIN" = "$MAIN_BIN" ]; then
+  echo "install-trinity-agent: REFUSED: --memory-binary equals --main-binary ($MAIN_BIN); give the memory instance's own binary path, or omit it" >&2
+  exit 2
+fi
 DOMAIN="gui/$(id -u)"
 PARK="$AGENTS.vault-sync-parked"
 log(){ echo "install-trinity-agent: $*"; }
 run(){ if [ "$MODE" = dry ]; then log "DRY: $*"; else "$@"; fi; }
 
-# The plist as one tag per line (XML; a binary plist is converted with plutil when present).
-plist_lines(){
-  if head -c 6 "$1" | grep -q '^bplist'; then
-    command -v plutil >/dev/null 2>&1 || return 1
-    plutil -convert xml1 -o - "$1"
-  else
-    cat "$1"
-  fi | tr -d '\n\r\t' | sed 's/>[[:space:]]*</>\
-</g'
-}
-# Prints LABEL, PROG (Program, else ProgramArguments[0]) and MANAGED=1|0 (EnvironmentVariables sets
-# NEXUS_SYNC_CONFIG_DIR) for a plist. Top-level keys only.
+# P1-a (#34 gate): plists are read with plutil, never a hand parser. The gate MEASURED that a commented-out
+# <key>Program</key> was parked by the old line-based parser; plutil ignores comments. Any plist plutil cannot parse
+# (`plutil -lint` fails) is SKIPPED, never parked. Missing key = empty value.
+pl_get(){ plutil -extract "$1" raw -o - "$2" 2>/dev/null; }   # $1 key path  $2 plist
+# Prints LABEL=, PROG= (Program, else ProgramArguments.0) and MANAGED=1|0 (EnvironmentVariables sets a NON-EMPTY
+# NEXUS_SYNC_CONFIG_DIR; P1-b: an empty value is not a managed instance). Returns 1 on a parse error.
 plist_facts(){
-  plist_lines "$1" | awk '
-    function text(t) { sub(/^<string>/, "", t); sub(/<\/string>$/, "", t); return t }
-    BEGIN { depth = 0; pending = ""; label = ""; prog = ""; arg0 = ""; nargs = 0; envdepth = -1; managed = 0 }
-    {
-      t = $0
-      if (t ~ /^<dict>$/) { depth++ }
-      if (t ~ /^<\/dict>$/) { if (depth == envdepth) envdepth = -1; depth--; next }
-      if (pending == "Label") { pending = ""; if (t ~ /^<string>/) label = text(t); next }
-      if (pending == "Program") { pending = ""; if (t ~ /^<string>/) prog = text(t); next }
-      if (pending == "Args") {
-        if (t == "<array>") next
-        if (t ~ /^<string>/) { nargs++; if (nargs == 1) arg0 = text(t); next }
-        pending = ""; next
-      }
-      if (pending == "Env") { pending = ""; if (t == "<dict>") envdepth = depth; next }
-      if (depth == 1 && t == "<key>Label</key>") { pending = "Label"; next }
-      if (depth == 1 && t == "<key>Program</key>") { pending = "Program"; next }
-      if (depth == 1 && t == "<key>ProgramArguments</key>") { pending = "Args"; next }
-      if (depth == 1 && t == "<key>EnvironmentVariables</key>") { pending = "Env"; next }
-      if (envdepth >= 0 && depth == envdepth && t == "<key>NEXUS_SYNC_CONFIG_DIR</key>") { managed = 1; next }
-    }
-    END { if (prog == "") prog = arg0; print "LABEL=" label; print "PROG=" prog; print "MANAGED=" managed }'
+  local prog cfg
+  plutil -lint "$1" >/dev/null 2>&1 || return 1
+  prog=$(pl_get Program "$1"); [ -n "$prog" ] || prog=$(pl_get ProgramArguments.0 "$1")
+  cfg=$(pl_get EnvironmentVariables.NEXUS_SYNC_CONFIG_DIR "$1")
+  printf 'LABEL=%s\nPROG=%s\nMANAGED=%s\n' "$(pl_get Label "$1")" "$prog" "$([ -n "$cfg" ] && echo 1 || echo 0)"
 }
 # Vault-mode daemon pids: full command line starting with the exact main binary path (then a space or the end),
 # not a managed instance (no NEXUS_SYNC_CONFIG_DIR in its environment), never the memory binary.
@@ -123,7 +108,8 @@ daemon_pids(){
       "$MAIN_BIN"|"$MAIN_BIN "*) ;;
       *) continue ;;
     esac
-    if ps -E -ww -o command= -p "$pid" 2>/dev/null | grep -q 'NEXUS_SYNC_CONFIG_DIR='; then continue; fi
+    # P1-b: managed only with a NON-EMPTY value, matched as a whole env entry (start of line or after a space).
+    if ps -E -ww -o command= -p "$pid" 2>/dev/null | grep -qE '(^|[[:space:]])NEXUS_SYNC_CONFIG_DIR=[^[:space:]]'; then continue; fi
     out="$out $pid"
   done < <(ps -axo pid=,command= 2>/dev/null | sed 's/^[[:space:]]*//')
   printf '%s' "${out# }"
@@ -173,31 +159,39 @@ fi
 # 1. park every other agent that competes (exact Program / ProgramArguments[0] match; never a managed instance)
 MANIFEST="$PARK/manifest-$(date +%Y%m%dT%H%M%S).tsv"
 parked_any=0
+# P3: the restore commands for everything parked so far; printed before ANY non-zero exit after parking starts.
+print_restore(){
+  [ "$parked_any" = 1 ] && [ "$MODE" != dry ] && [ -f "$MANIFEST" ] || return 0
+  log "parked moves recorded in $MANIFEST. To undo:"
+  log "  $0 --restore '$MANIFEST' --agents-dir '$AGENTS'"
+  while IFS=$'\t' read -r parked orig label; do
+    log "  or by hand: mv -n '$parked' '$orig' && launchctl bootstrap $DOMAIN '$orig'"
+  done < "$MANIFEST"
+}
+die_after_park(){ print_restore; exit "$1"; }
 for f in "$AGENTS"/*.plist; do
   [ -f "$f" ] || continue
   [ "$(basename "$f")" = "$LABEL.plist" ] && continue
-  facts=$(plist_facts "$f") || continue
+  if ! facts=$(plist_facts "$f"); then log "skipping $f: plutil cannot parse it (never parked)"; continue; fi
   prog=$(printf '%s\n' "$facts" | sed -n 's/^PROG=//p'); other=$(printf '%s\n' "$facts" | sed -n 's/^LABEL=//p')
   managed=$(printf '%s\n' "$facts" | sed -n 's/^MANAGED=//p')
   [ "$prog" = "$MAIN_BIN" ] || continue
   [ -n "$MEM_BIN" ] && [ "$prog" = "$MEM_BIN" ] && continue
   if [ "$managed" = 1 ]; then log "not parking $f: a managed instance (NEXUS_SYNC_CONFIG_DIR set)"; continue; fi
   dest="$PARK/$(basename "$f")"
-  if [ -e "$dest" ]; then log "FAIL: $dest already exists; not clobbering it (mv -n). Resolve by hand, then rerun."; exit 2; fi
+  if [ -e "$dest" ]; then log "FAIL: $dest already exists; not clobbering it (mv -n). Resolve by hand, then rerun."; die_after_park 2; fi
   log "competing launch route: $f (label ${other:-?}, program $prog): booting out and parking it"
   [ -n "$other" ] && run launchctl bootout "$DOMAIN/$other"
   run mkdir -p "$PARK"
   run mv -n "$f" "$dest"
+  # P3: `mv -n` may "succeed" without moving (an existing target); check the result, not only the return code.
+  if [ "$MODE" != dry ] && { [ ! -e "$dest" ] || [ -e "$f" ]; }; then
+    log "FAIL: could not park $f to $dest (mv -n did not move it); stopping"; die_after_park 26
+  fi
   if [ "$MODE" != dry ]; then printf '%s\t%s\t%s\n' "$dest" "$f" "$other" >> "$MANIFEST"; fi
   parked_any=1
 done
-if [ "$parked_any" = 1 ] && [ "$MODE" != dry ]; then
-  log "parked moves recorded in $MANIFEST. To undo:"
-  log "  $0 --restore '$MANIFEST' --agents-dir '$AGENTS'"
-  while IFS=$'\t' read -r parked orig label; do
-    log "  or by hand: mv -n '$parked' '$orig' && launchctl bootstrap $DOMAIN '$orig'"
-  done < "$MANIFEST"
-fi
+print_restore
 # 2. Login Items
 log "removing '$APP_NAME' from Login Items (if present)"
 run osascript -e "tell application \"System Events\" to delete (every login item whose name is \"$APP_NAME\")" || true
@@ -209,7 +203,7 @@ if [ -n "$left" ]; then
     for pid in $left; do log "TEST: stopping pid $pid via --test-kill-cmd"; run "$TEST_KILL" -TERM "$pid"; done
   elif [ "$MODE" != dry ]; then
     log "FAIL: a vault-mode copy is still running (pid $left). Quit it from its tray menu (Quit), then rerun. This script never kills."
-    exit 24
+    exit 24   # the restore commands were already printed after step 1
   else
     log "DRY: a vault-mode copy is running (pid $left); a real run would stop here (exit 24) and ask for a tray Quit"
   fi

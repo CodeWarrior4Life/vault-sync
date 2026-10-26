@@ -23,21 +23,31 @@ requires a **receipt**:
 
 ## Matching rules (#29 follow-up P1, P2)
 
-- **Agents: exact paths only, never a substring.** An agent competes only if its `Program`, or else its
-  `ProgramArguments[0]`, EQUALS the main binary, and its `EnvironmentVariables` do not set `NEXUS_SYNC_CONFIG_DIR`.
+- **Agents: exact paths only, never a substring, read with `plutil`.** An agent competes only if its `Program`, or
+  else its `ProgramArguments[0]`, EQUALS the main binary, and its `EnvironmentVariables` do not set a NON-EMPTY
+  `NEXUS_SYNC_CONFIG_DIR`.
+  - Values come from `plutil -extract Program raw` and `plutil -extract ProgramArguments.0 raw`.
+  - A plist that `plutil -lint` rejects is skipped, never parked.
+  - A commented-out `<key>Program</key>` is not a key. The old line parser parked such a decoy; the gate measured it.
+  - An empty `NEXUS_SYNC_CONFIG_DIR` does not make an instance managed.
+  - `--memory-binary` must differ from `--main-binary`; the script refuses (exit 2) otherwise.
   - The main binary is set by `--main-binary`, default `/Applications/Nexus Vault Sync.app/Contents/MacOS/vault-sync-daemon`.
   - These are not parked: a `.app.bak` copy, a `pkill -x vault-sync-daemon` agent, a wrapper that mentions the app,
     the managed (memory) instance, and the `--memory-binary` instance.
 - **Processes: full command line, not `pgrep -x`.** macOS truncates the process name to 16 characters (MAXCOMLEN),
   and `vault-sync-daemon` has 17, so `pgrep -x vault-sync-daemon` can miss the daemon.
   - A running copy is a line of `ps -axo pid=,command=` that starts with the exact main-binary path, and whose
-    environment (`ps -E`) has no `NEXUS_SYNC_CONFIG_DIR`.
+    environment (`ps -E`) has no non-empty `NEXUS_SYNC_CONFIG_DIR=` entry, matched as a whole entry (an
+  `X_NEXUS_SYNC_CONFIG_DIR=` does not count).
   - **MEASURE both output shapes on Trinity at the canary** before trusting the receipt.
 
 ## Parking is reversible (P3)
 
 - Parked plists are moved with `mv -n`, so nothing is clobbered, into `<agents-dir>.vault-sync-parked/`.
 - Each move is recorded in `manifest-<timestamp>.tsv`, and the script prints the exact restore commands.
+- Each move's RESULT is checked, not only `mv`'s return code, because `mv -n` can return 0 without moving. A park
+  that did not happen stops the run (exit 26). The restore commands for everything parked so far are printed
+  BEFORE any non-zero exit.
 - `install-trinity-agent.sh --restore <manifest>` moves each plist back and bootstraps it. It refuses (exit 25) when
   the original path already exists.
 
@@ -71,3 +81,4 @@ The remedy is to quit that copy, run `launchctl kickstart -k gui/$(id -u)/com.la
 | 23 | none running |
 | 24 | a vault-mode copy is still running |
 | 25 | restore blocked |
+| 26 | a park move did not happen (restore commands printed first) |
