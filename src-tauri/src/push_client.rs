@@ -751,12 +751,14 @@ impl PushClient {
                     "push refused locally: content violates the text-lane contract (I3) - not sent, skip + ack"
                 );
                 if let Some(l) = &self.rejected_ledger {
-                    l.record(
+                    if let Err(e) = l.record(
                         &evt.path,
                         &sha256_hex(&content_bytes),
                         crate::rejected_ledger::STATUS_LOCAL_I3,
                         &format!("local I3: {} at byte offset {}", v.kind, v.offset),
-                    );
+                    ) {
+                        tracing::error!(path = %evt.path, error = %e, "rejected_ledger: durable write FAILED - acking anyway (I47); the path is re-queued next pass");
+                    }
                 }
                 return PushOutcome::Skipped(SkipReason::LocalContractViolation {
                     kind: v.kind,
@@ -1110,9 +1112,17 @@ impl PushClient {
                         "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
                     // WS-A A3: bind the rejection to the exact bytes so the
-                    // reconciliation backstop stops re-queueing them.
+                    // reconciliation backstop stops re-queueing them. ORDER
+                    // (AR-015): server response -> ledger row written DURABLY
+                    // (this call persists atomically before returning) -> the
+                    // caller (drain_once) acks the journal cursor. A failed
+                    // write is an ERROR and the entry is still acked: I47
+                    // requires the ack, and the path simply re-queues next
+                    // pass (the pre-existing behaviour, not a storm).
                     if let Some(l) = &self.rejected_ledger {
-                        l.record(&evt.path, &drained_sha, status, &detail);
+                        if let Err(e) = l.record(&evt.path, &drained_sha, status, &detail) {
+                            tracing::error!(path = %evt.path, status, error = %e, "rejected_ledger: durable write FAILED - acking anyway (I47); the path is re-queued next pass");
+                        }
                     }
                     return PushOutcome::Skipped(SkipReason::ServerRejected { status, detail });
                 }
@@ -3423,8 +3433,10 @@ mod tests {
             .await;
         let (_d, journal) = make_journal_with(vec![evt("notes/a.md", body)]);
         let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
-        ledger.record("notes/a.md", "old-rejected-sha", 400, "invalid path");
-        ledger.record("notes/other.md", "x", 422, "nul");
+        ledger
+            .record("notes/a.md", "old-rejected-sha", 400, "invalid path")
+            .unwrap();
+        ledger.record("notes/other.md", "x", 422, "nul").unwrap();
         let client = make_client(&srv.url(), journal.clone())
             .await
             .with_rejected_ledger(Arc::clone(&ledger));
@@ -3439,6 +3451,150 @@ mod tests {
             "Sent must clear the path"
         );
         assert_eq!(ledger.len(), 1, "other paths untouched");
+    }
+
+    /// AR-015 (d): a ledger persistence failure logs ERROR and the rejection
+    /// is STILL acked (I47) — the path simply re-queues next pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ledger_persist_failure_still_acks_the_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let ldir = TempDir::new().unwrap();
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::load(
+            &crate::state_io::StateDir::for_test_scoped(
+                ldir.path(),
+                crate::state_io::Scope::ConfigDir,
+            ),
+        ));
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"{}")]);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        // The atomic replace cannot create its temp file in a read-only dir.
+        std::fs::set_permissions(ldir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let out = client.drain_once().await;
+        std::fs::set_permissions(ldir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(
+                out[0].1,
+                PushOutcome::Skipped(SkipReason::ServerRejected { status: 400, .. })
+            ),
+            "{:?}",
+            out[0].1
+        );
+        assert_eq!(
+            journal.len(),
+            0,
+            "still acked (I47) despite the ledger write failure"
+        );
+        assert!(ledger.get("notes/a.md").is_some(), "row kept in memory");
+    }
+
+    /// AR-015 (f): ordering is server response -> durable ledger row -> ack. A
+    /// crash injected between the ledger write and the ack (the event is
+    /// processed, the cursor never acked) leaves the row on disk: after a
+    /// "restart" (fresh ledger loaded from the same dir) the next
+    /// reconciliation pass does NOT queue the path, and the journaled event
+    /// replays exactly once (no storm).
+    #[tokio::test]
+    async fn crash_between_ledger_write_and_ack_leaves_entry_present() {
+        let mut srv = Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(2)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let rel = "notes/Untitled 1.canvas";
+        let body = b"{}";
+        let vault = TempDir::new().unwrap();
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join(rel), body).unwrap();
+        let ldir = TempDir::new().unwrap();
+        let ledger_sd = || {
+            crate::state_io::StateDir::for_test_scoped(
+                ldir.path(),
+                crate::state_io::Scope::ConfigDir,
+            )
+        };
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::load(&ledger_sd()));
+        let (_d, journal) = make_journal_with(vec![evt(rel, body)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+
+        // Process the event WITHOUT the drain fold => ledger written, no ack.
+        let (events, _cursors): (Vec<PushEvent>, Vec<JournalCursor>) =
+            journal.drain(8).unwrap().into_iter().unzip();
+        let out = client.process_event(&events[0]).await;
+        assert!(matches!(
+            out,
+            PushOutcome::Skipped(SkipReason::ServerRejected { .. })
+        ));
+        assert_eq!(
+            journal.len(),
+            1,
+            "crash before ack: the cursor is still journaled"
+        );
+        drop(client);
+        drop(ledger);
+
+        // "Restart": the row is on disk.
+        let ledger2 = Arc::new(crate::rejected_ledger::RejectedLedger::load(&ledger_sd()));
+        let e = ledger2.get(rel).expect("entry survives the crash");
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert_eq!(e.status, 400);
+
+        // Next reconciliation pass does NOT queue the path.
+        let _recon = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"deltas":[{{"path":"{rel}","state":"missing-on-server"}}]}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
+        let vr = crate::verify_repair::VerifyRepair::new(
+            vault.path().to_path_buf(),
+            Arc::clone(&api),
+            journal.clone(),
+            "dev-test".into(),
+            crate::verify_repair::VerifyRepairConfig::default(),
+        )
+        .with_rejected_ledger(Arc::clone(&ledger2));
+        let report = vr.run().await.unwrap();
+        assert_eq!(
+            report.modify_count, 0,
+            "ledgered bytes are not re-queued after the restart"
+        );
+        assert_eq!(report.rejected_skipped_count, 1);
+        assert_eq!(
+            journal.len(),
+            1,
+            "only the pre-crash journaled event remains"
+        );
+
+        // The surviving journaled event replays exactly once and is acked.
+        let client2 =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+                .await
+                .with_rejected_ledger(Arc::clone(&ledger2));
+        let out = client2.drain_once().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(journal.len(), 0);
+        assert_eq!(ledger2.get(rel).unwrap().count, 2);
+        push.assert_async().await; // 1 pre-crash + 1 replay; no storm
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and

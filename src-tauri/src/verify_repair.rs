@@ -572,33 +572,21 @@ impl VerifyRepair {
 
             match dir {
                 Direction::Push => {
-                    let Some(local) = local_index.get(delta.path.as_str()) else {
-                        // reconcile-batch only echoes paths we sent, so this is
-                        // unreachable in practice; guard defensively.
-                        tracing::warn!(
-                            path = %delta.path,
-                            state = %delta.state,
-                            "reconcile-batch delta for a path not in local manifest"
-                        );
-                        report.errors.push((
-                            delta.path.clone(),
-                            "delta path not in local manifest".to_string(),
-                        ));
-                        continue;
-                    };
+                    let local = local_index.get(delta.path.as_str());
 
-                    // WS-A A3 (TKT-17fc22e5): these exact bytes were already
-                    // rejected permanently (server 400/422 or local I3). Queueing
-                    // them again cannot succeed — this is the re-queue loop that
-                    // produced 215 rejections/day for 3 paths. Not counted as a
-                    // queued push; counted under `rejected_skipped_count`. A
-                    // changed sha falls through and gets one more chance.
-                    if let Some(l) = &self.rejected_ledger {
-                        if l.is_rejected(&delta.path, &local.content_hash) {
+                    // WS-A A3 (TKT-17fc22e5, AR-007): these exact bytes were
+                    // rejected permanently (server 400/422 or local I3) less
+                    // than 24 h ago. Queueing them again cannot succeed — this
+                    // is the re-queue loop that produced 215 rejections/day for
+                    // 3 paths. Not counted as a queued push; counted under
+                    // `rejected_skipped_count`. A changed sha, or an expired
+                    // window (one retry per path per day), falls through.
+                    if let (Some(l), Some(local)) = (&self.rejected_ledger, local) {
+                        if l.should_suppress(&delta.path, &local.content_hash) {
                             tracing::debug!(
                                 path = %delta.path,
                                 sha = %local.content_hash,
-                                "reconciliation: push NOT queued - these bytes were already rejected permanently (rejected ledger); retried when the bytes change"
+                                "reconciliation: push NOT queued - these bytes were rejected permanently within the last 24h (rejected ledger); retried once a day or when the bytes change"
                             );
                             report.rejected_skipped_count += 1;
                             continue;
@@ -612,6 +600,21 @@ impl VerifyRepair {
                     if report.modify_paths_sample.len() < SAMPLE_CAP {
                         report.modify_paths_sample.push(delta.path.clone());
                     }
+
+                    let Some(local) = local else {
+                        // reconcile-batch only echoes paths we sent, so this is
+                        // unreachable in practice; guard defensively.
+                        tracing::warn!(
+                            path = %delta.path,
+                            state = %delta.state,
+                            "reconcile-batch delta for a path not in local manifest"
+                        );
+                        report.errors.push((
+                            delta.path.clone(),
+                            "delta path not in local manifest".to_string(),
+                        ));
+                        continue;
+                    };
 
                     // LIGHTWEIGHT (lazy) push ref — no file read here. The
                     // push_client reads the body from disk at drain time. R4 /
@@ -1696,13 +1699,15 @@ mod tests {
         );
     }
 
-    /// WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4): the re-queue loop is closed.
-    /// Two reconciliation passes over an UNCHANGED rejected file produce ONE
-    /// push attempt (the second pass is suppressed by the rejected ledger);
-    /// changing one byte produces a second attempt. The push mock expects
-    /// exactly 2 hits across three passes.
+    /// WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4, AR-007): the re-queue loop is
+    /// closed TEMPORALLY. Bytes rejected at T0 are NOT queued at T0+1h and
+    /// ARE queued once at T0+25h (one attempt per path per day); a re-rejection
+    /// restarts the window; changing one byte queues immediately. The push mock
+    /// expects exactly 3 attempts across five passes.
     #[tokio::test]
-    async fn rejected_ledger_suppresses_requeue_until_bytes_change() {
+    async fn rejected_ledger_suppresses_requeue_for_24h_then_retries_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const T0: u64 = 1_700_000_000;
         let vault = TempDir::new().unwrap();
         let rel = "notes/Untitled 1.canvas";
         write_file(vault.path(), rel, b"{\"nodes\":[]}");
@@ -1714,14 +1719,14 @@ mod tests {
             .with_body(format!(
                 r#"{{"deltas":[{{"path":"{rel}","state":"drift","server_hash":"deadbeef"}}]}}"#
             ))
-            .expect(3)
+            .expect(5)
             .create_async()
             .await;
         let push = srv
             .mock("POST", "/api/sync/push")
             .with_status(400)
             .with_body(r#"{"detail":"invalid path"}"#)
-            .expect(2)
+            .expect(3)
             .create_async()
             .await;
 
@@ -1732,7 +1737,12 @@ mod tests {
             &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
         );
         shadow.record(rel, "deadbeef"); // shadow == server => genuine local edit => Push
-        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let clock_t = Arc::new(AtomicU64::new(T0));
+        let clock: crate::rejected_ledger::Clock = {
+            let t = Arc::clone(&clock_t);
+            Arc::new(move || t.load(Ordering::SeqCst))
+        };
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory_with_clock(clock));
         let vr = vr
             .with_shadow(Arc::clone(&shadow))
             .with_rejected_ledger(Arc::clone(&ledger));
@@ -1751,7 +1761,7 @@ mod tests {
         )
         .with_rejected_ledger(Arc::clone(&ledger));
 
-        // Pass 1: nothing ledgered => queued, drained, rejected, ledgered.
+        // T0, pass 1: nothing ledgered => queued, drained, rejected, ledgered.
         let r1 = vr.run().await.unwrap();
         assert_eq!(r1.modify_count, 1);
         assert_eq!(r1.rejected_skipped_count, 0);
@@ -1768,31 +1778,47 @@ mod tests {
             out[0].1
         );
         assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.get(rel).unwrap().last_seen, T0);
 
-        // Pass 2: same bytes => NOT queued.
+        // T0+1h, pass 2: same bytes inside the window => NOT queued.
+        clock_t.store(T0 + 3600, Ordering::SeqCst);
         let r2 = vr.run().await.unwrap();
         assert_eq!(
             r2.modify_count, 0,
-            "unchanged rejected bytes must not be re-queued"
+            "unchanged rejected bytes must not be re-queued at T0+1h"
         );
         assert_eq!(r2.rejected_skipped_count, 1);
-        assert_eq!(
-            journal.len(),
-            0,
-            "nothing in the journal after the suppressed pass"
-        );
+        assert_eq!(journal.len(), 0);
 
-        // Pass 3: one byte changed => queued once more (second push attempt).
-        write_file(vault.path(), rel, b"{\"nodes\":[ ]}");
+        // T0+25h, pass 3: window expired => queued ONCE (second push attempt),
+        // rejected again => last_seen / count update.
+        clock_t.store(T0 + 25 * 3600, Ordering::SeqCst);
         let r3 = vr.run().await.unwrap();
-        assert_eq!(r3.modify_count, 1, "changed bytes get one more chance");
+        assert_eq!(r3.modify_count, 1, "retried once after 24h");
         assert_eq!(r3.rejected_skipped_count, 0);
-        assert_eq!(journal.len(), 1);
         client.drain_once().await;
-        push.assert_async().await; // exactly 2 push attempts across 3 passes
+        let e = ledger.get(rel).unwrap();
+        assert_eq!(e.count, 2);
+        assert_eq!(e.first_seen, T0);
+        assert_eq!(e.last_seen, T0 + 25 * 3600);
+        assert_eq!(e.reason, "invalid path");
+
+        // T0+26h, pass 4: the window restarted => NOT queued.
+        clock_t.store(T0 + 26 * 3600, Ordering::SeqCst);
+        let r4 = vr.run().await.unwrap();
+        assert_eq!(r4.modify_count, 0, "re-rejection restarts the 24h window");
+        assert_eq!(r4.rejected_skipped_count, 1);
+
+        // T0+26h, pass 5: one byte changed => queued immediately (third attempt).
+        write_file(vault.path(), rel, b"{\"nodes\":[ ]}");
+        let r5 = vr.run().await.unwrap();
+        assert_eq!(r5.modify_count, 1, "changed bytes retry immediately");
+        assert_eq!(r5.rejected_skipped_count, 0);
+        client.drain_once().await;
+        push.assert_async().await; // exactly 3 push attempts across 5 passes
         let e = ledger.get(rel).unwrap();
         assert_eq!(e.count, 1, "new bytes => a fresh row for the new sha");
-        assert_eq!(e.reason, "invalid path");
+        assert_eq!(ledger.len(), 1, "one row per path");
     }
 
     #[tokio::test]

@@ -575,7 +575,7 @@ fn t_cs2_30_owners_never_follow_planted_symlinks() {
             StateFile::RejectedLedger => {
                 let l = crate::rejected_ledger::RejectedLedger::load(&sd);
                 assert!(l.is_empty());
-                l.record("a", "sha", 400, "b");
+                let _ = l.record("a", "sha", 400, "b");
             }
         }
         assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL", "{f:?}");
