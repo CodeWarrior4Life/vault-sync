@@ -25,6 +25,9 @@ use std::time::Duration;
 use crate::api_client::{
     ApiClient, ApiError, NotePayload, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
+use crate::auth_backoff::{
+    auth_retry_delay, clock_jitter_unit, AUTH_BACKOFF_BASE, AUTH_BACKOFF_CAP, AUTH_ERROR_REPEAT,
+};
 use crate::journal_owner::JournalOwner;
 use crate::push_journal::{
     new_event_id, JournalCursor, PushAction, PushBase, PushEvent, CURRENT_SCHEMA,
@@ -177,6 +180,48 @@ pub enum PushOutcome {
     Failed(FailureReason),
 }
 
+/// TKT-8fc0b2a4 (A5): the push drain's auth-failure cooldown - fail loud,
+/// stand down, await credential recovery. One 401/403 arms it for the next
+/// delay of the shared schedule (30 s doubling to 10 min, jittered); while
+/// armed, `drain_once` makes NO network call and touches NO journal entry.
+/// At expiry ONE cheap probe (`api.health()`) decides: 200 clears the gate
+/// and the drain proceeds; 401/403 re-arms at the next step; a transient
+/// error re-arms at the same step. The journal entry that hit the 401 was
+/// ACKED per Sync Contract I47 (ack on every terminal outcome incl.
+/// Unauthorized/Forbidden; I48: no retry inside a drain); the edit is NOT
+/// lost - the file-vs-shadow divergence is re-derived by the next
+/// reconciliation pass once the server accepts the token again. A hard
+/// revoke is never recovered by retrying: recovery is the server
+/// un-revoking or a re-pair; this gate only keeps the daemon alive, bounded
+/// and visible until then.
+#[derive(Debug)]
+pub struct AuthGate {
+    /// `Some(t)` while armed: no drain before `t`.
+    until: Option<std::time::Instant>,
+    /// 0-based retry number driving the schedule; reset on recovery.
+    attempt: u32,
+    /// When the episode opened (`None` = auth healthy).
+    since: Option<std::time::Instant>,
+    /// When the ERROR line was last emitted (once per hour while persisting).
+    last_error_log: Option<std::time::Instant>,
+    /// The schedule (production: 30 s / 10 min; tests pass milliseconds).
+    base: Duration,
+    cap: Duration,
+}
+
+impl Default for AuthGate {
+    fn default() -> Self {
+        Self {
+            until: None,
+            attempt: 0,
+            since: None,
+            last_error_log: None,
+            base: AUTH_BACKOFF_BASE,
+            cap: AUTH_BACKOFF_CAP,
+        }
+    }
+}
+
 pub struct PushClient {
     api: Arc<ApiClient>,
     /// CS-3 (J2): the subscriber's one journal owner, borrowed.
@@ -225,6 +270,8 @@ pub struct PushClient {
     /// min-daemon-version gate rejected us and only an upgrade (or gate
     /// change) can help. Std mutex: held only for a read/write of an Option.
     gate_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// TKT-8fc0b2a4 (A5): the auth-failure drain cooldown (see [`AuthGate`]).
+    auth_gate: Arc<std::sync::Mutex<AuthGate>>,
     /// D2 (v0.4.28): write machinery for ack-materialize-back. The rewrite
     /// MUST ride `Materializer::write_aligned_bytes` (per-path lock, echo
     /// guard, atomic tmp+rename) - a bespoke write path would miss echo
@@ -274,6 +321,7 @@ impl PushClient {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
@@ -304,6 +352,143 @@ impl PushClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         *g = Some(std::time::Instant::now() + duration);
+    }
+
+    /// TKT-8fc0b2a4 (A5): override the auth cooldown schedule (tests use
+    /// milliseconds; production keeps 30 s doubling to 10 min).
+    pub fn with_auth_backoff(self, base: Duration, cap: Duration) -> Self {
+        {
+            let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+            g.base = base;
+            g.cap = cap.max(base);
+        }
+        self
+    }
+
+    /// TKT-8fc0b2a4 (A5): true while the auth cooldown is armed or an
+    /// auth-failure episode is open.
+    pub fn auth_failed(&self) -> bool {
+        self.auth_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .since
+            .is_some()
+    }
+
+    /// TKT-8fc0b2a4 (A5): one 401/403 (from a push, or from the cooldown
+    /// probe). Arms the drain cooldown for the next delay of the shared
+    /// schedule (idempotent while already armed, so N chains failing in one
+    /// tick arm it once), opens the episode on the first rejection (ERROR
+    /// once, tray `auth_failed_since`), repeats the ERROR once per hour while
+    /// it persists, DEBUG otherwise. `advance` moves the schedule one step
+    /// (a 401/403); `false` re-arms at the current step (a transient probe
+    /// error says nothing about the credential).
+    fn arm_auth_cooldown(&self, status: u16, context: &str, advance: bool) {
+        let now = std::time::Instant::now();
+        let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if g.until.is_some_and(|t| now < t) {
+            return;
+        }
+        let attempt = g.attempt;
+        let wait = auth_retry_delay(attempt, g.base, g.cap, clock_jitter_unit());
+        g.until = Some(now + wait);
+        if advance {
+            g.attempt = g.attempt.saturating_add(1);
+        }
+        let first = g.since.is_none();
+        if first {
+            g.since = Some(now);
+            g.last_error_log = Some(now);
+        }
+        let failed_for_secs = g.since.map(|t| now.duration_since(t).as_secs());
+        let repeat = !first
+            && g.last_error_log
+                .is_none_or(|t| now.duration_since(t) >= AUTH_ERROR_REPEAT);
+        if repeat {
+            g.last_error_log = Some(now);
+        }
+        let (base_secs, cap_secs) = (g.base.as_secs(), g.cap.as_secs());
+        drop(g);
+        if first {
+            tracing::error!(
+                status,
+                context = %context,
+                cooldown_secs = wait.as_secs(),
+                "PUSH AUTH FAILURE: the server rejected this device's token (HTTP {status}). The drain stands down (no network) with backoff ({base_secs}s doubling to {cap_secs}s, +/-10% jitter) and probes /api/sync/health at each step; the rejected entry is acked per Sync Contract I47 and the edit is re-derived by reconciliation once the server accepts the token again. A revoked token is NOT recovered by retrying: un-revoke on the server or re-pair the device."
+            );
+            if let Some(tray) = &self.tray_state {
+                if let Ok(mut w) = tray.write() {
+                    w.mark_auth_failed(chrono::Utc::now().timestamp());
+                }
+            }
+        } else if repeat {
+            tracing::error!(
+                status,
+                context = %context,
+                attempt,
+                failed_for_secs = failed_for_secs.unwrap_or(0),
+                cooldown_secs = wait.as_secs(),
+                "PUSH AUTH FAILURE persists: the server still rejects this device's token (HTTP {status}); drain still standing down and probing; un-revoke on the server or re-pair the device to resume"
+            );
+        } else {
+            tracing::debug!(
+                status,
+                context = %context,
+                attempt,
+                cooldown_secs = wait.as_secs(),
+                "push auth failure persists; drain cooldown re-armed"
+            );
+        }
+    }
+
+    /// TKT-8fc0b2a4 (A5): the cooldown expired; ONE cheap authenticated
+    /// probe decides whether the drain may proceed. Returns true iff it may.
+    async fn auth_probe_allows_drain(&self) -> bool {
+        match self.api.health().await {
+            Ok(_) => {
+                self.clear_auth_cooldown();
+                true
+            }
+            Err(ApiError::Unauthorized) => {
+                self.arm_auth_cooldown(401, "probe:/api/sync/health", true);
+                false
+            }
+            Err(ApiError::Forbidden) => {
+                self.arm_auth_cooldown(403, "probe:/api/sync/health", true);
+                false
+            }
+            Err(e) => {
+                // Transient (network / 5xx): says nothing about the
+                // credential. Hold the same step; do not inflate the schedule.
+                tracing::debug!(error = %e, "push auth probe failed transiently; holding the cooldown step");
+                self.arm_auth_cooldown(0, "probe:/api/sync/health", false);
+                false
+            }
+        }
+    }
+
+    /// TKT-8fc0b2a4 (A5): an authenticated push succeeded; close the episode
+    /// (idempotent, silent while healthy).
+    fn clear_auth_cooldown(&self) {
+        let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if g.since.is_none() && g.until.is_none() {
+            return;
+        }
+        let failed_for_secs = g.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        g.until = None;
+        g.attempt = 0;
+        g.since = None;
+        g.last_error_log = None;
+        drop(g);
+        tracing::info!(
+            failed_for_secs,
+            "push auth RECOVERED: the server accepted this device's token again; the drain resumes and the next reconciliation pass re-queues any edit acked during the episode"
+        );
+        if let Some(tray) = &self.tray_state {
+            if let Ok(mut w) = tray.write() {
+                w.clear_auth_failed();
+            }
+        }
     }
 
     /// Builder-style: attach a SharedTrayState so push outcomes update the
@@ -489,6 +674,27 @@ impl PushClient {
                 }
             }
         }
+        // TKT-8fc0b2a4 (A5): auth-failure cooldown. After a 401/403 we stand
+        // down - no journal drain, no network - until the scheduled time; then
+        // ONE health probe decides (200: proceed; 401/403: re-arm next step).
+        {
+            let until = self
+                .auth_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .until;
+            if let Some(until) = until {
+                if std::time::Instant::now() < until {
+                    tracing::debug!(
+                        "push_client: auth-failure cooldown active - skipping drain tick (no network)"
+                    );
+                    return Vec::new();
+                }
+                if !self.auth_probe_allows_drain().await {
+                    return Vec::new();
+                }
+            }
+        }
 
         let batch: Vec<(PushEvent, JournalCursor)> =
             match self.journal.drain(self.config.batch_size) {
@@ -538,6 +744,16 @@ impl PushClient {
                     | PushOutcome::Merged { .. }
                     | PushOutcome::ConflictMarkers { .. }
                     | PushOutcome::Skipped(_)
+                    // Sync Contract v1 [I47]: ACK on every terminal outcome
+                    // INCLUDING Unauthorized and Forbidden (NACK only on
+                    // NetworkExhausted); [I48]: no retry/backoff on
+                    // 401/403/409/400 within a drain. Acking here does NOT
+                    // lose the edit: the file's hash still differs from the
+                    // shadow, so the next reconciliation pass re-derives the
+                    // push ("hash-mismatch -> Push") once the server accepts
+                    // the token again. TKT-8fc0b2a4 (A5) adds the auth
+                    // cooldown (armed in process_event) so the drain stands
+                    // down between attempts instead of storming.
                     | PushOutcome::Failed(FailureReason::Unauthorized)
                     | PushOutcome::Failed(FailureReason::Forbidden)
                     | PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
@@ -905,6 +1121,9 @@ impl PushClient {
             }
             match self.api.push(&req).await {
                 Ok(resp) => {
+                    // TKT-8fc0b2a4 (A5): any accepted authenticated response
+                    // closes an open auth-failure episode.
+                    self.clear_auth_cooldown();
                     // D2 trigger (v0.4.28, B2'): the server ACCEPTED but its
                     // canonical hash differs from what we sent - it
                     // canonicalized (or region-defended) our bytes. NOT keyed
@@ -1027,10 +1246,15 @@ impl PushClient {
                     }
                     return map_response(resp);
                 }
+                // TKT-8fc0b2a4 (A5): arm the bounded auth cooldown (the
+                // drain stands down, probes, resumes); the caller acks the
+                // entry per I47 and reconciliation re-derives the edit.
                 Err(ApiError::Unauthorized) => {
+                    self.arm_auth_cooldown(401, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Unauthorized);
                 }
                 Err(ApiError::Forbidden) => {
+                    self.arm_auth_cooldown(403, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Forbidden);
                 }
                 Err(ApiError::Conflict { expected_hash }) => {
@@ -2823,6 +3047,7 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
@@ -2856,6 +3081,7 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
@@ -2885,6 +3111,7 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
@@ -2913,6 +3140,7 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
@@ -3946,6 +4174,200 @@ mod tests {
         m.assert_async().await;
     }
 
+    /// TKT-8fc0b2a4 (A5) + Sync Contract I47/I48: a 401 is a terminal
+    /// outcome - the entry is ACKED (journal len 0, no retry inside the
+    /// drain) - and the drain then STANDS DOWN: three ticks under the
+    /// cooldown make no network call and the journal does not grow. At
+    /// expiry one health probe decides: a 401 probe re-arms (still failed);
+    /// a 200 probe clears the episode. Nothing is lost: see the companion
+    /// test for reconciliation re-deriving the acked edit.
+    #[tokio::test]
+    async fn auth_failure_acks_per_i47_stands_down_and_probe_decides() {
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"hello")]);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_auth_backoff(Duration::from_millis(120), Duration::from_millis(120));
+        assert_eq!(journal.len(), 1);
+
+        // Tick 1: 401 -> Failed(Unauthorized), acked per I47, cooldown armed.
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Unauthorized)
+        ));
+        assert_eq!(journal.len(), 0, "I47: a 401 is terminal and acked");
+        assert!(client.auth_failed());
+
+        // Ticks 2-4 (inside the cooldown): no network, journal does not grow.
+        for i in 0..3 {
+            let outcomes = client.drain_once().await;
+            assert!(
+                outcomes.is_empty(),
+                "cooldown tick {i} must make no attempt"
+            );
+            assert_eq!(journal.len(), 0, "the journal must not grow under cooldown");
+        }
+        m_push.assert_async().await; // exactly ONE push attempt so far
+
+        // Expiry: the probe answers 401 -> re-armed, still failed, no push.
+        let m_probe_401 = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert!(client.drain_once().await.is_empty());
+        assert!(client.auth_failed(), "a 401 probe keeps the episode open");
+        m_probe_401.assert_async().await;
+        m_push.assert_async().await; // still ONE push attempt
+
+        // Next expiry: the probe answers 200 -> the episode closes.
+        let m_probe_200 = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_body(
+                r#"{"subscriber_id":"x","scope_roots":[],"scope_excludes":[],"materializer_mode":"live","shadow_path":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        let outcomes = client.drain_once().await;
+        assert!(outcomes.is_empty(), "nothing journaled yet: {outcomes:?}");
+        assert!(!client.auth_failed(), "a 200 probe closes the auth episode");
+        m_probe_200.assert_async().await;
+        m_push.assert_async().await; // the drain made no push on an empty journal
+    }
+
+    /// TKT-8fc0b2a4 (A5): the edit acked on the 401 is NOT lost. After the
+    /// probe clears the cooldown, a reconciliation pass sees the file's hash
+    /// differ from the shadow (shadow == server hash => genuine local edit),
+    /// re-queues the path, and the next drain Sends it.
+    #[tokio::test]
+    async fn after_probe_200_reconciliation_requeues_the_acked_edit_and_it_is_sent() {
+        use crate::sync_shadow::ShadowStore;
+        use crate::verify_repair::{VerifyRepair, VerifyRepairConfig};
+
+        let vault = TempDir::new().unwrap();
+        let rel = "notes/a.md";
+        let body = b"alpha-local";
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join(rel), body).unwrap();
+
+        let mut srv = Server::new_async().await;
+        let m_push_401 = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt(rel, body)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_auth_backoff(Duration::from_millis(100), Duration::from_millis(100));
+
+        // The 401: acked per I47, episode open.
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Unauthorized)
+        ));
+        assert_eq!(journal.len(), 0);
+        m_push_401.assert_async().await;
+
+        // Credentials recover: the probe answers 200 and the gate clears.
+        let _m_health = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_body(
+                r#"{"subscriber_id":"x","scope_roots":[],"scope_excludes":[],"materializer_mode":"live","shadow_path":null}"#,
+            )
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        assert!(client.drain_once().await.is_empty());
+        assert!(!client.auth_failed());
+
+        // Reconciliation: local differs from the server ("drift"); the shadow
+        // equals the server's current hash, so the difference is a genuine
+        // local edit and the path is re-queued as a push.
+        let _m_recon = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
+            )
+            .create_async()
+            .await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
+        shadow.record(rel, "deadbeef");
+        let vr = VerifyRepair::new(
+            vault.path().to_path_buf(),
+            Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap()),
+            journal.clone(),
+            "dev-test".into(),
+            VerifyRepairConfig::default(),
+        )
+        .with_shadow(shadow);
+        let report = vr.run().await.unwrap();
+        assert_eq!(report.modify_count, 1, "reconciliation re-derived the edit");
+        assert_eq!(journal.len(), 1, "the acked edit is back in the journal");
+
+        // The server accepts: the re-derived edit is Sent.
+        let m_push_200 = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","content_hash":"deadbeef"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "expected Sent after recovery, got {:?}",
+            outcomes[0].1
+        );
+        assert_eq!(journal.len(), 0);
+        m_push_200.assert_async().await;
+    }
+
+    /// TKT-8fc0b2a4 (A5): 403 (subscriber revoked) takes the same path as
+    /// 401 - acked per I47, cooldown armed, the next tick makes no call.
+    #[tokio::test]
+    async fn forbidden_acks_and_arms_cooldown() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/b.md", b"hello")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Forbidden)
+        ));
+        assert_eq!(journal.len(), 0, "I47: a 403 is terminal and acked");
+        assert!(client.auth_failed());
+        // Production cooldown (30 s): the next tick is suppressed, no network.
+        assert!(client.drain_once().await.is_empty());
+        m.assert_async().await;
+    }
+
     #[test]
     fn retry_backoff_capped_at_max_backoff_ms() {
         // initial=500 max=60_000 — at attempt=20, 500 * 2^20 = 524_288_000
@@ -4150,6 +4572,7 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,

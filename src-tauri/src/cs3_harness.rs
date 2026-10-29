@@ -71,6 +71,10 @@ fn child_knobs() -> crate::boot::BootKnobs {
     if std::env::var("CS3_STALL_ZERO").is_ok() {
         k.stall_threshold = Some(Duration::ZERO);
     }
+    // TKT-8fc0b2a4 (A4): a millisecond auth retry schedule for T-CS3-18.
+    if let Some(d) = env_ms("CS3_AUTH_BACKOFF_MS") {
+        k.auth_backoff = Some((d, d));
+    }
     k.push_loop_interval_ms = Some(
         std::env::var("CS3_PUSH_MS")
             .ok()
@@ -472,24 +476,33 @@ async fn child_main(scenario: String) {
             println!("LIVE={}", c.sup.is_live());
             println!("NO_EXIT");
         }
-        // T-CS3-18: the mock SSE answers 401.
+        // T-CS3-18 (TKT-8fc0b2a4 A4): the mock SSE answers 401 on every
+        // connect. The daemon stays LIVE and keeps retrying on the schedule
+        // (CS3_AUTH_BACKOFF_MS); one event + one notice per episode; the
+        // tray shows AuthFailed with auth_failed_since stamped.
         "sse_401" => {
-            let stopped = wait_for(
+            let raised = wait_for(
                 || {
-                    c.slot.get().is_some_and(|h| {
-                        h.liveness()
-                            == Liveness::Stopped {
-                                reason: "sse_auth_failed".into(),
-                            }
-                    })
+                    crate::sync_health::state_events()
+                        .iter()
+                        .any(|e| matches!(e, StateHealthEvent::SseAuthFailed { .. }))
                 },
                 Duration::from_secs(20),
             )
             .await;
-            println!("STOPPED_SSE_AUTH={stopped}");
-            let e = crate::commands::verify_repair_with(Some(&c.slot)).await;
-            println!("VR_RESULT={:?}", e.err());
+            println!("AUTH_EVENT_RAISED={raised}");
+            // Several retries happen in this window (base 300 ms); the
+            // event and the notice must NOT repeat per attempt.
             tokio::time::sleep(Duration::from_secs(3)).await;
+            let live = c.slot.get().is_some_and(|h| h.liveness() == Liveness::Live);
+            println!("LIVE={live}");
+            let (status, since) = c
+                .tray
+                .read()
+                .map(|t| (t.status, t.auth_failed_since))
+                .unwrap_or((crate::tray_state::ConnectionStatus::Error, None));
+            println!("TRAY_STATUS={status:?}");
+            println!("AUTH_FAILED_SINCE_SET={}", since.is_some());
             print_events(|e| matches!(e, StateHealthEvent::SseAuthFailed { .. }));
             println!("NO_EXIT");
         }
@@ -832,6 +845,9 @@ mod parent {
         pub srv: mockito::ServerGuard,
         pub pushes: Arc<Mutex<Vec<PushSeen>>>,
         pub reconciles: Arc<Mutex<usize>>,
+        /// `Some` when `sse_401`: the 401 SSE mock, so the parent can assert
+        /// the daemon RETRIED the stream (TKT-8fc0b2a4 A4).
+        pub sse_401_mock: Option<mockito::Mock>,
     }
 
     pub(super) struct MockOpts {
@@ -899,12 +915,16 @@ mod parent {
             )
             .create_async()
             .await;
+        let mut sse_401_mock = None;
         if opts.sse_401 {
-            srv.mock("GET", "/api/sync/events")
-                .with_status(401)
-                .with_body("unauthorized")
-                .create_async()
-                .await;
+            sse_401_mock = Some(
+                srv.mock("GET", "/api/sync/events")
+                    .with_status(401)
+                    .with_body("unauthorized")
+                    .expect_at_least(2)
+                    .create_async()
+                    .await,
+            );
         } else {
             let prelude = opts.sse_prelude.clone();
             let sent = Arc::new(AtomicBool::new(false));
@@ -987,6 +1007,7 @@ mod parent {
             srv,
             pushes,
             reconciles,
+            sse_401_mock,
         }
     }
 
@@ -1662,27 +1683,46 @@ fn t_cs3_17_supervised_ends() {
     assert_eq!(out.kv("BORROW0").as_deref(), Some("None"), "{}", out.dump());
 }
 
-/// T-CS3-18 (gate C6): the mock SSE answers 401: no exit (3 s observed), `live`
-/// reads `Stopped{sse_auth_failed}`, `sse_auth_failed{sub}` is raised once,
-/// exactly ONE notice names what stopped, why and the one action, V&R refuses
-/// with `NotLive`, and the watcher ends after the boot task drops their
-/// handles are logged as cascade with no exit 70 and no second notice.
-/// Mutations: classify the 401 as an unexpected end (exit 70); notice on
-/// each cascade end; omit the notice.
+/// T-CS3-18 (gate C6, re-stated by TKT-8fc0b2a4 A4): the mock SSE answers
+/// 401 on every connect. The daemon does NOT stop and does NOT exit: `live`
+/// stays `Live`, the stream is retried on the auth schedule (>= 2 connects
+/// in the window), `sse_auth_failed{sub}` is raised ONCE and exactly ONE
+/// notice names what is not being delivered, why, what recovers it, and
+/// the one action; the tray reads `AuthFailed` with `auth_failed_since`.
+/// Mutations: return on the 401 (Stopped/exit); raise the event or the
+/// notice per attempt; omit the notice; drop the tray stamp.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn t_cs3_18_sse_401_terminal() {
+async fn t_cs3_18_sse_401_retries_live() {
     let m = mock(MockOpts {
         sse_401: true,
         ..Default::default()
     })
     .await;
     let env = one_root_env(&m.srv.url());
-    let out = run_child(&env, "sse_401", &m.srv.url(), &[]);
+    let out = run_child(
+        &env,
+        "sse_401",
+        &m.srv.url(),
+        &[("CS3_AUTH_BACKOFF_MS", "300")],
+    );
     assert_eq!(out.code, Some(0), "{}", out.dump());
     assert!(out.has("NO_EXIT"), "{}", out.dump());
     assert_eq!(
-        out.kv("STOPPED_SSE_AUTH").as_deref(),
+        out.kv("AUTH_EVENT_RAISED").as_deref(),
+        Some("true"),
+        "{}",
+        out.dump()
+    );
+    assert_eq!(out.kv("LIVE").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(
+        out.kv("TRAY_STATUS").as_deref(),
+        Some("AuthFailed"),
+        "{}",
+        out.dump()
+    );
+    assert_eq!(
+        out.kv("AUTH_FAILED_SINCE_SET").as_deref(),
         Some("true"),
         "{}",
         out.dump()
@@ -1695,6 +1735,7 @@ async fn t_cs3_18_sse_401_terminal() {
     assert_eq!(notices.len(), 1, "{}", out.dump());
     let n = notices[0];
     assert!(n.contains("pull and push for subscriber sub-a"), "{n}");
+    assert!(n.contains("NOT being delivered"), "{n}");
     assert!(n.contains("HTTP 401"), "{n}");
     assert!(n.contains("re-pair this device"), "{n}");
     assert_eq!(
@@ -1706,20 +1747,14 @@ async fn t_cs3_18_sse_401_terminal() {
         "{}",
         out.dump()
     );
-    let vr = out.kv("VR_RESULT").unwrap_or_default();
     assert!(
-        vr.contains("the daemon is stopping (sse_auth_failed)"),
+        !out.stdout.lines().any(|l| l.starts_with("HOST_EXIT=")),
         "{}",
         out.dump()
     );
-    assert!(
-        out.stderr
-            .lines()
-            .any(|l| l.contains("cascade") && l.contains("watcher:0")),
-        "the watcher end was not logged as cascade\n{}",
-        out.dump()
-    );
     assert_eq!(count(&out.stderr, "exiting 70"), 0, "{}", out.dump());
+    // The stream was retried, not abandoned.
+    m.sse_401_mock.as_ref().unwrap().assert_async().await;
 }
 
 #[cfg(unix)]
