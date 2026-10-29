@@ -120,6 +120,9 @@ pub struct TrayState {
     /// CS-3 §3.1: the sha8 of the config snapshot this process runs on
     /// (empty when unpaired).
     pub config_sha8: String,
+    /// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): pushes refused LOCALLY by the
+    /// pre-push I3 check (NUL byte / invalid UTF-8) — nothing was sent.
+    pub pushes_refused_local_i3: u64,
 }
 
 impl TrayState {
@@ -152,6 +155,7 @@ impl TrayState {
             update_available: None,
             config_pending_restart: false,
             config_sha8: String::new(),
+            pushes_refused_local_i3: 0,
         }
     }
 
@@ -245,6 +249,11 @@ impl TrayState {
     /// and stamps `last_recon_at` to now.
     pub fn set_recon_in_progress(&mut self, in_progress: bool) {
         self.recon_in_progress = in_progress;
+    }
+
+    /// WS-A A2: a push was refused by the local I3 check (never sent).
+    pub fn inc_pushes_refused_local_i3(&mut self) {
+        self.pushes_refused_local_i3 = self.pushes_refused_local_i3.saturating_add(1);
     }
 
     pub fn note_recon_pass(&mut self, pulls: u64, pushes: u64) {

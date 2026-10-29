@@ -129,6 +129,16 @@ pub enum SkipReason {
         /// `api_client::rejection_detail`. Never note content.
         detail: String,
     },
+    /// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): Sync Contract obligation I3,
+    /// enforced CLIENT-SIDE before any byte leaves the host. The text lane
+    /// (.md / .canvas) must be valid UTF-8 with no NUL byte; the server 422s
+    /// anything else, and re-sending the same bytes can never succeed. `kind`
+    /// is `"nul"` or `"utf8"`; `offset` is the byte index of the first
+    /// violation. Nothing was sent.
+    LocalContractViolation {
+        kind: &'static str,
+        offset: usize,
+    },
     /// Managed-instance mode (spec §5, 2026-08-08): a `*.conflict-from-*`
     /// sibling or the conflict-stash manifest reached the push path — refused
     /// so conflict artifacts written INSIDE a managed root never become
@@ -529,6 +539,10 @@ impl PushClient {
                         | PushOutcome::Failed(FailureReason::UpgradeRequired { .. }) => {
                             w.inc_uploads_failed()
                         }
+                        // WS-A A2: every local I3 refusal is counted.
+                        PushOutcome::Skipped(SkipReason::LocalContractViolation { .. }) => {
+                            w.inc_pushes_refused_local_i3()
+                        }
                         _ => {}
                     }
                 }
@@ -688,6 +702,25 @@ impl PushClient {
                 }
             }
         };
+        // WS-A A2: pre-push I3 check. A NUL byte or invalid UTF-8 in the text
+        // lane is refused HERE, with the offset, before any byte is sent: the
+        // server would 422 it, and every re-send of the same bytes would 422
+        // again. Deletes carry no body.
+        if !matches!(evt.action, PushAction::Delete) {
+            if let Some(v) = find_text_contract_violation(&content_bytes) {
+                tracing::warn!(
+                    path = %evt.path,
+                    kind = v.kind,
+                    offset = v.offset,
+                    len = content_bytes.len(),
+                    "push refused locally: content violates the text-lane contract (I3) - not sent, skip + ack"
+                );
+                return PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                    kind: v.kind,
+                    offset: v.offset,
+                });
+            }
+        }
         let content_b64 = B64.encode(&content_bytes);
 
         // D2/D3 (v0.4.28): the sha of the bytes we ACTUALLY drained and will
@@ -1655,6 +1688,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
+}
+
+/// WS-A A2: the first text-lane contract (I3) violation found in `bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextContractViolation {
+    /// `"nul"` (a 0x00 byte) or `"utf8"` (an invalid UTF-8 sequence).
+    pub kind: &'static str,
+    /// Byte offset of the violation: the NUL's index, or the index at which
+    /// the UTF-8 decoder first failed (`Utf8Error::valid_up_to`).
+    pub offset: usize,
+}
+
+/// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): scan text-lane content for the
+/// Sync Contract I3 obligations the server enforces with a 422: no NUL byte,
+/// valid UTF-8. Returns the EARLIEST violation by offset (a NUL inside an
+/// otherwise valid file reports as `nul`; a NUL after a bad sequence reports
+/// the bad sequence). `None` means the bytes are sendable.
+pub fn find_text_contract_violation(bytes: &[u8]) -> Option<TextContractViolation> {
+    let nul = bytes.iter().position(|b| *b == 0);
+    let utf8 = std::str::from_utf8(bytes).err().map(|e| e.valid_up_to());
+    match (nul, utf8) {
+        (None, None) => None,
+        (Some(n), None) => Some(TextContractViolation {
+            kind: "nul",
+            offset: n,
+        }),
+        (None, Some(u)) => Some(TextContractViolation {
+            kind: "utf8",
+            offset: u,
+        }),
+        (Some(n), Some(u)) => {
+            if n <= u {
+                Some(TextContractViolation {
+                    kind: "nul",
+                    offset: n,
+                })
+            } else {
+                Some(TextContractViolation {
+                    kind: "utf8",
+                    offset: u,
+                })
+            }
+        }
+    }
 }
 
 struct FrontmatterEnd {
@@ -3047,6 +3124,159 @@ mod tests {
             journal.len(),
             0,
             "400 outcome must be acked (journal drained)"
+        );
+        m.assert_async().await;
+    }
+
+    // ---- WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): pre-push I3 check ----
+
+    /// Positive controls for the scanner: a NUL at offset 0, at the last byte,
+    /// and at a known interior offset; invalid UTF-8 at its decode offset; a
+    /// clean fixture is `None`.
+    #[test]
+    fn i3_scanner_positive_controls() {
+        assert_eq!(find_text_contract_violation(b"clean text\n"), None);
+        assert_eq!(find_text_contract_violation(b""), None);
+        assert_eq!(
+            find_text_contract_violation(b"\0abc"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 0
+            })
+        );
+        assert_eq!(
+            find_text_contract_violation(b"abc\0"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 3
+            })
+        );
+        let mut fx = b"---\ntitle: x\n---\nbody ".to_vec();
+        let at = fx.len();
+        fx.push(0);
+        fx.extend_from_slice(b" tail\n");
+        assert_eq!(
+            find_text_contract_violation(&fx),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: at
+            })
+        );
+        // Invalid UTF-8: a lone continuation byte after 5 valid bytes.
+        assert_eq!(
+            find_text_contract_violation(b"hello\x80world"),
+            Some(TextContractViolation {
+                kind: "utf8",
+                offset: 5
+            })
+        );
+        // Both present: the earliest by offset wins.
+        assert_eq!(
+            find_text_contract_violation(b"ab\x80cd\0"),
+            Some(TextContractViolation {
+                kind: "utf8",
+                offset: 2
+            })
+        );
+        assert_eq!(
+            find_text_contract_violation(b"a\0b\x80"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 1
+            })
+        );
+        // Multi-byte valid UTF-8 is fine.
+        assert_eq!(find_text_contract_violation("héllo — ✓".as_bytes()), None);
+    }
+
+    /// A fixture with exactly one NUL at a known offset is refused with that
+    /// offset, NOTHING is sent (the push mock expects 0 calls), the journal
+    /// entry is acked, and the tray counter is incremented.
+    #[tokio::test]
+    async fn i3_nul_fixture_is_refused_with_offset_and_nothing_sent() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let mut fx = b"---\ntitle: x\n---\nbody ".to_vec();
+        let at = fx.len();
+        fx.push(0);
+        fx.extend_from_slice(b" tail\n");
+        let (_d, journal) = make_journal_with(vec![evt("notes/nul.md", &fx)]);
+        let tray: crate::tray_state::SharedTrayState =
+            Arc::new(std::sync::RwLock::new(crate::tray_state::TrayState::new(
+                "sub-test".into(),
+                srv.url(),
+                PathBuf::from("/nonexistent-vault-root"),
+            )));
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_tray_state(tray.clone());
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                kind: "nul",
+                offset: at
+            }),
+            "the NUL must be refused with its exact offset"
+        );
+        assert_eq!(journal.len(), 0, "a refused push is acked, never retried");
+        assert_eq!(tray.read().unwrap().pushes_refused_local_i3, 1);
+        m.assert_async().await;
+    }
+
+    /// Invalid UTF-8 is the second I3 violation class: refused with kind
+    /// `utf8` at the decoder's failure offset, nothing sent.
+    #[tokio::test]
+    async fn i3_invalid_utf8_fixture_is_refused() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/bad.md", b"ok\xff\xfe")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                kind: "utf8",
+                offset: 2
+            })
+        );
+        assert_eq!(journal.len(), 0);
+        m.assert_async().await;
+    }
+
+    /// Negative control: a clean fixture goes through the check untouched and
+    /// is pushed exactly once.
+    #[tokio::test]
+    async fn i3_clean_fixture_is_pushed() {
+        let body = b"---\ntitle: x\n---\nclean body\n";
+        let sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&sha))
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/clean.md", body)]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "clean content must be sent, got {:?}",
+            outcomes[0].1
         );
         m.assert_async().await;
     }
