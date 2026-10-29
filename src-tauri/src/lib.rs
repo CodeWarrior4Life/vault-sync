@@ -29,6 +29,7 @@ pub mod obsidian_install_detect;
 pub mod obsidian_plugin_detect;
 pub mod ownership;
 pub mod pairing;
+pub mod path_policy;
 pub mod pull_backfill;
 pub mod push_client;
 pub mod push_journal;

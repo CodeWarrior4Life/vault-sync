@@ -25,6 +25,7 @@ use crate::integrity_check::{
     ByteLevelResult, ExpectedIntegrity, IntegrityChecker, IntegrityError, IntegrityResult,
 };
 use crate::journal_owner::JournalOwner;
+use crate::path_policy::is_chunk_pseudo_path;
 use crate::push_journal::{new_event_id, PushAction, PushBase, PushEvent, CURRENT_SCHEMA};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::scope::is_safe_path;
@@ -75,6 +76,9 @@ pub enum MaterializerError {
     PathTraversal(String),
     #[error("RASP substrate path refused (read-only by daemon): {0}")]
     SubstrateRefuse(String),
+    /// TKT-a3e3ceb1: `<name>.md#chunk_N` is a search-index pseudo-row, never a note.
+    #[error("chunk pseudo-path is never a note: {0}")]
+    ChunkPseudoPath(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("sha mismatch: expected {expected}, got {actual}")]
@@ -100,6 +104,9 @@ pub enum SkipReason {
     /// RASP substrate fence refused the path. `rule` is the static label of
     /// the matching rule, e.g. `"00_VAULT.md"` or `"_rapport/people/"`.
     SubstrateRefused { rule: &'static str },
+    /// TKT-a3e3ceb1: the path is a `<name>.md#chunk_N` search-index
+    /// pseudo-row, not a note. Never written.
+    ChunkPseudoPath,
     /// Local content already matches the server's canonical SHA after
     /// frontmatter normalization. No write needed.
     IdenticalToLocal,
@@ -758,6 +765,12 @@ impl Materializer {
                 payload.path
             );
             return Ok(MaterializeOutcome::Skipped(SkipReason::DisabledMode));
+        }
+
+        // 1b. TKT-a3e3ceb1: a vault_notes chunk pseudo-row is never a note.
+        //     Callers tally + log once per pass; no per-path log here.
+        if is_chunk_pseudo_path(&payload.path) {
+            return Ok(MaterializeOutcome::Skipped(SkipReason::ChunkPseudoPath));
         }
 
         // 2. Path safety.
@@ -1564,6 +1577,9 @@ impl Materializer {
             );
             return Ok(AlignOutcome::SkippedDisabled);
         }
+        if is_chunk_pseudo_path(rel_path) {
+            return Err(MaterializerError::ChunkPseudoPath(rel_path.to_string()));
+        }
         if !is_safe_path(rel_path) {
             return Err(MaterializerError::PathTraversal(rel_path.to_string()));
         }
@@ -1774,6 +1790,11 @@ impl Materializer {
     /// runtime tree.  Disabled mode no-ops.
     #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn soft_delete(&self, path: &str) -> Result<(), MaterializerError> {
+        // TKT-a3e3ceb1: a chunk pseudo-row is never a note, so there is nothing
+        // to delete and no delete leg may ever touch such a path.
+        if is_chunk_pseudo_path(path) {
+            return Ok(());
+        }
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
         }
@@ -5515,5 +5536,63 @@ mod tests {
             assert_eq!(merged_lines, fixture_lines + 2);
             assert_eq!((lost_local, lost_server, forks, enqueued), (0, 0, 0, 1));
         }
+    }
+
+    // ---- TKT-a3e3ceb1: chunk pseudo-paths are never written/aligned/deleted ----
+
+    #[test]
+    fn tkt_a3e3ceb1_write_refuses_chunk_pseudo_path_but_writes_sibling() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let out = m.write(&payload("01_Inbox/foo.md#chunk_3", "x")).unwrap();
+        assert_eq!(
+            out,
+            MaterializeOutcome::Skipped(SkipReason::ChunkPseudoPath)
+        );
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(
+            !dir.join("foo.md#chunk_3").exists(),
+            "chunk file must never be created"
+        );
+        let out = m.write(&payload("01_Inbox/foo.md", "x")).unwrap();
+        assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "{out:?}");
+        assert!(dir.join("foo.md").exists());
+    }
+
+    #[test]
+    fn tkt_a3e3ceb1_aligned_write_refuses_chunk_pseudo_path() {
+        let (_v, _w, m) = mk(MaterializerMode::Live, default_cfg());
+        let sha = sha256_hex("x");
+        let err = m
+            .write_aligned_bytes(
+                &format!("{VAULT}/01_Inbox/foo.md#chunk_3"),
+                b"x",
+                &sha,
+                &sha,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, MaterializerError::ChunkPseudoPath(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tkt_a3e3ceb1_soft_delete_never_touches_chunk_pseudo_path_but_deletes_sibling() {
+        let (v, _w, m) = mk(MaterializerMode::Live, default_cfg());
+        let dir = v.path().join(VAULT).join("01_Inbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.md#chunk_3"), b"residue").unwrap();
+        std::fs::write(dir.join("foo.md"), b"real").unwrap();
+        m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md#chunk_3"))
+            .unwrap();
+        assert!(
+            dir.join("foo.md#chunk_3").exists(),
+            "delete leg must not touch a chunk path"
+        );
+        m.soft_delete(&format!("{VAULT}/01_Inbox/foo.md")).unwrap();
+        assert!(
+            !dir.join("foo.md").exists(),
+            "sibling normal path is still deleted"
+        );
     }
 }

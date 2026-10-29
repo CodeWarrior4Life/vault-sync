@@ -556,7 +556,13 @@ impl VerifyRepair {
         // P0 2026-08-26: paths the server has retired that are still local.
         let mut pending_local_deletes: Vec<String> = Vec::new();
 
+        // TKT-a3e3ceb1: a server-advertised chunk pseudo-path must never reach a
+        // push / pull / local-delete decision. One summary line per pass.
+        let delta_chunk_refusals = crate::path_policy::ChunkRefusals::new();
         for delta in &deltas {
+            if delta_chunk_refusals.refuse(&delta.path) {
+                continue;
+            }
             let server_hash = delta.server_hash.as_deref();
             let local_hash = local_index
                 .get(delta.path.as_str())
@@ -665,6 +671,8 @@ impl VerifyRepair {
                 }
             }
         }
+
+        delta_chunk_refusals.log_summary("verify_repair.deltas");
 
         // Batch-write all collected push refs in ONE journal append cycle.
         // append_batch degrades gracefully: if the batch would exceed the
@@ -1003,6 +1011,7 @@ impl VerifyRepair {
         };
 
         let mut out: Vec<CandidatePath> = Vec::new();
+        let chunk_refusals = crate::path_policy::ChunkRefusals::new();
 
         for entry in WalkDir::new(&root).follow_links(false).into_iter() {
             let entry = match entry {
@@ -1095,6 +1104,13 @@ impl VerifyRepair {
                 continue;
             }
 
+            // TKT-a3e3ceb1: a `<name>.md#chunk_N` file (materialized by an older
+            // daemon) is a pseudo-row residue, never a note: never hashed,
+            // never manifested, never pushed.
+            if chunk_refusals.refuse(&rel_str) {
+                continue;
+            }
+
             // Substrate fence.
             if self.config.respect_substrate_fence {
                 if let PathClassification::Substrate { rule } = classify_path(&rel_str) {
@@ -1116,6 +1132,7 @@ impl VerifyRepair {
             });
         }
 
+        chunk_refusals.log_summary("verify_repair.manifest");
         Ok(out)
     }
 
@@ -2571,5 +2588,56 @@ mod tests {
         let pairs = roots_to_reconcile_pairs(&roots, "sub-legacy-123");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].1, "sub-legacy-123");
+    }
+
+    // ---- TKT-a3e3ceb1: a chunk pseudo-path is never manifested / hashed / acted on ----
+
+    #[tokio::test]
+    async fn tkt_a3e3ceb1_manifest_excludes_chunk_pseudo_files() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "notes/Foo.md#chunk_3", b"residue from an old daemon");
+        write_file(v, "notes/Foo.md", b"alpha");
+        // Isolate the predicate: let the extension gate accept the chunk file
+        // so ONLY the chunk policy can exclude it.
+        let mut cfg = test_config();
+        cfg.allowed_extensions.push("#chunk_3".into());
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", cfg).await;
+        let m = vr.build_local_manifest().unwrap();
+        let paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/Foo.md"]);
+    }
+
+    #[tokio::test]
+    async fn tkt_a3e3ceb1_server_advertised_chunk_delta_is_ignored_sibling_processed() {
+        let vault = TempDir::new().unwrap();
+        write_file(vault.path(), "notes/a.md", b"alpha-local");
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"notes/a.md#chunk_1","state":"drift","server_hash":"cafe"},{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
+            )
+            .create_async()
+            .await;
+        let (vr, journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
+        shadow.record("notes/a.md", "deadbeef");
+        // Shadow==server for the chunk path too, so WITHOUT the guard it would
+        // resolve to a Push decision and surface as an error.
+        shadow.record("notes/a.md#chunk_1", "cafe");
+        let report = vr.with_shadow(shadow).run().await.unwrap();
+        assert_eq!(report.modify_count, 1, "only the sibling is pushed");
+        assert!(
+            report.errors.is_empty(),
+            "chunk delta must not even error: {:?}",
+            report.errors
+        );
+        assert_eq!(journal.len(), 1);
     }
 }

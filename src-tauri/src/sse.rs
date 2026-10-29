@@ -572,6 +572,12 @@ impl SseConsumer {
                         error!("path traversal rejected at SSE: {}", env.path);
                         continue;
                     }
+                    // TKT-a3e3ceb1: a chunk pseudo-row is never a note. Refuse before
+                    // fetch/write/delete; no per-path log (storm), debug only.
+                    if crate::path_policy::is_chunk_pseudo_path(&env.path) {
+                        debug!("sse: chunk pseudo-path refused (TKT-a3e3ceb1)");
+                        continue;
+                    }
                     if !self.event_in_scope(&env.path) {
                         debug!("defensive scope drop: {}", env.path);
                         continue;
