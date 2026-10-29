@@ -192,8 +192,11 @@ pub enum PushOutcome {
 /// error re-arms at the same step. The journal entry that hit the 401 was
 /// ACKED per Sync Contract I47 (ack on every terminal outcome incl.
 /// Unauthorized/Forbidden; I48: no retry inside a drain); the edit is NOT
-/// lost - the file-vs-shadow divergence is re-derived by the next
-/// reconciliation pass once the server accepts the token again. A hard
+/// lost IF it was an upsert (create/modify): the file-vs-shadow divergence is
+/// re-derived by the next reconciliation pass once the server accepts the
+/// token again. A DELETE, or the old path of a RENAME (journaled as a delete),
+/// acked under 401/403 is NOT replayed by this daemon version: reconciliation
+/// has no delete concept (see verify_repair.rs) and nothing re-queues it. A hard
 /// revoke is never recovered by retrying: recovery is the server
 /// un-revoking or a re-pair; this gate only keeps the daemon alive, bounded
 /// and visible until then.
@@ -417,7 +420,7 @@ impl PushClient {
                 status,
                 context = %context,
                 cooldown_secs = wait.as_secs(),
-                "PUSH AUTH FAILURE: the server rejected this device's token (HTTP {status}). The drain stands down (no network) with backoff ({base_secs}s doubling to {cap_secs}s, +/-10% jitter) and probes /api/sync/health at each step; the rejected entry is acked per Sync Contract I47 and the edit is re-derived by reconciliation once the server accepts the token again. A revoked token is NOT recovered by retrying: un-revoke on the server or re-pair the device."
+                "PUSH AUTH FAILURE: the server rejected this device's token (HTTP {status}). The drain stands down (no network) with backoff ({base_secs}s doubling to {cap_secs}s, +/-10% jitter) and probes /api/sync/health at each step; the rejected entry is acked per Sync Contract I47; an upsert is re-derived from the file by reconciliation once the server accepts the token again, but a delete or a rename's old path acked here is NOT replayed by this daemon version (each such path is logged at WARN). A revoked token is NOT recovered by retrying: un-revoke on the server or re-pair the device."
             );
             if let Some(tray) = &self.tray_state {
                 if let Ok(mut w) = tray.write() {
@@ -755,10 +758,12 @@ impl PushClient {
                     // INCLUDING Unauthorized and Forbidden (NACK only on
                     // NetworkExhausted); [I48]: no retry/backoff on
                     // 401/403/409/400 within a drain. Acking here does NOT
-                    // lose the edit: the file's hash still differs from the
+                    // lose an UPSERT: the file's hash still differs from the
                     // shadow, so the next reconciliation pass re-derives the
                     // push ("hash-mismatch -> Push") once the server accepts
-                    // the token again. TKT-8fc0b2a4 (A5) adds the auth
+                    // the token again. A DELETE (or a rename's old path,
+                    // journaled as a delete) acked here is NOT replayed by
+                    // this daemon version; it is WARN-logged per path below. TKT-8fc0b2a4 (A5) adds the auth
                     // cooldown (armed in process_event) so the drain stands
                     // down between attempts instead of storming.
                     | PushOutcome::Failed(FailureReason::Unauthorized)
@@ -767,6 +772,20 @@ impl PushClient {
             );
             if should_ack {
                 to_ack.push(cur);
+                // gate-11 M1: an acked 401/403 delete / rename-old-path is
+                // never replayed (reconciliation has no delete concept).
+                if matches!(evt.action, PushAction::Delete)
+                    && matches!(
+                        outcome,
+                        PushOutcome::Failed(FailureReason::Unauthorized)
+                            | PushOutcome::Failed(FailureReason::Forbidden)
+                    )
+                {
+                    tracing::warn!(
+                        path = %evt.path,
+                        "PUSH delete/rename-old-path ACKED under 401/403 and NOT replayed by this daemon version: the server may still hold this path"
+                    );
+                }
             }
             // WS-A A3: the server took bytes for this path — it is no longer
             // a rejected path (whatever it was rejected for, the content that
