@@ -274,3 +274,94 @@ async fn push_500_stays_server_error() {
     let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
     assert!(matches!(err, ApiError::Server(500)), "got {err:?}");
 }
+
+/// R1 (gate-11 on PR #46, TKT-2eb6f5bf): a push 403 whose body names a
+/// subscriber WRITE POLICY is carried as the permanent-reject class with the
+/// server's reason, so the push client ledgers + WARNs instead of opening an
+/// auth episode. Exact strings from Nexus `sync_routes_p1.py`.
+#[tokio::test]
+async fn push_403_policy_detail_is_rejected_403_not_forbidden() {
+    for detail in [
+        "subscriber is read-only",
+        "subscriber is shadow-mode (observer); pushes not accepted",
+    ] {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"detail":"{detail}"}}"#))
+            .create_async()
+            .await;
+        let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
+        match err {
+            ApiError::Rejected { status, detail: d } => {
+                assert_eq!(status, 403, "{detail}");
+                assert_eq!(d, detail);
+            }
+            other => panic!("[{detail}] expected ApiError::Rejected, got {other:?}"),
+        }
+    }
+}
+
+/// R1: `/note` 403 "path outside subscriber scope" (a reserved key served to
+/// a bare-route subscriber) is a per-path policy refusal with a valid token:
+/// `Rejected { 403, reason }`, so every caller's WARN names the cause instead
+/// of the misleading "forbidden — subscriber revoked".
+#[tokio::test]
+async fn fetch_note_403_outside_scope_is_rejected_403() {
+    let mut srv = Server::new_async().await;
+    let _m = srv
+        .mock("GET", mockito::Matcher::Any)
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":"path outside subscriber scope"}"#)
+        .create_async()
+        .await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client
+        .fetch_note("_Mainframe-staging/x.md")
+        .await
+        .unwrap_err();
+    match err {
+        ApiError::Rejected { status, detail } => {
+            assert_eq!(status, 403);
+            assert_eq!(detail, "path outside subscriber scope");
+        }
+        other => panic!("expected ApiError::Rejected, got {other:?}"),
+    }
+}
+
+/// R1 negative control: a 403 that names the CREDENTIAL, or carries no body,
+/// is still `Forbidden` (the auth-episode class) on both routes.
+#[tokio::test]
+async fn credential_403_stays_forbidden_on_push_and_note() {
+    for body in [
+        Some(r#"{"detail":"Device revoked"}"#),
+        Some("<html>403</html>"),
+        None,
+    ] {
+        let mut srv = Server::new_async().await;
+        let mut mp = srv.mock("POST", "/api/sync/push").with_status(403);
+        let mut mn = srv.mock("GET", mockito::Matcher::Any).with_status(403);
+        if let Some(b) = body {
+            mp = mp.with_body(b);
+            mn = mn.with_body(b);
+        }
+        let _mp = mp.create_async().await;
+        let _mn = mn.create_async().await;
+        let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        assert!(
+            matches!(
+                client.push(&push_req("a.md", "aGk=")).await,
+                Err(ApiError::Forbidden)
+            ),
+            "push [{body:?}]"
+        );
+        assert!(
+            matches!(client.fetch_note("a.md").await, Err(ApiError::Forbidden)),
+            "note [{body:?}]"
+        );
+    }
+}

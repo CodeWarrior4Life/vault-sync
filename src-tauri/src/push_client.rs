@@ -128,6 +128,10 @@ pub enum SkipReason {
     /// (`is_junk_path`) should already keep these from being enqueued.
     /// v0.4.28 (D4/M5a): HTTP 422 (non-UTF-8 / NUL content) is the same
     /// permanent-reject class and carries `status: 422`.
+    /// R1 (gate-11 on PR #46, TKT-2eb6f5bf): HTTP 403 whose body names a
+    /// server POLICY ("subscriber is read-only", "subscriber is shadow-mode")
+    /// is this class too, with `status: 403` — the token is VALID, so it is
+    /// never an auth episode (`api_client::forbidden_is_permanent_policy`).
     ServerRejected {
         status: u16,
         /// WS-A A1 (TKT-17fc22e5, TKT-8fc0b2a4): the server's own reason
@@ -1284,6 +1288,9 @@ impl PushClient {
                     self.arm_auth_cooldown(401, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Unauthorized);
                 }
+                // R1: ONLY a 403 the api_client could not classify as a
+                // policy reaches here (a policy 403 arrives as `Rejected`
+                // below). This arm is the credential path: revoked token.
                 Err(ApiError::Forbidden) => {
                     self.arm_auth_cooldown(403, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Forbidden);
@@ -1359,6 +1366,9 @@ impl PushClient {
                 // cause in its body on every 400/422; it is carried here as
                 // `reason=` so a permanent rejection is never silent again
                 // (Trinity: 215 reason-less lines/day for 3 paths).
+                // R1: a POLICY 403 (read-only / shadow-mode subscriber) lands
+                // here with status 403: WARN with the server's reason, ledger
+                // the bytes, skip + ack. The auth cooldown is NOT touched.
                 Err(ApiError::Rejected { status, detail }) => {
                     tracing::warn!(
                         path = %evt.path,
@@ -4397,6 +4407,119 @@ mod tests {
         // Production cooldown (30 s): the next tick is suppressed, no network.
         assert!(client.drain_once().await.is_empty());
         m.assert_async().await;
+    }
+
+    /// R1 (gate-11 on PR #46, TKT-2eb6f5bf): a 403 whose body names a
+    /// subscriber WRITE POLICY is not an auth failure. With a VALID token the
+    /// server answers `{"detail":"subscriber is read-only"}` (or shadow-mode)
+    /// to every push; before R1 that opened a PUSH AUTH FAILURE episode
+    /// ("un-revoke or re-pair"), armed the 30 s..10 min cooldown and stood
+    /// the whole drain down. Required: `Skipped(ServerRejected{403, reason})`,
+    /// the entry acked (I47), the bytes ledgered (no re-queue storm), NO auth
+    /// episode (`auth_failed()` false), and the NEXT tick still talks to the
+    /// server (no cooldown) — proven by the mock seeing the second push.
+    #[tokio::test]
+    async fn policy_403_is_server_rejected_not_an_auth_episode() {
+        for detail in [
+            "subscriber is read-only",
+            "subscriber is shadow-mode (observer); pushes not accepted",
+        ] {
+            let mut srv = Server::new_async().await;
+            let m = srv
+                .mock("POST", "/api/sync/push")
+                .with_status(403)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"detail":"{detail}"}}"#))
+                .expect(2)
+                .create_async()
+                .await;
+            let (_d, journal) = make_journal_with(vec![evt("notes/ro.md", b"hello")]);
+            let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+            let client = make_client(&srv.url(), journal.clone())
+                .await
+                .with_rejected_ledger(Arc::clone(&ledger));
+
+            let outcomes = client.drain_once().await;
+            assert_eq!(outcomes.len(), 1, "{detail}");
+            match &outcomes[0].1 {
+                PushOutcome::Skipped(SkipReason::ServerRejected { status, detail: d }) => {
+                    assert_eq!(*status, 403, "{detail}");
+                    assert_eq!(d, detail, "the server's own reason is carried");
+                }
+                other => panic!("[{detail}] expected ServerRejected, got {other:?}"),
+            }
+            assert_eq!(journal.len(), 0, "[{detail}] I47: terminal, acked");
+            let row = ledger
+                .get("notes/ro.md")
+                .unwrap_or_else(|| panic!("[{detail}] the rejected bytes are ledgered"));
+            assert_eq!(row.status, 403);
+            assert_eq!(row.reason, detail);
+            assert!(
+                !client.auth_failed(),
+                "[{detail}] a policy 403 must NEVER open an auth episode"
+            );
+            // The second tick is NOT suppressed: the drain still talks to
+            // the server (the mock's expect(2) asserts the call happened).
+            journal
+                .append(evt("notes/ro2.md", b"again"))
+                .expect("journal append");
+            let again = client.drain_once().await;
+            assert_eq!(
+                again.len(),
+                1,
+                "[{detail}] no cooldown stood the drain down"
+            );
+            assert!(
+                matches!(
+                    again[0].1,
+                    PushOutcome::Skipped(SkipReason::ServerRejected { status: 403, .. })
+                ),
+                "[{detail}] got {:?}",
+                again[0].1
+            );
+            assert!(!client.auth_failed(), "[{detail}] still no episode");
+            m.assert_async().await;
+        }
+    }
+
+    /// R1 negative control: a 403 that names the CREDENTIAL ("Device
+    /// revoked", or no body at all) still takes the auth path — acked,
+    /// cooldown armed, episode open, next tick silent. The classifier must
+    /// not widen into every 403.
+    #[tokio::test]
+    async fn credential_403_still_arms_the_auth_episode() {
+        for body in [Some(r#"{"detail":"Device revoked"}"#), None] {
+            let mut srv = Server::new_async().await;
+            let mut mock = srv.mock("POST", "/api/sync/push").with_status(403);
+            if let Some(b) = body {
+                mock = mock
+                    .with_header("content-type", "application/json")
+                    .with_body(b);
+            }
+            let m = mock.expect(1).create_async().await;
+            let (_d, journal) = make_journal_with(vec![evt("notes/rv.md", b"hello")]);
+            let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+            let client = make_client(&srv.url(), journal.clone())
+                .await
+                .with_rejected_ledger(Arc::clone(&ledger));
+            let outcomes = client.drain_once().await;
+            assert!(
+                matches!(outcomes[0].1, PushOutcome::Failed(FailureReason::Forbidden)),
+                "[{body:?}] got {:?}",
+                outcomes[0].1
+            );
+            assert_eq!(journal.len(), 0, "[{body:?}] I47: acked");
+            assert!(
+                ledger.get("notes/rv.md").is_none(),
+                "[{body:?}] not ledgered"
+            );
+            assert!(client.auth_failed(), "[{body:?}] the auth episode opens");
+            assert!(
+                client.drain_once().await.is_empty(),
+                "[{body:?}] cooldown: next tick makes no call"
+            );
+            m.assert_async().await;
+        }
     }
 
     #[test]
