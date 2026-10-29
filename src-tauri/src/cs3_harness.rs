@@ -593,6 +593,25 @@ async fn child_main(scenario: String) {
             tokio::time::sleep(Duration::from_secs(10)).await;
             println!("NO_EXIT");
         }
+        // B4 (crate::fault_inject): the env-armed hook ends a Required task;
+        // the child only observes. `CS3_SKIP_READY` skips the readiness wait
+        // (a 401 SSE never gets ready).
+        "fault_inject" => {
+            if std::env::var("CS3_SKIP_READY").is_err() {
+                let ready = wait_for(
+                    || c.slot.get().is_some_and(|h| h.borrow(0).is_ok()),
+                    Duration::from_secs(20),
+                )
+                .await;
+                println!("READY={ready}");
+            }
+            let hold = env_ms("CS3_HOLD_MS").unwrap_or(Duration::from_secs(8));
+            tokio::time::sleep(hold).await;
+            println!("LIVE={}", c.sup.is_live());
+            println!("LIVENESS={:?}", c.sup.liveness());
+            println!("FIRED={}", c.sup.fault().is_some_and(|f| f.fired()));
+            println!("NO_EXIT");
+        }
         o => panic!("unknown CS-3 child scenario {o}"),
     }
 }
@@ -790,6 +809,20 @@ mod parent {
         }
         for (k, v) in extra {
             cmd.env(k, v);
+        }
+        // B4: run the child as the VAULT instance (no NEXUS_SYNC_CONFIG_DIR):
+        // the paired config and tokens are copied to the OS default config
+        // dir under the child's own XDG_CONFIG_HOME (Linux layout).
+        if extra.iter().any(|(k, _)| *k == "CS3_VAULT_INSTANCE") {
+            let dir = env.home.join(".config").join("nexus-vault-sync");
+            std::fs::create_dir_all(&dir).unwrap();
+            for e in std::fs::read_dir(&env.cfg_dir).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_file() {
+                    std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+                }
+            }
+            cmd.env_remove("NEXUS_SYNC_CONFIG_DIR");
         }
         let mut child = cmd.spawn().unwrap();
         let so = child.stdout.take().unwrap();
@@ -1954,4 +1987,200 @@ async fn t_cs3_22_pre_exit_flush_persists() {
         "the dirty entry was lost: {shadow}\n{}",
         out.dump()
     );
+}
+
+// ---------------------------------------------------------------------------
+// B4 (PB-2D87-VS-SCOPE): the env-guarded Required-task-end fault hook,
+// driven through the real `Supervisor::process` env read and `start_sync`.
+// The harness child is always a managed instance (NEXUS_SYNC_CONFIG_DIR).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn b4_run(opts: MockOpts, extra: &[(&str, &str)]) -> Out {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let m = rt.block_on(mock(opts));
+    let env = one_root_env(&m.srv.url());
+    run_child(&env, "fault_inject", &m.srv.url(), extra)
+}
+
+/// B4 (a): no trigger: no behaviour change (ready, live, no exit, no hook
+/// line at all).
+#[cfg(unix)]
+#[test]
+fn b4_fault_inject_unarmed_no_change() {
+    let out = b4_run(MockOpts::default(), &[("CS3_HOLD_MS", "3000")]);
+    assert_eq!(out.code, Some(0), "{}", out.dump());
+    assert!(out.has("NO_EXIT"), "{}", out.dump());
+    assert_eq!(out.kv("READY").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(out.kv("LIVE").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(out.kv("FIRED").as_deref(), Some("false"));
+    assert_eq!(count(&out.stderr, "FAULT INJECTION"), 0, "{}", out.dump());
+    assert_eq!(
+        count(&out.stderr, "REQUIRED task ended"),
+        0,
+        "{}",
+        out.dump()
+    );
+}
+
+/// B4 (b): the trigger without `VAULT_SYNC_TEST_MODE=1` is refused (one
+/// WARN) and ignored: the named task runs on, no exit.
+/// Negative control: remove the test-mode guard in `fault_inject::decide`
+/// and this child exits 70.
+#[cfg(unix)]
+#[test]
+fn b4_fault_inject_refused_without_guard() {
+    for tm in [None, Some("0"), Some("true")] {
+        let mut extra = vec![
+            ("VAULT_SYNC_TEST_END_REQUIRED_TASK", "drain_loop:0@1"),
+            ("CS3_HOLD_MS", "3000"),
+        ];
+        if let Some(v) = tm {
+            extra.push(("VAULT_SYNC_TEST_MODE", v));
+        }
+        let out = b4_run(MockOpts::default(), &extra);
+        assert_eq!(out.code, Some(0), "test_mode={tm:?}\n{}", out.dump());
+        assert!(out.has("NO_EXIT"), "{}", out.dump());
+        assert_eq!(out.kv("LIVE").as_deref(), Some("true"), "{}", out.dump());
+        assert_eq!(out.kv("FIRED").as_deref(), Some("false"));
+        assert_eq!(
+            count(&out.stderr, "FAULT INJECTION REFUSED"),
+            1,
+            "{}",
+            out.dump()
+        );
+        assert_eq!(count(&out.stderr, "FAULT INJECTION ARMED"), 0);
+        assert_eq!(count(&out.stderr, "FAULT INJECTION FIRED"), 0);
+    }
+}
+
+/// B4 (c): armed with the guard, the named Required task (the drain loop,
+/// supervised through `supervise`; and the SSE consumer, classified by the
+/// boot task) ends after its delay and the REAL supervisor path exits 70
+/// once: one ARMED and one FIRED line, one `REQUIRED task ended
+/// unexpectedly` naming the task with `cause="returned"`, no notice.
+#[cfg(unix)]
+#[test]
+fn b4_fault_inject_armed_required_end_exits_70() {
+    for task in ["drain_loop:0", "sse_consumer"] {
+        let trig = format!("{task}@2");
+        let out = b4_run(
+            MockOpts::default(),
+            &[
+                ("VAULT_SYNC_TEST_END_REQUIRED_TASK", trig.as_str()),
+                ("VAULT_SYNC_TEST_MODE", "1"),
+                ("CS3_HOLD_MS", "15000"),
+            ],
+        );
+        assert_eq!(out.code, Some(70), "{task}\n{}", out.dump());
+        assert!(out.has("HOST_EXIT=70"), "{}", out.dump());
+        assert!(!out.has("NO_EXIT"), "{}", out.dump());
+        assert_eq!(
+            count(&out.stderr, "FAULT INJECTION ARMED"),
+            1,
+            "{}",
+            out.dump()
+        );
+        let fired: Vec<&str> = out
+            .stderr
+            .lines()
+            .filter(|l| l.contains("FAULT INJECTION FIRED"))
+            .collect();
+        assert_eq!(fired.len(), 1, "{}", out.dump());
+        assert!(fired[0].contains(task), "{fired:?}");
+        let ended: Vec<&str> = out
+            .stderr
+            .lines()
+            .filter(|l| l.contains("REQUIRED task ended unexpectedly"))
+            .collect();
+        assert_eq!(ended.len(), 1, "{}", out.dump());
+        assert!(
+            ended[0].contains(&format!("task=\"{task}\""))
+                || ended[0].contains(&format!("task={task}")),
+            "{ended:?}"
+        );
+        assert!(ended[0].contains("returned"), "{ended:?}");
+        assert!(
+            !out.stdout.lines().any(|l| l.starts_with("NOTICE|")),
+            "exit 70 raised a notice\n{}",
+            out.dump()
+        );
+    }
+}
+
+/// B4 (c, Terminal): armed with the guard against a daemon already in a
+/// Terminal stop (SSE 401), the injected end is a cascade: no exit, the one
+/// 401 notice only.
+#[cfg(unix)]
+#[test]
+fn b4_fault_inject_after_terminal_is_cascade() {
+    let out = b4_run(
+        MockOpts {
+            sse_401: true,
+            ..Default::default()
+        },
+        &[
+            ("VAULT_SYNC_TEST_END_REQUIRED_TASK", "drain_loop:0@4"),
+            ("VAULT_SYNC_TEST_MODE", "1"),
+            ("CS3_SKIP_READY", "1"),
+            ("CS3_HOLD_MS", "8000"),
+        ],
+    );
+    assert_eq!(out.code, Some(0), "{}", out.dump());
+    assert!(out.has("NO_EXIT"), "{}", out.dump());
+    assert_eq!(out.kv("FIRED").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(
+        out.kv("LIVENESS").as_deref(),
+        Some("Stopped { reason: \"sse_auth_failed\" }"),
+        "{}",
+        out.dump()
+    );
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.contains("(cascade)") && l.contains("drain_loop:0")),
+        "{}",
+        out.dump()
+    );
+    assert_eq!(count(&out.stderr, "REQUIRED task ended unexpectedly"), 0);
+    let notices = out
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("NOTICE|"))
+        .count();
+    assert_eq!(notices, 1, "{}", out.dump());
+}
+
+/// B4 (b, structural guard): the VAULT instance (no NEXUS_SYNC_CONFIG_DIR)
+/// refuses the trigger even with `VAULT_SYNC_TEST_MODE=1`, so a trigger
+/// leaked to every agent or unit of the user can never fault the operator's
+/// vault daemon. The child boots and gets ready, so the refusal is not
+/// vacuous.
+/// Negative control: remove the managed-instance guard in
+/// `fault_inject::decide` and this child exits 70.
+#[cfg(target_os = "linux")]
+#[test]
+fn b4_fault_inject_refused_in_vault_instance() {
+    let out = b4_run(
+        MockOpts::default(),
+        &[
+            ("VAULT_SYNC_TEST_END_REQUIRED_TASK", "drain_loop:0@1"),
+            ("VAULT_SYNC_TEST_MODE", "1"),
+            ("CS3_VAULT_INSTANCE", "1"),
+            ("CS3_HOLD_MS", "3000"),
+        ],
+    );
+    assert_eq!(out.code, Some(0), "{}", out.dump());
+    assert!(out.has("NO_EXIT"), "{}", out.dump());
+    assert_eq!(out.kv("READY").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(out.kv("LIVE").as_deref(), Some("true"), "{}", out.dump());
+    assert_eq!(out.kv("FIRED").as_deref(), Some("false"));
+    let refused: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("FAULT INJECTION REFUSED"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{}", out.dump());
+    assert!(refused[0].contains("vault instance"), "{refused:?}");
+    assert_eq!(count(&out.stderr, "FAULT INJECTION FIRED"), 0);
 }

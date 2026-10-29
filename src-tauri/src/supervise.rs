@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use crate::fault_inject::FaultInject;
 use crate::state_io::{ExitGate, CLAIM_RESTART};
 use crate::sync_health::{raise_state_event, StateHealthEvent};
 
@@ -199,6 +200,9 @@ pub struct Supervisor {
     notices: Mutex<HashSet<String>>,
     /// TKT-a6e5c227: a restart leaves by exit 70 instead of `app.restart()`.
     supervised: bool,
+    /// B4: the env-guarded fault-injection hook (`None` unless armed; see
+    /// [`crate::fault_inject`]). Only [`Supervisor::process`] reads the env.
+    fault: Option<FaultInject>,
     #[cfg(test)]
     hooks: test_hooks::Hooks,
 }
@@ -230,7 +234,12 @@ impl Supervisor {
     /// The process supervisor: the process exit gate, and liveness published
     /// for `ownership_lost`. Call once per process.
     pub fn process(host: Arc<dyn Host>) -> Arc<Self> {
-        let sup = Self::build(host, ExitGate::process(), is_supervised());
+        let sup = Self::build(
+            host,
+            ExitGate::process(),
+            is_supervised(),
+            FaultInject::from_env(),
+        );
         if PROCESS_LIVE.set(sup.live.clone()).is_err() {
             tracing::error!("supervise: process supervisor already installed");
         }
@@ -240,7 +249,18 @@ impl Supervisor {
     /// A supervisor on an explicit gate (in-process tests).
     /// Unsupervised (a restart self-spawns through `app.restart()`).
     pub fn with_gate(host: Arc<dyn Host>, gate: ExitGate) -> Arc<Self> {
-        Self::build(host, gate, false)
+        Self::build(host, gate, false, None)
+    }
+
+    /// A supervisor on an explicit gate with an explicit fault injection
+    /// (in-process B4 tests).
+    #[cfg(test)]
+    pub fn with_gate_and_fault(
+        host: Arc<dyn Host>,
+        gate: ExitGate,
+        fault: Option<FaultInject>,
+    ) -> Arc<Self> {
+        Self::build(host, gate, false, fault)
     }
 
     /// A supervisor on an explicit gate with explicit supervision (tests).
@@ -250,10 +270,15 @@ impl Supervisor {
         gate: ExitGate,
         supervised: bool,
     ) -> Arc<Self> {
-        Self::build(host, gate, supervised)
+        Self::build(host, gate, supervised, None)
     }
 
-    fn build(host: Arc<dyn Host>, gate: ExitGate, supervised: bool) -> Arc<Self> {
+    fn build(
+        host: Arc<dyn Host>,
+        gate: ExitGate,
+        supervised: bool,
+        fault: Option<FaultInject>,
+    ) -> Arc<Self> {
         let (live, _rx) = watch::channel(Liveness::Live);
         Arc::new(Self {
             host,
@@ -262,6 +287,7 @@ impl Supervisor {
             pre_exit: Mutex::new(Vec::new()),
             notices: Mutex::new(HashSet::new()),
             supervised,
+            fault,
             #[cfg(test)]
             hooks: test_hooks::Hooks::default(),
         })
@@ -269,6 +295,22 @@ impl Supervisor {
 
     pub fn host(&self) -> &Arc<dyn Host> {
         &self.host
+    }
+
+    /// B4: the armed fault injection, if any.
+    pub fn fault(&self) -> Option<&FaultInject> {
+        self.fault.as_ref()
+    }
+
+    /// B4: the injection timer for `spec` iff the hook is armed for this
+    /// Required task (at most once per process). A task supervised outside
+    /// [`Self::supervise_handle`] (the SSE consumer, classified by the boot
+    /// task) races its own run against this timer.
+    pub fn fault_timer(
+        &self,
+        spec: &TaskSpec,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.fault.as_ref().and_then(|f| f.timer_for(spec))
     }
 
     pub fn gate(&self) -> &ExitGate {
@@ -324,8 +366,24 @@ impl Supervisor {
         h: tauri::async_runtime::JoinHandle<TaskEnd>,
     ) {
         let me = Arc::clone(self);
+        let fault = self.fault_timer(&spec);
         tauri::async_runtime::spawn(async move {
-            let end = h.await.map_err(|e| e.to_string());
+            let end = match fault {
+                None => h.await.map_err(|e| e.to_string()),
+                // B4: the armed test hook. If the timer wins, the task is
+                // aborted and reported as an unexpected return, so the real
+                // classification below decides (exit 70, or cascade).
+                Some(timer) => {
+                    let mut h = std::pin::pin!(h);
+                    tokio::select! {
+                        r = &mut h => r.map_err(|e| e.to_string()),
+                        () = timer => {
+                            h.abort();
+                            Ok(TaskEnd::Returned)
+                        }
+                    }
+                }
+            };
             me.task_ended(&spec, end);
         });
     }
