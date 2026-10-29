@@ -556,7 +556,7 @@ pub fn raise_state_event(e: StateHealthEvent) -> bool {
             sync_health_event = e.name(),
             sub = %sub,
             status = *status,
-            "sync_health: sse_auth_failed; pull and push stopped for this subscriber until re-pair"
+            "sync_health: sse_auth_failed; the server rejects this device's token - pull and push are not being delivered for this subscriber; the daemon keeps the cursor and retries with backoff, awaiting credential recovery (the server accepting the token again, or a re-pair)"
         ),
         StateHealthEvent::BootAborted { stage } => tracing::warn!(
             sync_health_event = e.name(),

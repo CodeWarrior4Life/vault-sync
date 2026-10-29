@@ -38,7 +38,7 @@
 //! never split a rename into delete+create (that's exactly the nexus-sync
 //! rename bug §1 implicitly references).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -263,6 +263,61 @@ fn storm_threshold(w: &FileWatcher) -> u64 {
     w.storm_threshold
 }
 
+/// TKT-abfe94fc (A7): cap on distinct dropped paths remembered per day.
+pub const DROP_LOG_CAP: usize = 10_000;
+
+/// TKT-abfe94fc (A7): the once-per-path-per-day dedup behind the filter-drop
+/// INFO line. Keyed by `(path, UTC day)`: the set is cleared on a day change
+/// and when it reaches `cap` (a full set clears rather than refusing, so the
+/// worst case under a 10,000+-path drop storm is one extra line per path,
+/// never a silent path). Pure: the day is passed in.
+#[derive(Debug)]
+pub struct DropLogOnce {
+    day: i64,
+    seen: HashSet<String>,
+    cap: usize,
+}
+
+impl DropLogOnce {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            day: i64::MIN,
+            seen: HashSet::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// True iff `path` has not been logged yet on `day` (and records it).
+    pub fn should_log(&mut self, path: &str, day: i64) -> bool {
+        if day != self.day {
+            self.day = day;
+            self.seen.clear();
+        }
+        if self.seen.contains(path) {
+            return false;
+        }
+        if self.seen.len() >= self.cap {
+            self.seen.clear();
+        }
+        self.seen.insert(path.to_string());
+        true
+    }
+
+    /// Distinct paths remembered for the current day.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+/// The current UTC day number (days since the epoch) for [`DropLogOnce`].
+fn utc_day_now() -> i64 {
+    chrono::Utc::now().timestamp().div_euclid(86_400)
+}
+
 pub struct FileWatcher {
     vault_root: PathBuf,
     /// CS-3 (J5): the same journal owner the root's drain loop borrows.
@@ -274,6 +329,9 @@ pub struct FileWatcher {
     /// `classify_and_count` (used by integration tests + the spawned
     /// FS-watcher task) increments per-reason filter counters.
     tray_state: Option<SharedTrayState>,
+    /// TKT-abfe94fc (A7, no silent drop): the once-per-path-per-day set
+    /// behind the INFO line every filter drop emits (see [`DropLogOnce`]).
+    drop_log: Arc<Mutex<DropLogOnce>>,
     /// Count of CONSECUTIVE journal `CapacityExceeded` append failures. Reset
     /// to 0 on any successful append. Feeds the storm circuit-breaker.
     cap_fail_streak: Arc<AtomicU64>,
@@ -347,6 +405,7 @@ impl FileWatcher {
             config,
             device_id: device_id.into(),
             tray_state: None,
+            drop_log: Arc::new(Mutex::new(DropLogOnce::new(DROP_LOG_CAP))),
             delete_ledger: None,
             cap_fail_streak: Arc::new(AtomicU64::new(0)),
             storm_threshold: STORM_BREAKER_THRESHOLD,
@@ -481,7 +540,41 @@ impl FileWatcher {
                 }
             }
         }
+        self.log_drop(&decision, utc_day_now());
         decision
+    }
+
+    /// TKT-abfe94fc (A7, no silent drop): every filter drop (substrate,
+    /// extension, out-of-scope, exclude) logs at INFO with the rule name and
+    /// the path, ONCE per path per UTC day, in addition to the counters.
+    /// Pre-fix a drop was a tray counter and a DEBUG line the daemon never
+    /// prints at its INFO level, so a note that never reached the server
+    /// left no trace of why. The delete-burst drop keeps its own loud WARN.
+    /// `day` is injected so the dedup is testable without a clock.
+    pub(crate) fn log_drop(&self, decision: &FilterDecision, day: i64) {
+        let (rule, path): (String, &str) = match decision {
+            FilterDecision::Allow(_) | FilterDecision::DropDeleteBurst { .. } => return,
+            FilterDecision::DropSubstrate { path, rule } => (format!("substrate:{rule}"), path),
+            FilterDecision::DropExtension { path, ext } => (format!("extension:{ext}"), path),
+            FilterDecision::DropOutOfScope { path } => ("out_of_scope".to_string(), path),
+            FilterDecision::DropChunkPseudo { path } => ("chunk_pseudo".to_string(), path),
+            FilterDecision::DropExclude { path, exclude_rule } => {
+                (format!("exclude:{exclude_rule}"), path)
+            }
+        };
+        let should = self
+            .drop_log
+            .lock()
+            .map(|mut d| d.should_log(path, day))
+            .unwrap_or(true);
+        if should {
+            tracing::info!(
+                target: "vault_sync_daemon::file_watcher",
+                rule = %rule,
+                path = %path,
+                "file_watcher: event DROPPED by filter (not pushed; logged once per path per day, counted in tray state)"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1557,6 +1650,108 @@ mod tests {
         WatchEvent::Modified {
             path: p.to_string(),
         }
+    }
+
+    // ---- TKT-abfe94fc (A7): no silent drop ---------------------------------
+
+    /// The pure dedup: one `true` per (path, day); a new day re-admits the
+    /// path; the cap clears the set instead of refusing new paths.
+    #[test]
+    fn drop_log_once_is_once_per_path_per_day_and_capped() {
+        let mut d = DropLogOnce::new(3);
+        assert!(d.should_log("a.exe", 100));
+        assert!(!d.should_log("a.exe", 100), "same path, same day: silent");
+        assert!(d.should_log("b.exe", 100));
+        assert!(d.should_log("a.exe", 101), "a new day logs the path again");
+        assert!(!d.should_log("a.exe", 101));
+        assert_eq!(d.len(), 1, "the day change evicted the old day's set");
+        // Cap: 3 distinct paths fill it; the 4th clears and is logged.
+        assert!(d.should_log("b.exe", 101));
+        assert!(d.should_log("c.exe", 101));
+        assert_eq!(d.len(), 3);
+        assert!(d.should_log("d.exe", 101));
+        assert_eq!(d.len(), 1, "a full set clears rather than refusing");
+        // Negative epoch days (pre-1970) are ordinary keys.
+        assert!(d.should_log("a.exe", -5));
+        assert!(!d.should_log("a.exe", -5));
+    }
+
+    /// Capture-subscriber proof on the real watcher: two drops of the same
+    /// path on the same day produce ONE INFO line naming the rule and the
+    /// path; a different day produces another. Substrate, extension,
+    /// out-of-scope and exclude drops all log; an Allow logs nothing.
+    #[test]
+    fn filter_drops_log_once_per_path_per_day() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let dir = TempDir::new().unwrap();
+        let watcher = make_watcher(&dir, vec![], vec!["private/"]);
+        tracing::subscriber::with_default(sub, || {
+            // Extension drop, twice on day 100: one line.
+            let d = watcher.classify(&modified("Notes/tool.exe"));
+            assert!(matches!(d, FilterDecision::DropExtension { .. }), "{d:?}");
+            watcher.log_drop(&d, 100);
+            watcher.log_drop(&d, 100);
+            // Same path, next day: a second line.
+            watcher.log_drop(&d, 101);
+            // Exclude drop and an Allow (silent) on day 101.
+            let e = watcher.classify(&modified("private/secret.md"));
+            assert!(matches!(e, FilterDecision::DropExclude { .. }), "{e:?}");
+            watcher.log_drop(&e, 101);
+            let a = watcher.classify(&modified("Notes/ok.md"));
+            assert!(matches!(a, FilterDecision::Allow(_)), "{a:?}");
+            watcher.log_drop(&a, 101);
+            // Out-of-scope and substrate drops log too.
+            watcher.log_drop(
+                &FilterDecision::DropOutOfScope {
+                    path: "../escape.md".into(),
+                },
+                101,
+            );
+            watcher.log_drop(
+                &FilterDecision::DropSubstrate {
+                    path: ".lattice-runtime/x.md".into(),
+                    rule: "runtime_dir",
+                },
+                101,
+            );
+        });
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("event DROPPED by filter"))
+            .collect();
+        assert_eq!(lines.len(), 5, "{log}");
+        let exe: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("Notes/tool.exe"))
+            .collect();
+        assert_eq!(exe.len(), 2, "two days => two lines, not three\n{log}");
+        assert!(exe[0].contains("rule=extension:exe"), "{log}");
+        assert!(exe[0].contains(" INFO "), "{log}");
+        assert!(
+            log.contains("rule=exclude:") && log.contains("private/secret.md"),
+            "{log}"
+        );
+        assert!(log.contains("rule=out_of_scope"), "{log}");
+        assert!(log.contains("rule=substrate:runtime_dir"), "{log}");
+        assert!(!log.contains("Notes/ok.md"), "an Allow must not log\n{log}");
     }
     fn created(p: &str) -> WatchEvent {
         WatchEvent::Created {

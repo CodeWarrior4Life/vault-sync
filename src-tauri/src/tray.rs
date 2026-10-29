@@ -734,10 +734,20 @@ pub fn build_tooltip(state: &TrayState) -> String {
     //     So we join only the issues that are actually present, and the
     //     delete-burst entry names exactly what is paused (outbound
     //     delete-propagation) plus reassures that inbound note sync is fine.
-    if state.integrity_failures > 0 || state.conflict_unresolved > 0 || state.delete_burst_paused {
+    //     WS-A A6: a path the server (or the local I3 check) refuses is an
+    //     active problem too — it is named here so a permanent rejection is
+    //     never invisible on the tray.
+    if state.integrity_failures > 0
+        || state.conflict_unresolved > 0
+        || state.delete_burst_paused
+        || state.rejected_paths > 0
+    {
         let mut parts: Vec<String> = Vec::new();
         if state.integrity_failures > 0 {
             parts.push(format!("{} integrity", state.integrity_failures));
+        }
+        if state.rejected_paths > 0 {
+            parts.push(format!("{} rejected paths", state.rejected_paths));
         }
         if state.conflict_unresolved > 0 {
             parts.push(format!("{} conflicts", state.conflict_unresolved));
@@ -831,6 +841,16 @@ mod tests {
         s.last_error = Some("503 backend".into());
         let t = build_tooltip(&s);
         assert!(t.contains("last error: 503 backend"), "got: {t}");
+    }
+
+    /// WS-A A6: a rejected path surfaces as an issue on the tooltip.
+    #[test]
+    fn tooltip_issue_branch_with_rejected_paths() {
+        let mut s = fresh();
+        s.set_rejected_paths(3);
+        let t = build_tooltip(&s);
+        assert!(t.starts_with("⚠"), "got: {t}");
+        assert!(t.contains("3 rejected paths"), "got: {t}");
     }
 
     #[test]

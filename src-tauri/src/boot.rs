@@ -47,7 +47,7 @@ use crate::tray_state::SharedTrayState;
 use crate::{
     api_client, base_seq_store, conflict_stash, echo_guard, heartbeat, managed_instance,
     materializer, obsidian_install_detect, obsidian_plugin_detect, pull_backfill, push_client,
-    read_receipt, reconciliation, redflag, sse, sync_shadow, token_store,
+    read_receipt, reconciliation, redflag, rejected_ledger, sse, sync_shadow, token_store,
 };
 
 /// The production [`Host`]: the Tauri app.
@@ -91,6 +91,9 @@ pub struct BootKnobs {
     pub storm_threshold: Option<u64>,
     /// The push drain loop's idle interval (`None`: the client default).
     pub push_loop_interval_ms: Option<u64>,
+    /// TKT-8fc0b2a4 (A4/A5): the auth-failure retry schedule's `(base, cap)`
+    /// (`None`: 30 s doubling to 10 min; the harness passes milliseconds).
+    pub auth_backoff: Option<(Duration, Duration)>,
 }
 
 impl Default for BootKnobs {
@@ -101,6 +104,7 @@ impl Default for BootKnobs {
             config_watch_period: Duration::from_secs(60),
             storm_threshold: None,
             push_loop_interval_ms: None,
+            auth_backoff: None,
         }
     }
 }
@@ -474,7 +478,11 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     let sync_health = SyncHealth::new();
     sup.supervise_handle(
         TaskSpec::new("heartbeat", TaskClass::Optional),
-        heartbeat::spawn(Arc::clone(&api), Arc::clone(&sync_health)),
+        heartbeat::spawn(
+            Arc::clone(&api),
+            Arc::clone(&sync_health),
+            Some(tray.clone()),
+        ),
     );
 
     // ---- B2 --------------------------------------------------------------
@@ -627,6 +635,15 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         sync_health,
         knobs: knobs.clone(),
         stash_quarantine: workspace.join(conflict_stash::StashQuarantine::DIR_NAME),
+        // WS-A A3: config-scope (beside reconcile-retry-ledger.json), loaded
+        // once for the process; in-memory if the config dir is not bootstrapped.
+        rejected_ledger: Arc::new(match crate::state_io::registry().config_dir() {
+            Ok(sd) => rejected_ledger::RejectedLedger::load(&sd),
+            Err(e) => {
+                tracing::warn!("rejected ledger not persisted: {e}");
+                rejected_ledger::RejectedLedger::in_memory()
+            }
+        }),
     };
     let watch_handles: Vec<WatchHandle> = roots
         .iter()
@@ -656,9 +673,22 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     ) {
         Ok(c) => {
             let h = Arc::clone(&handles);
-            c.with_tray_state(tray)
+            // TKT-8fc0b2a4 (A4) / gate C6: the consumer no longer stops on
+            // 401/403; it raises the one event and the one notice per
+            // episode through this hook and keeps retrying.
+            let notice_host = Arc::clone(&host);
+            let notice_sub = snapshot.top_sub().to_string();
+            let mut c = c
+                .with_tray_state(tray)
                 .with_state_dir(&state_dir)
                 .with_on_connected(Arc::new(move || h.mark_sse_connected()))
+                .with_on_auth_failed(Arc::new(move |status| {
+                    sse_auth_notice(notice_host.as_ref(), &notice_sub, status)
+                }));
+            if let Some((base, cap)) = knobs.auth_backoff {
+                c = c.with_auth_backoff(base, cap);
+            }
+            c
         }
         Err(e) => {
             tracing::error!("sse consumer init failed: {e}");
@@ -699,8 +729,33 @@ fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "panic".to_string())
 }
 
+/// TKT-8fc0b2a4 (A4) / gate C6 (No Silent Holds): the ONE state event and the
+/// ONE notice per auth-failure episode. The consumer does not stop (it keeps
+/// the cursor and retries the connection with backoff, awaiting credential
+/// recovery), so the notice says what is NOT being delivered, why, what
+/// recovers it (the server accepting the token again) and the one action
+/// the owner can take now. Called by the consumer's `on_auth_failed` hook.
+pub(crate) fn sse_auth_notice(host: &dyn Host, sub: &str, status: u16) {
+    crate::sync_health::raise_state_event(StateHealthEvent::SseAuthFailed {
+        sub: sub.to_string(),
+        status,
+    });
+    host.notify(
+        "Vault Sync: device token rejected",
+        &format!(
+            "What: pull and push for subscriber {sub} on this host are NOT being delivered. \
+             Why: the server rejected this device's token (HTTP {status}). \
+             The daemon keeps the sync cursor and retries (30 s to 10 min); delivery resumes only when the server accepts this token again. \
+             To resume now: re-pair this device in the Vault Sync wizard."
+        ),
+    );
+}
+
 /// Gate C6 (No Silent Holds): the SSE 401/403 Terminal stop and its one
 /// dedicated notice: what stopped, why, and the one action that lifts it.
+/// Since TKT-8fc0b2a4 (A4) the consumer retries instead of returning, so
+/// this end is no longer produced by the running loop; it stays as the typed
+/// end for the classifier path ([`sse::auth_failure_status`]).
 pub(crate) fn sse_auth_terminal(sub: &str, status: u16) -> TaskEnd {
     TaskEnd::Terminal {
         reason: "sse_auth_failed".to_string(),
@@ -797,6 +852,9 @@ struct PipelineCtx {
     knobs: BootKnobs,
     /// R2(a) (TKT-406f6cb3): `<workspace>/conflict-quarantine`.
     stash_quarantine: std::path::PathBuf,
+    /// WS-A A3 (TKT-17fc22e5): ONE rejected ledger shared by every root's
+    /// push client and reconciliation backstop (one file, one writer set).
+    rejected_ledger: Arc<rejected_ledger::RejectedLedger>,
 }
 
 /// TKT-35f75318 wiring (B10): build the SSE consumer. It materializes into
@@ -965,7 +1023,8 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
     .with_sync_health(Arc::clone(&ctx.sync_health))
     .with_materializer(ctx.materializer.clone())
     .with_enqueued_hashes(Arc::clone(&enqueued_hashes))
-    .with_drain_hook(drain_mark);
+    .with_drain_hook(drain_mark)
+    .with_rejected_ledger(Arc::clone(&ctx.rejected_ledger));
 
     tracing::info!(
         "starting push_client drain loop for subscriber_id={}",
@@ -1009,6 +1068,7 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
                 ctx.tray.clone(),
                 ctx.materializer.clone(),
                 Arc::clone(&ctx.shadow),
+                Arc::clone(&ctx.rejected_ledger),
             ),
         ),
         Err(e) => {

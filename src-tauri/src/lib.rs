@@ -5,6 +5,7 @@
 #![deny(clippy::await_holding_lock)]
 pub mod api_client;
 pub mod append_merge;
+pub mod auth_backoff;
 pub mod base_seq_store;
 pub mod boot;
 pub mod canonical_form;
@@ -36,6 +37,7 @@ pub mod rasp_fence;
 pub mod read_receipt;
 pub mod reconciliation;
 pub mod redflag;
+pub mod rejected_ledger;
 pub mod retry_ledger;
 pub mod scope;
 pub mod sse;

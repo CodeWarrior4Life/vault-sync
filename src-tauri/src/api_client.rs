@@ -41,7 +41,13 @@ pub fn user_agent_string() -> String {
 /// ONLY when known — a bare `null` could clobber a good `last_sync_at` on a
 /// daemon that has not pushed since restart, so absence means "no update to
 /// that column".
-fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) -> serde_json::Value {
+/// TKT-8fc0b2a4 (A6): `auth_failed_since` is inserted ONLY while an
+/// auth-failure episode is open, same convention (omitted, never `null`).
+fn heartbeat_body(
+    last_seen: DateTime<Utc>,
+    last_sync: Option<DateTime<Utc>>,
+    auth_failed_since: Option<DateTime<Utc>>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "daemon_version": daemon_version(),
         "daemon_platform": daemon_platform(),
@@ -49,6 +55,9 @@ fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) ->
     });
     if let Some(ls) = last_sync {
         body["last_sync"] = serde_json::Value::String(ls.to_rfc3339());
+    }
+    if let Some(afs) = auth_failed_since {
+        body["auth_failed_since"] = serde_json::Value::String(afs.to_rfc3339());
     }
     body
 }
@@ -139,6 +148,14 @@ pub enum ApiError {
     NotFound(String),
     #[error("server error: HTTP {0}")]
     Server(u16),
+    /// WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): HTTP 400 or 422 on push. A
+    /// PERMANENT rejection: re-sending the same bytes can never succeed. The
+    /// server names the cause in its body on every such raise (FastAPI
+    /// `{"detail": "..."}`); `detail` is that field, or the raw body when the
+    /// body is not JSON, capped at [`REJECTED_DETAIL_CAP`] chars. A 4xx error
+    /// body is not note content, but it is capped anyway.
+    #[error("rejected permanently (HTTP {status}): {detail}")]
+    Rejected { status: u16, detail: String },
     #[error("rate limited; retry after {retry_after_secs} seconds")]
     RateLimited { retry_after_secs: u64 },
     #[error("network error: {0}")]
@@ -671,12 +688,16 @@ impl ApiClient {
     ///   fire-and-observe freshness ping, and tolerating an empty or differently
     ///   shaped body keeps it compatible across server versions that do mount
     ///   the route.
+    /// * TKT-8fc0b2a4 (A6): `auth_failed_since` (the start of an open SSE/push
+    ///   auth-failure episode) rides along when set, omitted otherwise, so the
+    ///   registry can see a revoked daemon that is alive and retrying.
     pub async fn patch_self_heartbeat(
         &self,
         last_seen: DateTime<Utc>,
         last_sync: Option<DateTime<Utc>>,
+        auth_failed_since: Option<DateTime<Utc>>,
     ) -> Result<HeartbeatOutcome, ApiError> {
-        let body = heartbeat_body(last_seen, last_sync);
+        let body = heartbeat_body(last_seen, last_sync, auth_failed_since);
         let resp = self
             .http
             .patch(format!("{}/api/sync/subscribers/me", self.base_url))
@@ -739,8 +760,49 @@ impl ApiClient {
                     .collect();
                 Err(ApiError::UpgradeRequired { detail })
             }
+            // WS-A A1: 400 / 422 are permanent rejections whose cause the
+            // server names in the body. Carry it; never drop it again.
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ApiError::Rejected {
+                    status: status.as_u16(),
+                    detail: rejection_detail(&body),
+                })
+            }
             s => Err(ApiError::Server(s.as_u16())),
         }
+    }
+}
+
+/// WS-A A1: cap on the carried rejection reason (chars). Long enough for the
+/// server's worst message (the NUL-byte reason names the path), short enough
+/// that a log line and a ledger row stay bounded.
+pub const REJECTED_DETAIL_CAP: usize = 512;
+
+/// WS-A A1: extract the human-readable reason from a 400/422 response body.
+///
+/// FastAPI raises carry `{"detail": "<reason>"}`; a validation 422 carries
+/// `{"detail": [ {...}, ... ]}` (kept as its JSON text so the field names
+/// survive); anything else (HTML from a proxy, plain text) is carried raw.
+/// Always trimmed and capped at [`REJECTED_DETAIL_CAP`] chars; an empty body
+/// becomes `"<empty body>"` so the log line never reads `reason=`.
+pub fn rejection_detail(body: &str) -> String {
+    let picked: String = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => match map.get("detail") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => body.to_string(),
+            Some(other) => other.to_string(),
+        },
+        _ => body.to_string(),
+    };
+    let trimmed = picked.trim();
+    if trimmed.is_empty() {
+        return "<empty body>".to_string();
+    }
+    if trimmed.chars().count() <= REJECTED_DETAIL_CAP {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(REJECTED_DETAIL_CAP).collect()
     }
 }
 
@@ -748,6 +810,39 @@ impl ApiClient {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// WS-A A1: the reason extractor handles every body shape the server sends.
+    #[test]
+    fn rejection_detail_extracts_fastapi_detail_or_raw_body() {
+        assert_eq!(
+            rejection_detail(r#"{"detail":"invalid path"}"#),
+            "invalid path"
+        );
+        assert_eq!(
+            rejection_detail(
+                r#"{"detail":"content contains NUL bytes; not storable in the text bare core (path=a.md)"}"#
+            ),
+            "content contains NUL bytes; not storable in the text bare core (path=a.md)"
+        );
+        // Validation 422: detail is a list; its JSON text is carried.
+        let v =
+            rejection_detail(r#"{"detail":[{"loc":["body","content"],"msg":"field required"}]}"#);
+        assert!(v.contains("field required"), "got {v}");
+        // Non-JSON body: raw, trimmed.
+        assert_eq!(
+            rejection_detail("  Invalid base64 content \n"),
+            "Invalid base64 content"
+        );
+        // JSON without detail: raw body.
+        assert_eq!(rejection_detail(r#"{"error":"x"}"#), r#"{"error":"x"}"#);
+        // Empty: a sentinel, never an empty reason.
+        assert_eq!(rejection_detail(""), "<empty body>");
+        assert_eq!(rejection_detail("   "), "<empty body>");
+        // Cap at 512 chars on a char boundary (multi-byte safe).
+        let long = "é".repeat(2000);
+        let capped = rejection_detail(&long);
+        assert_eq!(capped.chars().count(), REJECTED_DETAIL_CAP);
+    }
 
     /// v0.4.30 ship gate: the self-reported daemon_version (User-Agent + the
     /// startup PATCH /subscribers/me the server's S5 min-version gate reads)
@@ -934,7 +1029,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let out = api
-            .patch_self_heartbeat(last_seen, Some(last_sync))
+            .patch_self_heartbeat(last_seen, Some(last_sync), None)
             .await
             .expect("heartbeat succeeds");
         assert_eq!(out, HeartbeatOutcome::Acknowledged);
@@ -952,7 +1047,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         // Unknown => key absent entirely (not null).
-        let absent = heartbeat_body(last_seen, None);
+        let absent = heartbeat_body(last_seen, None, None);
         assert!(absent.get("last_seen").is_some());
         assert!(
             absent.get("last_sync").is_none(),
@@ -963,8 +1058,32 @@ mod tests {
         let last_sync = DateTime::parse_from_rfc3339("2026-08-02T09:59:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let present = heartbeat_body(last_seen, Some(last_sync));
+        let present = heartbeat_body(last_seen, Some(last_sync), None);
         assert_eq!(present["last_sync"], "2026-08-02T09:59:00+00:00");
+    }
+
+    /// TKT-8fc0b2a4 (A6): `auth_failed_since` follows the same convention -
+    /// OMITTED while auth is healthy (never `null`), present as RFC3339 while
+    /// an auth-failure episode is open.
+    #[test]
+    fn heartbeat_body_omits_auth_failed_since_when_healthy_and_includes_it_when_failed() {
+        let last_seen = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let healthy = heartbeat_body(last_seen, None, None);
+        assert!(
+            healthy.get("auth_failed_since").is_none(),
+            "auth_failed_since must be OMITTED while healthy: {healthy}"
+        );
+        let since = DateTime::parse_from_rfc3339("2026-08-02T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let failed = heartbeat_body(last_seen, None, Some(since));
+        assert_eq!(failed["auth_failed_since"], "2026-08-02T09:30:00+00:00");
+        // Independent of last_sync: both may be present together.
+        let both = heartbeat_body(last_seen, Some(since), Some(since));
+        assert!(both.get("last_sync").is_some());
+        assert!(both.get("auth_failed_since").is_some());
     }
 
     /// (Deliverable 3c) An OLDER server that does not mount the route answers
@@ -985,7 +1104,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let out = api
-            .patch_self_heartbeat(last_seen, None)
+            .patch_self_heartbeat(last_seen, None, None)
             .await
             .expect("405 is tolerated, not an error");
         assert_eq!(

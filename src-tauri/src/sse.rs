@@ -5,10 +5,15 @@ use crate::tray_state::{ConnectionStatus, SharedTrayState};
 use eventsource_client::{Client, Error as SseError, SSE};
 use futures::TryStreamExt;
 use serde::Deserialize;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+
+use crate::auth_backoff::{
+    auth_retry_delay, clock_jitter_unit, AUTH_BACKOFF_BASE, AUTH_BACKOFF_CAP, AUTH_ERROR_REPEAT,
+};
 
 /// D2 (S511, TKT-2dc9a17e): extract a `u64` change_seq from the SSE envelope's
 /// `lsn`, which the server may send as an integer OR a stringified integer
@@ -93,10 +98,36 @@ pub struct SseConsumer {
     /// CS-3 §3.3 readiness: called on every `Connected` (the handles latch
     /// `sse_connected_once`).
     on_connected: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// TKT-8fc0b2a4 (A4): true from the first 401/403 of an auth-failure
+    /// episode until the next accepted connect. Shared between `run` (sets
+    /// it on the rejection) and `run_one_session` (clears it on `Connected`
+    /// and logs the recovery with the cursor it resumed from).
+    auth_failed: AtomicBool,
+    /// TKT-8fc0b2a4 (A4): the auth retry schedule's base and cap
+    /// (production: 30 s doubling to 10 min; tests pass milliseconds).
+    auth_backoff_base: Duration,
+    auth_backoff_cap: Duration,
+    /// TKT-8fc0b2a4 (A4) / gate C6 (No Silent Holds): called ONCE per
+    /// transition into `AuthFailed` with the HTTP status, so the boot task
+    /// can raise the one state event and the one notice without the loop
+    /// having to stop.
+    on_auth_failed: Option<std::sync::Arc<dyn Fn(u16) + Send + Sync>>,
 }
 
-/// CS-3 §3.5 (P13): the HTTP status of an SSE auth failure (401/403) that
-/// made [`SseConsumer::run`] stop by design, if `e` is one.
+/// Per-`run()` bookkeeping for one auth-failure episode (A4).
+struct AuthRetry {
+    /// 0-based retry number; drives the schedule. Reset on each new episode.
+    attempt: u32,
+    /// When the episode began (for the `failed_for_secs` field).
+    since: Instant,
+    /// When the ERROR line was last emitted (once per hour while persisting).
+    last_error_log: Instant,
+}
+
+/// CS-3 §3.5 (P13): the HTTP status of an SSE auth failure (401/403), if `e`
+/// is one. Since TKT-8fc0b2a4 (A4) [`SseConsumer::run`] no longer returns on
+/// 401/403 (it retries with backoff); the classifier is kept for the boot
+/// task's typed end path.
 pub fn auth_failure_status(e: &anyhow::Error) -> Option<u16> {
     match e.downcast_ref::<SseError>() {
         Some(SseError::UnexpectedResponse(resp, _)) => {
@@ -141,6 +172,10 @@ impl SseConsumer {
             state_dir: None,
             liveness_window: LIVENESS_WINDOW,
             on_connected: None,
+            auth_failed: AtomicBool::new(false),
+            auth_backoff_base: AUTH_BACKOFF_BASE,
+            auth_backoff_cap: AUTH_BACKOFF_CAP,
+            on_auth_failed: None,
         })
     }
 
@@ -148,6 +183,26 @@ impl SseConsumer {
     pub fn with_on_connected(mut self, f: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
         self.on_connected = Some(f);
         self
+    }
+
+    /// TKT-8fc0b2a4 (A4): run `f(status)` once per transition into
+    /// `AuthFailed` (gate C6: the one notice and the one state event).
+    pub fn with_on_auth_failed(mut self, f: std::sync::Arc<dyn Fn(u16) + Send + Sync>) -> Self {
+        self.on_auth_failed = Some(f);
+        self
+    }
+
+    /// TKT-8fc0b2a4 (A4): override the auth retry schedule (tests use
+    /// milliseconds; production keeps 30 s doubling to 10 min).
+    pub fn with_auth_backoff(mut self, base: Duration, cap: Duration) -> Self {
+        self.auth_backoff_base = base;
+        self.auth_backoff_cap = cap.max(base);
+        self
+    }
+
+    /// TKT-8fc0b2a4 (A4): true while an auth-failure episode is open.
+    pub fn auth_failed(&self) -> bool {
+        self.auth_failed.load(Ordering::SeqCst)
     }
 
     /// TKT-fc62ea8a: override the liveness window (tests use sub-second
@@ -247,12 +302,114 @@ impl SseConsumer {
         }
     }
 
+    /// A6: stamp `auth_failed_since` (first rejection of the episode wins).
+    fn ts_mark_auth_failed(&self) {
+        if let Some(s) = &self.tray_state {
+            if let Ok(mut st) = s.write() {
+                st.mark_auth_failed(chrono::Utc::now().timestamp());
+            }
+        }
+    }
+
+    /// A6: clear `auth_failed_since` on recovery.
+    fn ts_clear_auth_failed(&self) {
+        if let Some(s) = &self.tray_state {
+            if let Ok(mut st) = s.write() {
+                st.clear_auth_failed();
+            }
+        }
+    }
+
+    /// TKT-8fc0b2a4 (A4): one 401/403 on connect. Opens the episode on the
+    /// first rejection (ERROR once, tray `AuthFailed` + `auth_failed_since`,
+    /// the `on_auth_failed` hook), repeats the ERROR once per hour while it
+    /// persists (every other attempt is DEBUG), and returns how long to wait
+    /// before the next connect per the shared schedule. `last_event_id` is
+    /// read for the log only: the cursor is NEVER touched by a rejection.
+    fn note_auth_failure(
+        &self,
+        status: u16,
+        last_event_id: Option<&str>,
+        auth: &mut Option<AuthRetry>,
+    ) -> Duration {
+        let now = Instant::now();
+        let cursor = last_event_id.unwrap_or("<none>");
+        let first = !self.auth_failed.swap(true, Ordering::SeqCst);
+        let attempt = match auth {
+            Some(a) if !first => a.attempt,
+            _ => 0,
+        };
+        let wait = auth_retry_delay(
+            attempt,
+            self.auth_backoff_base,
+            self.auth_backoff_cap,
+            clock_jitter_unit(),
+        );
+        if first {
+            *auth = Some(AuthRetry {
+                attempt: 1,
+                since: now,
+                last_error_log: now,
+            });
+            error!(
+                status,
+                cursor,
+                retry_in_secs = wait.as_secs(),
+                "SSE AUTH FAILURE: the server rejected this device's token (HTTP {status}); delivery is NOT stopped - keeping the cursor and retrying the connection with backoff ({}s doubling to {}s, +/-10% jitter), awaiting credential recovery (the server accepting the token again, or a re-pair)",
+                self.auth_backoff_base.as_secs(),
+                self.auth_backoff_cap.as_secs()
+            );
+            self.ts_err(
+                ConnectionStatus::AuthFailed,
+                format!("token rejected (HTTP {status}); retrying"),
+            );
+            self.ts_mark_auth_failed();
+            if let Some(f) = &self.on_auth_failed {
+                f(status);
+            }
+            return wait;
+        }
+        let a = auth.get_or_insert_with(|| AuthRetry {
+            attempt: 0,
+            since: now,
+            last_error_log: now,
+        });
+        a.attempt = a.attempt.saturating_add(1);
+        if now.duration_since(a.last_error_log) >= AUTH_ERROR_REPEAT {
+            a.last_error_log = now;
+            error!(
+                status,
+                cursor,
+                attempt,
+                failed_for_secs = now.duration_since(a.since).as_secs(),
+                retry_in_secs = wait.as_secs(),
+                "SSE AUTH FAILURE persists: the server still rejects this device's token (HTTP {status}); cursor kept, still retrying the connection with backoff; un-revoke on the server or re-pair the device to resume"
+            );
+            // Pin the tray status: an intervening 5xx/disconnect may have
+            // moved it to Reconnecting while the episode is still open.
+            self.ts_err(
+                ConnectionStatus::AuthFailed,
+                format!("token rejected (HTTP {status}); retrying"),
+            );
+        } else {
+            debug!(
+                status,
+                attempt,
+                retry_in_secs = wait.as_secs(),
+                "SSE auth failure persists; next retry scheduled"
+            );
+        }
+        wait
+    }
+
     pub async fn run(
         &self,
         mut last_event_id: Option<String>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut backoff = Duration::from_secs(1);
+        // A4: the open auth-failure episode's retry bookkeeping, if any.
+        let mut auth: Option<AuthRetry> = None;
         self.ts_set(ConnectionStatus::Connecting);
         loop {
             if *shutdown.borrow() {
@@ -276,15 +433,29 @@ impl SseConsumer {
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
-                Err(SseError::UnexpectedResponse(resp, body)) => {
+                Err(SseError::UnexpectedResponse(resp, _body)) => {
                     let status = resp.status();
                     if status == 401 || status == 403 {
-                        error!(status = status, "SSE auth failure; not retrying");
-                        self.ts_err(
-                            ConnectionStatus::AuthFailed,
-                            format!("token rejected (HTTP {status})"),
-                        );
-                        return Err(SseError::UnexpectedResponse(resp, body).into());
+                        // TKT-8fc0b2a4 (A4): NEVER end delivery on an auth
+                        // failure. Pre-fix this returned Err and the loop
+                        // ended; the daemon's other threads kept running, so
+                        // every liveness instrument read alive while delivery
+                        // was dead for three days (2026-07-07, Trinity).
+                        // This is a CONNECTION retry governed by the Sync
+                        // Contract's SSE section (reconnect with
+                        // Last-Event-ID), NOT a push retry under [I48]: no
+                        // event is re-sent, `last_event_id` is kept, and the
+                        // next accepted connect resumes incrementally from
+                        // it. Fail loud, keep the cursor, await credential
+                        // recovery (un-revoke or re-pair); retrying alone
+                        // cannot recover a hard revoke.
+                        let wait =
+                            self.note_auth_failure(status, last_event_id.as_deref(), &mut auth);
+                        tokio::select! {
+                            _ = sleep(wait) => {}
+                            _ = shutdown.changed() => { break; }
+                        }
+                        continue;
                     }
                     let retry_secs = resp
                         .get_header_value("retry-after")
@@ -370,6 +541,15 @@ impl SseConsumer {
             match event {
                 SSE::Connected(_) => {
                     debug!("SSE connected");
+                    // A4: the server accepted the token again. Close the
+                    // episode and say where delivery resumes from.
+                    if self.auth_failed.swap(false, Ordering::SeqCst) {
+                        info!(
+                            cursor = last_event_id.as_deref().unwrap_or("<none>"),
+                            "SSE auth RECOVERED: the server accepted this device's token again; resuming delivery from the kept cursor (incremental catch-up, no re-materialize)"
+                        );
+                        self.ts_clear_auth_failed();
+                    }
                     self.ts_set(ConnectionStatus::Connected);
                     if let Some(f) = &self.on_connected {
                         f();

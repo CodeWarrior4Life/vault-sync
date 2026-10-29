@@ -25,6 +25,9 @@ use std::time::Duration;
 use crate::api_client::{
     ApiClient, ApiError, NotePayload, PushApiAction, PushRequest, PushResponse, PushStatus,
 };
+use crate::auth_backoff::{
+    auth_retry_delay, clock_jitter_unit, AUTH_BACKOFF_BASE, AUTH_BACKOFF_CAP, AUTH_ERROR_REPEAT,
+};
 use crate::journal_owner::JournalOwner;
 use crate::push_journal::{
     new_event_id, JournalCursor, PushAction, PushBase, PushEvent, CURRENT_SCHEMA,
@@ -127,6 +130,20 @@ pub enum SkipReason {
     /// permanent-reject class and carries `status: 422`.
     ServerRejected {
         status: u16,
+        /// WS-A A1 (TKT-17fc22e5, TKT-8fc0b2a4): the server's own reason
+        /// (its FastAPI `detail`, or the raw body), capped at 512 chars by
+        /// `api_client::rejection_detail`. Never note content.
+        detail: String,
+    },
+    /// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): Sync Contract obligation I3,
+    /// enforced CLIENT-SIDE before any byte leaves the host. The text lane
+    /// (.md / .canvas) must be valid UTF-8 with no NUL byte; the server 422s
+    /// anything else, and re-sending the same bytes can never succeed. `kind`
+    /// is `"nul"` or `"utf8"`; `offset` is the byte index of the first
+    /// violation. Nothing was sent.
+    LocalContractViolation {
+        kind: &'static str,
+        offset: usize,
     },
     /// Managed-instance mode (spec §5, 2026-08-08): a `*.conflict-from-*`
     /// sibling or the conflict-stash manifest reached the push path — refused
@@ -164,6 +181,51 @@ pub enum PushOutcome {
     ConflictMarkers { merged_content: String },
     Skipped(SkipReason),
     Failed(FailureReason),
+}
+
+/// TKT-8fc0b2a4 (A5): the push drain's auth-failure cooldown - fail loud,
+/// stand down, await credential recovery. One 401/403 arms it for the next
+/// delay of the shared schedule (30 s doubling to 10 min, jittered); while
+/// armed, `drain_once` makes NO network call and touches NO journal entry.
+/// At expiry ONE cheap probe (`api.health()`) decides: 200 clears the gate
+/// and the drain proceeds; 401/403 re-arms at the next step; a transient
+/// error re-arms at the same step. The journal entry that hit the 401 was
+/// ACKED per Sync Contract I47 (ack on every terminal outcome incl.
+/// Unauthorized/Forbidden; I48: no retry inside a drain); the edit is NOT
+/// lost IF it was an upsert (create/modify): the file-vs-shadow divergence is
+/// re-derived by the next reconciliation pass once the server accepts the
+/// token again. A DELETE, or the old path of a RENAME (journaled as a delete),
+/// acked under 401/403 is NOT replayed by this daemon version: reconciliation
+/// has no delete concept (see verify_repair.rs) and nothing re-queues it. A hard
+/// revoke is never recovered by retrying: recovery is the server
+/// un-revoking or a re-pair; this gate only keeps the daemon alive, bounded
+/// and visible until then.
+#[derive(Debug)]
+pub struct AuthGate {
+    /// `Some(t)` while armed: no drain before `t`.
+    until: Option<std::time::Instant>,
+    /// 0-based retry number driving the schedule; reset on recovery.
+    attempt: u32,
+    /// When the episode opened (`None` = auth healthy).
+    since: Option<std::time::Instant>,
+    /// When the ERROR line was last emitted (once per hour while persisting).
+    last_error_log: Option<std::time::Instant>,
+    /// The schedule (production: 30 s / 10 min; tests pass milliseconds).
+    base: Duration,
+    cap: Duration,
+}
+
+impl Default for AuthGate {
+    fn default() -> Self {
+        Self {
+            until: None,
+            attempt: 0,
+            since: None,
+            last_error_log: None,
+            base: AUTH_BACKOFF_BASE,
+            cap: AUTH_BACKOFF_CAP,
+        }
+    }
 }
 
 pub struct PushClient {
@@ -214,6 +276,8 @@ pub struct PushClient {
     /// min-daemon-version gate rejected us and only an upgrade (or gate
     /// change) can help. Std mutex: held only for a read/write of an Option.
     gate_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// TKT-8fc0b2a4 (A5): the auth-failure drain cooldown (see [`AuthGate`]).
+    auth_gate: Arc<std::sync::Mutex<AuthGate>>,
     /// D2 (v0.4.28): write machinery for ack-materialize-back. The rewrite
     /// MUST ride `Materializer::write_aligned_bytes` (per-path lock, echo
     /// guard, atomic tmp+rename) - a bespoke write path would miss echo
@@ -235,6 +299,12 @@ pub struct PushClient {
     /// [`crate::conflict_stash::is_append_only_flight_recorder`]). `None` keeps
     /// the in-vault `.conflict-from-*` sibling for every path.
     stash_quarantine_dir: Option<PathBuf>,
+    /// WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4): the durable rejected ledger.
+    /// A `ServerRejected` / `LocalContractViolation` outcome records the
+    /// path + the sha of the bytes it tried to send; `Sent` / `Merged` clears
+    /// the path. Reconciliation consults it before re-queueing. `None` = no
+    /// recording (unit tests / degraded wiring).
+    rejected_ledger: Option<Arc<crate::rejected_ledger::RejectedLedger>>,
 }
 
 impl PushClient {
@@ -257,11 +327,23 @@ impl PushClient {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         }
+    }
+
+    /// WS-A A3: attach the shared rejected ledger (production: the one
+    /// instance `boot` also hands to the reconciliation backstop).
+    pub fn with_rejected_ledger(
+        mut self,
+        ledger: Arc<crate::rejected_ledger::RejectedLedger>,
+    ) -> Self {
+        self.rejected_ledger = Some(ledger);
+        self
     }
 
     /// S5 (v0.4.28): arm the min-version gate cooldown for `duration` from
@@ -276,6 +358,143 @@ impl PushClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         *g = Some(std::time::Instant::now() + duration);
+    }
+
+    /// TKT-8fc0b2a4 (A5): override the auth cooldown schedule (tests use
+    /// milliseconds; production keeps 30 s doubling to 10 min).
+    pub fn with_auth_backoff(self, base: Duration, cap: Duration) -> Self {
+        {
+            let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+            g.base = base;
+            g.cap = cap.max(base);
+        }
+        self
+    }
+
+    /// TKT-8fc0b2a4 (A5): true while the auth cooldown is armed or an
+    /// auth-failure episode is open.
+    pub fn auth_failed(&self) -> bool {
+        self.auth_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .since
+            .is_some()
+    }
+
+    /// TKT-8fc0b2a4 (A5): one 401/403 (from a push, or from the cooldown
+    /// probe). Arms the drain cooldown for the next delay of the shared
+    /// schedule (idempotent while already armed, so N chains failing in one
+    /// tick arm it once), opens the episode on the first rejection (ERROR
+    /// once, tray `auth_failed_since`), repeats the ERROR once per hour while
+    /// it persists, DEBUG otherwise. `advance` moves the schedule one step
+    /// (a 401/403); `false` re-arms at the current step (a transient probe
+    /// error says nothing about the credential).
+    fn arm_auth_cooldown(&self, status: u16, context: &str, advance: bool) {
+        let now = std::time::Instant::now();
+        let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if g.until.is_some_and(|t| now < t) {
+            return;
+        }
+        let attempt = g.attempt;
+        let wait = auth_retry_delay(attempt, g.base, g.cap, clock_jitter_unit());
+        g.until = Some(now + wait);
+        if advance {
+            g.attempt = g.attempt.saturating_add(1);
+        }
+        let first = g.since.is_none();
+        if first {
+            g.since = Some(now);
+            g.last_error_log = Some(now);
+        }
+        let failed_for_secs = g.since.map(|t| now.duration_since(t).as_secs());
+        let repeat = !first
+            && g.last_error_log
+                .is_none_or(|t| now.duration_since(t) >= AUTH_ERROR_REPEAT);
+        if repeat {
+            g.last_error_log = Some(now);
+        }
+        let (base_secs, cap_secs) = (g.base.as_secs(), g.cap.as_secs());
+        drop(g);
+        if first {
+            tracing::error!(
+                status,
+                context = %context,
+                cooldown_secs = wait.as_secs(),
+                "PUSH AUTH FAILURE: the server rejected this device's token (HTTP {status}). The drain stands down (no network) with backoff ({base_secs}s doubling to {cap_secs}s, +/-10% jitter) and probes /api/sync/health at each step; the rejected entry is acked per Sync Contract I47; an upsert is re-derived from the file by reconciliation once the server accepts the token again, but a delete or a rename's old path acked here is NOT replayed by this daemon version (each such path is logged at WARN). A revoked token is NOT recovered by retrying: un-revoke on the server or re-pair the device."
+            );
+            if let Some(tray) = &self.tray_state {
+                if let Ok(mut w) = tray.write() {
+                    w.mark_auth_failed(chrono::Utc::now().timestamp());
+                }
+            }
+        } else if repeat {
+            tracing::error!(
+                status,
+                context = %context,
+                attempt,
+                failed_for_secs = failed_for_secs.unwrap_or(0),
+                cooldown_secs = wait.as_secs(),
+                "PUSH AUTH FAILURE persists: the server still rejects this device's token (HTTP {status}); drain still standing down and probing; un-revoke on the server or re-pair the device to resume"
+            );
+        } else {
+            tracing::debug!(
+                status,
+                context = %context,
+                attempt,
+                cooldown_secs = wait.as_secs(),
+                "push auth failure persists; drain cooldown re-armed"
+            );
+        }
+    }
+
+    /// TKT-8fc0b2a4 (A5): the cooldown expired; ONE cheap authenticated
+    /// probe decides whether the drain may proceed. Returns true iff it may.
+    async fn auth_probe_allows_drain(&self) -> bool {
+        match self.api.health().await {
+            Ok(_) => {
+                self.clear_auth_cooldown();
+                true
+            }
+            Err(ApiError::Unauthorized) => {
+                self.arm_auth_cooldown(401, "probe:/api/sync/health", true);
+                false
+            }
+            Err(ApiError::Forbidden) => {
+                self.arm_auth_cooldown(403, "probe:/api/sync/health", true);
+                false
+            }
+            Err(e) => {
+                // Transient (network / 5xx): says nothing about the
+                // credential. Hold the same step; do not inflate the schedule.
+                tracing::debug!(error = %e, "push auth probe failed transiently; holding the cooldown step");
+                self.arm_auth_cooldown(0, "probe:/api/sync/health", false);
+                false
+            }
+        }
+    }
+
+    /// TKT-8fc0b2a4 (A5): an authenticated push succeeded; close the episode
+    /// (idempotent, silent while healthy).
+    fn clear_auth_cooldown(&self) {
+        let mut g = self.auth_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if g.since.is_none() && g.until.is_none() {
+            return;
+        }
+        let failed_for_secs = g.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        g.until = None;
+        g.attempt = 0;
+        g.since = None;
+        g.last_error_log = None;
+        drop(g);
+        tracing::info!(
+            failed_for_secs,
+            "push auth RECOVERED: the server accepted this device's token again; the drain resumes and the next reconciliation pass re-queues any edit acked during the episode"
+        );
+        if let Some(tray) = &self.tray_state {
+            if let Ok(mut w) = tray.write() {
+                w.clear_auth_failed();
+            }
+        }
     }
 
     /// Builder-style: attach a SharedTrayState so push outcomes update the
@@ -465,6 +684,27 @@ impl PushClient {
                 }
             }
         }
+        // TKT-8fc0b2a4 (A5): auth-failure cooldown. After a 401/403 we stand
+        // down - no journal drain, no network - until the scheduled time; then
+        // ONE health probe decides (200: proceed; 401/403: re-arm next step).
+        {
+            let until = self
+                .auth_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .until;
+            if let Some(until) = until {
+                if std::time::Instant::now() < until {
+                    tracing::debug!(
+                        "push_client: auth-failure cooldown active - skipping drain tick (no network)"
+                    );
+                    return Vec::new();
+                }
+                if !self.auth_probe_allows_drain().await {
+                    return Vec::new();
+                }
+            }
+        }
 
         let batch: Vec<(PushEvent, JournalCursor)> =
             match self.journal.drain(self.config.batch_size) {
@@ -514,12 +754,49 @@ impl PushClient {
                     | PushOutcome::Merged { .. }
                     | PushOutcome::ConflictMarkers { .. }
                     | PushOutcome::Skipped(_)
+                    // Sync Contract v1 [I47]: ACK on every terminal outcome
+                    // INCLUDING Unauthorized and Forbidden (NACK only on
+                    // NetworkExhausted); [I48]: no retry/backoff on
+                    // 401/403/409/400 within a drain. Acking here does NOT
+                    // lose an UPSERT: the file's hash still differs from the
+                    // shadow, so the next reconciliation pass re-derives the
+                    // push ("hash-mismatch -> Push") once the server accepts
+                    // the token again. A DELETE (or a rename's old path,
+                    // journaled as a delete) acked here is NOT replayed by
+                    // this daemon version; it is WARN-logged per path below. TKT-8fc0b2a4 (A5) adds the auth
+                    // cooldown (armed in process_event) so the drain stands
+                    // down between attempts instead of storming.
                     | PushOutcome::Failed(FailureReason::Unauthorized)
                     | PushOutcome::Failed(FailureReason::Forbidden)
                     | PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
             );
             if should_ack {
                 to_ack.push(cur);
+                // gate-11 M1: an acked 401/403 delete / rename-old-path is
+                // never replayed (reconciliation has no delete concept).
+                if matches!(evt.action, PushAction::Delete)
+                    && matches!(
+                        outcome,
+                        PushOutcome::Failed(FailureReason::Unauthorized)
+                            | PushOutcome::Failed(FailureReason::Forbidden)
+                    )
+                {
+                    tracing::warn!(
+                        path = %evt.path,
+                        "PUSH delete/rename-old-path ACKED under 401/403 and NOT replayed by this daemon version: the server may still hold this path"
+                    );
+                }
+            }
+            // WS-A A3: the server took bytes for this path — it is no longer
+            // a rejected path (whatever it was rejected for, the content that
+            // reached the server now differs).
+            if let Some(l) = &self.rejected_ledger {
+                if matches!(
+                    outcome,
+                    PushOutcome::Sent { .. } | PushOutcome::Merged { .. }
+                ) {
+                    l.clear(&evt.path);
+                }
             }
             // v0.3 tray telemetry — increment on Sent (success) or Failed
             // (NetworkExhausted only; auth/conflict outcomes are explicit
@@ -531,6 +808,14 @@ impl PushClient {
                         PushOutcome::Failed(FailureReason::NetworkExhausted { .. })
                         | PushOutcome::Failed(FailureReason::UpgradeRequired { .. }) => {
                             w.inc_uploads_failed()
+                        }
+                        // WS-A A2: every local I3 refusal is counted.
+                        PushOutcome::Skipped(SkipReason::LocalContractViolation { .. }) => {
+                            w.inc_pushes_refused_local_i3()
+                        }
+                        // WS-A A6: every permanent server rejection is counted.
+                        PushOutcome::Skipped(SkipReason::ServerRejected { .. }) => {
+                            w.inc_pushes_rejected_permanent()
                         }
                         _ => {}
                     }
@@ -548,6 +833,9 @@ impl PushClient {
         if let Some(tray) = &self.tray_state {
             if let Ok(mut w) = tray.write() {
                 w.set_uploads_pending(pending_after);
+                if let Some(l) = &self.rejected_ledger {
+                    w.set_rejected_paths(l.len());
+                }
             }
         }
         // opfix-vaultsync-dormancy (R1+R3): stamp progress whenever the
@@ -696,6 +984,35 @@ impl PushClient {
                 }
             }
         };
+        // WS-A A2: pre-push I3 check. A NUL byte or invalid UTF-8 in the text
+        // lane is refused HERE, with the offset, before any byte is sent: the
+        // server would 422 it, and every re-send of the same bytes would 422
+        // again. Deletes carry no body.
+        if !matches!(evt.action, PushAction::Delete) {
+            if let Some(v) = find_text_contract_violation(&content_bytes) {
+                tracing::warn!(
+                    path = %evt.path,
+                    kind = v.kind,
+                    offset = v.offset,
+                    len = content_bytes.len(),
+                    "push refused locally: content violates the text-lane contract (I3) - not sent, skip + ack"
+                );
+                if let Some(l) = &self.rejected_ledger {
+                    if let Err(e) = l.record(
+                        &evt.path,
+                        &sha256_hex(&content_bytes),
+                        crate::rejected_ledger::STATUS_LOCAL_I3,
+                        &format!("local I3: {} at byte offset {}", v.kind, v.offset),
+                    ) {
+                        tracing::error!(path = %evt.path, error = %e, "rejected_ledger: durable write FAILED - acking anyway (I47); the path is re-queued next pass");
+                    }
+                }
+                return PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                    kind: v.kind,
+                    offset: v.offset,
+                });
+            }
+        }
         let content_b64 = B64.encode(&content_bytes);
 
         // D2/D3 (v0.4.28): the sha of the bytes we ACTUALLY drained and will
@@ -835,6 +1152,9 @@ impl PushClient {
             }
             match self.api.push(&req).await {
                 Ok(resp) => {
+                    // TKT-8fc0b2a4 (A5): any accepted authenticated response
+                    // closes an open auth-failure episode.
+                    self.clear_auth_cooldown();
                     // D2 trigger (v0.4.28, B2'): the server ACCEPTED but its
                     // canonical hash differs from what we sent - it
                     // canonicalized (or region-defended) our bytes. NOT keyed
@@ -957,10 +1277,15 @@ impl PushClient {
                     }
                     return map_response(resp);
                 }
+                // TKT-8fc0b2a4 (A5): arm the bounded auth cooldown (the
+                // drain stands down, probes, resumes); the caller acks the
+                // entry per I47 and reconciliation re-derives the edit.
                 Err(ApiError::Unauthorized) => {
+                    self.arm_auth_cooldown(401, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Unauthorized);
                 }
                 Err(ApiError::Forbidden) => {
+                    self.arm_auth_cooldown(403, &evt.path, true);
                     return PushOutcome::Failed(FailureReason::Forbidden);
                 }
                 Err(ApiError::Conflict { expected_hash }) => {
@@ -1030,13 +1355,31 @@ impl PushClient {
                 // can never succeed. Before this arm, 422 fell into the generic
                 // transient arm -> 5 retries -> NetworkExhausted -> NOT acked ->
                 // journal-wedged, retried every drain tick forever.
-                Err(ApiError::Server(status @ (400 | 422))) => {
-                    tracing::info!(
+                // WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): the server names the
+                // cause in its body on every 400/422; it is carried here as
+                // `reason=` so a permanent rejection is never silent again
+                // (Trinity: 215 reason-less lines/day for 3 paths).
+                Err(ApiError::Rejected { status, detail }) => {
+                    tracing::warn!(
                         path = %evt.path,
                         status,
+                        reason = %detail,
                         "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
-                    return PushOutcome::Skipped(SkipReason::ServerRejected { status });
+                    // WS-A A3: bind the rejection to the exact bytes so the
+                    // reconciliation backstop stops re-queueing them. ORDER
+                    // (AR-015): server response -> ledger row written DURABLY
+                    // (this call persists atomically before returning) -> the
+                    // caller (drain_once) acks the journal cursor. A failed
+                    // write is an ERROR and the entry is still acked: I47
+                    // requires the ack, and the path simply re-queues next
+                    // pass (the pre-existing behaviour, not a storm).
+                    if let Some(l) = &self.rejected_ledger {
+                        if let Err(e) = l.record(&evt.path, &drained_sha, status, &detail) {
+                            tracing::error!(path = %evt.path, status, error = %e, "rejected_ledger: durable write FAILED - acking anyway (I47); the path is re-queued next pass");
+                        }
+                    }
+                    return PushOutcome::Skipped(SkipReason::ServerRejected { status, detail });
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -1658,6 +2001,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
+}
+
+/// WS-A A2: the first text-lane contract (I3) violation found in `bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextContractViolation {
+    /// `"nul"` (a 0x00 byte) or `"utf8"` (an invalid UTF-8 sequence).
+    pub kind: &'static str,
+    /// Byte offset of the violation: the NUL's index, or the index at which
+    /// the UTF-8 decoder first failed (`Utf8Error::valid_up_to`).
+    pub offset: usize,
+}
+
+/// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): scan text-lane content for the
+/// Sync Contract I3 obligations the server enforces with a 422: no NUL byte,
+/// valid UTF-8. Returns the EARLIEST violation by offset (a NUL inside an
+/// otherwise valid file reports as `nul`; a NUL after a bad sequence reports
+/// the bad sequence). `None` means the bytes are sendable.
+pub fn find_text_contract_violation(bytes: &[u8]) -> Option<TextContractViolation> {
+    let nul = bytes.iter().position(|b| *b == 0);
+    let utf8 = std::str::from_utf8(bytes).err().map(|e| e.valid_up_to());
+    match (nul, utf8) {
+        (None, None) => None,
+        (Some(n), None) => Some(TextContractViolation {
+            kind: "nul",
+            offset: n,
+        }),
+        (None, Some(u)) => Some(TextContractViolation {
+            kind: "utf8",
+            offset: u,
+        }),
+        (Some(n), Some(u)) => {
+            if n <= u {
+                Some(TextContractViolation {
+                    kind: "nul",
+                    offset: n,
+                })
+            } else {
+                Some(TextContractViolation {
+                    kind: "utf8",
+                    offset: u,
+                })
+            }
+        }
+    }
 }
 
 struct FrontmatterEnd {
@@ -2691,10 +3078,12 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -2723,10 +3112,12 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -2751,10 +3142,12 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -2778,10 +3171,12 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -3005,8 +3400,11 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
             outcomes[0].1,
-            PushOutcome::Skipped(SkipReason::ServerRejected { status: 422 }),
-            "422 must be a permanent ServerRejected skip"
+            PushOutcome::Skipped(SkipReason::ServerRejected {
+                status: 422,
+                detail: "content is not valid UTF-8".to_string(),
+            }),
+            "422 must be a permanent ServerRejected skip carrying the server's detail"
         );
         // Acked: the journal entry is consumed, never retried.
         assert_eq!(
@@ -3015,6 +3413,447 @@ mod tests {
             "422 outcome must be acked (journal drained)"
         );
         m.assert_async().await; // exactly one HTTP attempt
+    }
+
+    /// WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): a 400 carries the server's
+    /// `detail` into the skip reason. A mutation that drops the detail (empty
+    /// string, or the status-only variant) fails this assertion.
+    #[tokio::test]
+    async fn test_400_server_rejected_carries_detail() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/Untitled 1.canvas", b"{}")]);
+        let tray: crate::tray_state::SharedTrayState =
+            Arc::new(std::sync::RwLock::new(crate::tray_state::TrayState::new(
+                "sub-test".into(),
+                srv.url(),
+                PathBuf::from("/nonexistent-vault-root"),
+            )));
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_tray_state(tray.clone())
+            .with_rejected_ledger(ledger);
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PushOutcome::Skipped(SkipReason::ServerRejected { status, detail }) => {
+                assert_eq!(*status, 400);
+                assert_eq!(detail, "invalid path", "the server's detail must survive");
+            }
+            other => panic!("expected ServerRejected, got {other:?}"),
+        }
+        // WS-A A6: counted, and the ledger gauge reflects the one rejected path.
+        let h = tray.read().unwrap().push_health();
+        assert_eq!(h.pushes_rejected_permanent, 1);
+        assert_eq!(h.rejected_paths, 1);
+        assert_eq!(
+            journal.len(),
+            0,
+            "400 outcome must be acked (journal drained)"
+        );
+        m.assert_async().await;
+    }
+
+    // ---- WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): pre-push I3 check ----
+
+    /// Positive controls for the scanner: a NUL at offset 0, at the last byte,
+    /// and at a known interior offset; invalid UTF-8 at its decode offset; a
+    /// clean fixture is `None`.
+    #[test]
+    fn i3_scanner_positive_controls() {
+        assert_eq!(find_text_contract_violation(b"clean text\n"), None);
+        assert_eq!(find_text_contract_violation(b""), None);
+        assert_eq!(
+            find_text_contract_violation(b"\0abc"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 0
+            })
+        );
+        assert_eq!(
+            find_text_contract_violation(b"abc\0"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 3
+            })
+        );
+        let mut fx = b"---\ntitle: x\n---\nbody ".to_vec();
+        let at = fx.len();
+        fx.push(0);
+        fx.extend_from_slice(b" tail\n");
+        assert_eq!(
+            find_text_contract_violation(&fx),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: at
+            })
+        );
+        // Invalid UTF-8: a lone continuation byte after 5 valid bytes.
+        assert_eq!(
+            find_text_contract_violation(b"hello\x80world"),
+            Some(TextContractViolation {
+                kind: "utf8",
+                offset: 5
+            })
+        );
+        // Both present: the earliest by offset wins.
+        assert_eq!(
+            find_text_contract_violation(b"ab\x80cd\0"),
+            Some(TextContractViolation {
+                kind: "utf8",
+                offset: 2
+            })
+        );
+        assert_eq!(
+            find_text_contract_violation(b"a\0b\x80"),
+            Some(TextContractViolation {
+                kind: "nul",
+                offset: 1
+            })
+        );
+        // Multi-byte valid UTF-8 is fine.
+        assert_eq!(find_text_contract_violation("héllo — ✓".as_bytes()), None);
+    }
+
+    /// A fixture with exactly one NUL at a known offset is refused with that
+    /// offset, NOTHING is sent (the push mock expects 0 calls), the journal
+    /// entry is acked, and the tray counter is incremented.
+    #[tokio::test]
+    async fn i3_nul_fixture_is_refused_with_offset_and_nothing_sent() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let mut fx = b"---\ntitle: x\n---\nbody ".to_vec();
+        let at = fx.len();
+        fx.push(0);
+        fx.extend_from_slice(b" tail\n");
+        let (_d, journal) = make_journal_with(vec![evt("notes/nul.md", &fx)]);
+        let tray: crate::tray_state::SharedTrayState =
+            Arc::new(std::sync::RwLock::new(crate::tray_state::TrayState::new(
+                "sub-test".into(),
+                srv.url(),
+                PathBuf::from("/nonexistent-vault-root"),
+            )));
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_tray_state(tray.clone());
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                kind: "nul",
+                offset: at
+            }),
+            "the NUL must be refused with its exact offset"
+        );
+        assert_eq!(journal.len(), 0, "a refused push is acked, never retried");
+        assert_eq!(tray.read().unwrap().pushes_refused_local_i3, 1);
+        m.assert_async().await;
+    }
+
+    /// Invalid UTF-8 is the second I3 violation class: refused with kind
+    /// `utf8` at the decoder's failure offset, nothing sent.
+    #[tokio::test]
+    async fn i3_invalid_utf8_fixture_is_refused() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/bad.md", b"ok\xff\xfe")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert_eq!(
+            outcomes[0].1,
+            PushOutcome::Skipped(SkipReason::LocalContractViolation {
+                kind: "utf8",
+                offset: 2
+            })
+        );
+        assert_eq!(journal.len(), 0);
+        m.assert_async().await;
+    }
+
+    /// Negative control: a clean fixture goes through the check untouched and
+    /// is pushed exactly once.
+    #[tokio::test]
+    async fn i3_clean_fixture_is_pushed() {
+        let body = b"---\ntitle: x\n---\nclean body\n";
+        let sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&sha))
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/clean.md", body)]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "clean content must be sent, got {:?}",
+            outcomes[0].1
+        );
+        m.assert_async().await;
+    }
+
+    // ---- WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4): rejected ledger ----
+
+    /// A 400 records (path, sha of the sent bytes, status, reason); a second
+    /// rejection of the same bytes bumps the count.
+    #[tokio::test]
+    async fn server_rejected_records_rejected_ledger_entry() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(2)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let body = b"{}";
+        let (_d, journal) = make_journal_with(vec![evt("notes/Untitled 1.canvas", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        client.drain_once().await;
+        let e = ledger.get("notes/Untitled 1.canvas").expect("ledgered");
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert_eq!(e.status, 400);
+        assert_eq!(e.reason, "invalid path");
+        assert_eq!(e.count, 1);
+        journal
+            .append(evt("notes/Untitled 1.canvas", body))
+            .unwrap();
+        client.drain_once().await;
+        assert_eq!(ledger.get("notes/Untitled 1.canvas").unwrap().count, 2);
+        assert_eq!(ledger.len(), 1);
+    }
+
+    /// A local I3 refusal is ledgered with status 0 and the sha of the bytes
+    /// that would have been sent.
+    #[tokio::test]
+    async fn local_i3_refusal_records_ledger_entry_with_status_zero() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .create_async()
+            .await;
+        let body = b"a\0b";
+        let (_d, journal) = make_journal_with(vec![evt("notes/nul.md", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        client.drain_once().await;
+        let e = ledger.get("notes/nul.md").expect("ledgered");
+        assert_eq!(e.status, crate::rejected_ledger::STATUS_LOCAL_I3);
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert!(
+            e.reason.contains("nul") && e.reason.contains("offset 1"),
+            "{}",
+            e.reason
+        );
+    }
+
+    /// An accepted push clears the path from the ledger.
+    #[tokio::test]
+    async fn sent_clears_rejected_ledger_entry() {
+        let body = b"fixed content\n";
+        let sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&sha))
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        ledger
+            .record("notes/a.md", "old-rejected-sha", 400, "invalid path")
+            .unwrap();
+        ledger.record("notes/other.md", "x", 422, "nul").unwrap();
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "{:?}",
+            out[0].1
+        );
+        assert!(
+            ledger.get("notes/a.md").is_none(),
+            "Sent must clear the path"
+        );
+        assert_eq!(ledger.len(), 1, "other paths untouched");
+    }
+
+    /// AR-015 (d): a ledger persistence failure logs ERROR and the rejection
+    /// is STILL acked (I47) — the path simply re-queues next pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ledger_persist_failure_still_acks_the_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let ldir = TempDir::new().unwrap();
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::load(
+            &crate::state_io::StateDir::for_test_scoped(
+                ldir.path(),
+                crate::state_io::Scope::ConfigDir,
+            ),
+        ));
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"{}")]);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        // The atomic replace cannot create its temp file in a read-only dir.
+        std::fs::set_permissions(ldir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let out = client.drain_once().await;
+        std::fs::set_permissions(ldir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(
+                out[0].1,
+                PushOutcome::Skipped(SkipReason::ServerRejected { status: 400, .. })
+            ),
+            "{:?}",
+            out[0].1
+        );
+        assert_eq!(
+            journal.len(),
+            0,
+            "still acked (I47) despite the ledger write failure"
+        );
+        assert!(ledger.get("notes/a.md").is_some(), "row kept in memory");
+    }
+
+    /// AR-015 (f): ordering is server response -> durable ledger row -> ack. A
+    /// crash injected between the ledger write and the ack (the event is
+    /// processed, the cursor never acked) leaves the row on disk: after a
+    /// "restart" (fresh ledger loaded from the same dir) the next
+    /// reconciliation pass does NOT queue the path, and the journaled event
+    /// replays exactly once (no storm).
+    #[tokio::test]
+    async fn crash_between_ledger_write_and_ack_leaves_entry_present() {
+        let mut srv = Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .expect(2)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let rel = "notes/Untitled 1.canvas";
+        let body = b"{}";
+        let vault = TempDir::new().unwrap();
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join(rel), body).unwrap();
+        let ldir = TempDir::new().unwrap();
+        let ledger_sd = || {
+            crate::state_io::StateDir::for_test_scoped(
+                ldir.path(),
+                crate::state_io::Scope::ConfigDir,
+            )
+        };
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::load(&ledger_sd()));
+        let (_d, journal) = make_journal_with(vec![evt(rel, body)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+
+        // Process the event WITHOUT the drain fold => ledger written, no ack.
+        let (events, _cursors): (Vec<PushEvent>, Vec<JournalCursor>) =
+            journal.drain(8).unwrap().into_iter().unzip();
+        let out = client.process_event(&events[0]).await;
+        assert!(matches!(
+            out,
+            PushOutcome::Skipped(SkipReason::ServerRejected { .. })
+        ));
+        assert_eq!(
+            journal.len(),
+            1,
+            "crash before ack: the cursor is still journaled"
+        );
+        drop(client);
+        drop(ledger);
+
+        // "Restart": the row is on disk.
+        let ledger2 = Arc::new(crate::rejected_ledger::RejectedLedger::load(&ledger_sd()));
+        let e = ledger2.get(rel).expect("entry survives the crash");
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert_eq!(e.status, 400);
+
+        // Next reconciliation pass does NOT queue the path.
+        let _recon = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"deltas":[{{"path":"{rel}","state":"missing-on-server"}}]}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let api = Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap());
+        let vr = crate::verify_repair::VerifyRepair::new(
+            vault.path().to_path_buf(),
+            Arc::clone(&api),
+            journal.clone(),
+            "dev-test".into(),
+            crate::verify_repair::VerifyRepairConfig::default(),
+        )
+        .with_rejected_ledger(Arc::clone(&ledger2));
+        let report = vr.run().await.unwrap();
+        assert_eq!(
+            report.modify_count, 0,
+            "ledgered bytes are not re-queued after the restart"
+        );
+        assert_eq!(report.rejected_skipped_count, 1);
+        assert_eq!(
+            journal.len(),
+            1,
+            "only the pre-crash journaled event remains"
+        );
+
+        // The surviving journaled event replays exactly once and is acked.
+        let client2 =
+            make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+                .await
+                .with_rejected_ledger(Arc::clone(&ledger2));
+        let out = client2.drain_once().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(journal.len(), 0);
+        assert_eq!(ledger2.get(rel).unwrap().count, 2);
+        push.assert_async().await; // 1 pre-crash + 1 replay; no storm
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
@@ -3366,6 +4205,200 @@ mod tests {
         m.assert_async().await;
     }
 
+    /// TKT-8fc0b2a4 (A5) + Sync Contract I47/I48: a 401 is a terminal
+    /// outcome - the entry is ACKED (journal len 0, no retry inside the
+    /// drain) - and the drain then STANDS DOWN: three ticks under the
+    /// cooldown make no network call and the journal does not grow. At
+    /// expiry one health probe decides: a 401 probe re-arms (still failed);
+    /// a 200 probe clears the episode. Nothing is lost: see the companion
+    /// test for reconciliation re-deriving the acked edit.
+    #[tokio::test]
+    async fn auth_failure_acks_per_i47_stands_down_and_probe_decides() {
+        let mut srv = Server::new_async().await;
+        let m_push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", b"hello")]);
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_auth_backoff(Duration::from_millis(120), Duration::from_millis(120));
+        assert_eq!(journal.len(), 1);
+
+        // Tick 1: 401 -> Failed(Unauthorized), acked per I47, cooldown armed.
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Unauthorized)
+        ));
+        assert_eq!(journal.len(), 0, "I47: a 401 is terminal and acked");
+        assert!(client.auth_failed());
+
+        // Ticks 2-4 (inside the cooldown): no network, journal does not grow.
+        for i in 0..3 {
+            let outcomes = client.drain_once().await;
+            assert!(
+                outcomes.is_empty(),
+                "cooldown tick {i} must make no attempt"
+            );
+            assert_eq!(journal.len(), 0, "the journal must not grow under cooldown");
+        }
+        m_push.assert_async().await; // exactly ONE push attempt so far
+
+        // Expiry: the probe answers 401 -> re-armed, still failed, no push.
+        let m_probe_401 = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert!(client.drain_once().await.is_empty());
+        assert!(client.auth_failed(), "a 401 probe keeps the episode open");
+        m_probe_401.assert_async().await;
+        m_push.assert_async().await; // still ONE push attempt
+
+        // Next expiry: the probe answers 200 -> the episode closes.
+        let m_probe_200 = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_body(
+                r#"{"subscriber_id":"x","scope_roots":[],"scope_excludes":[],"materializer_mode":"live","shadow_path":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        let outcomes = client.drain_once().await;
+        assert!(outcomes.is_empty(), "nothing journaled yet: {outcomes:?}");
+        assert!(!client.auth_failed(), "a 200 probe closes the auth episode");
+        m_probe_200.assert_async().await;
+        m_push.assert_async().await; // the drain made no push on an empty journal
+    }
+
+    /// TKT-8fc0b2a4 (A5): the edit acked on the 401 is NOT lost. After the
+    /// probe clears the cooldown, a reconciliation pass sees the file's hash
+    /// differ from the shadow (shadow == server hash => genuine local edit),
+    /// re-queues the path, and the next drain Sends it.
+    #[tokio::test]
+    async fn after_probe_200_reconciliation_requeues_the_acked_edit_and_it_is_sent() {
+        use crate::sync_shadow::ShadowStore;
+        use crate::verify_repair::{VerifyRepair, VerifyRepairConfig};
+
+        let vault = TempDir::new().unwrap();
+        let rel = "notes/a.md";
+        let body = b"alpha-local";
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join(rel), body).unwrap();
+
+        let mut srv = Server::new_async().await;
+        let m_push_401 = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt(rel, body)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_auth_backoff(Duration::from_millis(100), Duration::from_millis(100));
+
+        // The 401: acked per I47, episode open.
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Unauthorized)
+        ));
+        assert_eq!(journal.len(), 0);
+        m_push_401.assert_async().await;
+
+        // Credentials recover: the probe answers 200 and the gate clears.
+        let _m_health = srv
+            .mock("GET", "/api/sync/health")
+            .with_status(200)
+            .with_body(
+                r#"{"subscriber_id":"x","scope_roots":[],"scope_excludes":[],"materializer_mode":"live","shadow_path":null}"#,
+            )
+            .create_async()
+            .await;
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        assert!(client.drain_once().await.is_empty());
+        assert!(!client.auth_failed());
+
+        // Reconciliation: local differs from the server ("drift"); the shadow
+        // equals the server's current hash, so the difference is a genuine
+        // local edit and the path is re-queued as a push.
+        let _m_recon = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"notes/a.md","state":"drift","server_hash":"deadbeef"}]}"#,
+            )
+            .create_async()
+            .await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ));
+        shadow.record(rel, "deadbeef");
+        let vr = VerifyRepair::new(
+            vault.path().to_path_buf(),
+            Arc::new(ApiClient::new(&srv.url(), "vsk_test").unwrap()),
+            journal.clone(),
+            "dev-test".into(),
+            VerifyRepairConfig::default(),
+        )
+        .with_shadow(shadow);
+        let report = vr.run().await.unwrap();
+        assert_eq!(report.modify_count, 1, "reconciliation re-derived the edit");
+        assert_eq!(journal.len(), 1, "the acked edit is back in the journal");
+
+        // The server accepts: the re-derived edit is Sent.
+        let m_push_200 = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","content_hash":"deadbeef"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].1, PushOutcome::Sent { .. }),
+            "expected Sent after recovery, got {:?}",
+            outcomes[0].1
+        );
+        assert_eq!(journal.len(), 0);
+        m_push_200.assert_async().await;
+    }
+
+    /// TKT-8fc0b2a4 (A5): 403 (subscriber revoked) takes the same path as
+    /// 401 - acked per I47, cooldown armed, the next tick makes no call.
+    #[tokio::test]
+    async fn forbidden_acks_and_arms_cooldown() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/b.md", b"hello")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+        let outcomes = client.drain_once().await;
+        assert!(matches!(
+            outcomes[0].1,
+            PushOutcome::Failed(FailureReason::Forbidden)
+        ));
+        assert_eq!(journal.len(), 0, "I47: a 403 is terminal and acked");
+        assert!(client.auth_failed());
+        // Production cooldown (30 s): the next tick is suppressed, no network.
+        assert!(client.drain_once().await.is_empty());
+        m.assert_async().await;
+    }
+
     #[test]
     fn retry_backoff_capped_at_max_backoff_ms() {
         // initial=500 max=60_000 — at attempt=20, 500 * 2^20 = 524_288_000
@@ -3570,10 +4603,12 @@ mod tests {
             read_receipt_store: None,
             sync_health: None,
             gate_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            auth_gate: Arc::new(std::sync::Mutex::new(AuthGate::default())),
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
