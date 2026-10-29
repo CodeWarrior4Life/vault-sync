@@ -149,7 +149,13 @@ pub enum ApiError {
     #[error("server error: HTTP {0}")]
     Server(u16),
     /// WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): HTTP 400 or 422 on push. A
-    /// PERMANENT rejection: re-sending the same bytes can never succeed. The
+    /// PERMANENT rejection: re-sending the same bytes can never succeed.
+    /// R1 (gate-11 on PR #46, TKT-2eb6f5bf): ALSO an HTTP 403 whose body
+    /// names a server-side POLICY rather than the credential — a read-only
+    /// or shadow-mode subscriber on push, a path outside the subscriber's
+    /// scope on `/note` — see [`forbidden_is_permanent_policy`]. Those are
+    /// permanent for this path under this subscriber; retrying cannot pass
+    /// and the token is VALID, so they must never open an auth episode. The
     /// server names the cause in its body on every such raise (FastAPI
     /// `{"detail": "..."}`); `detail` is that field, or the raw body when the
     /// body is not JSON, capped at [`REJECTED_DETAIL_CAP`] chars. A 4xx error
@@ -490,7 +496,10 @@ impl ApiClient {
             // instead of the opaque "error decoding response body".
             StatusCode::OK => decode_json(resp, "fetch_note").await,
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
-            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+            // R1: "path outside subscriber scope" (a reserved key served to a
+            // bare-route subscriber) is a per-path policy refusal with a valid
+            // token - carried as a permanent rejection, never an auth failure.
+            StatusCode::FORBIDDEN => Err(classify_forbidden(resp).await),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound(path.to_string())),
             StatusCode::SERVICE_UNAVAILABLE => {
                 let retry = resp
@@ -737,7 +746,12 @@ impl ApiClient {
                 })
             }
             StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
-            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+            // R1: a 403 is an auth failure ONLY when the server did not name a
+            // policy. "subscriber is read-only" / "shadow-mode" are per-
+            // subscriber write policies: the token is valid, the push can
+            // never pass, so it is the permanent-reject class (ledger + WARN +
+            // ack), never a cooldown/auth episode.
+            StatusCode::FORBIDDEN => Err(classify_forbidden(resp).await),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound(req.path.to_string())),
             StatusCode::SERVICE_UNAVAILABLE => {
                 let retry = resp
@@ -771,6 +785,44 @@ impl ApiClient {
             }
             s => Err(ApiError::Server(s.as_u16())),
         }
+    }
+}
+
+/// R1 (gate-11 on PR #46, TKT-2eb6f5bf): the server's 403 `detail` strings
+/// that name a POLICY, not the credential. Each is the exact prefix of the
+/// `HTTPException(status_code=403, detail=...)` raised in Nexus
+/// `sync_routes_p1.py` (`/push`: read-only, shadow-mode; `/note`: scope).
+/// Matched as prefixes so a server that appends context (e.g. the path)
+/// still classifies. Anything else on a 403 — "Device revoked", an empty
+/// body, a proxy page — stays [`ApiError::Forbidden`] = the auth episode.
+pub const FORBIDDEN_POLICY_DETAILS: &[&str] = &[
+    "subscriber is read-only",
+    "subscriber is shadow-mode",
+    "path outside subscriber scope",
+];
+
+/// R1: true iff a 403 `detail` names a server-side policy (see
+/// [`FORBIDDEN_POLICY_DETAILS`]) rather than a rejected credential.
+pub fn forbidden_is_permanent_policy(detail: &str) -> bool {
+    let d = detail.trim();
+    FORBIDDEN_POLICY_DETAILS.iter().any(|p| d.starts_with(p))
+}
+
+/// R1: read a 403 body and classify it — a named policy becomes
+/// `Rejected { status: 403, detail }` (the permanent per-path class); any
+/// other 403 is `Forbidden` (the credential was rejected). A body that
+/// cannot be read is treated as empty = `Forbidden` (fail toward the loud,
+/// bounded path, never toward silently ledgering a revoked token).
+async fn classify_forbidden(resp: reqwest::Response) -> ApiError {
+    let body = resp.text().await.unwrap_or_default();
+    let detail = rejection_detail(&body);
+    if forbidden_is_permanent_policy(&detail) {
+        ApiError::Rejected {
+            status: 403,
+            detail,
+        }
+    } else {
+        ApiError::Forbidden
     }
 }
 
@@ -810,6 +862,31 @@ pub fn rejection_detail(body: &str) -> String {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// R1: the three policy details classify as permanent; the credential
+    /// details (and junk) do not. Exact strings from Nexus sync_routes*.py.
+    #[test]
+    fn forbidden_policy_classifier_matches_server_details_only() {
+        assert!(forbidden_is_permanent_policy("subscriber is read-only"));
+        assert!(forbidden_is_permanent_policy(
+            "subscriber is shadow-mode (observer); pushes not accepted"
+        ));
+        assert!(forbidden_is_permanent_policy(
+            "path outside subscriber scope"
+        ));
+        assert!(
+            forbidden_is_permanent_policy("  subscriber is read-only\n"),
+            "whitespace-tolerant"
+        );
+        assert!(!forbidden_is_permanent_policy("Device revoked"));
+        assert!(!forbidden_is_permanent_policy(
+            "Device is frozen (read-only)"
+        ));
+        assert!(!forbidden_is_permanent_policy("admin auth required"));
+        assert!(!forbidden_is_permanent_policy("<empty body>"));
+        assert!(!forbidden_is_permanent_policy(""));
+        assert!(!forbidden_is_permanent_policy("<html>403 Forbidden</html>"));
+    }
 
     /// WS-A A1: the reason extractor handles every body shape the server sends.
     #[test]
