@@ -737,10 +737,13 @@ impl PushClient {
             return PushOutcome::Skipped(SkipReason::IdenticalToServer { hash: drained_sha });
         }
         // R2: this push (or delete) is about to change what the server holds;
-        // until a response proves otherwise, local == server is unknown.
-        if let Some(sh) = &self.shadow_store {
-            sh.forget_received(&evt.path);
-        }
+        // until a response proves otherwise, local == server is unknown. Keep
+        // the generation: the Accepted handler may re-note only if nothing
+        // (an SSE soft_delete, a materialize) touched the path meanwhile.
+        let push_gen: Option<u64> = self
+            .shadow_store
+            .as_ref()
+            .and_then(|sh| sh.forget_received(&evt.path));
 
         // I29 (S513, TKT-2dc9a17e): backfill the CAS base from the shadow store.
         //
@@ -894,12 +897,18 @@ impl PushClient {
                             // server now holds them: re-note the ledger so a
                             // later FS event for these same bytes is not
                             // re-sent. Merged / canonicalized / deletes: the
-                            // entry stays forgotten.
+                            // entry stays forgotten. Review M-B: only if the
+                            // path's generation is unchanged since this push's
+                            // own clear - an SSE soft_delete (or materialize)
+                            // that landed while our response was in flight
+                            // wins, so a gone file is never re-armed.
                             if matches!(resp.status, PushStatus::Accepted)
                                 && !matches!(evt.action, PushAction::Delete)
                                 && h == drained_sha
                             {
-                                sh.note_received(&evt.path, &drained_sha);
+                                if let Some(g) = push_gen {
+                                    sh.note_received_if_unchanged(&evt.path, &drained_sha, g);
+                                }
                             }
                         }
                     }
@@ -4961,6 +4970,79 @@ mod tests {
             matches!(out[1].1, PushOutcome::Sent { .. }),
             "re-create got {:?}",
             out[1].1
+        );
+        m.assert_async().await;
+    }
+
+    /// Review M-B (TKT-406f6cb3): our push of X is in flight; the server
+    /// accepts it, then another device deletes P and the SSE soft_delete runs
+    /// HERE (clearing the received mark, moving the file aside) BEFORE our HTTP
+    /// response is processed. The Accepted handler must NOT re-arm the gate
+    /// with X for a file that is gone (server tombstoned) - otherwise the
+    /// user's byte-identical restore of X is dropped and reconcile soft-deletes
+    /// it. The interleaving is real: mockito runs the body callback after the
+    /// request arrives and before the client sees the response. FAILS without
+    /// the generation check.
+    #[tokio::test]
+    async fn r2_mb_soft_delete_racing_accepted_response_does_not_rearm_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let vault = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = r2_shadow(&sdir);
+        let rel = "notes/raced-delete.md";
+        let x = b"local edit X\n";
+        let abs = vault.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, x).unwrap();
+
+        let first = Arc::new(AtomicBool::new(true));
+        let (sh_cb, abs_cb, first_cb) = (shadow.clone(), abs.clone(), first.clone());
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                if first_cb.swap(false, Ordering::SeqCst) {
+                    // The SSE soft_delete of P lands mid-flight.
+                    sh_cb.forget_received("notes/raced-delete.md");
+                    let _ = std::fs::remove_file(&abs_cb);
+                }
+                R2_ACCEPT.as_bytes().to_vec()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+
+        let (_d, journal) = make_journal_with(vec![r2_watcher_evt(rel, PushAction::Modify, x)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_shadow_store(shadow.clone());
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "got {:?}",
+            out[0].1
+        );
+        assert!(
+            !abs.exists(),
+            "precondition: the file was soft-deleted mid-flight"
+        );
+        assert_eq!(
+            shadow.received(rel),
+            None,
+            "a stale Accepted response must not re-arm the gate for a deleted file"
+        );
+
+        // The user restores byte-identical X: it must be sent.
+        std::fs::write(&abs, x).unwrap();
+        journal
+            .append(r2_watcher_evt(rel, PushAction::Modify, x))
+            .unwrap();
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "identical restore after a raced server delete must be sent, got {:?}",
+            out[0].1
         );
         m.assert_async().await;
     }

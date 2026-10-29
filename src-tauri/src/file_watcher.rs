@@ -1136,6 +1136,16 @@ impl FileWatcher {
                 // (TKT-c3605db8), which must be invisible to the valve and
                 // never re-pushed.
                 if let WatchEvent::Deleted { path } = &allowed {
+                    // R2 review M-A (TKT-406f6cb3): the file is gone, whoever
+                    // deleted it, so its enqueue-dedup entry is void. Cleared
+                    // BEFORE the soft-delete-echo early return: pre-fix only
+                    // the user-delete path reached the clear further down, so
+                    // after a SERVER delete the stale entry (== shadow) made the
+                    // dedup drop a byte-identical restore before it was ever
+                    // journaled, and reconcile then soft-deleted the restore.
+                    if let Ok(mut m) = self.enqueued_hashes.lock() {
+                        m.remove(path);
+                    }
                     if self.consume_delete_echo(path) {
                         tracing::debug!(
                             "file_watcher: skipping materializer soft-delete echo for {path} (not counted toward delete-burst, not re-pushed)"
@@ -1914,7 +1924,16 @@ mod tests {
         w.handle_fs_path(&abs).await; // Create(File)
         w.handle_fs_path(&abs).await; // Modify(Name(Any))
 
+        // Review LOW-7: the scenario must actually exercise the drain - the
+        // one-shot guard eats event 1, the D6 dedup cannot recognise a server
+        // write, so event 2 IS journaled. Without this the test would pass
+        // vacuously if nothing reached the journal.
+        assert!(
+            !w.journal.is_empty(),
+            "precondition: the second FS event reached the journal"
+        );
         let out = client.drain_once().await;
+        assert!(!out.is_empty(), "at least one echo ref reached the drain");
         for (_, o) in &out {
             assert!(
                 matches!(
@@ -2022,6 +2041,73 @@ mod tests {
             matches!(out[1].1, crate::push_client::PushOutcome::Sent { .. }),
             "the restore must be sent, got {:?}",
             out[1].1
+        );
+        push.assert_async().await;
+    }
+
+    /// Review M-A (TKT-406f6cb3): a SERVER-side delete of an EXISTING file,
+    /// then a byte-identical user restore. The file was previously pushed by
+    /// this watcher (enqueued_hashes[p] == R) and accepted (shadow == R). The
+    /// materializer's soft_delete records a delete echo; the watcher consumes
+    /// it and returned BEFORE clearing the dedup entry, so the restore event
+    /// matched entry == R && shadow == R and was dropped before the journal -
+    /// the drain gate never ran and reconcile later soft-deleted the restore.
+    /// The restore must be journaled AND sent. FAILS without the M-A clear.
+    #[tokio::test]
+    async fn r2_ma_server_delete_then_identical_restore_is_journaled_and_sent() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let (w, guard, shadow) = r2_wired_watcher(&dir, &sdir);
+        let m = r2_materializer(&dir, &ws, &guard, &shadow);
+        let mut srv = mockito::Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(R2_ACCEPT)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = r2_push_client(&srv.url(), &w, &dir, &shadow);
+
+        let rel = "01_Notes/server-deleted.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let r = b"authored here, then deleted on another host\n";
+        // 1. A local edit, pushed and accepted: enqueued_hashes[p] = R, shadow = R.
+        std::fs::write(&abs, r).unwrap();
+        w.handle_fs_path(&abs).await;
+        let out = client.drain_once().await;
+        assert!(matches!(
+            out[0].1,
+            crate::push_client::PushOutcome::Sent { .. }
+        ));
+        assert_eq!(
+            shadow.get(rel),
+            Some(sha256_hex(r)),
+            "precondition: shadow == R"
+        );
+
+        // 2. Another host deletes P: the SSE soft_delete moves the file aside
+        //    and records a delete echo; the watcher consumes the echo.
+        m.soft_delete(rel).unwrap();
+        assert!(!abs.exists());
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.len(), 0, "the delete echo is not re-pushed");
+
+        // 3. The user restores byte-identical bytes.
+        std::fs::write(&abs, r).unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.len(),
+            1,
+            "a restore after a SERVER delete must reach the journal"
+        );
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, crate::push_client::PushOutcome::Sent { .. }),
+            "and must be sent, got {:?}",
+            out[0].1
         );
         push.assert_async().await;
     }

@@ -351,7 +351,15 @@ pub struct ShadowStore {
     /// on purpose on several paths (failed ack-align rewrite, non-accepted
     /// delete) and lags the server, so a shadow-keyed gate swallows genuine
     /// reverts. Lost on restart => the gate fails OPEN (an idempotent push).
-    received: Mutex<HashMap<String, String>>,
+    received: Mutex<HashMap<String, ReceivedMark>>,
+}
+
+/// R2 (TKT-406f6cb3): one received-ledger entry. `gen` is bumped by every
+/// clear and every materializer note (review M-B).
+#[derive(Debug, Default)]
+struct ReceivedMark {
+    sha: Option<String>,
+    gen: u64,
 }
 
 /// R7 (TKT-166e1c07, 2026-07-18 trinity incident): detect the misconfiguration
@@ -549,19 +557,49 @@ impl ShadowStore {
 
     /// R2 (TKT-406f6cb3): mark that the local file at `path` now holds exactly
     /// the server's bytes `sha` (see the `received` field). In-memory only.
+    ///
+    /// Bumps the path's generation: a materializer write supersedes whatever
+    /// an in-flight push was about to conclude (review M-B).
     pub fn note_received(&self, path: &str, sha: &str) {
         let key = self.canon_key(path);
         if let Ok(mut m) = self.received.lock() {
-            m.insert(key, sha.to_string());
+            let e = m.entry(key).or_default();
+            e.gen = e.gen.wrapping_add(1);
+            e.sha = Some(sha.to_string());
         }
     }
 
     /// R2: forget the received mark for `path` (anything that may make "local
-    /// == server" untrue: a push leaving the host, any delete).
-    pub fn forget_received(&self, path: &str) {
+    /// == server" untrue: a push leaving the host, any delete). Bumps and
+    /// returns the path's generation; a push keeps it to prove, when its
+    /// response arrives, that nothing (a soft-delete, a materialize) touched
+    /// the path in between (review M-B). A poisoned lock returns `None`.
+    pub fn forget_received(&self, path: &str) -> Option<u64> {
         let key = self.canon_key(path);
-        if let Ok(mut m) = self.received.lock() {
-            m.remove(&key);
+        let mut m = self.received.lock().ok()?;
+        let e = m.entry(key).or_default();
+        e.gen = e.gen.wrapping_add(1);
+        e.sha = None;
+        Some(e.gen)
+    }
+
+    /// R2 review M-B: note `sha` as received ONLY if the path's generation is
+    /// still `gen` (the value the caller's own `forget_received` returned).
+    /// An intervening clear or materialize (e.g. an SSE soft_delete of the
+    /// note racing our push's HTTP response) bumps the generation, so a stale
+    /// response can never re-arm the gate for a file that is gone. Returns
+    /// whether it noted.
+    pub fn note_received_if_unchanged(&self, path: &str, sha: &str, gen: u64) -> bool {
+        let key = self.canon_key(path);
+        let Ok(mut m) = self.received.lock() else {
+            return false;
+        };
+        match m.get_mut(&key) {
+            Some(e) if e.gen == gen => {
+                e.sha = Some(sha.to_string());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -569,7 +607,10 @@ impl ShadowStore {
     /// A poisoned lock reads as `None` (gate fails open).
     pub fn received(&self, path: &str) -> Option<String> {
         let key = self.canon_key(path);
-        self.received.lock().ok().and_then(|m| m.get(&key).cloned())
+        self.received
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).and_then(|e| e.sha.clone()))
     }
 
     /// The last-synced server hash recorded for `path`, if any. D8 (S511): the
