@@ -41,7 +41,13 @@ pub fn user_agent_string() -> String {
 /// ONLY when known — a bare `null` could clobber a good `last_sync_at` on a
 /// daemon that has not pushed since restart, so absence means "no update to
 /// that column".
-fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) -> serde_json::Value {
+/// TKT-8fc0b2a4 (A6): `auth_failed_since` is inserted ONLY while an
+/// auth-failure episode is open, same convention (omitted, never `null`).
+fn heartbeat_body(
+    last_seen: DateTime<Utc>,
+    last_sync: Option<DateTime<Utc>>,
+    auth_failed_since: Option<DateTime<Utc>>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "daemon_version": daemon_version(),
         "daemon_platform": daemon_platform(),
@@ -49,6 +55,9 @@ fn heartbeat_body(last_seen: DateTime<Utc>, last_sync: Option<DateTime<Utc>>) ->
     });
     if let Some(ls) = last_sync {
         body["last_sync"] = serde_json::Value::String(ls.to_rfc3339());
+    }
+    if let Some(afs) = auth_failed_since {
+        body["auth_failed_since"] = serde_json::Value::String(afs.to_rfc3339());
     }
     body
 }
@@ -671,12 +680,16 @@ impl ApiClient {
     ///   fire-and-observe freshness ping, and tolerating an empty or differently
     ///   shaped body keeps it compatible across server versions that do mount
     ///   the route.
+    /// * TKT-8fc0b2a4 (A6): `auth_failed_since` (the start of an open SSE/push
+    ///   auth-failure episode) rides along when set, omitted otherwise, so the
+    ///   registry can see a revoked daemon that is alive and retrying.
     pub async fn patch_self_heartbeat(
         &self,
         last_seen: DateTime<Utc>,
         last_sync: Option<DateTime<Utc>>,
+        auth_failed_since: Option<DateTime<Utc>>,
     ) -> Result<HeartbeatOutcome, ApiError> {
-        let body = heartbeat_body(last_seen, last_sync);
+        let body = heartbeat_body(last_seen, last_sync, auth_failed_since);
         let resp = self
             .http
             .patch(format!("{}/api/sync/subscribers/me", self.base_url))
@@ -934,7 +947,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let out = api
-            .patch_self_heartbeat(last_seen, Some(last_sync))
+            .patch_self_heartbeat(last_seen, Some(last_sync), None)
             .await
             .expect("heartbeat succeeds");
         assert_eq!(out, HeartbeatOutcome::Acknowledged);
@@ -952,7 +965,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         // Unknown => key absent entirely (not null).
-        let absent = heartbeat_body(last_seen, None);
+        let absent = heartbeat_body(last_seen, None, None);
         assert!(absent.get("last_seen").is_some());
         assert!(
             absent.get("last_sync").is_none(),
@@ -963,8 +976,32 @@ mod tests {
         let last_sync = DateTime::parse_from_rfc3339("2026-08-02T09:59:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let present = heartbeat_body(last_seen, Some(last_sync));
+        let present = heartbeat_body(last_seen, Some(last_sync), None);
         assert_eq!(present["last_sync"], "2026-08-02T09:59:00+00:00");
+    }
+
+    /// TKT-8fc0b2a4 (A6): `auth_failed_since` follows the same convention -
+    /// OMITTED while auth is healthy (never `null`), present as RFC3339 while
+    /// an auth-failure episode is open.
+    #[test]
+    fn heartbeat_body_omits_auth_failed_since_when_healthy_and_includes_it_when_failed() {
+        let last_seen = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let healthy = heartbeat_body(last_seen, None, None);
+        assert!(
+            healthy.get("auth_failed_since").is_none(),
+            "auth_failed_since must be OMITTED while healthy: {healthy}"
+        );
+        let since = DateTime::parse_from_rfc3339("2026-08-02T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let failed = heartbeat_body(last_seen, None, Some(since));
+        assert_eq!(failed["auth_failed_since"], "2026-08-02T09:30:00+00:00");
+        // Independent of last_sync: both may be present together.
+        let both = heartbeat_body(last_seen, Some(since), Some(since));
+        assert!(both.get("last_sync").is_some());
+        assert!(both.get("auth_failed_since").is_some());
     }
 
     /// (Deliverable 3c) An OLDER server that does not mount the route answers
@@ -985,7 +1022,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let out = api
-            .patch_self_heartbeat(last_seen, None)
+            .patch_self_heartbeat(last_seen, None, None)
             .await
             .expect("405 is tolerated, not an error");
         assert_eq!(

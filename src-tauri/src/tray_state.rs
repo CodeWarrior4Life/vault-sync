@@ -120,6 +120,16 @@ pub struct TrayState {
     /// CS-3 §3.1: the sha8 of the config snapshot this process runs on
     /// (empty when unpaired).
     pub config_sha8: String,
+
+    // ---- TKT-8fc0b2a4 (WS-A4/A5/A6) auth failure: fail loud, keep the
+    // ---- cursor, await credential recovery -------------------------------
+    /// Epoch seconds of the FIRST 401/403 of the current auth-failure
+    /// episode (SSE connect or push), `None` while auth is healthy. Set by
+    /// the SSE loop and the push drain on their first rejection, kept at the
+    /// earliest stamp while the episode persists, cleared by either side on
+    /// the first accepted request. Carried in the heartbeat PATCH so the
+    /// registry can see a revoked daemon that is still alive and retrying.
+    pub auth_failed_since: Option<i64>,
 }
 
 impl TrayState {
@@ -152,7 +162,24 @@ impl TrayState {
             update_available: None,
             config_pending_restart: false,
             config_sha8: String::new(),
+            auth_failed_since: None,
         }
+    }
+
+    // ---- TKT-8fc0b2a4 (WS-A4/A5/A6) auth-failure setters -----------------
+
+    /// Record the start of an auth-failure episode at `now_epoch` (seconds).
+    /// Idempotent: a later rejection in the same episode keeps the FIRST
+    /// stamp, so `auth_failed_since` always answers "since when".
+    pub fn mark_auth_failed(&mut self, now_epoch: i64) {
+        if self.auth_failed_since.is_none() {
+            self.auth_failed_since = Some(now_epoch);
+        }
+    }
+
+    /// Clear the auth-failure episode (an authenticated request succeeded).
+    pub fn clear_auth_failed(&mut self) {
+        self.auth_failed_since = None;
     }
 
     /// CS-3 §3.1: set/clear the config-pending-restart notice flag.
@@ -354,6 +381,21 @@ mod tests {
         assert!(s.redflag_tripped);
         s.set_redflag_tripped(false);
         assert!(!s.redflag_tripped);
+    }
+
+    /// TKT-8fc0b2a4 (A6): the episode stamp keeps its FIRST value across
+    /// repeated rejections and clears on recovery.
+    #[test]
+    fn auth_failed_since_keeps_first_stamp_and_clears() {
+        let mut s = fresh();
+        assert_eq!(s.auth_failed_since, None);
+        s.mark_auth_failed(1_700_000_000);
+        s.mark_auth_failed(1_700_000_600);
+        assert_eq!(s.auth_failed_since, Some(1_700_000_000));
+        s.clear_auth_failed();
+        assert_eq!(s.auth_failed_since, None);
+        s.mark_auth_failed(1_700_001_000);
+        assert_eq!(s.auth_failed_since, Some(1_700_001_000));
     }
 
     #[test]

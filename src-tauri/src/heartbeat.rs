@@ -98,16 +98,24 @@ pub(crate) fn unsupported_log_action(n: u32) -> UnsupportedLog {
 /// is logged at WARN and the next tick simply retries. A transient non-405
 /// error does NOT reset the counter -- a network blip between 405s must not
 /// silence a standing routing gap; only a real 200 acknowledgement resets it.
+///
+/// TKT-8fc0b2a4 (A6): `auth_failed_since` (epoch secs, from the tray state's
+/// open auth-failure episode) rides along when `Some`, omitted when `None` --
+/// the same omit-not-fabricate convention as `last_sync`.
 pub async fn run_once(
     api: &ApiClient,
     health: &SyncHealth,
     now: DateTime<Utc>,
     unsupported_ticks: &AtomicU32,
+    auth_failed_since: Option<i64>,
 ) -> Result<HeartbeatOutcome, ApiError> {
     let last_sync = health
         .last_sync_epoch()
         .and_then(|e| DateTime::<Utc>::from_timestamp(e, 0));
-    let result = api.patch_self_heartbeat(now, last_sync).await;
+    let auth_failed_since = auth_failed_since.and_then(|e| DateTime::<Utc>::from_timestamp(e, 0));
+    let result = api
+        .patch_self_heartbeat(now, last_sync, auth_failed_since)
+        .await;
     match &result {
         Ok(HeartbeatOutcome::Acknowledged) => {
             // A live route ends any 405 streak: reset so a later regression
@@ -170,9 +178,12 @@ pub async fn run_once(
 /// counter lives for the loop's lifetime so the 405 streak is tracked across
 /// beats (log-once, quiet window, then periodic escalation).
 /// CS-3: returns its `JoinHandle` for the supervisor (class Optional).
+/// TKT-8fc0b2a4 (A6): `tray` is read each tick for `auth_failed_since`
+/// (`None` = no tray wired, field omitted).
 pub fn spawn(
     api: Arc<ApiClient>,
     health: Arc<SyncHealth>,
+    tray: Option<crate::tray_state::SharedTrayState>,
 ) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
         let unsupported_ticks = AtomicU32::new(0);
@@ -183,7 +194,17 @@ pub fn spawn(
             tick.tick().await;
             #[cfg(test)]
             crate::faults::point("heartbeat");
-            let _ = run_once(&api, &health, Utc::now(), &unsupported_ticks).await;
+            let auth_failed_since = tray
+                .as_ref()
+                .and_then(|t| t.read().ok().and_then(|s| s.auth_failed_since));
+            let _ = run_once(
+                &api,
+                &health,
+                Utc::now(),
+                &unsupported_ticks,
+                auth_failed_since,
+            )
+            .await;
         }
     })
 }
@@ -215,7 +236,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        let first = run_once(&api, &health, now, &ticks).await.unwrap();
+        let first = run_once(&api, &health, now, &ticks, None).await.unwrap();
         assert_eq!(first, HeartbeatOutcome::Unsupported);
         assert_eq!(
             ticks.load(Ordering::Relaxed),
@@ -224,7 +245,7 @@ mod tests {
         );
         assert_eq!(unsupported_log_action(1), UnsupportedLog::Once);
 
-        let second = run_once(&api, &health, now, &ticks).await.unwrap();
+        let second = run_once(&api, &health, now, &ticks, None).await.unwrap();
         assert_eq!(second, HeartbeatOutcome::Unsupported);
         assert_eq!(ticks.load(Ordering::Relaxed), 2);
         // Second beat is inside the tolerance window -- no second WARN.
@@ -281,7 +302,7 @@ mod tests {
             .with_timezone(&Utc);
 
         // One more 405: still escalating.
-        let out = run_once(&api, &health, now, &ticks).await.unwrap();
+        let out = run_once(&api, &health, now, &ticks, None).await.unwrap();
         assert_eq!(out, HeartbeatOutcome::Unsupported);
         assert_eq!(
             unsupported_log_action(ticks.load(Ordering::Relaxed)),
@@ -297,7 +318,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let out = run_once(&api, &health, now, &ticks).await.unwrap();
+        let out = run_once(&api, &health, now, &ticks, None).await.unwrap();
         assert_eq!(out, HeartbeatOutcome::Acknowledged);
         assert_eq!(
             ticks.load(Ordering::Relaxed),
@@ -338,8 +359,60 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        let out = run_once(&api, &health, now, &latch).await.unwrap();
+        let out = run_once(&api, &health, now, &latch, None).await.unwrap();
         assert_eq!(out, HeartbeatOutcome::Acknowledged);
         m.assert_async().await;
+    }
+
+    /// TKT-8fc0b2a4 (A6): the heartbeat PATCH carries `auth_failed_since`
+    /// (RFC3339, from the epoch-secs stamp) while an auth-failure episode is
+    /// open, and the field is ABSENT from the wire body when `None`.
+    #[tokio::test]
+    async fn run_once_carries_auth_failed_since_when_set_and_omits_it_when_none() {
+        let mut srv = mockito::Server::new_async().await;
+        let api = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+        let health = SyncHealth::new();
+        let latch = AtomicU32::new(0);
+        let now = DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Set: the wire body names the episode start.
+        let m_set = srv
+            .mock("PATCH", "/api/sync/subscribers/me")
+            .match_body(mockito::Matcher::Regex(
+                r#""auth_failed_since":"2026-08-02T09:30:00\+00:00""#.into(),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let since = DateTime::parse_from_rfc3339("2026-08-02T09:30:00Z")
+            .unwrap()
+            .timestamp();
+        let out = run_once(&api, &health, now, &latch, Some(since))
+            .await
+            .unwrap();
+        assert_eq!(out, HeartbeatOutcome::Acknowledged);
+        m_set.assert_async().await;
+
+        // None: the key is absent (a regex that only matches bodies WITHOUT
+        // the key -- Rust regex has no lookahead, so match the whole body
+        // shape: it must be `last_seen` straight after `daemon_platform`'s
+        // closing quote-comma with no auth key anywhere).
+        let m_none = srv
+            .mock("PATCH", "/api/sync/subscribers/me")
+            .match_body(mockito::Matcher::Regex(
+                r#"^\{("daemon_platform"|"daemon_version"|"last_seen"):"[^"]*"(,("daemon_platform"|"daemon_version"|"last_seen"):"[^"]*")*\}$"#.into(),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let out = run_once(&api, &health, now, &latch, None).await.unwrap();
+        assert_eq!(out, HeartbeatOutcome::Acknowledged);
+        m_none.assert_async().await;
     }
 }

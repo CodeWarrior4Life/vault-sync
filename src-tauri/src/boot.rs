@@ -474,7 +474,11 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
     let sync_health = SyncHealth::new();
     sup.supervise_handle(
         TaskSpec::new("heartbeat", TaskClass::Optional),
-        heartbeat::spawn(Arc::clone(&api), Arc::clone(&sync_health)),
+        heartbeat::spawn(
+            Arc::clone(&api),
+            Arc::clone(&sync_health),
+            Some(tray.clone()),
+        ),
     );
 
     // ---- B2 --------------------------------------------------------------
