@@ -1136,6 +1136,16 @@ impl FileWatcher {
                 // (TKT-c3605db8), which must be invisible to the valve and
                 // never re-pushed.
                 if let WatchEvent::Deleted { path } = &allowed {
+                    // R2 review M-A (TKT-406f6cb3): the file is gone, whoever
+                    // deleted it, so its enqueue-dedup entry is void. Cleared
+                    // BEFORE the soft-delete-echo early return: pre-fix only
+                    // the user-delete path reached the clear further down, so
+                    // after a SERVER delete the stale entry (== shadow) made the
+                    // dedup drop a byte-identical restore before it was ever
+                    // journaled, and reconcile then soft-deleted the restore.
+                    if let Ok(mut m) = self.enqueued_hashes.lock() {
+                        m.remove(path);
+                    }
                     if self.consume_delete_echo(path) {
                         tracing::debug!(
                             "file_watcher: skipping materializer soft-delete echo for {path} (not counted toward delete-burst, not re-pushed)"
@@ -1205,6 +1215,16 @@ impl FileWatcher {
                 // acceptance means un-accepted content is always re-enqueued.
                 // When no shadow store is wired, fall back to the prior
                 // enqueued-hash-only behavior (back-compat).
+                //
+                // R2 (TKT-406f6cb3): this gate is deliberately NOT the echo
+                // defence. An inbound materialize is never in enqueued_hashes,
+                // so its FS events DO enqueue a (lazy, tiny) ref here; the push
+                // client's drain gate then drops it without any HTTP because the
+                // drained bytes equal the received-hash ledger
+                // (`ShadowStore::received`). Keying suppression on the shadow
+                // here was rejected in review: the shadow lags the server (kept
+                // stale on failed align / non-accepted delete), so it swallowed
+                // genuine local reverts.
                 if let (Some(sha), Some(p)) = (&content_sha, write_path) {
                     let enqueued_match = self
                         .enqueued_hashes
@@ -1774,6 +1794,350 @@ mod tests {
             w.journal.len(),
             1,
             "a genuine edit must never be suppressed"
+        );
+    }
+
+    /// R2 (TKT-406f6cb3) helper: a watcher wired EXACTLY like production
+    /// (`boot::spawn_push_pipeline`): shared echo guard + shared shadow store.
+    fn r2_wired_watcher(
+        dir: &TempDir,
+        sdir: &TempDir,
+    ) -> (
+        FileWatcher,
+        Arc<crate::echo_guard::EchoGuard>,
+        Arc<crate::sync_shadow::ShadowStore>,
+    ) {
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
+        let guard = Arc::new(crate::echo_guard::EchoGuard::new());
+        let w = make_watcher(dir, vec![], vec![])
+            .with_echo_guard(guard.clone())
+            .with_shadow_store(shadow.clone());
+        (w, guard, shadow)
+    }
+
+    /// R2 helper: the REAL Live materializer over the watcher's root, sharing
+    /// its echo guard and shadow store (production wiring).
+    fn r2_materializer(
+        root: &TempDir,
+        ws: &TempDir,
+        guard: &Arc<crate::echo_guard::EchoGuard>,
+        shadow: &Arc<crate::sync_shadow::ShadowStore>,
+    ) -> crate::materializer::Materializer {
+        crate::materializer::Materializer::new(
+            root.path().to_path_buf(),
+            None,
+            crate::materializer::MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".to_string(),
+            crate::materializer::MaterializerConfig {
+                device_id: "trinity".into(),
+                ..Default::default()
+            },
+        )
+        .with_echo_guard(guard.clone())
+        .with_shadow_store(shadow.clone())
+    }
+
+    fn r2_payload(path: &str, body: &str) -> crate::api_client::NotePayload {
+        crate::api_client::NotePayload {
+            path: path.into(),
+            frontmatter: serde_json::Value::Null,
+            body: body.into(),
+            sha256: sha256_hex(body.as_bytes()),
+            modified: None,
+            file_mtime: None,
+            created: None,
+            change_seq: None,
+            enriched_body: Some(body.into()),
+        }
+    }
+
+    /// R2 helper: a push client over the watcher's journal + shadow, pointed at
+    /// a mock server.
+    fn r2_push_client(
+        url: &str,
+        w: &FileWatcher,
+        root: &TempDir,
+        shadow: &Arc<crate::sync_shadow::ShadowStore>,
+    ) -> crate::push_client::PushClient {
+        let api = Arc::new(crate::api_client::ApiClient::new(url, "vsk_test").unwrap());
+        crate::push_client::PushClient::new(
+            api,
+            w.journal.clone(),
+            "dev-test".into(),
+            crate::push_client::PushClientConfig {
+                allowed_extensions: vec![".md".into()],
+                strip_frontmatter_fields_for_diff: vec![],
+                max_retry_attempts: 1,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 2,
+                batch_size: 16,
+                loop_interval_ms: 50,
+                push_concurrency: 1,
+                busy_loop_interval_ms: 5,
+                managed_payload_excludes: false,
+            },
+            root.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone())
+    }
+
+    const R2_ACCEPT: &str = r#"{"status":"accepted","seq":1,"content_hash":null,"server_hash":null,"server_seq":2,"merged_content":null,"message":null}"#;
+
+    /// R2 (TKT-406f6cb3) REGRESSION - the Trinity echo, end to end. The REAL
+    /// materializer writes link's bytes (atomic temp+rename); that one write
+    /// reaches `handle_fs_path` as MORE THAN ONE event for the target (notify
+    /// 7.0 FSEvents emits one `Event` per flag; notify-debouncer-full 0.4.0
+    /// keeps rename events unconditionally). The one-shot echo guard eats
+    /// event 1; event 2 is enqueued because the D6 layer-2 dedup needs
+    /// `enqueued_hashes[p] == sha`, which a server-originated write never sets.
+    /// Pre-fix that ref was POSTed (`push accepted` for link's hash 5-12 s
+    /// later). With the fix the drain gate sees drained bytes == the received
+    /// ledger and sends NOTHING. FAILS on origin/main (mock hit).
+    #[tokio::test]
+    async fn r2_inbound_materialize_seen_as_two_fs_events_is_not_echo_pushed() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let (w, guard, shadow) = r2_wired_watcher(&dir, &sdir);
+        let m = r2_materializer(&dir, &ws, &guard, &shadow);
+        let mut srv = mockito::Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(R2_ACCEPT)
+            .expect(0)
+            .create_async()
+            .await;
+        let client = r2_push_client(&srv.url(), &w, &dir, &shadow);
+
+        let rel = "02_Projects/Nexus/active-work.md";
+        std::fs::create_dir_all(dir.path().join("02_Projects/Nexus")).unwrap();
+        m.write(&r2_payload(
+            rel,
+            "# flight recorder\n- **11:20** link appended\n",
+        ))
+        .unwrap();
+        let abs = dir.path().join(rel);
+        w.handle_fs_path(&abs).await; // Create(File)
+        w.handle_fs_path(&abs).await; // Modify(Name(Any))
+
+        // Review LOW-7: the scenario must actually exercise the drain - the
+        // one-shot guard eats event 1, the D6 dedup cannot recognise a server
+        // write, so event 2 IS journaled. Without this the test would pass
+        // vacuously if nothing reached the journal.
+        assert!(
+            !w.journal.is_empty(),
+            "precondition: the second FS event reached the journal"
+        );
+        let out = client.drain_once().await;
+        assert!(!out.is_empty(), "at least one echo ref reached the drain");
+        for (_, o) in &out {
+            assert!(
+                matches!(
+                    o,
+                    crate::push_client::PushOutcome::Skipped(
+                        crate::push_client::SkipReason::IdenticalToServer { .. }
+                    )
+                ),
+                "an inbound materialize must never be pushed back, got {o:?}"
+            );
+        }
+        assert_eq!(w.journal.len(), 0, "echo refs acked as no-ops");
+        push.assert_async().await;
+    }
+
+    /// Review H2a (watcher side): a push of X is pending and the user reverts
+    /// the file to H1, the hash the shadow still holds. The watcher MUST
+    /// enqueue the revert - the shadow lags the server (X is about to land).
+    /// ffb8859's shadow-only watcher gate suppressed it (H1 == shadow), so the
+    /// revert never propagated. FAILS with that gate.
+    #[tokio::test]
+    async fn r2_h2a_revert_to_shadow_hash_while_push_pending_is_enqueued() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let (w, _guard, shadow) = r2_wired_watcher(&dir, &sdir);
+        let rel = "01_Notes/undo.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let h1 = b"received v1\n";
+        shadow.record(rel, &sha256_hex(h1));
+
+        std::fs::write(&abs, b"local edit v2\n").unwrap();
+        w.handle_fs_path(&abs).await; // the edit: enqueued (push pending)
+        assert_eq!(w.journal.len(), 1);
+
+        std::fs::write(&abs, h1).unwrap(); // the user undoes it
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.len(),
+            2,
+            "a revert to the (stale) shadow hash must be enqueued"
+        );
+    }
+
+    /// Review H1 (restart variant): before a restart the user deleted P (the
+    /// Delete is still journaled); after the restart (fresh watcher, fresh
+    /// push client, shadow reloaded at H, ledger empty) the user restores
+    /// byte-identical P. The watcher must enqueue it and the drain must SEND
+    /// it after the delete, or reconcile later soft-deletes the restore.
+    /// ffb8859's watcher suppressed it (H == shadow, tombstone lost on
+    /// restart). FAILS with that gate.
+    #[tokio::test]
+    async fn r2_h1_restart_with_journaled_delete_then_identical_restore_is_sent() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let rel = "01_Notes/restored.md";
+        let bytes = b"synced body\n";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        // "Before the restart": the delete was journaled.
+        let (w0, _g0, shadow0) = r2_wired_watcher(&dir, &sdir);
+        shadow0.record(rel, &sha256_hex(bytes));
+        let _durable = shadow0.flush().unwrap();
+        std::fs::write(&abs, bytes).unwrap();
+        std::fs::remove_file(&abs).unwrap();
+        w0.handle_fs_path(&abs).await;
+        assert_eq!(w0.journal.len(), 1, "delete journaled");
+        let journal = w0.journal.clone();
+        drop(w0);
+
+        // "After the restart": fresh watcher on the SAME journal, reloaded
+        // shadow - loaded the way production does (with the vault folder
+        // names; an empty list on a non-empty store PARKS the push client, R7).
+        let shadow = crate::sync_shadow::ShadowStore::load_with_vault_folders(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+            vec!["Mainframe".into()],
+        );
+        assert_eq!(
+            shadow.get(rel),
+            Some(sha256_hex(bytes)),
+            "shadow persisted at H"
+        );
+        let mut w = make_watcher(&dir, vec![], vec![]).with_shadow_store(shadow.clone());
+        w.journal = journal;
+        std::fs::write(&abs, bytes).unwrap(); // identical restore
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.len(),
+            2,
+            "the restore must be enqueued after restart"
+        );
+
+        let mut srv = mockito::Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(R2_ACCEPT)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = r2_push_client(&srv.url(), &w, &dir, &shadow);
+        let out = client.drain_once().await;
+        assert_eq!(out.len(), 2);
+        assert!(
+            matches!(out[1].1, crate::push_client::PushOutcome::Sent { .. }),
+            "the restore must be sent, got {:?}",
+            out[1].1
+        );
+        push.assert_async().await;
+    }
+
+    /// Review M-A (TKT-406f6cb3): a SERVER-side delete of an EXISTING file,
+    /// then a byte-identical user restore. The file was previously pushed by
+    /// this watcher (enqueued_hashes[p] == R) and accepted (shadow == R). The
+    /// materializer's soft_delete records a delete echo; the watcher consumes
+    /// it and returned BEFORE clearing the dedup entry, so the restore event
+    /// matched entry == R && shadow == R and was dropped before the journal -
+    /// the drain gate never ran and reconcile later soft-deleted the restore.
+    /// The restore must be journaled AND sent. FAILS without the M-A clear.
+    #[tokio::test]
+    async fn r2_ma_server_delete_then_identical_restore_is_journaled_and_sent() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let (w, guard, shadow) = r2_wired_watcher(&dir, &sdir);
+        let m = r2_materializer(&dir, &ws, &guard, &shadow);
+        let mut srv = mockito::Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(R2_ACCEPT)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = r2_push_client(&srv.url(), &w, &dir, &shadow);
+
+        let rel = "01_Notes/server-deleted.md";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let r = b"authored here, then deleted on another host\n";
+        // 1. A local edit, pushed and accepted: enqueued_hashes[p] = R, shadow = R.
+        std::fs::write(&abs, r).unwrap();
+        w.handle_fs_path(&abs).await;
+        let out = client.drain_once().await;
+        assert!(matches!(
+            out[0].1,
+            crate::push_client::PushOutcome::Sent { .. }
+        ));
+        assert_eq!(
+            shadow.get(rel),
+            Some(sha256_hex(r)),
+            "precondition: shadow == R"
+        );
+
+        // 2. Another host deletes P: the SSE soft_delete moves the file aside
+        //    and records a delete echo; the watcher consumes the echo.
+        m.soft_delete(rel).unwrap();
+        assert!(!abs.exists());
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.len(), 0, "the delete echo is not re-pushed");
+
+        // 3. The user restores byte-identical bytes.
+        std::fs::write(&abs, r).unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.len(),
+            1,
+            "a restore after a SERVER delete must reach the journal"
+        );
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, crate::push_client::PushOutcome::Sent { .. }),
+            "and must be sent, got {:?}",
+            out[0].1
+        );
+        push.assert_async().await;
+    }
+
+    /// R2 SAFETY: a delete followed by a byte-identical restore (Obsidian
+    /// "restore from trash", `git checkout`) is enqueued: a delete clears the
+    /// path's enqueued_hashes entry, so the D6 dedup cannot suppress it.
+    #[tokio::test]
+    async fn r2_delete_then_identical_restore_still_enqueues() {
+        let dir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let (w, _guard, shadow) = r2_wired_watcher(&dir, &sdir);
+
+        let rel = "01_Notes/restored.md";
+        let bytes = b"synced body\n";
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, bytes).unwrap();
+        shadow.record(rel, &sha256_hex(bytes));
+
+        std::fs::remove_file(&abs).unwrap();
+        w.handle_fs_path(&abs).await; // user delete -> enqueued
+        assert_eq!(w.journal.len(), 1);
+
+        std::fs::write(&abs, bytes).unwrap(); // identical restore
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.len(),
+            2,
+            "a restore after a delete must enqueue even though bytes == shadow"
         );
     }
 
@@ -2767,6 +3131,115 @@ mod tests {
 
         let j = journal.clone();
         assert!(!j.is_empty(), "expected at least one event in journal");
+    }
+
+    /// R2 (TKT-406f6cb3) FS-integration probe: the REAL `Materializer::write`
+    /// (Live, atomic temp+rename, echo guard + shadow recorded exactly as in
+    /// production) observed by the REAL notify/debouncer stack. Asserts the
+    /// inbound write never reaches the push journal. Ignored for the same CI
+    /// timing reasons as `fs_integration_smoke`; run locally with
+    /// `cargo test --lib r2_fs_ -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn r2_fs_real_materialize_is_not_echoed_into_journal() {
+        use crate::materializer::{Materializer, MaterializerConfig, MaterializerMode};
+        let vaults = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+        );
+        let guard = Arc::new(crate::echo_guard::EchoGuard::new());
+        std::fs::create_dir_all(vaults.path().join("02_Projects/Nexus")).unwrap();
+        let journal = make_journal(&jdir);
+        let w = FileWatcher::new(
+            vaults.path().to_path_buf(),
+            journal.clone(),
+            make_burst(),
+            FileWatcherConfig::default(),
+            "dev-test",
+        )
+        .unwrap()
+        .with_echo_guard(guard.clone())
+        .with_shadow_store(shadow.clone());
+        let _handle = w.start().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let m = Materializer::new(
+            vaults.path().to_path_buf(),
+            Some("shadow/".to_string()),
+            MaterializerMode::Live,
+            ws.path().to_path_buf(),
+            "sub-test".to_string(),
+            MaterializerConfig {
+                device_id: "trinity".into(),
+                ..Default::default()
+            },
+        )
+        .with_echo_guard(guard.clone())
+        .with_shadow_store(shadow.clone());
+
+        // Three successive inbound appends to a link-authored recorder.
+        let mut body = String::from("# recorder\n");
+        for i in 0..3 {
+            body.push_str(&format!("- **11:2{i}** link append {i}\n"));
+            let p = crate::api_client::NotePayload {
+                path: "02_Projects/Nexus/active-work.md".into(),
+                frontmatter: serde_json::Value::Null,
+                body: body.clone(),
+                sha256: sha256_hex(body.as_bytes()),
+                modified: None,
+                file_mtime: None,
+                created: None,
+                change_seq: None,
+                enriched_body: Some(body.clone()),
+            };
+            m.write(&p).unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // The watcher may journal echo refs (the D6 dedup cannot know a
+        // server write); none of them may become an HTTP push.
+        let mut srv = mockito::Server::new_async().await;
+        let push = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(R2_ACCEPT)
+            .expect(0)
+            .create_async()
+            .await;
+        let api = Arc::new(crate::api_client::ApiClient::new(&srv.url(), "vsk_test").unwrap());
+        let client = crate::push_client::PushClient::new(
+            api,
+            journal.clone(),
+            "dev-test".into(),
+            crate::push_client::PushClientConfig {
+                allowed_extensions: vec![".md".into()],
+                strip_frontmatter_fields_for_diff: vec![],
+                max_retry_attempts: 1,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 2,
+                batch_size: 16,
+                loop_interval_ms: 50,
+                push_concurrency: 1,
+                busy_loop_interval_ms: 5,
+                managed_payload_excludes: false,
+            },
+            vaults.path().to_path_buf(),
+        )
+        .with_shadow_store(shadow.clone());
+        let echoes = journal.len();
+        let out = client.drain_once().await;
+        eprintln!("R2 probe: {echoes} echo ref(s) journaled by the real notify stack");
+        assert_eq!(journal.len(), 0, "every echo ref acked as a no-op");
+        assert!(out.iter().all(|(_, o)| matches!(
+            o,
+            crate::push_client::PushOutcome::Skipped(
+                crate::push_client::SkipReason::IdenticalToServer { .. }
+            )
+        )));
+        push.assert_async().await;
     }
 
     /// Symlink-escape FS test — requires SeCreateSymbolicLinkPrivilege on

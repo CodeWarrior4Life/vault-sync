@@ -255,14 +255,284 @@ pub struct StashDecision {
     pub reason: String,
 }
 
+/// R2(a) (TKT-406f6cb3): is `rel_path` an append-only flight recorder -
+/// `active-work.md` or the per-host partition `active-work.<host>.md`
+/// (Per-Host Flight Recorder Partition, 2026-09-10)? These files are
+/// append-only and multi-MB; a "losing" revision is almost always a stale
+/// prefix of the winner, so an in-vault `.conflict-from-*` fork of one is
+/// several MB of zero-information noise that Obsidian indexes (Trinity held
+/// ~7,800 of them, 1.1 GB, and they crashed Obsidian). Conflict copies of a
+/// recorder (`active-work.conflict-from-...md`) are NOT recorders.
+pub fn is_append_only_flight_recorder(rel_path: &str) -> bool {
+    let name = rel_path.rsplit(['/', '\\']).next().unwrap_or(rel_path);
+    if name == "active-work.md" {
+        return true;
+    }
+    name.strip_prefix("active-work.")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|host| {
+            !host.is_empty()
+                && !host.starts_with("conflict-from-")
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+}
+
+/// R2(a) review M2: resolve `p` for an inside-vault comparison WITHOUT writing
+/// anything: canonicalize the nearest EXISTING ancestor (so symlinked spellings
+/// such as `/home/u` vs `/var/home/u` agree), then re-append the not-yet-created
+/// tail. Windows verbatim prefixes (`\\?\`, `\\?\UNC\`) are stripped so a
+/// canonical and a plain spelling compare equal.
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return strip_verbatim(out);
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return strip_verbatim(abs.clone()),
+        }
+    }
+}
+
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+
+/// Case-fold on the platforms whose default filesystems are case-insensitive
+/// (APFS/HFS+ default, NTFS), so `~/vault` and `~/Vault` are the same tree.
+fn fold_case(p: PathBuf) -> PathBuf {
+    if cfg!(any(target_os = "macos", windows)) {
+        PathBuf::from(p.to_string_lossy().to_lowercase())
+    } else {
+        p
+    }
+}
+
+/// R2(a) review M2: is `child` the same as, or inside, `root` after symlink
+/// resolution, verbatim-prefix stripping and (macOS/Windows) case folding?
+/// Matters when the vault root is an ANCESTOR of the app-data dir (a vault at
+/// `$HOME` / `%USERPROFILE%`): the quarantine would then land in the vault and
+/// sync (`Library`/`AppData`/`.local` are ordinary folders to a vault walker).
+pub(crate) fn path_is_within(child: &Path, root: &Path) -> bool {
+    fold_case(resolve_for_compare(child)).starts_with(fold_case(resolve_for_compare(root)))
+}
+
+/// R2(a) review LOW: serialize quarantine manifest appends inside this process
+/// (materializer and push client may stash concurrently); each line is also
+/// written with ONE `write_all` on an O_APPEND handle.
+static QUARANTINE_MANIFEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// R2(a) (TKT-406f6cb3): content-addressed conflict QUARANTINE outside the
+/// vault tree. Preserves the S511 D4 guarantee (losing bytes are never
+/// dropped) without writing a fork into the vault: each losing revision is
+/// stored once as `blobs/<sha256>.md` and described by one JSONL line in
+/// `manifest.jsonl` (`path`, `sha256`, `bytes`, `ts`, `server_seq`, `device`,
+/// `blob`). Content addressing makes it idempotent: the same losing bytes
+/// recurring (a repeated 409) cost nothing. Lives in the daemon's app-data
+/// dir beside `logs/` (see [`StashQuarantine::default_dir`]).
+#[derive(Debug, Clone)]
+pub struct StashQuarantine {
+    dir: PathBuf,
+}
+
+impl StashQuarantine {
+    pub const DIR_NAME: &'static str = "conflict-quarantine";
+    pub const MANIFEST: &'static str = "manifest.jsonl";
+
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// `<data_local_dir>/Nexus/conflict-quarantine` - the sibling of the
+    /// daemon's `logs/` dir (macOS `~/Library/Application Support/Nexus/`,
+    /// Linux `~/.local/share/Nexus/`). Never inside a vault.
+    pub fn default_dir() -> PathBuf {
+        crate::commands::resolve_workspace_root().join(Self::DIR_NAME)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Preserve `content` (the losing revision of `original_path`). Returns the
+    /// blob path. `server_seq` is the server version the client had last
+    /// observed for the path (`None` when unknown).
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
+    pub fn write(
+        &self,
+        original_path: &str,
+        content: &[u8],
+        device_id: &str,
+        server_seq: Option<i64>,
+    ) -> Result<PathBuf, StashError> {
+        let sha = hex::encode(Sha256::digest(content));
+        let blobs = self.dir.join("blobs");
+        let blob = blobs.join(format!("{sha}.md"));
+        let manifest = self.dir.join(Self::MANIFEST);
+        // CS-2 gate 4: never into a state dir.
+        crate::state_io::refuse_state_target(&blob)
+            .and_then(|_| crate::state_io::refuse_state_target(&manifest))
+            .map_err(|e| StashError::ForeignStateWrite(e.to_string()))?;
+        fs::create_dir_all(&blobs)?;
+        // Content-addressed idempotency: if these exact bytes are already safe,
+        // the blob is not rewritten - but the manifest line IS still appended
+        // (review LOW: a second path, or a second loss of the same path, must
+        // be recorded; lines are ~250 bytes).
+        if !fs::read(&blob).is_ok_and(|b| b == content) {
+            let mut tmp = NamedTempFile::new_in(&blobs)?;
+            tmp.write_all(content)?;
+            tmp.flush()?;
+            tmp.persist(&blob).map_err(|e| StashError::Io(e.error))?;
+        }
+
+        let line = serde_json::json!({
+            "path": original_path.replace('\\', "/"),
+            "sha256": sha,
+            "bytes": content.len(),
+            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "server_seq": server_seq,
+            "device": device_id,
+            "blob": format!("blobs/{sha}.md"),
+        });
+        // The blob is the load-bearing artifact; a manifest failure is logged,
+        // never propagated (same rule as the AR-008 in-vault manifest).
+        let mut buf = line.to_string().into_bytes();
+        buf.push(b'\n');
+        let appended = {
+            let _held = QUARANTINE_MANIFEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&manifest)
+                .and_then(|mut f| f.write_all(&buf))
+        };
+        if let Err(e) = appended {
+            tracing::warn!(
+                original = %original_path,
+                blob = %blob.display(),
+                error = %e,
+                "R2: quarantine blob written but manifest line could not be appended"
+            );
+        }
+        Ok(blob)
+    }
+}
+
 pub struct ConflictStash {
     vault_root: PathBuf,
     policy: ConflictPolicy,
+    /// R2(a) (TKT-406f6cb3): when set, stashes of append-only flight recorders
+    /// go to this out-of-vault quarantine instead of a vault sibling.
+    quarantine: Option<StashQuarantine>,
 }
 
 impl ConflictStash {
     pub fn new(vault_root: PathBuf, policy: ConflictPolicy) -> Self {
-        Self { vault_root, policy }
+        Self {
+            vault_root,
+            policy,
+            quarantine: None,
+        }
+    }
+
+    /// R2(a): route flight-recorder stashes to `dir` (outside the vault).
+    /// `None` keeps the in-vault sibling for every path (pre-R2 behavior). A
+    /// `dir` that resolves INSIDE the vault root is refused (in-vault fallback)
+    /// so the quarantine can never become vault payload.
+    pub fn with_quarantine(mut self, dir: Option<PathBuf>) -> Self {
+        self.quarantine = dir.and_then(|d| {
+            if path_is_within(&d, &self.vault_root) {
+                tracing::warn!(
+                    quarantine = %d.display(),
+                    vault_root = %self.vault_root.display(),
+                    "R2: conflict quarantine dir is inside the vault root - ignored, stashes stay in-vault"
+                );
+                None
+            } else {
+                Some(StashQuarantine::new(d))
+            }
+        });
+        self
+    }
+
+    fn quarantine_for(&self, original_path: &str) -> Option<&StashQuarantine> {
+        self.quarantine
+            .as_ref()
+            .filter(|_| is_append_only_flight_recorder(original_path))
+    }
+
+    /// R2(a): quarantine `content` if `original_path` is a recorder and a
+    /// quarantine is wired. `None` => the caller must stash in-vault: either
+    /// not applicable, or the quarantine write FAILED (review M1: the losing
+    /// bytes may exist nowhere else, so a quarantine failure must never drop
+    /// them - fall back to the in-vault sibling, the S511 D4 floor).
+    fn try_quarantine(
+        &self,
+        original_path: &str,
+        content: &[u8],
+        device_id: &str,
+        server_seq: Option<i64>,
+    ) -> Option<PathBuf> {
+        let q = self.quarantine_for(original_path)?;
+        match q.write(original_path, content, device_id, server_seq) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    original = %original_path,
+                    quarantine = %q.dir().display(),
+                    error = %e,
+                    "R2: conflict quarantine write FAILED - falling back to the in-vault stash so the losing bytes are preserved"
+                );
+                None
+            }
+        }
+    }
+
+    /// R2(a): like [`Self::write_stash`] but carries the server seq the caller
+    /// last observed for the path (recorded in the quarantine manifest). The
+    /// push leg's CAS-409 uses this: its stash `lsn` is 0 by convention, but it
+    /// does know the observed `base_seq`.
+    pub fn write_stash_with_server_seq(
+        &self,
+        original_path: &str,
+        local_content: &[u8],
+        device_id: &str,
+        local_lsn: u64,
+        server_seq: Option<i64>,
+    ) -> Result<PathBuf, StashError> {
+        if let Some(p) = self.try_quarantine(original_path, local_content, device_id, server_seq) {
+            return Ok(p);
+        }
+        self.write_stash_in_vault(original_path, local_content, device_id, local_lsn)
     }
 
     /// Decide whether the divergent local revision should be stashed.
@@ -387,8 +657,29 @@ impl ConflictStash {
     /// - Atomic tmp+rename (tempfile::NamedTempFile + persist).
     /// - Never overwrite an existing stash file — append `-2`, `-3`, ...
     /// - Path safety: parent dir's canonical path must stay within vault_root.
-    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
+    ///
+    /// R2(a) (TKT-406f6cb3): flight recorders never fork inside the vault when
+    /// a quarantine is wired (the materializer passes the server change_seq as
+    /// `local_lsn`); a FAILED quarantine write falls back to the in-vault
+    /// sibling so the losing bytes are always preserved.
     pub fn write_stash(
+        &self,
+        original_path: &str,
+        local_content: &[u8],
+        device_id: &str,
+        local_lsn: u64,
+    ) -> Result<PathBuf, StashError> {
+        let seq = (local_lsn != 0).then_some(local_lsn as i64);
+        if let Some(p) = self.try_quarantine(original_path, local_content, device_id, seq) {
+            return Ok(p);
+        }
+        self.write_stash_in_vault(original_path, local_content, device_id, local_lsn)
+    }
+
+    /// The in-vault `.conflict-from-*` sibling write (the pre-R2 `write_stash`
+    /// body, unchanged).
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
+    fn write_stash_in_vault(
         &self,
         original_path: &str,
         local_content: &[u8],
@@ -1158,5 +1449,172 @@ mod tests {
         );
         // Missing root must not error
         assert_eq!(stash.unresolved_count().unwrap(), 0);
+    }
+
+    /// R2(a) (TKT-406f6cb3): which paths are append-only flight recorders.
+    #[test]
+    fn r2_flight_recorder_classifier() {
+        for yes in [
+            "active-work.md",
+            "02_Projects/Nexus/active-work.md",
+            "02_Projects/Nexus/active-work.trinity.md",
+            "02_Projects/Lattice/lattice-security/active-work.link.md",
+            "02_Projects/Lattice/Pitboss/active-work.icarus.md",
+            "a\\b\\active-work.link.md",
+        ] {
+            assert!(is_append_only_flight_recorder(yes), "{yes} is a recorder");
+        }
+        for no in [
+            "02_Projects/Nexus/active-work.conflict-from-f2383e35-2e9d-4da2-b5ed-de8a35778fa3-12.md",
+            "02_Projects/Nexus/active-work.md.deleted-20261029T112200Z-000000001",
+            "02_Projects/Nexus/my-active-work.md",
+            "02_Projects/Nexus/active-work..md",
+            "02_Projects/Nexus/active-work.a.b.md",
+            "02_Projects/Nexus/Active-Work.md",
+            "02_Projects/Nexus/notes.md",
+        ] {
+            assert!(!is_append_only_flight_recorder(no), "{no} is NOT a recorder");
+        }
+    }
+
+    /// R2(a): recorder stashes land in the quarantine (content-addressed,
+    /// idempotent: one blob + one manifest line for repeated identical losing
+    /// bytes), and NOTHING is written inside the vault.
+    #[test]
+    fn r2_recorder_stash_goes_to_quarantine_idempotently() {
+        let vault = tempdir().unwrap();
+        let q = tempdir().unwrap();
+        let stash = ConflictStash::new(vault.path().to_path_buf(), ConflictPolicy::NewerWins)
+            .with_quarantine(Some(q.path().to_path_buf()));
+        let rel = "02_Projects/Nexus/active-work.md";
+        let bytes = b"- line 1\n- line 2\n";
+        let p1 = stash.write_stash(rel, bytes, "trinity", 77).unwrap();
+        let p2 = stash.write_stash(rel, bytes, "trinity", 78).unwrap();
+        assert_eq!(p1, p2, "same losing bytes are stored once");
+        assert!(p1.starts_with(q.path()), "blob lives in the quarantine");
+        assert_eq!(fs::read(&p1).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(q.path().join("blobs")).unwrap().count(),
+            1,
+            "content-addressed: one blob for identical losing bytes"
+        );
+        let manifest = fs::read_to_string(q.path().join(StashQuarantine::MANIFEST)).unwrap();
+        // Review LOW: every stash event is recorded (a second loss, or a second
+        // path with the same bytes, must not go unrecorded).
+        let lines: Vec<serde_json::Value> = manifest
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "one manifest line per stash event");
+        assert_eq!(
+            lines[0]["server_seq"], 77,
+            "materializer lsn is the server change_seq"
+        );
+        assert_eq!(lines[1]["server_seq"], 78);
+        assert_eq!(
+            fs::read_dir(vault.path()).unwrap().count(),
+            0,
+            "nothing written inside the vault"
+        );
+    }
+
+    /// Review M1: a FAILED quarantine write must fall back to the in-vault
+    /// sibling - on the push-side 409 the losing bytes exist nowhere else.
+    /// The quarantine "dir" here is a regular FILE, so creating `blobs/` fails.
+    #[test]
+    fn r2_quarantine_write_failure_falls_back_in_vault() {
+        let vault = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let not_a_dir = outside.path().join("conflict-quarantine");
+        fs::write(&not_a_dir, b"i am a file").unwrap();
+        let stash = ConflictStash::new(vault.path().to_path_buf(), ConflictPolicy::NewerWins)
+            .with_quarantine(Some(not_a_dir));
+        let rel = "02_Projects/Nexus/active-work.md";
+        let losing = b"- the only copy of these bytes\n";
+        let p = stash
+            .write_stash_with_server_seq(rel, losing, "trinity", 0, Some(9))
+            .expect("must not fail: fall back in-vault");
+        assert!(p.starts_with(vault.path()), "fell back in-vault, got {p:?}");
+        assert!(p.to_string_lossy().contains(".conflict-from-"));
+        assert_eq!(fs::read(&p).unwrap(), losing, "losing bytes preserved");
+        // And the plain write_stash entry point behaves the same.
+        let p2 = stash
+            .write_stash(rel, b"- other loser\n", "trinity", 5)
+            .unwrap();
+        assert!(p2.starts_with(vault.path()));
+    }
+
+    /// Review M2: the inside-vault refusal must see through SYMLINKED
+    /// spellings of a not-yet-created quarantine dir. Vault at `real/`; the
+    /// quarantine is spelled via `link -> real` and does not exist yet (the
+    /// vault-at-$HOME case: `~/.local/share/Nexus/conflict-quarantine`).
+    /// ffb8859 compared the raw spelling (canonicalize fails on a missing dir)
+    /// and accepted it, so blobs would land inside the vault and sync.
+    #[cfg(unix)]
+    #[test]
+    fn r2_quarantine_refused_via_symlinked_spelling_of_missing_dir() {
+        let base = tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let q = link.join(".local/share/Nexus/conflict-quarantine");
+        assert!(!q.exists());
+        let stash = ConflictStash::new(real.clone(), ConflictPolicy::NewerWins)
+            .with_quarantine(Some(q.clone()));
+        let p = stash
+            .write_stash("02_Projects/Nexus/active-work.md", b"x", "trinity", 1)
+            .unwrap();
+        assert!(
+            p.to_string_lossy().contains(".conflict-from-"),
+            "quarantine inside the vault (via symlink) must be refused, got {p:?}"
+        );
+        assert!(!q.exists(), "no quarantine dir created inside the vault");
+        // Reverse spelling: vault given via the symlink, quarantine via real.
+        assert!(path_is_within(
+            &real.join("Library/Application Support/Nexus/conflict-quarantine"),
+            &link
+        ));
+        // A genuinely outside dir is still accepted.
+        assert!(!path_is_within(&base.path().join("elsewhere/q"), &real));
+    }
+
+    /// Review M2: case-variant spellings on the case-insensitive platforms.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn r2_quarantine_refused_via_case_variant_spelling() {
+        let base = tempdir().unwrap();
+        let vault = base.path().join("Vault");
+        fs::create_dir_all(&vault).unwrap();
+        let q = base
+            .path()
+            .join("VAULT")
+            .join("AppData/Nexus/conflict-quarantine");
+        assert!(path_is_within(&q, &vault));
+    }
+
+    /// Review M2: the not-yet-created quarantine under a vault-root ANCESTOR
+    /// (vault == home) is refused with matching spellings too.
+    #[test]
+    fn r2_quarantine_refused_when_vault_is_ancestor_of_missing_dir() {
+        let home = tempdir().unwrap();
+        let q = home.path().join(".local/share/Nexus/conflict-quarantine");
+        assert!(path_is_within(&q, home.path()));
+        assert!(!path_is_within(home.path(), &q));
+    }
+
+    /// R2(a): a quarantine dir INSIDE the vault is refused (fall back to the
+    /// in-vault sibling) so the quarantine can never become vault payload.
+    #[test]
+    fn r2_quarantine_inside_vault_is_refused() {
+        let vault = tempdir().unwrap();
+        let inside = vault.path().join(".quarantine");
+        let stash = ConflictStash::new(vault.path().to_path_buf(), ConflictPolicy::NewerWins)
+            .with_quarantine(Some(inside.clone()));
+        let p = stash
+            .write_stash("02_Projects/Nexus/active-work.md", b"x", "trinity", 1)
+            .unwrap();
+        assert!(p.to_string_lossy().contains(".conflict-from-"), "got {p:?}");
+        assert!(!inside.exists());
     }
 }

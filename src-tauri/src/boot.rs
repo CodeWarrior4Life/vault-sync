@@ -463,6 +463,11 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         device_id: cfg.subscriber_id.clone(),
         conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
         append_arms_enabled,
+        // R2(a) (TKT-406f6cb3): flight-recorder conflict stashes go to the
+        // app-data quarantine (beside logs/), never into the vault.
+        // (BootEnv.workspace == resolve_workspace_root() in production; a
+        // harness workspace keeps the quarantine inside its temp tree.)
+        stash_quarantine_dir: Some(workspace.join(conflict_stash::StashQuarantine::DIR_NAME)),
         ..Default::default()
     };
     let echo_guard = Arc::new(echo_guard::EchoGuard::new());
@@ -621,6 +626,7 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         read_receipt: Arc::clone(&read_receipt),
         sync_health,
         knobs: knobs.clone(),
+        stash_quarantine: workspace.join(conflict_stash::StashQuarantine::DIR_NAME),
     };
     let watch_handles: Vec<WatchHandle> = roots
         .iter()
@@ -789,6 +795,8 @@ struct PipelineCtx {
     read_receipt: Arc<read_receipt::ReadReceiptStore>,
     sync_health: Arc<SyncHealth>,
     knobs: BootKnobs,
+    /// R2(a) (TKT-406f6cb3): `<workspace>/conflict-quarantine`.
+    stash_quarantine: std::path::PathBuf,
 }
 
 /// TKT-35f75318 wiring (B10): build the SSE consumer. It materializes into
@@ -951,6 +959,7 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
     )
     .with_tray_state(ctx.tray.clone())
     .with_shadow_store(Arc::clone(&ctx.shadow))
+    .with_stash_quarantine(ctx.stash_quarantine.clone())
     .with_base_seq_store(Arc::clone(&ctx.base_seq))
     .with_read_receipt_store(Arc::clone(&ctx.read_receipt))
     .with_sync_health(Arc::clone(&ctx.sync_health))
