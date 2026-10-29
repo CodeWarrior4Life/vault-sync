@@ -50,6 +50,7 @@ use std::time::Duration;
 
 use crate::api_client::{ApiClient, ChangeRow};
 use crate::materializer::{MaterializeOutcome, Materializer};
+use crate::path_policy::{is_chunk_pseudo_path, ChunkRefusals};
 use crate::rasp_fence::{classify_path, PathClassification};
 use crate::reconciliation::{EnvReader, ProcessEnv};
 use crate::scope::is_safe_path;
@@ -112,6 +113,10 @@ pub fn should_backfill_with_intent(path: &str, target_exists: bool, delete_pendi
         return false;
     }
     if delete_pending {
+        return false;
+    }
+    // TKT-a3e3ceb1: a `<name>.md#chunk_N` vault_notes pseudo-row is never a note.
+    if is_chunk_pseudo_path(path) {
         return false;
     }
     if !is_safe_path(path) {
@@ -201,6 +206,7 @@ pub async fn run_pull_backfill_guarded(
     use futures::stream::{self, StreamExt};
 
     let mut stats = PullBackfillStats::default();
+    let chunk_refusals = ChunkRefusals::new();
     let mut since: i64 = 0;
     // ONE snapshot per pass (see doc comment): a mid-pass change must not make
     // the guard apply to some pages and not others.
@@ -225,6 +231,11 @@ pub async fn run_pull_backfill_guarded(
             break;
         }
         stats.enumerated += page.changes.len();
+        // TKT-a3e3ceb1: count chunk pseudo-rows (refused inside the planner);
+        // ONE summary line per pass, never per path.
+        for row in &page.changes {
+            chunk_refusals.refuse(&row.path);
+        }
 
         // Plan: which paths are genuinely missing locally? (No body fetched yet.)
         let to_pull = plan_backfill_with_intent(
@@ -275,6 +286,7 @@ pub async fn run_pull_backfill_guarded(
         since = page.next_lsn;
     }
 
+    chunk_refusals.log_summary("pull_backfill");
     tracing::info!(
         enumerated = stats.enumerated,
         created = stats.created,
@@ -510,5 +522,21 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(ENV_DISABLE_BACKFILL.to_string(), "1".to_string());
         assert!(is_backfill_disabled(&MapEnv(m)));
+    }
+
+    // ---- TKT-a3e3ceb1: chunk pseudo-rows are never backfilled ---- //
+
+    #[test]
+    fn tkt_a3e3ceb1_backfill_refuses_chunk_pseudo_paths_but_pulls_siblings() {
+        assert!(!should_backfill("01_Notes/Foo.md#chunk_12", false));
+        assert!(should_backfill("01_Notes/Foo.md", false));
+        let changes = vec![
+            row("01_Notes/Foo.md", 1),
+            row("01_Notes/Foo.md#chunk_0", 2),
+            row("01_Notes/Foo.md#chunk_1", 3),
+            row("01_Notes/chunk_notes.md", 4),
+        ];
+        let plan = plan_backfill(&changes, |_| false);
+        assert_eq!(plan, vec!["01_Notes/Foo.md", "01_Notes/chunk_notes.md"]);
     }
 }

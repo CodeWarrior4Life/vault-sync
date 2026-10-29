@@ -345,7 +345,12 @@ pub async fn seed_shadow_from_server_if_empty(
 
     let mut seeded = 0usize;
     let mut skipped_drift = 0usize;
+    // TKT-a3e3ceb1: never seed a shadow baseline for a chunk pseudo-path.
+    let chunk_refusals = crate::path_policy::ChunkRefusals::new();
     for delta in &deltas {
+        if chunk_refusals.refuse(&delta.path) {
+            continue;
+        }
         // FAIL-CLOSED seed (Highwater, S531): seed shadow = the server's current
         // hash for `match` ONLY.
         //  - match (local == server): local is PROVEN byte-equal to the server, so
@@ -379,6 +384,7 @@ pub async fn seed_shadow_from_server_if_empty(
             skipped_drift += 1;
         }
     }
+    chunk_refusals.log_summary("reconciliation.seed");
     if let Err(e) = shadow.flush() {
         tracing::warn!(error = %e, "reconciliation: D9 seed flush failed (will retry on periodic flush)");
     }
