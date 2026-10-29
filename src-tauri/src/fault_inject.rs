@@ -344,10 +344,10 @@ impl FaultInject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use crate::cs3_tests::RecordingHost;
     use crate::state_io::ExitGate;
     use crate::supervise::{Liveness, Supervisor, TaskEnd};
+    use std::ffi::OsString;
     use std::sync::Arc;
     use std::time::Instant;
 
