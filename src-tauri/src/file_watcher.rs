@@ -557,6 +557,7 @@ impl FileWatcher {
             FilterDecision::DropSubstrate { path, rule } => (format!("substrate:{rule}"), path),
             FilterDecision::DropExtension { path, ext } => (format!("extension:{ext}"), path),
             FilterDecision::DropOutOfScope { path } => ("out_of_scope".to_string(), path),
+            FilterDecision::DropChunkPseudo { path } => ("chunk_pseudo".to_string(), path),
             FilterDecision::DropExclude { path, exclude_rule } => {
                 (format!("exclude:{exclude_rule}"), path)
             }
