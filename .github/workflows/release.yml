@@ -5,6 +5,8 @@ on:
 
 permissions:
   contents: write  # needed by softprops/action-gh-release to create + upload assets
+  id-token: write     # B2 (PB-2D87-VS-SCOPE): OIDC token for actions/attest-build-provenance
+  attestations: write # B2: write the SLSA provenance attestation for each shipped artifact
 
 jobs:
   build:
@@ -20,7 +22,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable @ 2026-10-29; pinned by SHA (PR #43 review M2: id-token is job-wide)
         with: { targets: '${{ matrix.target }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
@@ -122,8 +124,27 @@ jobs:
           done
           [ "$n" -eq 2 ] || { echo "::error::expected 1 .app.tar.gz + 1 .sig in $BUNDLE_DIR, staged $n"; exit 1; }
           ls -l dist-gh
+      # B2 (PB-2D87-VS-SCOPE, vault-sync 0.5.1 fleet placement plan): SLSA build provenance for EVERY file
+      # the GH release ships, so a downloaded asset proves which workflow run and which commit built it:
+      #   gh attestation verify <file> --repo CodeWarrior4Life/vault-sync \
+      #     --signer-workflow CodeWarrior4Life/vault-sync/.github/workflows/release.yml \
+      #     --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+      # (--signer-workflow + --source-ref are REQUIRED: without them any workflow in the repo with
+      #  id-token could produce a passing attestation; PR #43 review M1.) This step is fail-closed: if
+      # Sigstore/attestations are down the leg uploads nothing (review M3).
+      # The subject list mirrors the "Upload to GH Release" files list below; keep the two in step.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe.sig
+            dist-gh/*
       - name: Upload to GH Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2 @ 2026-10-29; pinned by SHA (PR #43 review M2)
         with:
           files: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
