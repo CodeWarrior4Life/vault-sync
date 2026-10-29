@@ -1701,6 +1701,7 @@ fn a6_process_restart_honours_supervised_env() {
             let d = TempDir::new().unwrap();
             let marker = d.path().join("successor");
             let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+            crate::fault_inject::scrub_test_hook_env(&mut c);
             c.args([
                 "--exact",
                 "cs3_tests::a6_child_process_restart",

@@ -707,9 +707,11 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         None => run.await,
         // B4 (crate::fault_inject): the armed test hook ends the consumer as
         // an unexpected return; the classification below decides.
+        // `biased`: the timer is polled first, so a zero delay is deterministic.
         Some(timer) => tokio::select! {
-            r = run => r,
+            biased;
             () = timer => Ok(Ok(())),
+            r = run => r,
         },
     };
     let end = match res {

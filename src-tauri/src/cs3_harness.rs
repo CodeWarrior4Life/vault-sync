@@ -778,7 +778,15 @@ mod parent {
         }
     }
 
-    pub(super) fn run_child(env: &Env, scenario: &str, url: &str, extra: &[(&str, &str)]) -> Out {
+    /// The child command. The B4 hook variables are scrubbed FIRST (L3), so
+    /// a caller's `VAULT_SYNC_TEST_*` never reaches the child unless `extra`
+    /// names it.
+    pub(super) fn child_command(
+        env: &Env,
+        scenario: &str,
+        url: &str,
+        extra: &[(&str, &str)],
+    ) -> Command {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
             "--exact",
@@ -801,6 +809,7 @@ mod parent {
         .env("RUST_BACKTRACE", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+        crate::fault_inject::scrub_test_hook_env(&mut cmd);
         if !extra
             .iter()
             .any(|(k, _)| *k == "VAULT_SYNC_RECON_INTERVAL_SECS")
@@ -824,6 +833,11 @@ mod parent {
             }
             cmd.env_remove("NEXUS_SYNC_CONFIG_DIR");
         }
+        cmd
+    }
+
+    pub(super) fn run_child(env: &Env, scenario: &str, url: &str, extra: &[(&str, &str)]) -> Out {
+        let mut cmd = child_command(env, scenario, url, extra);
         let mut child = cmd.spawn().unwrap();
         let so = child.stdout.take().unwrap();
         let se = child.stderr.take().unwrap();
@@ -2000,7 +2014,52 @@ fn b4_run(opts: MockOpts, extra: &[(&str, &str)]) -> Out {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let m = rt.block_on(mock(opts));
     let env = one_root_env(&m.srv.url());
-    run_child(&env, "fault_inject", &m.srv.url(), extra)
+    // `<cfg>` stands for this child's NEXUS_SYNC_CONFIG_DIR. The test-mode
+    // guard binds to that dir (M1), so an armed case must name it exactly.
+    let cfg = env.cfg_dir.to_str().unwrap().to_string();
+    let owned: Vec<(String, String)> = extra
+        .iter()
+        .map(|(k, v)| {
+            let v = if *v == "<cfg>" {
+                cfg.clone()
+            } else {
+                v.to_string()
+            };
+            (k.to_string(), v)
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    run_child(&env, "fault_inject", &m.srv.url(), &refs)
+}
+
+/// L3 (subprocess): the child command the harness builds has no inherited
+/// hook variable. Negative control: remove the scrub call in
+/// `child_command` and this fails.
+#[cfg(unix)]
+#[test]
+fn b4_child_command_scrubs_inherited_hook_env() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let m = rt.block_on(mock(MockOpts::default()));
+    let env = one_root_env(&m.srv.url());
+    let cmd = child_command(&env, "fault_inject", &m.srv.url(), &[]);
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        removed
+            .iter()
+            .any(|k| k == "VAULT_SYNC_TEST_END_REQUIRED_TASK"),
+        "{removed:?}"
+    );
+    assert!(
+        removed.iter().any(|k| k == "VAULT_SYNC_TEST_MODE"),
+        "{removed:?}"
+    );
 }
 
 /// B4 (a): no trigger: no behaviour change (ready, live, no exit, no hook
@@ -2023,14 +2082,23 @@ fn b4_fault_inject_unarmed_no_change() {
     );
 }
 
-/// B4 (b): the trigger without `VAULT_SYNC_TEST_MODE=1` is refused (one
-/// WARN) and ignored: the named task runs on, no exit.
-/// Negative control: remove the test-mode guard in `fault_inject::decide`
-/// and this child exits 70.
+/// B4 (b, M1): the trigger is refused unless `VAULT_SYNC_TEST_MODE` is bound
+/// to this managed instance's config dir (the full path, or its final
+/// component, which is `cfg` here). Unset, `0`, `true`, the generic `1` a
+/// leaked environment carries, and a foreign path are all refused (one
+/// WARN); the named task runs on, no exit.
+/// Negative control: relax `fault_inject::check_test_mode` to accept `1`
+/// (or drop the binding) and the `1` case below exits 70.
 #[cfg(unix)]
 #[test]
-fn b4_fault_inject_refused_without_guard() {
-    for tm in [None, Some("0"), Some("true")] {
+fn b4_fault_inject_refused_unless_test_mode_binds_to_config_dir() {
+    for tm in [
+        None,
+        Some("0"),
+        Some("true"),
+        Some("1"),
+        Some("/other/dir/not-this-instance"),
+    ] {
         let mut extra = vec![
             ("VAULT_SYNC_TEST_END_REQUIRED_TASK", "drain_loop:0@1"),
             ("CS3_HOLD_MS", "3000"),
@@ -2068,7 +2136,7 @@ fn b4_fault_inject_armed_required_end_exits_70() {
             MockOpts::default(),
             &[
                 ("VAULT_SYNC_TEST_END_REQUIRED_TASK", trig.as_str()),
-                ("VAULT_SYNC_TEST_MODE", "1"),
+                ("VAULT_SYNC_TEST_MODE", "<cfg>"),
                 ("CS3_HOLD_MS", "15000"),
             ],
         );
@@ -2121,7 +2189,7 @@ fn b4_fault_inject_after_terminal_is_cascade() {
         },
         &[
             ("VAULT_SYNC_TEST_END_REQUIRED_TASK", "drain_loop:0@4"),
-            ("VAULT_SYNC_TEST_MODE", "1"),
+            ("VAULT_SYNC_TEST_MODE", "<cfg>"),
             ("CS3_SKIP_READY", "1"),
             ("CS3_HOLD_MS", "8000"),
         ],

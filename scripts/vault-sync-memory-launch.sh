@@ -109,6 +109,18 @@ if [ -f "$DEFAULT_CFG" ]; then
     fi
 fi
 
+# --- (d) strip the test-hook environment, then exec ----------------------------
+# A managed service must never run a fault-injection drill. The unit's
+# environment can pick up VAULT_SYNC_TEST_* from user-wide channels
+# (launchctl setenv, systemctl --user import-environment, dbus activation),
+# and a leaked trigger would make the daemon exit 70 on every relaunch. The
+# daemon also refuses a bare VAULT_SYNC_TEST_MODE=1 (crate fault_inject); this
+# removes the variables before the daemon can read them. A drill runs the
+# binary directly, not through this launcher.
+while IFS= read -r test_var; do
+    unset "$test_var"
+done < <(compgen -e | grep '^VAULT_SYNC_TEST_' || true)
+
 # --- (d) all gates green — exec the daemon (env passes through exec) --------------
 echo "[vault-sync-memory-launch] gates passed: sha256 ok, version=$ACTUAL_VERSION exact, config dir $NEXUS_SYNC_CONFIG_DIR sane (root: $MANAGED_ROOT). exec'ing daemon." >&2
 exec "$BIN" --silent "$@"

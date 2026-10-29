@@ -373,14 +373,18 @@ impl Supervisor {
                 // B4: the armed test hook. If the timer wins, the task is
                 // aborted and reported as an unexpected return, so the real
                 // classification below decides (exit 70, or cascade).
+                // `biased`: the timer is polled first, so a zero delay wins
+                // even when the task has already returned (M3). Without it,
+                // tokio picks a ready branch at random.
                 Some(timer) => {
                     let mut h = std::pin::pin!(h);
                     tokio::select! {
-                        r = &mut h => r.map_err(|e| e.to_string()),
+                        biased;
                         () = timer => {
                             h.abort();
                             Ok(TaskEnd::Returned)
                         }
+                        r = &mut h => r.map_err(|e| e.to_string()),
                     }
                 }
             };
