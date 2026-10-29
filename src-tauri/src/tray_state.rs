@@ -20,6 +20,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -120,6 +121,9 @@ pub struct TrayState {
     /// CS-3 §3.1: the sha8 of the config snapshot this process runs on
     /// (empty when unpaired).
     pub config_sha8: String,
+    /// WS-A A6 (TKT-17fc22e5 / TKT-8fc0b2a4): pushes the server rejected
+    /// PERMANENTLY (HTTP 400 / 422; skip + ack, never retried). Monotonic.
+    pub pushes_rejected_permanent: u64,
     /// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): pushes refused LOCALLY by the
     /// pre-push I3 check (NUL byte / invalid UTF-8) — nothing was sent.
     pub pushes_refused_local_i3: u64,
@@ -163,6 +167,7 @@ impl TrayState {
             update_available: None,
             config_pending_restart: false,
             config_sha8: String::new(),
+            pushes_rejected_permanent: 0,
             pushes_refused_local_i3: 0,
             rejected_paths: 0,
             reconcile_skipped_rejected: 0,
@@ -261,6 +266,23 @@ impl TrayState {
         self.recon_in_progress = in_progress;
     }
 
+    /// WS-A A6: the server rejected a push permanently (HTTP 400 / 422).
+    pub fn inc_pushes_rejected_permanent(&mut self) {
+        self.pushes_rejected_permanent = self.pushes_rejected_permanent.saturating_add(1);
+    }
+
+    /// WS-A A6: the four fail-loud push-health counters as one serializable
+    /// snapshot — the shape every export surface (status JSON, heartbeat,
+    /// `sync-verify`) reads, so a new surface never re-derives field names.
+    pub fn push_health(&self) -> PushHealthCounters {
+        PushHealthCounters {
+            pushes_rejected_permanent: self.pushes_rejected_permanent,
+            rejected_paths: self.rejected_paths,
+            pushes_refused_local_i3: self.pushes_refused_local_i3,
+            reconcile_skipped_rejected: self.reconcile_skipped_rejected,
+        }
+    }
+
     /// WS-A A2: a push was refused by the local I3 check (never sent).
     pub fn inc_pushes_refused_local_i3(&mut self) {
         self.pushes_refused_local_i3 = self.pushes_refused_local_i3.saturating_add(1);
@@ -317,6 +339,29 @@ fn format_staleness(d: std::time::Duration) -> String {
 
 pub type SharedTrayState = Arc<RwLock<TrayState>>;
 
+/// WS-A A6 (TKT-17fc22e5 / TKT-8fc0b2a4): the push fail-loud counters,
+/// serializable for the health surface. Field names are the wire names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushHealthCounters {
+    /// Pushes the server rejected permanently (HTTP 400 / 422).
+    pub pushes_rejected_permanent: u64,
+    /// Distinct paths currently in `rejected-ledger.json`.
+    pub rejected_paths: u64,
+    /// Pushes refused locally by the pre-push I3 check (never sent).
+    pub pushes_refused_local_i3: u64,
+    /// Reconciliation pushes suppressed by the rejected ledger.
+    pub reconcile_skipped_rejected: u64,
+}
+
+impl PushHealthCounters {
+    /// True iff anything is being refused or suppressed: the daemon is
+    /// converging around a path it cannot push. A health surface treats this
+    /// as degraded, not stalled.
+    pub fn is_degraded(&self) -> bool {
+        self.rejected_paths > 0 || self.pushes_refused_local_i3 > 0
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -345,6 +390,52 @@ mod tests {
         assert_eq!(s.integrity_failures, 0);
         assert!(!s.redflag_tripped);
         assert!(!s.delete_burst_paused);
+        assert_eq!(s.pushes_rejected_permanent, 0);
+        assert_eq!(s.pushes_refused_local_i3, 0);
+        assert_eq!(s.rejected_paths, 0);
+        assert_eq!(s.reconcile_skipped_rejected, 0);
+        assert_eq!(s.push_health(), PushHealthCounters::default());
+        assert!(!s.push_health().is_degraded());
+    }
+
+    /// WS-A A6: the four counters have inc/set fns and round-trip through the
+    /// serializer with their wire names and values intact.
+    #[test]
+    fn push_health_counters_round_trip_through_serde() {
+        let mut s = fresh();
+        s.inc_pushes_rejected_permanent();
+        s.inc_pushes_rejected_permanent();
+        s.inc_pushes_refused_local_i3();
+        s.set_rejected_paths(3);
+        s.inc_reconcile_skipped_rejected(5);
+        s.inc_reconcile_skipped_rejected(2);
+        let snap = s.push_health();
+        assert_eq!(
+            snap,
+            PushHealthCounters {
+                pushes_rejected_permanent: 2,
+                rejected_paths: 3,
+                pushes_refused_local_i3: 1,
+                reconcile_skipped_rejected: 7,
+            }
+        );
+        assert!(snap.is_degraded());
+        let json = serde_json::to_string(&snap).unwrap();
+        for name in [
+            "pushes_rejected_permanent",
+            "rejected_paths",
+            "pushes_refused_local_i3",
+            "reconcile_skipped_rejected",
+        ] {
+            assert!(json.contains(&format!("\"{name}\"")), "{json}");
+        }
+        let back: PushHealthCounters = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap, "round-trip must be lossless");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["pushes_rejected_permanent"], 2);
+        assert_eq!(v["rejected_paths"], 3);
+        assert_eq!(v["pushes_refused_local_i3"], 1);
+        assert_eq!(v["reconcile_skipped_rejected"], 7);
     }
 
     #[test]

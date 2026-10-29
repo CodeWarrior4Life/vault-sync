@@ -571,6 +571,10 @@ impl PushClient {
                         PushOutcome::Skipped(SkipReason::LocalContractViolation { .. }) => {
                             w.inc_pushes_refused_local_i3()
                         }
+                        // WS-A A6: every permanent server rejection is counted.
+                        PushOutcome::Skipped(SkipReason::ServerRejected { .. }) => {
+                            w.inc_pushes_rejected_permanent()
+                        }
                         _ => {}
                     }
                 }
@@ -3157,7 +3161,17 @@ mod tests {
             .create_async()
             .await;
         let (_d, journal) = make_journal_with(vec![evt("notes/Untitled 1.canvas", b"{}")]);
-        let client = make_client(&srv.url(), journal.clone()).await;
+        let tray: crate::tray_state::SharedTrayState =
+            Arc::new(std::sync::RwLock::new(crate::tray_state::TrayState::new(
+                "sub-test".into(),
+                srv.url(),
+                PathBuf::from("/nonexistent-vault-root"),
+            )));
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_tray_state(tray.clone())
+            .with_rejected_ledger(ledger);
 
         let outcomes = client.drain_once().await;
         assert_eq!(outcomes.len(), 1);
@@ -3168,6 +3182,10 @@ mod tests {
             }
             other => panic!("expected ServerRejected, got {other:?}"),
         }
+        // WS-A A6: counted, and the ledger gauge reflects the one rejected path.
+        let h = tray.read().unwrap().push_health();
+        assert_eq!(h.pushes_rejected_permanent, 1);
+        assert_eq!(h.rejected_paths, 1);
         assert_eq!(
             journal.len(),
             0,
