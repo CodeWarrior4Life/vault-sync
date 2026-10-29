@@ -103,6 +103,9 @@ impl Default for PushClientConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
+    /// TKT-a3e3ceb1: `<name>.md#chunk_N` is a search-index pseudo-row, never
+    /// a note; never hashed, journaled or pushed.
+    ChunkPseudoPath,
     SubstrateRefused {
         rule: &'static str,
     },
@@ -361,6 +364,10 @@ impl PushClient {
         content_bytes: &[u8],
         last_server_hash: Option<&str>,
     ) -> Option<SkipReason> {
+        // 0. TKT-a3e3ceb1: chunk pseudo-paths are never notes.
+        if crate::path_policy::is_chunk_pseudo_path(path) {
+            return Some(SkipReason::ChunkPseudoPath);
+        }
         // 1. Substrate fence (R11).
         if let PathClassification::Substrate { rule } = classify_path(path) {
             return Some(SkipReason::SubstrateRefused { rule });
@@ -633,6 +640,11 @@ impl PushClient {
 
     async fn process_event(&self, evt: &PushEvent) -> PushOutcome {
         // Pre-HTTP guards (defense-in-depth — also applied at pre-journal).
+        // TKT-a3e3ceb1: a chunk pseudo-path that reached the journal is acked
+        // as Skipped (never POSTed, never read from disk, never hashed).
+        if crate::path_policy::is_chunk_pseudo_path(&evt.path) {
+            return PushOutcome::Skipped(SkipReason::ChunkPseudoPath);
+        }
         if let PathClassification::Substrate { rule } = classify_path(&evt.path) {
             tracing::warn!(path = %evt.path, rule, "substrate path reached journal — refusing to POST");
             return PushOutcome::Skipped(SkipReason::SubstrateRefused { rule });
@@ -5141,5 +5153,41 @@ mod tests {
             .count();
         assert_eq!(forks, 1, "ordinary notes keep the in-vault conflict copy");
         assert!(!qdir.path().join("manifest.jsonl").exists());
+    }
+
+    // ---- TKT-a3e3ceb1: a chunk pseudo-path is never pushed ----
+
+    #[tokio::test]
+    async fn tkt_a3e3ceb1_pre_journal_filter_refuses_chunk_pseudo_path() {
+        let (_d, journal) = make_journal_with(vec![]);
+        let client = make_client("http://127.0.0.1:1", journal).await;
+        assert_eq!(
+            client.pre_journal_filter("notes/a.md#chunk_4", b"body", None),
+            Some(SkipReason::ChunkPseudoPath)
+        );
+        assert_eq!(client.pre_journal_filter("notes/a.md", b"body", None), None);
+    }
+
+    #[tokio::test]
+    async fn tkt_a3e3ceb1_drain_never_posts_a_journaled_chunk_pseudo_path() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md#chunk_4", b"x")]);
+        let client = make_client(&srv.url(), journal).await;
+        let outcomes = client.drain_once().await;
+        assert!(
+            matches!(
+                outcomes[0].1,
+                PushOutcome::Skipped(SkipReason::ChunkPseudoPath)
+            ),
+            "{:?}",
+            outcomes[0].1
+        );
+        m.assert_async().await;
     }
 }

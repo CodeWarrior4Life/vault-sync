@@ -158,11 +158,28 @@ pub enum WatchEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterDecision {
     Allow(WatchEvent),
-    DropSubstrate { path: String, rule: &'static str },
-    DropExtension { path: String, ext: String },
-    DropOutOfScope { path: String },
-    DropExclude { path: String, exclude_rule: String },
-    DropDeleteBurst { path: String },
+    DropSubstrate {
+        path: String,
+        rule: &'static str,
+    },
+    /// TKT-a3e3ceb1: `<name>.md#chunk_N` is a vault_notes pseudo-row, never a note.
+    DropChunkPseudo {
+        path: String,
+    },
+    DropExtension {
+        path: String,
+        ext: String,
+    },
+    DropOutOfScope {
+        path: String,
+    },
+    DropExclude {
+        path: String,
+        exclude_rule: String,
+    },
+    DropDeleteBurst {
+        path: String,
+    },
 }
 
 /// Opaque handle returned by [`FileWatcher::start`]. Dropping the handle
@@ -460,6 +477,7 @@ impl FileWatcher {
                     FilterDecision::DropOutOfScope { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropExclude { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropDeleteBurst { .. } => w.inc_events_filtered(),
+                    FilterDecision::DropChunkPseudo { .. } => w.inc_events_filtered(),
                 }
             }
         }
@@ -617,6 +635,11 @@ impl FileWatcher {
             if !in_scope {
                 return FilterDecision::DropOutOfScope { path: norm };
             }
+        }
+
+        // (4b) TKT-a3e3ceb1: a chunk pseudo-path is never a note.
+        if crate::path_policy::is_chunk_pseudo_path(&norm) {
+            return FilterDecision::DropChunkPseudo { path: norm };
         }
 
         // (5) Extension gate.
@@ -1481,6 +1504,7 @@ fn rewrite_decision_path(d: FilterDecision, p: String) -> FilterDecision {
             exclude_rule,
         },
         FilterDecision::DropDeleteBurst { .. } => FilterDecision::DropDeleteBurst { path: p },
+        FilterDecision::DropChunkPseudo { .. } => FilterDecision::DropChunkPseudo { path: p },
     }
 }
 
@@ -3371,5 +3395,28 @@ mod tests {
             Ok(_) => panic!("expected InotifyLimitExceeded, got Ok(WatchHandle)"),
             Err(e) => panic!("expected InotifyLimitExceeded, got {e:?}"),
         }
+    }
+
+    // ---- TKT-a3e3ceb1: a chunk pseudo-path is never pushed ----
+
+    #[test]
+    fn tkt_a3e3ceb1_watcher_drops_chunk_pseudo_path_but_allows_sibling() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        for evt in [
+            modified("01_Notes/Foo.md#chunk_12"),
+            deleted("01_Notes/Foo.md#chunk_12"),
+        ] {
+            match w.classify(&evt) {
+                FilterDecision::DropChunkPseudo { path } => {
+                    assert_eq!(path, "01_Notes/Foo.md#chunk_12")
+                }
+                other => panic!("expected DropChunkPseudo, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            w.classify(&modified("01_Notes/Foo.md")),
+            FilterDecision::Allow(_)
+        ));
     }
 }
