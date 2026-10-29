@@ -8,11 +8,14 @@
 ///
 /// Tests 1 and 2 pass.  Tests 3 and 4 are #[ignore] — see TODO comments.
 use mockito::Server;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::watch;
 use vault_sync_daemon::materializer::{Materializer, MaterializerConfig, MaterializerMode};
 use vault_sync_daemon::sse::SseConsumer;
+use vault_sync_daemon::tray_state::{ConnectionStatus, SharedTrayState, TrayState};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -233,67 +236,181 @@ async fn sse_503_with_retry_after_honored() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: CF-S470-T22-401-fastfail — 401 (token revoked) propagates as fatal
-//         error and the consumer exits without retrying.
+// Test 5: TKT-8fc0b2a4 (WS-A4) — an auth failure (401/403) does NOT end
+//         delivery. The consumer enters AuthFailed, keeps the cursor, retries
+//         on the bounded schedule, and when the server accepts again the
+//         reconnect carries the ORIGINAL Last-Event-ID and the status returns
+//         to Connected.
 //
-// Without the fast-fail fix, the SSE consumer would treat 401 the same as a
-// 503 backoff and keep reconnecting with a token the server has already
-// rejected — burning Nexus rate-limit and never recovering.
+// Pre-fix (CF-S470-T22-401-fastfail, 2026-05) the loop returned Err on the
+// first 401 and delivery stayed dead for 3 days on Trinity (2026-07-07)
+// while every liveness instrument read alive. The previous tests here
+// (`sse_401_fast_fails_without_retry`, `sse_403_...`) asserted that old
+// contract and were replaced by this one.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn sse_401_fast_fails_without_retry() {
-    let mut srv = Server::new_async().await;
-    let vault = TempDir::new().unwrap();
+/// Minimal SSE origin: answers the first `n_reject` connects with `reject`
+/// (401 or 403) and every later connect with a 200 event-stream held open by
+/// keep-alives. Records each request's `Last-Event-ID` header (None when the
+/// header is absent) so the test can prove the cursor survived the failure.
+async fn spawn_auth_flapping_sse_server(
+    n_reject: usize,
+    reject: u16,
+    seen: Arc<Mutex<Vec<Option<String>>>>,
+) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut n = 0usize;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let read = sock.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..read]).to_string();
+            let lei = head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("last-event-id")
+                    .then(|| v.trim().to_string())
+            });
+            seen.lock().unwrap().push(lei);
+            n += 1;
+            if n <= n_reject {
+                let body = r#"{"detail":"token revoked"}"#;
+                let resp = format!(
+                    "HTTP/1.1 {reject} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                continue;
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: keep-alive\n\n";
+            if sock.write_all(resp.as_bytes()).await.is_err() {
+                continue;
+            }
+            // Hold the accepted session open for the rest of the test.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if sock.write_all(b": keep-alive\n\n").await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
 
-    // 401 with expect(1): mockito asserts at drop that the endpoint was hit
-    // exactly once — i.e. no reconnect attempt was made.
-    let _m_events = srv
-        .mock("GET", "/api/sync/events")
-        .with_status(401)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"detail":"token revoked"}"#)
-        .expect(1)
-        .create_async()
-        .await;
-
-    let consumer = make_consumer(&srv.url(), &vault);
-    let (_tx, rx) = watch::channel(false);
-
-    // Generous 3 s timeout — fast-fail should land in <100 ms post-fix.
-    // Pre-fix, the consumer would backoff (1 s → 2 s → 4 s …) and still be
-    // running after 3 s with multiple mock hits, blowing the expect(1) check.
-    let result = tokio::time::timeout(Duration::from_secs(3), consumer.run(None, rx)).await;
-
-    match result {
-        Ok(Ok(())) => panic!("consumer should not have completed cleanly on 401"),
-        Ok(Err(_)) => {} // expected — 401 propagated as fatal
-        Err(_) => panic!("consumer did not fast-fail on 401; still running after 3s"),
+async fn wait_for_tray(
+    tray: &SharedTrayState,
+    what: &str,
+    timeout: Duration,
+    pred: impl Fn(&TrayState) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        {
+            let t = tray.read().unwrap();
+            if pred(&t) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; status={:?} auth_failed_since={:?} last_error={:?}",
+                t.status,
+                t.auth_failed_since,
+                t.last_error
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-#[tokio::test]
-async fn sse_403_fast_fails_without_retry() {
-    let mut srv = Server::new_async().await;
+async fn auth_failure_retries_and_resumes(reject: u16) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let addr = spawn_auth_flapping_sse_server(2, reject, seen.clone()).await;
+    let base_url = format!("http://{addr}");
     let vault = TempDir::new().unwrap();
+    let tray: SharedTrayState = Arc::new(RwLock::new(TrayState::new(
+        "sub-test".to_string(),
+        base_url.clone(),
+        vault.path().to_path_buf(),
+    )));
+    let transitions = Arc::new(AtomicU32::new(0));
+    let t2 = Arc::clone(&transitions);
+    let consumer = make_consumer(&base_url, &vault)
+        .with_tray_state(tray.clone())
+        // Tiny schedule so the real loop runs in milliseconds (production:
+        // 30 s doubling to 10 min; the schedule itself is unit-tested in
+        // auth_backoff.rs).
+        .with_auth_backoff(Duration::from_millis(60), Duration::from_millis(200))
+        .with_on_auth_failed(Arc::new(move |_status| {
+            t2.fetch_add(1, Ordering::SeqCst);
+        }));
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn(async move { consumer.run(Some("lsn-41".to_string()), rx).await });
 
-    let _m_events = srv
-        .mock("GET", "/api/sync/events")
-        .with_status(403)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"detail":"forbidden"}"#)
-        .expect(1)
-        .create_async()
-        .await;
+    // The first rejection is VISIBLE: AuthFailed + auth_failed_since stamped.
+    wait_for_tray(&tray, "AuthFailed", Duration::from_secs(5), |t| {
+        t.status == ConnectionStatus::AuthFailed && t.auth_failed_since.is_some()
+    })
+    .await;
 
-    let consumer = make_consumer(&srv.url(), &vault);
-    let (_tx, rx) = watch::channel(false);
-
-    let result = tokio::time::timeout(Duration::from_secs(3), consumer.run(None, rx)).await;
-
-    match result {
-        Ok(Ok(())) => panic!("consumer should not have completed cleanly on 403"),
-        Ok(Err(_)) => {} // expected — 403 propagated as fatal
-        Err(_) => panic!("consumer did not fast-fail on 403; still running after 3s"),
+    // Then the server accepts: the loop reconnects and reports Connected
+    // without ever having returned.
+    wait_for_tray(&tray, "Connected", Duration::from_secs(10), |t| {
+        t.status == ConnectionStatus::Connected
+    })
+    .await;
+    assert!(
+        !handle.is_finished(),
+        "run() must not have returned on HTTP {reject}"
+    );
+    {
+        let t = tray.read().unwrap();
+        assert_eq!(
+            t.auth_failed_since, None,
+            "recovery clears auth_failed_since"
+        );
+        assert_eq!(t.last_error, None, "Connected clears last_error");
     }
+    assert_eq!(
+        transitions.load(Ordering::SeqCst),
+        1,
+        "the on_auth_failed hook fires ONCE per episode, not per attempt"
+    );
+
+    // The cursor: every connect, including the one that succeeded after two
+    // rejections, carried the ORIGINAL Last-Event-ID.
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        3,
+        "two rejected connects then the accepted one: {seen:?}"
+    );
+    for (i, lei) in seen.iter().enumerate() {
+        assert_eq!(
+            lei.as_deref(),
+            Some("lsn-41"),
+            "connect #{i} must carry the original cursor: {seen:?}"
+        );
+    }
+
+    let _ = tx.send(true);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn sse_401_retries_with_backoff_and_resumes_from_original_cursor() {
+    auth_failure_retries_and_resumes(401).await;
+}
+
+#[tokio::test]
+async fn sse_403_retries_with_backoff_and_resumes_from_original_cursor() {
+    auth_failure_retries_and_resumes(403).await;
 }
