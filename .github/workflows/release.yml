@@ -5,6 +5,8 @@ on:
 
 permissions:
   contents: write  # needed by softprops/action-gh-release to create + upload assets
+  id-token: write     # B2 (PB-2D87-VS-SCOPE): OIDC token for actions/attest-build-provenance
+  attestations: write # B2: write the SLSA provenance attestation for each shipped artifact
 
 jobs:
   build:
@@ -122,6 +124,20 @@ jobs:
           done
           [ "$n" -eq 2 ] || { echo "::error::expected 1 .app.tar.gz + 1 .sig in $BUNDLE_DIR, staged $n"; exit 1; }
           ls -l dist-gh
+      # B2 (PB-2D87-VS-SCOPE, vault-sync 0.5.1 fleet placement plan): SLSA build provenance for EVERY file
+      # the GH release ships, so a downloaded asset proves which workflow run and which commit built it:
+      #   gh attestation verify <file> --repo CodeWarrior4Life/vault-sync
+      # The subject list mirrors the "Upload to GH Release" files list below; keep the two in step.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe.sig
+            dist-gh/*
       - name: Upload to GH Release
         uses: softprops/action-gh-release@v2
         with:
