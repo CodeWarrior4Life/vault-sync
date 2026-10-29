@@ -941,6 +941,9 @@ impl Materializer {
                         if matches!(self.mode, MaterializerMode::Live) {
                             if let Some(sh) = &self.shadow_store {
                                 sh.record(&payload.path, &local_raw_sha);
+                                // R2 (TKT-406f6cb3): local is byte-identical to
+                                // the server's bytes - mark them received.
+                                sh.note_received(&payload.path, &local_raw_sha);
                             }
                             // R4 (TKT-f74edf99): CLOSE THE R1-NOOP NON-RECORDING
                             // HOLE. This arm previously recorded only the shadow
@@ -1488,6 +1491,13 @@ impl Materializer {
         if matches!(self.mode, MaterializerMode::Live) {
             if let Some(sh) = &self.shadow_store {
                 sh.record(&payload.path, &payload.sha256);
+                // R2 (TKT-406f6cb3): the vault now holds exactly the server's
+                // bytes (integrity matched) - mark them received so an FS echo
+                // of this write is never pushed back. Not on a mismatch
+                // (integrity-check disabled path): then local != server.
+                if actual_sha == payload.sha256 {
+                    sh.note_received(&payload.path, &actual_sha);
+                }
             }
             // R3 (THESEUS AR-002, TKT-166e1c07): record the observed base_seq at
             // the SAME post-byte-verify, Live-only point as the shadow hash. The
@@ -1653,6 +1663,9 @@ impl Materializer {
         // returned before this line.
         if let Some(sh) = &self.shadow_store {
             sh.record(rel_path, canonical_sha);
+            // R2 (TKT-406f6cb3): the aligned rewrite landed the server's exact
+            // canonical bytes locally.
+            sh.note_received(rel_path, canonical_sha);
         }
         info!(path = %rel_path, sha = %canonical_sha, "aligned write: local rewritten to server canonical bytes (D2)");
         Ok(AlignOutcome::Rewrote { path: target })
@@ -1764,6 +1777,14 @@ impl Materializer {
         if !is_safe_path(path) {
             return Err(MaterializerError::PathTraversal(path.into()));
         }
+        // R2 (TKT-406f6cb3): the server deleted this note, so nothing local can
+        // be "the bytes just received" any more. Forget the received-hash
+        // ledger entry FIRST - before every early return below, including the
+        // nothing-to-delete path (the user may already have deleted the file,
+        // and a later byte-identical restore must still be pushed; review H1).
+        if let Some(sh) = &self.shadow_store {
+            sh.forget_received(path);
+        }
         // RASP substrate fence — LIFTED (see write()'s step 3). classify_path
         // always returns Content now, so substrate deletes proceed as content.
         // Branch retained for fence restoration; never taken while rules empty.
@@ -1857,16 +1878,6 @@ impl Materializer {
                 g.unrecord_delete(path);
             }
             return Err(e.into());
-        }
-        // R2 (TKT-406f6cb3): the server deleted this note and the vault no
-        // longer holds it, so there is no synced copy: drop the baseline. The
-        // file_watcher/push_client content gate ("bytes == shadow => not a local
-        // change") must not treat a later byte-identical restore as unchanged.
-        // Live only, like every other shadow recording point (B1, S534).
-        if matches!(self.mode, MaterializerMode::Live) {
-            if let Some(sh) = &self.shadow_store {
-                sh.remove(path);
-            }
         }
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())
@@ -3083,12 +3094,38 @@ mod tests {
         );
     }
 
-    /// R2 (TKT-406f6cb3): an inbound server delete leaves no synced copy, so a
-    /// LIVE soft_delete drops the shadow baseline. Otherwise the content gate
-    /// ("bytes == shadow => not a local change") would treat a byte-identical
-    /// user restore as unchanged and never push it. FAILS on origin/main.
+    /// R2 (TKT-406f6cb3), review H1: an inbound server delete forgets the
+    /// received-hash ledger entry even when the file is ALREADY ABSENT (the
+    /// user deleted it first) - the nothing-to-delete early return used to
+    /// skip the clear, so a later byte-identical restore was swallowed by the
+    /// drain gate and reconcile then soft-deleted it. The shadow (reconcile's
+    /// baseline) is left exactly as before.
     #[test]
-    fn r2_live_soft_delete_clears_shadow_baseline() {
+    fn r2_soft_delete_of_absent_file_forgets_received() {
+        let (_v, ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&ws.path().join("shadow_hashes.json")),
+        );
+        let m = m.with_shadow_store(shadow.clone());
+        let rel = format!("{VAULT}/01_Inbox/user-deleted-first.md");
+        shadow.record(&rel, &sha256_hex("synced"));
+        shadow.note_received(&rel, &sha256_hex("synced"));
+        m.soft_delete(&rel).unwrap(); // nothing to delete
+        assert_eq!(
+            shadow.received(&rel),
+            None,
+            "ledger forgotten on the no-file path"
+        );
+        assert_eq!(
+            shadow.get(&rel),
+            Some(sha256_hex("synced")),
+            "shadow untouched"
+        );
+    }
+
+    /// R2: the same on the normal (file present) soft-delete path.
+    #[test]
+    fn r2_live_soft_delete_forgets_received() {
         let (v, ws, m) = mk(MaterializerMode::Live, default_cfg());
         let shadow = crate::sync_shadow::ShadowStore::load(
             &crate::state_io::StateDir::for_test_file(&ws.path().join("shadow_hashes.json")),
@@ -3097,13 +3134,24 @@ mod tests {
         let rel = format!("{VAULT}/01_Inbox/server-deleted.md");
         std::fs::create_dir_all(v.path().join(VAULT).join("01_Inbox")).unwrap();
         std::fs::write(v.path().join(&rel), b"synced").unwrap();
-        shadow.record(&rel, &sha256_hex("synced"));
+        shadow.note_received(&rel, &sha256_hex("synced"));
         m.soft_delete(&rel).unwrap();
-        assert_eq!(
-            shadow.get(&rel),
-            None,
-            "inbound delete must drop the baseline"
+        assert_eq!(shadow.received(&rel), None);
+    }
+
+    /// R2: a Live materialize write marks the server bytes as received (the
+    /// mark the push client's echo gate keys on), and an integrity-verified
+    /// write only.
+    #[test]
+    fn r2_live_write_notes_received() {
+        let (_v, ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&ws.path().join("shadow_hashes.json")),
         );
+        let m = m.with_shadow_store(shadow.clone());
+        let p = payload("01_Inbox/inbound.md", "from link");
+        m.write(&p).unwrap();
+        assert_eq!(shadow.received(&p.path), Some(p.sha256.clone()));
     }
 
     /// R2(a) (TKT-406f6cb3): a LIVE pull-side R4/R5 conflict on a flight

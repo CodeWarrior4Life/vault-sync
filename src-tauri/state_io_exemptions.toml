@@ -20,7 +20,7 @@
 "materializer::Materializer::write_aligned_bytes" = "vault writer: ack-materialize-back rewrite; gate-4 belt first"
 "materializer::Materializer::canonical_root_for_mode" = "creates the shadow-mode vault tree root (.lattice-runtime/<sub>/shadow), non-state (§2.3)"
 "materializer::Materializer::soft_delete" = "vault writer: soft-delete rename inside the vault; gate-4 belt first"
-"conflict_stash::ConflictStash::write_stash" = "vault writer: conflict stash sibling (NamedTempFile + persist); gate-4 belt first"
+"conflict_stash::ConflictStash::write_stash_in_vault" = "vault writer: conflict stash sibling (NamedTempFile + persist); gate-4 belt first"
 "conflict_stash::ConflictStash::record_stash_manifest" = "vault writer: stash manifest append; gate-4 belt first"
 "conflict_stash::StashQuarantine::write" = "R2 (TKT-406f6cb3): flight-recorder conflict quarantine blob + manifest in the app-data dir, OUTSIDE the vault; non-state, gate-4 belt first"
 "obsidian_plugin_detect::detect_and_disable" = "rewrites the vault's .obsidian/community-plugins.json toggle; non-state"

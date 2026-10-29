@@ -340,6 +340,18 @@ pub struct ShadowStore {
     /// would mass-mis-key and re-push the vault. Consumers (the push pipeline)
     /// read this and PARK rather than proceed. See [`detect_vault_scope_suspect`].
     vault_scope_suspect: AtomicBool,
+    /// R2 (TKT-406f6cb3): the RECEIVED-HASH LEDGER. In-memory ONLY (never
+    /// flushed, never read by reconcile). `path -> sha` is present iff this
+    /// process KNOWS the local file holds exactly the bytes the server holds:
+    /// set by the materializer right after it wrote (or verified identical)
+    /// the server's bytes, cleared the moment anything may make that untrue
+    /// (a push leaving the host, any delete, a soft-delete). The push client's
+    /// drain gate refuses to send bytes equal to it - an echo of what was
+    /// just received. Deliberately NOT the shadow: the shadow is kept stale
+    /// on purpose on several paths (failed ack-align rewrite, non-accepted
+    /// delete) and lags the server, so a shadow-keyed gate swallows genuine
+    /// reverts. Lost on restart => the gate fails OPEN (an idempotent push).
+    received: Mutex<HashMap<String, String>>,
 }
 
 /// R7 (TKT-166e1c07, 2026-07-18 trinity incident): detect the misconfiguration
@@ -505,6 +517,7 @@ impl ShadowStore {
             gen: FlushGen::new(migrated),
             vault_folders,
             vault_scope_suspect: AtomicBool::new(suspect.is_some()),
+            received: Mutex::new(HashMap::new()),
         })
     }
 
@@ -532,6 +545,31 @@ impl ShadowStore {
                 self.gen.bump();
             }
         }
+    }
+
+    /// R2 (TKT-406f6cb3): mark that the local file at `path` now holds exactly
+    /// the server's bytes `sha` (see the `received` field). In-memory only.
+    pub fn note_received(&self, path: &str, sha: &str) {
+        let key = self.canon_key(path);
+        if let Ok(mut m) = self.received.lock() {
+            m.insert(key, sha.to_string());
+        }
+    }
+
+    /// R2: forget the received mark for `path` (anything that may make "local
+    /// == server" untrue: a push leaving the host, any delete).
+    pub fn forget_received(&self, path: &str) {
+        let key = self.canon_key(path);
+        if let Ok(mut m) = self.received.lock() {
+            m.remove(&key);
+        }
+    }
+
+    /// R2: the sha the local file is known to share with the server, if any.
+    /// A poisoned lock reads as `None` (gate fails open).
+    pub fn received(&self, path: &str) -> Option<String> {
+        let key = self.canon_key(path);
+        self.received.lock().ok().and_then(|m| m.get(&key).cloned())
     }
 
     /// The last-synced server hash recorded for `path`, if any. D8 (S511): the
