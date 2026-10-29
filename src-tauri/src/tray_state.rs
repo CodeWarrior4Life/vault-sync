@@ -123,6 +123,14 @@ pub struct TrayState {
     /// WS-A A2 (TKT-17fc22e5 / TKT-8fc0b2a4): pushes refused LOCALLY by the
     /// pre-push I3 check (NUL byte / invalid UTF-8) — nothing was sent.
     pub pushes_refused_local_i3: u64,
+    /// WS-A A3: distinct paths currently in the rejected ledger
+    /// (`rejected-ledger.json`), i.e. paths whose current bytes the server
+    /// (or the local I3 check) refused and that reconciliation will not
+    /// re-queue until their bytes change.
+    pub rejected_paths: u64,
+    /// WS-A A3: reconciliation pushes NOT queued because the path's current
+    /// sha equals its ledgered rejected sha (the loop this closes).
+    pub reconcile_skipped_rejected: u64,
 }
 
 impl TrayState {
@@ -156,6 +164,8 @@ impl TrayState {
             config_pending_restart: false,
             config_sha8: String::new(),
             pushes_refused_local_i3: 0,
+            rejected_paths: 0,
+            reconcile_skipped_rejected: 0,
         }
     }
 
@@ -254,6 +264,16 @@ impl TrayState {
     /// WS-A A2: a push was refused by the local I3 check (never sent).
     pub fn inc_pushes_refused_local_i3(&mut self) {
         self.pushes_refused_local_i3 = self.pushes_refused_local_i3.saturating_add(1);
+    }
+
+    /// WS-A A3: the rejected ledger's current distinct-path count.
+    pub fn set_rejected_paths(&mut self, n: usize) {
+        self.rejected_paths = n as u64;
+    }
+
+    /// WS-A A3: `n` reconciliation pushes were suppressed by the rejected ledger.
+    pub fn inc_reconcile_skipped_rejected(&mut self, n: u64) {
+        self.reconcile_skipped_rejected = self.reconcile_skipped_rejected.saturating_add(n);
     }
 
     pub fn note_recon_pass(&mut self, pulls: u64, pushes: u64) {

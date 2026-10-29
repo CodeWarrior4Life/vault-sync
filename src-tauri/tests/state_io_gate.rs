@@ -61,6 +61,7 @@ const STATE_FILE_NAMES: &[&str] = &[
     "delete-burst-SUPPRESSED",
     "delete-burst-PAUSED",
     "reconcile-retry-ledger.json",
+    "rejected-ledger.json",
 ];
 
 const DISALLOWED_LINTS: &[&str] = &["clippy::disallowed_methods", "clippy::disallowed_method"];

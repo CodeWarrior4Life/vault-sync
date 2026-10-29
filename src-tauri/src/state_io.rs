@@ -75,6 +75,8 @@ pub enum StateFile {
     DeleteLedger,
     PauseMarker,
     ReconcileRetryLedger,
+    /// WS-A A3 (TKT-17fc22e5): permanently rejected pushes, config scope.
+    RejectedLedger,
 }
 
 impl StateFile {
@@ -89,6 +91,7 @@ impl StateFile {
         StateFile::DeleteLedger,
         StateFile::PauseMarker,
         StateFile::ReconcileRetryLedger,
+        StateFile::RejectedLedger,
     ];
 
     /// Fixed relative name: no `/`, no `..`, byte-identical to v1.
@@ -103,12 +106,13 @@ impl StateFile {
             StateFile::DeleteLedger => "delete-burst-SUPPRESSED",
             StateFile::PauseMarker => "delete-burst-PAUSED",
             StateFile::ReconcileRetryLedger => "reconcile-retry-ledger.json",
+            StateFile::RejectedLedger => "rejected-ledger.json",
         }
     }
 
     pub const fn scope(self) -> Scope {
         match self {
-            StateFile::ReconcileRetryLedger => Scope::ConfigDir,
+            StateFile::ReconcileRetryLedger | StateFile::RejectedLedger => Scope::ConfigDir,
             _ => Scope::SyncState,
         }
     }

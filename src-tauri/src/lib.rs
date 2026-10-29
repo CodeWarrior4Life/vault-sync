@@ -35,6 +35,7 @@ pub mod rasp_fence;
 pub mod read_receipt;
 pub mod reconciliation;
 pub mod redflag;
+pub mod rejected_ledger;
 pub mod retry_ledger;
 pub mod scope;
 pub mod sse;

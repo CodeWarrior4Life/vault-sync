@@ -143,6 +143,7 @@ pub async fn run_reconciliation_pass(
     tray_state: SharedTrayState,
     materializer: crate::materializer::Materializer,
     shadow: Arc<crate::sync_shadow::ShadowStore>,
+    rejected_ledger: Arc<crate::rejected_ledger::RejectedLedger>,
 ) -> Result<VerifyRepairReport, VerifyRepairError> {
     if let Ok(mut w) = tray_state.write() {
         w.set_recon_in_progress(true);
@@ -173,7 +174,8 @@ pub async fn run_reconciliation_pass(
     )
     .with_materializer(materializer)
     .with_shadow(shadow)
-    .with_retry_ledger(Arc::clone(&retry_ledger));
+    .with_retry_ledger(Arc::clone(&retry_ledger))
+    .with_rejected_ledger(Arc::clone(&rejected_ledger));
 
     tracing::info!("reconciliation: pass starting");
     let result = vr.run().await;
@@ -204,6 +206,8 @@ pub async fn run_reconciliation_pass(
                 pushes_queued = report.modify_count,
                 substrate_refused = report.substrate_refused_count,
                 retry_ledger_pending = retry_ledger.len(),
+                rejected_skipped = report.rejected_skipped_count,
+                rejected_paths = rejected_ledger.len(),
                 cycle = if cycle_red { "RED" } else { "green" },
                 soak_eligible = report.soak_eligible(),
                 elapsed_ms = report.elapsed_ms,
@@ -220,6 +224,9 @@ pub async fn run_reconciliation_pass(
             }
             if let Ok(mut w) = tray_state.write() {
                 w.note_recon_pass(report.add_count as u64, report.modify_count as u64);
+                // WS-A A3: surface the suppression and the ledger size.
+                w.inc_reconcile_skipped_rejected(report.rejected_skipped_count as u64);
+                w.set_rejected_paths(rejected_ledger.len());
             }
             // Surface a sample of the pulled paths in the log so drift is
             // visible without parsing tray counters.
@@ -436,6 +443,7 @@ pub fn spawn_reconciliation_task(
     tray_state: SharedTrayState,
     materializer: crate::materializer::Materializer,
     shadow: Arc<crate::sync_shadow::ShadowStore>,
+    rejected_ledger: Arc<crate::rejected_ledger::RejectedLedger>,
 ) -> tauri::async_runtime::JoinHandle<crate::supervise::TaskEnd> {
     tauri::async_runtime::spawn(async move {
         #[cfg(test)]
@@ -470,6 +478,7 @@ pub fn spawn_reconciliation_task(
                 tray_state.clone(),
                 materializer.clone(),
                 shadow.clone(),
+                Arc::clone(&rejected_ledger),
             )
             .await;
             // Errors are already WARN-logged by run_reconciliation_pass;

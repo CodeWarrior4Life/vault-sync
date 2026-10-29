@@ -185,6 +185,10 @@ fn fire_writers(fx: &Fixture, f: StateFile, custody_on: bool) {
             // Config scope: covered by `t_cs2_1_retry_ledger_config_scope`.
             fx.move_and_recreate();
         }
+        StateFile::RejectedLedger => {
+            // Config scope, same writer discipline as the retry ledger.
+            fx.move_and_recreate();
+        }
     }
 }
 
@@ -567,6 +571,11 @@ fn t_cs2_30_owners_never_follow_planted_symlinks() {
                 let l = crate::retry_ledger::RetryLedger::load(&sd);
                 assert!(l.is_empty());
                 l.record_failure("a", "b");
+            }
+            StateFile::RejectedLedger => {
+                let l = crate::rejected_ledger::RejectedLedger::load(&sd);
+                assert!(l.is_empty());
+                l.record("a", "sha", 400, "b");
             }
         }
         assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL", "{f:?}");

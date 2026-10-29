@@ -246,6 +246,12 @@ pub struct PushClient {
     /// [`crate::conflict_stash::is_append_only_flight_recorder`]). `None` keeps
     /// the in-vault `.conflict-from-*` sibling for every path.
     stash_quarantine_dir: Option<PathBuf>,
+    /// WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4): the durable rejected ledger.
+    /// A `ServerRejected` / `LocalContractViolation` outcome records the
+    /// path + the sha of the bytes it tried to send; `Sent` / `Merged` clears
+    /// the path. Reconciliation consults it before re-queueing. `None` = no
+    /// recording (unit tests / degraded wiring).
+    rejected_ledger: Option<Arc<crate::rejected_ledger::RejectedLedger>>,
 }
 
 impl PushClient {
@@ -272,7 +278,18 @@ impl PushClient {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         }
+    }
+
+    /// WS-A A3: attach the shared rejected ledger (production: the one
+    /// instance `boot` also hands to the reconciliation backstop).
+    pub fn with_rejected_ledger(
+        mut self,
+        ledger: Arc<crate::rejected_ledger::RejectedLedger>,
+    ) -> Self {
+        self.rejected_ledger = Some(ledger);
+        self
     }
 
     /// S5 (v0.4.28): arm the min-version gate cooldown for `duration` from
@@ -528,6 +545,17 @@ impl PushClient {
             if should_ack {
                 to_ack.push(cur);
             }
+            // WS-A A3: the server took bytes for this path — it is no longer
+            // a rejected path (whatever it was rejected for, the content that
+            // reached the server now differs).
+            if let Some(l) = &self.rejected_ledger {
+                if matches!(
+                    outcome,
+                    PushOutcome::Sent { .. } | PushOutcome::Merged { .. }
+                ) {
+                    l.clear(&evt.path);
+                }
+            }
             // v0.3 tray telemetry — increment on Sent (success) or Failed
             // (NetworkExhausted only; auth/conflict outcomes are explicit
             // skip-class, not "failure" for the dashboard's purposes).
@@ -559,6 +587,9 @@ impl PushClient {
         if let Some(tray) = &self.tray_state {
             if let Ok(mut w) = tray.write() {
                 w.set_uploads_pending(pending_after);
+                if let Some(l) = &self.rejected_ledger {
+                    w.set_rejected_paths(l.len());
+                }
             }
         }
         // opfix-vaultsync-dormancy (R1+R3): stamp progress whenever the
@@ -715,6 +746,14 @@ impl PushClient {
                     len = content_bytes.len(),
                     "push refused locally: content violates the text-lane contract (I3) - not sent, skip + ack"
                 );
+                if let Some(l) = &self.rejected_ledger {
+                    l.record(
+                        &evt.path,
+                        &sha256_hex(&content_bytes),
+                        crate::rejected_ledger::STATUS_LOCAL_I3,
+                        &format!("local I3: {} at byte offset {}", v.kind, v.offset),
+                    );
+                }
                 return PushOutcome::Skipped(SkipReason::LocalContractViolation {
                     kind: v.kind,
                     offset: v.offset,
@@ -1066,6 +1105,11 @@ impl PushClient {
                         reason = %detail,
                         "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
+                    // WS-A A3: bind the rejection to the exact bytes so the
+                    // reconciliation backstop stops re-queueing them.
+                    if let Some(l) = &self.rejected_ledger {
+                        l.record(&evt.path, &drained_sha, status, &detail);
+                    }
                     return PushOutcome::Skipped(SkipReason::ServerRejected { status, detail });
                 }
                 Err(e) => {
@@ -2769,6 +2813,7 @@ mod tests {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -2801,6 +2846,7 @@ mod tests {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -2829,6 +2875,7 @@ mod tests {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -2856,6 +2903,7 @@ mod tests {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -3279,6 +3327,100 @@ mod tests {
             outcomes[0].1
         );
         m.assert_async().await;
+    }
+
+    // ---- WS-A A3 (TKT-17fc22e5 / TKT-8fc0b2a4): rejected ledger ----
+
+    /// A 400 records (path, sha of the sent bytes, status, reason); a second
+    /// rejection of the same bytes bumps the count.
+    #[tokio::test]
+    async fn server_rejected_records_rejected_ledger_entry() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(2)
+            .with_status(400)
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let body = b"{}";
+        let (_d, journal) = make_journal_with(vec![evt("notes/Untitled 1.canvas", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        client.drain_once().await;
+        let e = ledger.get("notes/Untitled 1.canvas").expect("ledgered");
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert_eq!(e.status, 400);
+        assert_eq!(e.reason, "invalid path");
+        assert_eq!(e.count, 1);
+        journal
+            .append(evt("notes/Untitled 1.canvas", body))
+            .unwrap();
+        client.drain_once().await;
+        assert_eq!(ledger.get("notes/Untitled 1.canvas").unwrap().count, 2);
+        assert_eq!(ledger.len(), 1);
+    }
+
+    /// A local I3 refusal is ledgered with status 0 and the sha of the bytes
+    /// that would have been sent.
+    #[tokio::test]
+    async fn local_i3_refusal_records_ledger_entry_with_status_zero() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(0)
+            .create_async()
+            .await;
+        let body = b"a\0b";
+        let (_d, journal) = make_journal_with(vec![evt("notes/nul.md", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        client.drain_once().await;
+        let e = ledger.get("notes/nul.md").expect("ledgered");
+        assert_eq!(e.status, crate::rejected_ledger::STATUS_LOCAL_I3);
+        assert_eq!(e.content_sha256, sha256_hex(body));
+        assert!(
+            e.reason.contains("nul") && e.reason.contains("offset 1"),
+            "{}",
+            e.reason
+        );
+    }
+
+    /// An accepted push clears the path from the ledger.
+    #[tokio::test]
+    async fn sent_clears_rejected_ledger_entry() {
+        let body = b"fixed content\n";
+        let sha = sha256_hex(body);
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(200)
+            .with_body(accepted_body(&sha))
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/a.md", body)]);
+        let ledger = Arc::new(crate::rejected_ledger::RejectedLedger::in_memory());
+        ledger.record("notes/a.md", "old-rejected-sha", 400, "invalid path");
+        ledger.record("notes/other.md", "x", 422, "nul");
+        let client = make_client(&srv.url(), journal.clone())
+            .await
+            .with_rejected_ledger(Arc::clone(&ledger));
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "{:?}",
+            out[0].1
+        );
+        assert!(
+            ledger.get("notes/a.md").is_none(),
+            "Sent must clear the path"
+        );
+        assert_eq!(ledger.len(), 1, "other paths untouched");
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
@@ -3838,6 +3980,7 @@ mod tests {
             enqueued_hashes: None,
             drain_hook: None,
             stash_quarantine_dir: None,
+            rejected_ledger: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
