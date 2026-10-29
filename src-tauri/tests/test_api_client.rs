@@ -174,3 +174,103 @@ async fn health_503_returns_rate_limited() {
         }
     ));
 }
+
+// ---- WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): carry the rejection reason ----
+
+fn push_req<'a>(path: &'a str, b64: &'a str) -> vault_sync_daemon::api_client::PushRequest<'a> {
+    vault_sync_daemon::api_client::PushRequest {
+        device_id: "dev-test",
+        path,
+        content_b64: b64,
+        base_hash: "",
+        base_seq: None,
+        action: vault_sync_daemon::api_client::PushApiAction::Create,
+    }
+}
+
+/// A FastAPI 400 carries `{"detail": "<reason>"}`; the daemon logged the
+/// status only (215 lines/day on Trinity with no cause). The `detail` field
+/// must survive to the caller as `ApiError::Rejected { status, detail }`.
+#[tokio::test]
+async fn push_400_carries_json_detail_as_rejected() {
+    let mut srv = Server::new_async().await;
+    let _m = srv
+        .mock("POST", "/api/sync/push")
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":"invalid path"}"#)
+        .create_async()
+        .await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
+    match err {
+        ApiError::Rejected { status, detail } => {
+            assert_eq!(status, 400);
+            assert_eq!(detail, "invalid path");
+        }
+        other => panic!("expected ApiError::Rejected, got {other:?}"),
+    }
+}
+
+/// 422 is the same permanent class; a non-JSON body is carried raw.
+#[tokio::test]
+async fn push_422_carries_raw_body_when_not_json() {
+    let mut srv = Server::new_async().await;
+    let _m = srv
+        .mock("POST", "/api/sync/push")
+        .with_status(422)
+        .with_body("content contains NUL bytes; not storable")
+        .create_async()
+        .await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
+    match err {
+        ApiError::Rejected { status, detail } => {
+            assert_eq!(status, 422);
+            assert_eq!(detail, "content contains NUL bytes; not storable");
+        }
+        other => panic!("expected ApiError::Rejected, got {other:?}"),
+    }
+}
+
+/// The detail is bounded (512 chars) so a pathological body cannot bloat a
+/// log line or the rejected ledger.
+#[tokio::test]
+async fn push_400_detail_is_capped_at_512_chars() {
+    let mut srv = Server::new_async().await;
+    let long = "x".repeat(5000);
+    let _m = srv
+        .mock("POST", "/api/sync/push")
+        .with_status(400)
+        .with_body(format!(r#"{{"detail":"{long}"}}"#))
+        .create_async()
+        .await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
+    match err {
+        ApiError::Rejected { detail, .. } => {
+            assert!(
+                detail.chars().count() <= 512,
+                "detail must be capped, got {} chars",
+                detail.chars().count()
+            );
+        }
+        other => panic!("expected ApiError::Rejected, got {other:?}"),
+    }
+}
+
+/// A 500 stays the generic (retriable) `Server` class: only 400/422 are
+/// promoted to the permanent `Rejected` variant.
+#[tokio::test]
+async fn push_500_stays_server_error() {
+    let mut srv = Server::new_async().await;
+    let _m = srv
+        .mock("POST", "/api/sync/push")
+        .with_status(500)
+        .with_body(r#"{"detail":"boom"}"#)
+        .create_async()
+        .await;
+    let client = ApiClient::new(&srv.url(), "vsk_test").unwrap();
+    let err = client.push(&push_req("a.md", "aGk=")).await.unwrap_err();
+    assert!(matches!(err, ApiError::Server(500)), "got {err:?}");
+}

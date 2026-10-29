@@ -139,6 +139,14 @@ pub enum ApiError {
     NotFound(String),
     #[error("server error: HTTP {0}")]
     Server(u16),
+    /// WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): HTTP 400 or 422 on push. A
+    /// PERMANENT rejection: re-sending the same bytes can never succeed. The
+    /// server names the cause in its body on every such raise (FastAPI
+    /// `{"detail": "..."}`); `detail` is that field, or the raw body when the
+    /// body is not JSON, capped at [`REJECTED_DETAIL_CAP`] chars. A 4xx error
+    /// body is not note content, but it is capped anyway.
+    #[error("rejected permanently (HTTP {status}): {detail}")]
+    Rejected { status: u16, detail: String },
     #[error("rate limited; retry after {retry_after_secs} seconds")]
     RateLimited { retry_after_secs: u64 },
     #[error("network error: {0}")]
@@ -739,8 +747,49 @@ impl ApiClient {
                     .collect();
                 Err(ApiError::UpgradeRequired { detail })
             }
+            // WS-A A1: 400 / 422 are permanent rejections whose cause the
+            // server names in the body. Carry it; never drop it again.
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ApiError::Rejected {
+                    status: status.as_u16(),
+                    detail: rejection_detail(&body),
+                })
+            }
             s => Err(ApiError::Server(s.as_u16())),
         }
+    }
+}
+
+/// WS-A A1: cap on the carried rejection reason (chars). Long enough for the
+/// server's worst message (the NUL-byte reason names the path), short enough
+/// that a log line and a ledger row stay bounded.
+pub const REJECTED_DETAIL_CAP: usize = 512;
+
+/// WS-A A1: extract the human-readable reason from a 400/422 response body.
+///
+/// FastAPI raises carry `{"detail": "<reason>"}`; a validation 422 carries
+/// `{"detail": [ {...}, ... ]}` (kept as its JSON text so the field names
+/// survive); anything else (HTML from a proxy, plain text) is carried raw.
+/// Always trimmed and capped at [`REJECTED_DETAIL_CAP`] chars; an empty body
+/// becomes `"<empty body>"` so the log line never reads `reason=`.
+pub fn rejection_detail(body: &str) -> String {
+    let picked: String = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => match map.get("detail") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => body.to_string(),
+            Some(other) => other.to_string(),
+        },
+        _ => body.to_string(),
+    };
+    let trimmed = picked.trim();
+    if trimmed.is_empty() {
+        return "<empty body>".to_string();
+    }
+    if trimmed.chars().count() <= REJECTED_DETAIL_CAP {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(REJECTED_DETAIL_CAP).collect()
     }
 }
 
@@ -748,6 +797,39 @@ impl ApiClient {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// WS-A A1: the reason extractor handles every body shape the server sends.
+    #[test]
+    fn rejection_detail_extracts_fastapi_detail_or_raw_body() {
+        assert_eq!(
+            rejection_detail(r#"{"detail":"invalid path"}"#),
+            "invalid path"
+        );
+        assert_eq!(
+            rejection_detail(
+                r#"{"detail":"content contains NUL bytes; not storable in the text bare core (path=a.md)"}"#
+            ),
+            "content contains NUL bytes; not storable in the text bare core (path=a.md)"
+        );
+        // Validation 422: detail is a list; its JSON text is carried.
+        let v =
+            rejection_detail(r#"{"detail":[{"loc":["body","content"],"msg":"field required"}]}"#);
+        assert!(v.contains("field required"), "got {v}");
+        // Non-JSON body: raw, trimmed.
+        assert_eq!(
+            rejection_detail("  Invalid base64 content \n"),
+            "Invalid base64 content"
+        );
+        // JSON without detail: raw body.
+        assert_eq!(rejection_detail(r#"{"error":"x"}"#), r#"{"error":"x"}"#);
+        // Empty: a sentinel, never an empty reason.
+        assert_eq!(rejection_detail(""), "<empty body>");
+        assert_eq!(rejection_detail("   "), "<empty body>");
+        // Cap at 512 chars on a char boundary (multi-byte safe).
+        let long = "é".repeat(2000);
+        let capped = rejection_detail(&long);
+        assert_eq!(capped.chars().count(), REJECTED_DETAIL_CAP);
+    }
 
     /// v0.4.30 ship gate: the self-reported daemon_version (User-Agent + the
     /// startup PATCH /subscribers/me the server's S5 min-version gate reads)

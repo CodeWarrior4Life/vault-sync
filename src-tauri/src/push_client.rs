@@ -124,6 +124,10 @@ pub enum SkipReason {
     /// permanent-reject class and carries `status: 422`.
     ServerRejected {
         status: u16,
+        /// WS-A A1 (TKT-17fc22e5, TKT-8fc0b2a4): the server's own reason
+        /// (its FastAPI `detail`, or the raw body), capped at 512 chars by
+        /// `api_client::rejection_detail`. Never note content.
+        detail: String,
     },
     /// Managed-instance mode (spec §5, 2026-08-08): a `*.conflict-from-*`
     /// sibling or the conflict-stash manifest reached the push path — refused
@@ -1018,13 +1022,18 @@ impl PushClient {
                 // can never succeed. Before this arm, 422 fell into the generic
                 // transient arm -> 5 retries -> NetworkExhausted -> NOT acked ->
                 // journal-wedged, retried every drain tick forever.
-                Err(ApiError::Server(status @ (400 | 422))) => {
-                    tracing::info!(
+                // WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): the server names the
+                // cause in its body on every 400/422; it is carried here as
+                // `reason=` so a permanent rejection is never silent again
+                // (Trinity: 215 reason-less lines/day for 3 paths).
+                Err(ApiError::Rejected { status, detail }) => {
+                    tracing::warn!(
                         path = %evt.path,
                         status,
+                        reason = %detail,
                         "push rejected permanently (HTTP {status}) - skip + ack, no retry"
                     );
-                    return PushOutcome::Skipped(SkipReason::ServerRejected { status });
+                    return PushOutcome::Skipped(SkipReason::ServerRejected { status, detail });
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -2993,8 +3002,11 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
             outcomes[0].1,
-            PushOutcome::Skipped(SkipReason::ServerRejected { status: 422 }),
-            "422 must be a permanent ServerRejected skip"
+            PushOutcome::Skipped(SkipReason::ServerRejected {
+                status: 422,
+                detail: "content is not valid UTF-8".to_string(),
+            }),
+            "422 must be a permanent ServerRejected skip carrying the server's detail"
         );
         // Acked: the journal entry is consumed, never retried.
         assert_eq!(
@@ -3003,6 +3015,40 @@ mod tests {
             "422 outcome must be acked (journal drained)"
         );
         m.assert_async().await; // exactly one HTTP attempt
+    }
+
+    /// WS-A A1 (TKT-17fc22e5 / TKT-8fc0b2a4): a 400 carries the server's
+    /// `detail` into the skip reason. A mutation that drops the detail (empty
+    /// string, or the status-only variant) fails this assertion.
+    #[tokio::test]
+    async fn test_400_server_rejected_carries_detail() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .expect(1)
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"detail":"invalid path"}"#)
+            .create_async()
+            .await;
+        let (_d, journal) = make_journal_with(vec![evt("notes/Untitled 1.canvas", b"{}")]);
+        let client = make_client(&srv.url(), journal.clone()).await;
+
+        let outcomes = client.drain_once().await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PushOutcome::Skipped(SkipReason::ServerRejected { status, detail }) => {
+                assert_eq!(*status, 400);
+                assert_eq!(detail, "invalid path", "the server's detail must survive");
+            }
+            other => panic!("expected ServerRejected, got {other:?}"),
+        }
+        assert_eq!(
+            journal.len(),
+            0,
+            "400 outcome must be acked (journal drained)"
+        );
+        m.assert_async().await;
     }
 
     /// I29 (S513, TKT-2dc9a17e): a file_watcher push enqueues base_hash=None and
