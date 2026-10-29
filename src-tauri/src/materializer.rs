@@ -314,6 +314,12 @@ pub struct MaterializerConfig {
     /// behaviour back to the pre-fix always-stash floor WITHOUT a binary swap.
     /// When off, `Decision::Conflict` behaves exactly as before the fix.
     pub append_arms_enabled: bool,
+    /// R2(a) (TKT-406f6cb3): out-of-vault quarantine for conflict stashes of
+    /// append-only flight recorders (`active-work.md`, `active-work.<host>.md`,
+    /// see [`crate::conflict_stash::is_append_only_flight_recorder`]). `None`
+    /// keeps the in-vault `.conflict-from-*` sibling for every path; the daemon
+    /// sets it to [`crate::conflict_stash::StashQuarantine::default_dir`].
+    pub stash_quarantine_dir: Option<std::path::PathBuf>,
 }
 
 /// TKT-ddff1877: parse the `VAULT_SYNC_APPEND_ARMS` value. Anything other than
@@ -335,6 +341,7 @@ impl Default for MaterializerConfig {
             conflict_storm_threshold: 50,
             conflict_storm_window_secs: 600,
             append_arms_enabled: true,
+            stash_quarantine_dir: None,
         }
     }
 }
@@ -1331,7 +1338,8 @@ impl Materializer {
                             MaterializerMode::Live => self.vaults_root.clone(),
                             _ => self.shadow_root(),
                         };
-                        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
+                        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy)
+                            .with_quarantine(self.live_stash_quarantine());
                         // Compute the stash path FIRST and record it in the echo_guard
                         // BEFORE writing it, so the file_watcher recognizes the stash
                         // write as an echo and never enqueues the conflict copy as a
@@ -1681,6 +1689,15 @@ impl Materializer {
     /// stash target, for echo-guard keying. The echo guard is keyed by the
     /// same wire-path form the file_watcher normalizes to. Returns None if the
     /// stash path is not under the active root (it always is in practice).
+    /// R2(a) (TKT-406f6cb3): the flight-recorder conflict quarantine, LIVE mode
+    /// only. Shadow/Disabled stashes stay in the shadow tree, exactly as before.
+    fn live_stash_quarantine(&self) -> Option<PathBuf> {
+        match self.mode {
+            MaterializerMode::Live => self.config.stash_quarantine_dir.clone(),
+            _ => None,
+        }
+    }
+
     fn rel_for_stash(&self, stash_abs: &Path) -> Option<String> {
         let root = match self.mode {
             MaterializerMode::Live => &self.vaults_root,
@@ -1705,7 +1722,8 @@ impl Materializer {
             MaterializerMode::Live => self.vaults_root.clone(),
             _ => self.shadow_root(),
         };
-        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy);
+        let stasher = ConflictStash::new(stash_root, self.config.conflict_policy)
+            .with_quarantine(self.live_stash_quarantine());
         let seq: u64 = self
             .base_seq_store
             .as_ref()
@@ -1839,6 +1857,16 @@ impl Materializer {
                 g.unrecord_delete(path);
             }
             return Err(e.into());
+        }
+        // R2 (TKT-406f6cb3): the server deleted this note and the vault no
+        // longer holds it, so there is no synced copy: drop the baseline. The
+        // file_watcher/push_client content gate ("bytes == shadow => not a local
+        // change") must not treat a later byte-identical restore as unchanged.
+        // Live only, like every other shadow recording point (B1, S534).
+        if matches!(self.mode, MaterializerMode::Live) {
+            if let Some(sh) = &self.shadow_store {
+                sh.remove(path);
+            }
         }
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())
@@ -3052,6 +3080,64 @@ mod tests {
         assert!(
             !guard2.is_delete_echo("01_Inbox/shadow-del.md"),
             "shadow-mode soft_delete must NOT record a delete echo"
+        );
+    }
+
+    /// R2 (TKT-406f6cb3): an inbound server delete leaves no synced copy, so a
+    /// LIVE soft_delete drops the shadow baseline. Otherwise the content gate
+    /// ("bytes == shadow => not a local change") would treat a byte-identical
+    /// user restore as unchanged and never push it. FAILS on origin/main.
+    #[test]
+    fn r2_live_soft_delete_clears_shadow_baseline() {
+        let (v, ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let shadow = crate::sync_shadow::ShadowStore::load(
+            &crate::state_io::StateDir::for_test_file(&ws.path().join("shadow_hashes.json")),
+        );
+        let m = m.with_shadow_store(shadow.clone());
+        let rel = format!("{VAULT}/01_Inbox/server-deleted.md");
+        std::fs::create_dir_all(v.path().join(VAULT).join("01_Inbox")).unwrap();
+        std::fs::write(v.path().join(&rel), b"synced").unwrap();
+        shadow.record(&rel, &sha256_hex("synced"));
+        m.soft_delete(&rel).unwrap();
+        assert_eq!(
+            shadow.get(&rel),
+            None,
+            "inbound delete must drop the baseline"
+        );
+    }
+
+    /// R2(a) (TKT-406f6cb3): a LIVE pull-side R4/R5 conflict on a flight
+    /// recorder stashes the local loser into the quarantine, not the vault.
+    #[test]
+    fn r2_live_recorder_conflict_stash_is_quarantined() {
+        let q = TempDir::new().unwrap();
+        let cfg = MaterializerConfig {
+            stash_quarantine_dir: Some(q.path().to_path_buf()),
+            append_arms_enabled: false,
+            ..default_cfg()
+        };
+        let (v, _ws, m) = mk(MaterializerMode::Live, cfg);
+        let dir = v.path().join(VAULT).join("02_Projects/Nexus");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Shadow absent (R5, unknown provenance) + local != server => stash floor.
+        std::fs::write(dir.join("active-work.md"), b"local divergent recorder\n").unwrap();
+        let out = m
+            .write(&payload("02_Projects/Nexus/active-work.md", "server body"))
+            .unwrap();
+        let forks = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(forks, 0, "no in-vault fork for a recorder, outcome {out:?}");
+        let blob = q
+            .path()
+            .join("blobs")
+            .join(format!("{}.md", sha256_hex("local divergent recorder\n")));
+        assert_eq!(
+            std::fs::read(&blob).unwrap(),
+            b"local divergent recorder\n",
+            "losing bytes preserved in the quarantine"
         );
     }
 

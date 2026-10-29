@@ -227,6 +227,11 @@ pub struct PushClient {
     /// CS-3 §3.3 readiness: called after every `drain_once` in `run_loop`
     /// (the root's `FIRST_DRAIN_DONE` bit is a latch).
     drain_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// R2(a) (TKT-406f6cb3): out-of-vault quarantine for the CAS-409 stash of
+    /// an append-only flight recorder (see
+    /// [`crate::conflict_stash::is_append_only_flight_recorder`]). `None` keeps
+    /// the in-vault `.conflict-from-*` sibling for every path.
+    stash_quarantine_dir: Option<PathBuf>,
 }
 
 impl PushClient {
@@ -252,6 +257,7 @@ impl PushClient {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         }
     }
 
@@ -282,6 +288,14 @@ impl PushClient {
     /// pushed path. Backwards-compatible — without it, no recording.
     pub fn with_shadow_store(mut self, store: Arc<crate::sync_shadow::ShadowStore>) -> Self {
         self.shadow_store = Some(store);
+        self
+    }
+
+    /// R2(a) (TKT-406f6cb3): route the CAS-409 stash of append-only flight
+    /// recorders to `dir`, OUTSIDE the vault (production:
+    /// [`crate::conflict_stash::StashQuarantine::default_dir`]).
+    pub fn with_stash_quarantine(mut self, dir: PathBuf) -> Self {
+        self.stash_quarantine_dir = Some(dir);
         self
     }
 
@@ -684,6 +698,38 @@ impl PushClient {
             sha256_hex(&content_bytes)
         };
 
+        // R2 (TKT-406f6cb3): DRAIN-TIME content-identity gate - the client never
+        // sends bytes whose hash equals the hash it last received from (or had
+        // accepted by) the server for this path. Watcher pushes are lazy, so
+        // this is checked against the bytes ACTUALLY drained, independent of
+        // how or when the event was enqueued (FS-event multiplicity, echo-guard
+        // TTL, a materialize that landed between enqueue and drain, the 409
+        // refetch `Wrote` path rewriting the file). Such a push is at best an
+        // idempotent no-op, and at worst - when another host moved the server
+        // on meanwhile - a stale-base CAS-409 whose "losing" bytes are a stale
+        // copy of the RECEIVED file: the 7 MB `active-work.md` conflict forks.
+        //
+        // Scoped to `PushBase::Unknown` (watcher events only): reconcile pushes
+        // (`KnownBase`) and the R5 re-create (`NoRow`) are explicit decisions
+        // made against the server's row and are honored verbatim. Deletes carry
+        // no body. A shadow cleared by an accepted delete (below) or an inbound
+        // soft-delete means "no synced copy", so a re-create always sends.
+        if matches!(evt.base_hash, PushBase::Unknown)
+            && !matches!(evt.action, PushAction::Delete)
+            && self
+                .shadow_store
+                .as_ref()
+                .and_then(|s| s.get(&evt.path))
+                .is_some_and(|last| last == drained_sha)
+        {
+            tracing::debug!(
+                path = %evt.path,
+                hash = %drained_sha,
+                "push_client: drained bytes == last server hash - no-op, not sent (R2)"
+            );
+            return PushOutcome::Skipped(SkipReason::IdenticalToServer { hash: drained_sha });
+        }
+
         // I29 (S513, TKT-2dc9a17e): backfill the CAS base from the shadow store.
         //
         // file_watcher emits real-time Create/Modify pushes with base_hash=None —
@@ -824,7 +870,18 @@ impl PushClient {
                         // true the D2 branch above owns recording (via
                         // ack_materialize_back / write_aligned_bytes), not
                         // this fallback.
-                        if let Some(h) = shadow_hash_for_ack(
+                        if matches!(
+                            (&resp.status, evt.action),
+                            (PushStatus::Accepted, PushAction::Delete)
+                        ) {
+                            // R2 (TKT-406f6cb3): an accepted delete leaves NO
+                            // synced copy, so drop the baseline (mirrors the
+                            // base_seq `bs.remove` below). Recording a hash here
+                            // would make the R2 content gate treat a later
+                            // byte-identical re-create as "unchanged" and never
+                            // send it.
+                            sh.remove(&evt.path);
+                        } else if let Some(h) = shadow_hash_for_ack(
                             &resp.status,
                             &drained_sha,
                             resp.server_hash.as_deref(),
@@ -1039,8 +1096,18 @@ impl PushClient {
         let stasher = crate::conflict_stash::ConflictStash::new(
             self.vault_root.clone(),
             crate::conflict_stash::ConflictPolicy::NewerWins,
-        );
-        match stasher.write_stash(wire_path, local_bytes, &self.device_id, 0) {
+        )
+        .with_quarantine(self.stash_quarantine_dir.clone());
+        // R2(a): the quarantine manifest records the server seq we last
+        // observed for the path; the in-vault name keeps lsn 0 (unchanged).
+        let observed_seq = self.base_seq_store.as_ref().and_then(|s| s.get(wire_path));
+        match stasher.write_stash_with_server_seq(
+            wire_path,
+            local_bytes,
+            &self.device_id,
+            0,
+            observed_seq,
+        ) {
             Ok(stash) => {
                 tracing::warn!(
                     path = %wire_path,
@@ -2593,6 +2660,7 @@ mod tests {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         };
         let raw = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
         let normalized = client.normalize_for_diff(raw);
@@ -2624,6 +2692,7 @@ mod tests {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         };
         let raw = b"plain markdown body, no frontmatter\n";
         let out = client.normalize_for_diff(raw);
@@ -2651,6 +2720,7 @@ mod tests {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         };
         let raw = b"# heading\n---\nupdated: x\n---\nbody\n";
         let out = client.normalize_for_diff(raw);
@@ -2677,6 +2747,7 @@ mod tests {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         };
         let yesterday = b"---\nupdated: 2026-05-26\ntitle: x\n---\nbody\n";
         let today = b"---\nupdated: 2026-05-27\ntitle: x\n---\nbody\n";
@@ -3468,6 +3539,7 @@ mod tests {
             materializer: None,
             enqueued_hashes: None,
             drain_hook: None,
+            stash_quarantine_dir: None,
         };
         // Root-relative path "01_Inbox/note.md" — not prefixed with the
         // sync root string. The filter should pass (not substrate, allowed ext).
@@ -4561,5 +4633,252 @@ mod tests {
             std::fs::read(vault.path().join("01_Notes/rec.md")).unwrap(),
             local
         );
+    }
+
+    // ---------- R2 (TKT-406f6cb3): content-identity gate + recorder quarantine ----------
+
+    fn r2_shadow(sdir: &TempDir) -> Arc<crate::sync_shadow::ShadowStore> {
+        crate::sync_shadow::ShadowStore::load(&crate::state_io::StateDir::for_test_file(
+            &sdir.path().join("shadow_hashes.json"),
+        ))
+    }
+
+    fn r2_watcher_evt(path: &str, action: PushAction, bytes: &[u8]) -> PushEvent {
+        PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: crate::push_journal::new_event_id(),
+            path: path.to_string(),
+            action,
+            base_hash: PushBase::Unknown,
+            content_sha: if matches!(action, PushAction::Delete) {
+                String::new()
+            } else {
+                sha256_hex(bytes)
+            },
+            content_bytes: None,
+            queued_at: Utc::now(),
+            device_id: "dev-test".into(),
+        }
+    }
+
+    /// R2 REGRESSION (drain side): a watcher event whose drained bytes equal the
+    /// shadow (the hash last received from the server) must never leave the
+    /// host - whatever enqueued it. This is the Trinity echo at the drain
+    /// boundary: the file holds exactly what link pushed and Trinity just
+    /// materialized, and pre-fix it was POSTed again (`push accepted` for the
+    /// identical hash 5-12 s after link). FAILS on origin/main: the push is
+    /// sent (mock expect(0) violated, outcome Sent).
+    #[tokio::test]
+    async fn r2_drain_never_sends_bytes_equal_to_last_server_hash() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","seq":1,"content_hash":null,"server_hash":null,"server_seq":2,"merged_content":null,"message":null}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let vault = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = r2_shadow(&sdir);
+        let rel = "02_Projects/Nexus/active-work.md";
+        let received = b"# recorder\n- **11:20** link appended\n";
+        std::fs::create_dir_all(vault.path().join("02_Projects/Nexus")).unwrap();
+        std::fs::write(vault.path().join(rel), received).unwrap();
+        shadow.record(rel, &sha256_hex(received));
+
+        let (_d, journal) =
+            make_journal_with(vec![r2_watcher_evt(rel, PushAction::Modify, received)]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_shadow_store(shadow);
+
+        let out = client.drain_once().await;
+        assert!(
+            matches!(
+                out[0].1,
+                PushOutcome::Skipped(SkipReason::IdenticalToServer { .. })
+            ),
+            "bytes == last server hash must be a local no-op, got {:?}",
+            out[0].1
+        );
+        assert_eq!(journal.len(), 0, "the no-op is acked, not retried");
+        m.assert_async().await;
+    }
+
+    /// R2 SCOPE: the drain gate applies to watcher (`PushBase::Unknown`) events
+    /// only. A reconcile push carrying an explicit `KnownBase` is a decision made
+    /// against the server row and must still be sent, shadow match or not.
+    #[tokio::test]
+    async fn r2_drain_gate_does_not_touch_known_base_pushes() {
+        let mut srv = Server::new_async().await;
+        let m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","seq":1,"content_hash":null,"server_hash":null,"server_seq":2,"merged_content":null,"message":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let sdir = TempDir::new().unwrap();
+        let shadow = r2_shadow(&sdir);
+        let body = b"reconcile decided to push this\n";
+        shadow.record("notes/r.md", &sha256_hex(body));
+        let (_d, journal) = make_journal_with(vec![evt("notes/r.md", body)]);
+        let client = make_client(&srv.url(), journal)
+            .await
+            .with_shadow_store(shadow);
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "got {:?}",
+            out[0].1
+        );
+        m.assert_async().await;
+    }
+
+    /// R2 SAFETY: an accepted delete drops the shadow baseline, so the content
+    /// gate can never swallow a later byte-identical re-create of the note.
+    /// FAILS on origin/main: the accepted delete RECORDED a hash into the shadow.
+    #[tokio::test]
+    async fn r2_accepted_delete_clears_shadow_so_identical_recreate_is_sent() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(200)
+            .with_body(r#"{"status":"accepted","seq":1,"content_hash":"h","server_hash":"h","server_seq":3,"merged_content":null,"message":null}"#)
+            .create_async()
+            .await;
+        let vault = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let shadow = r2_shadow(&sdir);
+        let rel = "notes/gone.md";
+        let body = b"synced body\n";
+        shadow.record(rel, &sha256_hex(body));
+
+        let (_d, journal) = make_journal_with(vec![r2_watcher_evt(rel, PushAction::Delete, b"")]);
+        let client = make_client_with_root(&srv.url(), journal.clone(), vault.path().to_path_buf())
+            .await
+            .with_shadow_store(shadow.clone());
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "got {:?}",
+            out[0].1
+        );
+        assert_eq!(
+            shadow.get(rel),
+            None,
+            "an accepted delete leaves no baseline"
+        );
+
+        // Restore the identical bytes: the re-create MUST be sent.
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join(rel), body).unwrap();
+        journal
+            .append(r2_watcher_evt(rel, PushAction::Modify, body))
+            .unwrap();
+        let out = client.drain_once().await;
+        assert!(
+            matches!(out[0].1, PushOutcome::Sent { .. }),
+            "re-create got {:?}",
+            out[0].1
+        );
+    }
+
+    /// R2(a): a CAS-409 on an append-only flight recorder preserves the losing
+    /// bytes in the out-of-vault quarantine (blob + manifest line), and mints
+    /// NO `.conflict-from-*` fork inside the vault. The on-disk file has moved
+    /// on (a link append landed between drain and 409), which is exactly the
+    /// genuine-D4 case that used to write a 7 MB fork beside the recorder.
+    #[tokio::test]
+    async fn r2_cas_409_on_flight_recorder_quarantines_outside_vault() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv_hash"}"#)
+            .create_async()
+            .await;
+        let vault = TempDir::new().unwrap();
+        let qdir = TempDir::new().unwrap();
+        let sdir = TempDir::new().unwrap();
+        let bs = crate::base_seq_store::BaseSeqStore::load(
+            &crate::state_io::StateDir::for_test_file(&sdir.path().join("base_seq.json")),
+        );
+        let rel = "02_Projects/Nexus/active-work.md";
+        bs.record_observed(rel, 4242);
+        let dir = vault.path().join("02_Projects/Nexus");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("active-work.md"), b"- a\n- b\n- c (link append)\n").unwrap();
+
+        let losing = b"- a\n- b\n";
+        let (_d, journal) = make_journal_with(vec![evt(rel, losing)]);
+        let client = make_client_with_root(&srv.url(), journal, vault.path().to_path_buf())
+            .await
+            .with_base_seq_store(bs)
+            .with_stash_quarantine(qdir.path().to_path_buf());
+        let out = client.drain_once().await;
+        assert!(matches!(
+            out[0].1,
+            PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+        ));
+
+        let forks: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".conflict-from-"))
+            .collect();
+        assert!(
+            forks.is_empty(),
+            "no in-vault fork for a flight recorder, found {forks:?}"
+        );
+
+        let sha = sha256_hex(losing);
+        let blob = qdir.path().join("blobs").join(format!("{sha}.md"));
+        assert_eq!(
+            std::fs::read(&blob).unwrap(),
+            losing,
+            "losing bytes preserved (S511 D4)"
+        );
+        let manifest = std::fs::read_to_string(qdir.path().join("manifest.jsonl")).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(manifest.lines().next().unwrap()).unwrap();
+        assert_eq!(line["path"], rel);
+        assert_eq!(line["sha256"], sha);
+        assert_eq!(line["bytes"], losing.len());
+        assert_eq!(line["server_seq"], 4242);
+        assert!(line["ts"].as_str().is_some_and(|t| t.ends_with('Z')));
+    }
+
+    /// R2(a) scope: a NON-recorder 409 keeps the in-vault sibling even with a
+    /// quarantine wired (the resolver UI and operator see ordinary conflicts).
+    #[tokio::test]
+    async fn r2_cas_409_on_ordinary_note_still_stashes_in_vault() {
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":"srv_hash"}"#)
+            .create_async()
+            .await;
+        let vault = TempDir::new().unwrap();
+        let qdir = TempDir::new().unwrap();
+        let dir = vault.path().join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("raced.md"), b"moved on").unwrap();
+        let (_d, journal) = make_journal_with(vec![evt("notes/raced.md", b"my edit")]);
+        let client = make_client_with_root(&srv.url(), journal, vault.path().to_path_buf())
+            .await
+            .with_stash_quarantine(qdir.path().to_path_buf());
+        client.drain_once().await;
+        let forks = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".conflict-from-"))
+            .count();
+        assert_eq!(forks, 1, "ordinary notes keep the in-vault conflict copy");
+        assert!(!qdir.path().join("manifest.jsonl").exists());
     }
 }

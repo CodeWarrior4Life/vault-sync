@@ -463,6 +463,9 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         device_id: cfg.subscriber_id.clone(),
         conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
         append_arms_enabled,
+        // R2(a) (TKT-406f6cb3): flight-recorder conflict stashes go to the
+        // app-data quarantine (beside logs/), never into the vault.
+        stash_quarantine_dir: Some(conflict_stash::StashQuarantine::default_dir()),
         ..Default::default()
     };
     let echo_guard = Arc::new(echo_guard::EchoGuard::new());
@@ -951,6 +954,7 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
     )
     .with_tray_state(ctx.tray.clone())
     .with_shadow_store(Arc::clone(&ctx.shadow))
+    .with_stash_quarantine(conflict_stash::StashQuarantine::default_dir())
     .with_base_seq_store(Arc::clone(&ctx.base_seq))
     .with_read_receipt_store(Arc::clone(&ctx.read_receipt))
     .with_sync_health(Arc::clone(&ctx.sync_health))

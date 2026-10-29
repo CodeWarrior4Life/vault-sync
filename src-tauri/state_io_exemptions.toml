@@ -22,6 +22,7 @@
 "materializer::Materializer::soft_delete" = "vault writer: soft-delete rename inside the vault; gate-4 belt first"
 "conflict_stash::ConflictStash::write_stash" = "vault writer: conflict stash sibling (NamedTempFile + persist); gate-4 belt first"
 "conflict_stash::ConflictStash::record_stash_manifest" = "vault writer: stash manifest append; gate-4 belt first"
+"conflict_stash::StashQuarantine::write" = "R2 (TKT-406f6cb3): flight-recorder conflict quarantine blob + manifest in the app-data dir, OUTSIDE the vault; non-state, gate-4 belt first"
 "obsidian_plugin_detect::detect_and_disable" = "rewrites the vault's .obsidian/community-plugins.json toggle; non-state"
 "managed_instance::resolve_config_dir" = "Unit 1d: creates the managed config dir before config load (CS-2 §3.2 step 5 relies on it)"
 "managed_instance::acquire_daemon_lock_with" = "Unit 1d: the managed daemon.lock in the config dir; non-state"
