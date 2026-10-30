@@ -16,6 +16,7 @@ pub mod conflict_stash;
 pub mod delete_ledger;
 pub mod durable_file;
 pub mod echo_guard;
+pub mod fault_inject;
 #[cfg(test)]
 pub(crate) mod faults;
 pub mod file_watcher;

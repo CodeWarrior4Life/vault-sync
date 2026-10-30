@@ -544,7 +544,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let canon = resolve_config_dir(dir.path()).unwrap();
         let ready = dir.path().join("child-ready");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child_cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        crate::fault_inject::scrub_test_hook_env(&mut child_cmd);
+        let mut child = child_cmd
             .args([
                 "--exact",
                 "managed_instance::tests::t1d5_child_process_holder",
@@ -766,6 +768,7 @@ mod tests {
 
     fn a6_spawn(helper: &str, dir: &Path, ready: Option<&Path>) -> std::process::Child {
         let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        crate::fault_inject::scrub_test_hook_env(&mut c);
         c.args([
             "--exact",
             &format!("managed_instance::tests::{helper}"),

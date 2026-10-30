@@ -702,9 +702,18 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         "starting SSE consumer for subscriber_id={}",
         snapshot.top_sub()
     );
-    let res = std::panic::AssertUnwindSafe(consumer.run(resumed_id, shutdown_rx))
-        .catch_unwind()
-        .await;
+    let run = std::panic::AssertUnwindSafe(consumer.run(resumed_id, shutdown_rx)).catch_unwind();
+    let res = match sup.fault_timer(&sse_spec) {
+        None => run.await,
+        // B4 (crate::fault_inject): the armed test hook ends the consumer as
+        // an unexpected return; the classification below decides.
+        // `biased`: the timer is polled first, so a zero delay is deterministic.
+        Some(timer) => tokio::select! {
+            biased;
+            () = timer => Ok(Ok(())),
+            r = run => r,
+        },
+    };
     let end = match res {
         Err(p) => Err(panic_text(&p)),
         Ok(Ok(())) => Ok(TaskEnd::Returned),
