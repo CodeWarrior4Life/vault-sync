@@ -2176,12 +2176,14 @@ fn b4_fault_inject_armed_required_end_exits_70() {
     }
 }
 
-/// B4 (c, Terminal): armed with the guard against a daemon already in a
-/// Terminal stop (SSE 401), the injected end is a cascade: no exit, the one
-/// 401 notice only.
+/// B4 (c, SSE 401 under 0.5.1): since #46 an SSE 401 is no longer a
+/// Terminal stop. The consumer keeps the cursor and retries with backoff, so
+/// an injected end of a Required task during that retry is a designed
+/// restart: exit 70, plus the one 401 notice. The Terminal-cascade semantics
+/// stay covered at unit level (`fault_inject::b4_armed_after_terminal_is_cascade`).
 #[cfg(unix)]
 #[test]
-fn b4_fault_inject_after_terminal_is_cascade() {
+fn b4_fault_inject_during_sse_401_retry_exits_70() {
     let out = b4_run(
         MockOpts {
             sse_401: true,
@@ -2194,23 +2196,19 @@ fn b4_fault_inject_after_terminal_is_cascade() {
             ("CS3_HOLD_MS", "8000"),
         ],
     );
-    assert_eq!(out.code, Some(0), "{}", out.dump());
-    assert!(out.has("NO_EXIT"), "{}", out.dump());
-    assert_eq!(out.kv("FIRED").as_deref(), Some("true"), "{}", out.dump());
-    assert_eq!(
-        out.kv("LIVENESS").as_deref(),
-        Some("Stopped { reason: \"sse_auth_failed\" }"),
-        "{}",
-        out.dump()
-    );
+    assert_eq!(out.code, Some(70), "{}", out.dump());
+    let ended: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("REQUIRED task ended unexpectedly"))
+        .collect();
+    assert_eq!(ended.len(), 1, "{}", out.dump());
+    assert!(ended[0].contains("drain_loop:0"), "{ended:?}");
     assert!(
-        out.stderr
-            .lines()
-            .any(|l| l.contains("(cascade)") && l.contains("drain_loop:0")),
+        out.stderr.lines().any(|l| l.contains("SSE AUTH FAILURE")),
         "{}",
         out.dump()
     );
-    assert_eq!(count(&out.stderr, "REQUIRED task ended unexpectedly"), 0);
     let notices = out
         .stdout
         .lines()
