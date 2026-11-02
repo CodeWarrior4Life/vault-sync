@@ -1100,9 +1100,7 @@ fn spawn_push_pipeline(ctx: &PipelineCtx, key: RootKey) -> Option<WatchHandle> {
     }
 
     // --- file_watcher: local FS edits → the SAME journal owner (J5). ---
-    let burst = Arc::new(std::sync::Mutex::new(
-        redflag::DeleteBurstDetector::new(20, Duration::from_secs(30)).with_pause_marker(&sd),
-    ));
+    let burst = Arc::new(std::sync::Mutex::new(redflag::daemon_burst_detector(&sd)));
     redflag::register_delete_burst_handle(Arc::clone(&burst));
     let watcher_cfg = push_watcher_config(
         &spec,
