@@ -183,10 +183,11 @@ impl DeleteBurstDetector {
     /// way as always — remove the marker, or the tray action. Returns `true`
     /// iff this call latched the valve.
     fn relatch_from_marker(&mut self) -> bool {
-        let Some(sd) = &self.pause_marker else {
+        let (Some(sd), Some(shown)) = (&self.pause_marker, self.pause_marker_display()) else {
             return false;
         };
-        let shown = sd.display(Some(StateFile::PauseMarker));
+        // CS-2 C7: the marker's operator text comes from the one listed
+        // `.display()` site (`pause_marker_display`), never a new call site.
         match sd.exists(StateFile::PauseMarker) {
             Ok(false) => false,
             Ok(true) => {
