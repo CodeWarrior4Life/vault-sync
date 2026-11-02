@@ -163,9 +163,51 @@ impl DeleteBurstDetector {
 
     /// Attach the filesystem pause marker (P0 2026-08-26). The production
     /// wire-up always sets this; `new()` alone keeps the marker-less behavior.
+    ///
+    /// TKT-58b50a68: attaching the marker also RE-LATCHES from it. The latch
+    /// is otherwise in-memory only, so before this fix every daemon restart
+    /// came back unpaused while `delete-burst-PAUSED` still said PAUSED. That
+    /// silently disarmed the valve, and because `poll_marker_resume` returns
+    /// early when not paused, a later `rm` of the marker never replayed the
+    /// suppressed ledger. A marker-attached detector can no longer disagree
+    /// with the disk.
     pub fn with_pause_marker(mut self, sd: &Arc<StateDir>) -> Self {
         self.pause_marker = Some(Arc::clone(sd));
+        self.relatch_from_marker();
         self
+    }
+
+    /// Re-latch the valve if the pause marker is present. Fail-CLOSED: an
+    /// error reading the marker also latches (the watchdog treats an
+    /// unreadable marker as PAUSED too), and the operator resumes the same
+    /// way as always — remove the marker, or the tray action. Returns `true`
+    /// iff this call latched the valve.
+    fn relatch_from_marker(&mut self) -> bool {
+        let (Some(sd), Some(shown)) = (&self.pause_marker, self.pause_marker_display()) else {
+            return false;
+        };
+        // CS-2 C7: the marker's operator text comes from the one listed
+        // `.display()` site (`pause_marker_display`), never a new call site.
+        match sd.exists(StateFile::PauseMarker) {
+            Ok(false) => false,
+            Ok(true) => {
+                self.paused = true;
+                tracing::warn!(
+                    marker = %shown,
+                    "redflag: delete-burst pause marker present at startup — valve RE-LATCHED; outbound delete propagation stays PAUSED until the marker is removed"
+                );
+                true
+            }
+            Err(e) => {
+                self.paused = true;
+                tracing::error!(
+                    marker = %shown,
+                    error = %e,
+                    "redflag: could not read delete-burst pause marker at startup — valve LATCHED fail-closed; outbound delete propagation PAUSED"
+                );
+                true
+            }
+        }
     }
 
     /// Operator text naming the pause marker, if one is configured
@@ -378,6 +420,19 @@ impl DeleteBurstDetector {
     pub fn is_paused(&self) -> bool {
         self.paused
     }
+}
+
+/// Daemon delete-burst threshold: deletes per [`DAEMON_BURST_WINDOW`].
+pub const DAEMON_BURST_THRESHOLD: usize = 20;
+/// Daemon delete-burst sliding window.
+pub const DAEMON_BURST_WINDOW: Duration = Duration::from_secs(30);
+
+/// The detector exactly as the daemon builds it at boot (TKT-58b50a68).
+/// Kept as one function so the boot wire-up and its restart test cannot
+/// drift apart: it attaches the pause marker, which re-latches the valve
+/// when the marker survived the previous process.
+pub fn daemon_burst_detector(sd: &Arc<StateDir>) -> DeleteBurstDetector {
+    DeleteBurstDetector::new(DAEMON_BURST_THRESHOLD, DAEMON_BURST_WINDOW).with_pause_marker(sd)
 }
 
 /// Process-global handle to the daemon's single [`DeleteBurstDetector`].
@@ -712,6 +767,84 @@ mod tests {
             "20 deletes in 20ms must trip a 20/30s valve"
         );
         (det, marker)
+    }
+
+    // ----- TKT-58b50a68: the latch must SURVIVE a daemon restart ----- //
+    //
+    // MEASURED 2026-10-29 / 2026-11-02: icarus, link and (after the 05:41
+    // kernel-panic reboot) Trinity all came back UNLATCHED while
+    // `delete-burst-PAUSED` still said PAUSED, because the latch lived only in
+    // memory. These drive the exact boot constructor (`daemon_burst_detector`).
+
+    #[test]
+    fn boot_with_existing_marker_comes_up_paused() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("delete-burst-PAUSED"), b"PAUSED\n").unwrap();
+        let mut det = daemon_burst_detector(&crate::state_io::StateDir::for_test(dir.path()));
+        assert!(
+            det.is_paused(),
+            "a pause marker left by the previous process must re-latch the valve at boot"
+        );
+        assert_eq!(
+            det.record_delete_at(Instant::now()),
+            BurstStatus::Paused,
+            "the first delete after boot must be suppressed, not propagated"
+        );
+    }
+
+    #[test]
+    fn restart_keeps_the_pause_and_marker_removal_still_resumes() {
+        let dir = TempDir::new().unwrap();
+        let (first, marker) = tripped_with_marker(&dir);
+        drop(first); // the process that tripped the valve exits
+        assert!(marker.exists(), "precondition: marker survives the process");
+
+        let mut second = daemon_burst_detector(&crate::state_io::StateDir::for_test(dir.path()));
+        assert!(
+            second.is_paused(),
+            "restart must NOT silently disarm the valve"
+        );
+
+        // The headless resume path must work across the restart too: before
+        // the fix `poll_marker_resume` returned early (not paused), so the
+        // suppressed-delete ledger was never replayed.
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            second.poll_marker_resume(),
+            "removing the marker after a restart must resume (and trigger replay)"
+        );
+        assert!(!second.is_paused());
+    }
+
+    #[test]
+    fn boot_without_marker_comes_up_unpaused() {
+        let dir = TempDir::new().unwrap();
+        let mut det = daemon_burst_detector(&crate::state_io::StateDir::for_test(dir.path()));
+        assert!(!det.is_paused(), "no marker means no latch at boot");
+        assert!(matches!(
+            det.record_delete_at(Instant::now()),
+            BurstStatus::BelowThreshold { .. }
+        ));
+    }
+
+    #[test]
+    fn boot_marker_read_error_latches_fail_closed() {
+        // A state dir whose scope cannot hold the pause marker makes the
+        // marker read an Err. Unknown state must latch, never unlatch.
+        let dir = TempDir::new().unwrap();
+        let sd = crate::state_io::StateDir::for_test_scoped(
+            dir.path(),
+            crate::state_io::Scope::ConfigDir,
+        );
+        assert!(
+            sd.exists(StateFile::PauseMarker).is_err(),
+            "precondition: this fixture must make the marker read fail"
+        );
+        let det = daemon_burst_detector(&sd);
+        assert!(
+            det.is_paused(),
+            "an unreadable marker must latch fail-closed"
+        );
     }
 
     #[test]
