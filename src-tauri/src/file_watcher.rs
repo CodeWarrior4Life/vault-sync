@@ -2696,6 +2696,107 @@ mod tests {
         assert_eq!(w.journal.lock().unwrap().len(), 1);
     }
 
+    /// TKT-98da9ee3 / LSEC-G328 delete-safety: the delete-burst valve still
+    /// latches on a MANAGED (routed) root once the scope gate passes. Before
+    /// TKT-35f75318 every routed event was DropOutOfScope, so the valve was
+    /// never reached on a managed instance; restoring the scope match must not
+    /// open a path that bypasses it. Detector built exactly as boot builds it
+    /// (`redflag::daemon_burst_detector`, 20 deletes / 30 s, marker attached);
+    /// watcher built as spawn_push_pipeline builds it for a routed root
+    /// (`storage_prefix: Some(route)`, `managed_payload_excludes: true`) with
+    /// a non-empty scope gate that the route-prefixed storage key satisfies.
+    #[tokio::test]
+    async fn routed_managed_root_delete_burst_latches_valve_with_scope_gate_active() {
+        const N: usize = 25;
+        let threshold = crate::redflag::DAEMON_BURST_THRESHOLD;
+        assert_eq!(threshold, 20);
+        assert_eq!(
+            crate::redflag::DAEMON_BURST_WINDOW,
+            std::time::Duration::from_secs(30)
+        );
+        assert!(N > threshold);
+
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let state = jdir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        let burst = Arc::new(Mutex::new(crate::redflag::daemon_burst_detector(&marker)));
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec!["harness-memory/".to_string()],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: true,
+            storage_prefix: Some("harness-memory/Nexus".to_string()),
+        };
+        let w = FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(&jdir),
+            burst.clone(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_delete_ledger(ledger.clone());
+
+        // The scope gate is ACTIVE (non-empty scope_roots) and PASSES on the
+        // route-prefixed storage key; an out-of-route key would drop.
+        assert_eq!(
+            storage_key_for(Some("harness-memory/Nexus"), "m-00.md"),
+            "harness-memory/Nexus/m-00.md"
+        );
+        assert!(matches!(
+            w.classify(&deleted("m-00.md")),
+            FilterDecision::Allow(_)
+        ));
+        assert!(!burst.lock().unwrap().is_paused());
+        assert!(!marker.exists());
+
+        // N real file deletes, all inside one 30 s window.
+        let mut names: Vec<String> = (0..N).map(|i| format!("m-{i:02}.md")).collect();
+        for n in &names {
+            std::fs::write(dir.path().join(n), b"memory body").unwrap();
+        }
+        for n in &names {
+            let abs = dir.path().join(n);
+            std::fs::remove_file(&abs).unwrap();
+            w.handle_fs_path(&abs).await;
+        }
+
+        // Exactly the first `threshold` deletes are queued (the 20th trips the
+        // valve after it is allowed); NOTHING past the threshold is queued.
+        let queued = queued_delete_paths(&w);
+        names.sort();
+        assert_eq!(
+            queued,
+            names[..threshold].to_vec(),
+            "only the first {threshold} deletes may queue on a routed managed root"
+        );
+        // Valve latched and the marker written (the headless resume handle).
+        assert!(
+            burst.lock().unwrap().is_paused(),
+            "the delete-burst valve must latch on a routed managed root"
+        );
+        assert!(marker.exists(), "the pause marker must be written");
+        // Every delete past the threshold is SUPPRESSED and ledgered.
+        assert_eq!(
+            ledger.paths().into_iter().collect::<Vec<_>>(),
+            names[threshold..].to_vec(),
+            "every suppressed delete must be recorded in the ledger"
+        );
+        // A further delete while latched still does not queue (the journal
+        // is ack-based: `drain` above does not shrink `len`, so compare).
+        let before = w.journal.lock().unwrap().len();
+        let late = dir.path().join("late.md");
+        std::fs::write(&late, b"x").unwrap();
+        std::fs::remove_file(&late).unwrap();
+        w.handle_fs_path(&late).await;
+        assert_eq!(w.journal.lock().unwrap().len(), before);
+        assert!(ledger.paths().contains("late.md"));
+    }
+
     // ---------- to_push_event() ----------
 
     #[test]
