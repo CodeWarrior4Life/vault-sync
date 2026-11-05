@@ -320,6 +320,18 @@ impl TrayState {
         }
     }
 
+    /// TKT-457a5073 follow-up (review MEDIUM 1): the pull-side fail-loud
+    /// counters as one serializable snapshot, the sibling of
+    /// [`Self::push_health`] for the LOCAL status/health surface. NOT part of
+    /// the server heartbeat (`heartbeat.rs` does not read it; that contract
+    /// is unchanged).
+    pub fn pull_health(&self) -> PullHealthCounters {
+        PullHealthCounters {
+            shrink_guard_fired: self.shrink_guard_fired,
+            integrity_failures: self.integrity_failures,
+        }
+    }
+
     /// WS-A A2: a push was refused by the local I3 check (never sent).
     pub fn inc_pushes_refused_local_i3(&mut self) {
         self.pushes_refused_local_i3 = self.pushes_refused_local_i3.saturating_add(1);
@@ -399,6 +411,29 @@ impl PushHealthCounters {
     }
 }
 
+/// TKT-457a5073 follow-up: the pull fail-loud counters, serializable for the
+/// LOCAL health surface. Field names are the wire names. Both fields are
+/// `#[serde(default)]` so an older snapshot still deserializes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullHealthCounters {
+    /// Pulls where the content-shrink guard fired (local preserved, then
+    /// aligned to a much smaller server head). Monotonic since start.
+    #[serde(default)]
+    pub shrink_guard_fired: u64,
+    /// Post-write integrity-check failures. Monotonic since start.
+    #[serde(default)]
+    pub integrity_failures: u64,
+}
+
+impl PullHealthCounters {
+    /// True iff something on the pull side needs the owner's eyes: a note
+    /// was truncated by the server (its bytes are preserved) or a write did
+    /// not verify. A health surface treats this as "review", not stalled.
+    pub fn needs_review(&self) -> bool {
+        self.shrink_guard_fired > 0 || self.integrity_failures > 0
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -437,6 +472,36 @@ mod tests {
 
     /// WS-A A6: the four counters have inc/set fns and round-trip through the
     /// serializer with their wire names and values intact.
+    /// TKT-457a5073 follow-up: the pull-side snapshot is serializable with
+    /// stable wire names, round-trips, and `shrink_guard_fired` is exposed.
+    #[test]
+    fn pull_health_counters_round_trip_through_serde() {
+        let mut s = fresh();
+        assert_eq!(s.pull_health(), PullHealthCounters::default());
+        assert!(!s.pull_health().needs_review());
+        s.inc_shrink_guard_fired();
+        s.inc_shrink_guard_fired();
+        s.inc_integrity_failures();
+        let snap = s.pull_health();
+        assert_eq!(
+            snap,
+            PullHealthCounters {
+                shrink_guard_fired: 2,
+                integrity_failures: 1,
+            }
+        );
+        assert!(snap.needs_review());
+        let json = serde_json::to_string(&snap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["shrink_guard_fired"], 2);
+        assert_eq!(v["integrity_failures"], 1);
+        let back: PullHealthCounters = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        // An older snapshot without the fields still deserializes.
+        let old: PullHealthCounters = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, PullHealthCounters::default());
+    }
+
     #[test]
     fn push_health_counters_round_trip_through_serde() {
         let mut s = fresh();

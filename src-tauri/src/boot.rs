@@ -607,6 +607,12 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
         materializer_cfg,
     )
     .with_tray_state(tray.clone())
+    // TKT-457a5073 follow-up (review MEDIUM 1): shrink-guard hits page the
+    // owner through the supervisor's Host::notify (the stall / boot-abort
+    // path), rate-limited to one notification per 10 min after the first.
+    .with_shrink_pager(Arc::new(materializer::ShrinkGuardPager::new(Arc::clone(
+        &host,
+    ))))
     .with_echo_guard(Arc::clone(&echo_guard))
     .with_shadow_store(Arc::clone(&shadow))
     .with_base_seq_store(Arc::clone(&base_seq));
