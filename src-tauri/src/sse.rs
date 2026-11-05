@@ -614,7 +614,25 @@ impl SseConsumer {
                                             "sse: local edit preserved (R2), not overwritten; push pipeline will carry it up"
                                         );
                                     }
-                                    Ok(MaterializeOutcome::Stashed { stash_path }) => {
+                                    // TKT-457a5073 follow-up (review LOW 4):
+                                    // the content-shrink guard preserved local
+                                    // before aligning. Not (necessarily) a
+                                    // divergent-edit conflict - say so. Same
+                                    // control flow as the plain Stashed arm.
+                                    Ok(MaterializeOutcome::Stashed {
+                                        stash_path,
+                                        shrink_guard: true,
+                                    }) => {
+                                        warn!(
+                                            path = %env.path,
+                                            stash = %stash_path.display(),
+                                            "sse: SHRINK GUARD (TKT-457a5073) - server head much smaller than local; local bytes preserved at the stash path BEFORE aligning to the server (see the SHRINK GUARD error line)"
+                                        );
+                                    }
+                                    Ok(MaterializeOutcome::Stashed {
+                                        stash_path,
+                                        shrink_guard: false,
+                                    }) => {
                                         warn!(
                                             path = %env.path,
                                             stash = %stash_path.display(),

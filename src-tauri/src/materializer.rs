@@ -181,7 +181,16 @@ pub enum MaterializeOutcome {
     /// A local divergent revision was stashed before the canonical was
     /// written.  `stash_path` is the sibling stash file.  The canonical was
     /// also written to its final path.
-    Stashed { stash_path: PathBuf },
+    ///
+    /// `shrink_guard` (TKT-457a5073 follow-up, review LOW 4): true iff the
+    /// content-shrink guard fired on this write - the server head was much
+    /// smaller than local, so the local bytes were preserved BEFORE aligning.
+    /// A flag, not a variant, so every caller's control flow is unchanged;
+    /// `sse.rs` reads it to log a truthful line instead of "CONFLICT".
+    Stashed {
+        stash_path: PathBuf,
+        shrink_guard: bool,
+    },
     /// D1 (v0.4.28, B1' resolution): the local file was NORMALIZED-equal but
     /// RAW-unequal to the server canonical (a CRLF/BOM-only delta). It was
     /// rewritten in place to the server's exact canonical bytes through the
@@ -377,6 +386,120 @@ pub fn pull_would_shrink(
     (server_len as f64) < (local_len as f64) * ratio && loss >= min_loss_bytes
 }
 
+/// Monotonic clock, injectable so the pager's rate limit is testable
+/// (same pattern as [`crate::rejected_ledger::Clock`], but `Instant`-based:
+/// the window is a duration since boot, never a wall-clock fact).
+pub type InstantClock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+/// TKT-457a5073 follow-up (review MEDIUM 1): the shrink guard's OS/owner
+/// notification, through the SAME `Host::notify` path the supervisor uses for
+/// stalls and boot aborts (`boot.rs`). Rate-limited: the FIRST hit (counter
+/// 0 -> 1) always notifies; afterwards at most one notification per
+/// [`Self::DEFAULT_WINDOW`], and every notification carries the cumulative
+/// hit count so a suppressed burst is never invisible. The `error!` event
+/// line and the tray counter are NOT rate-limited (every hit is logged).
+pub struct ShrinkGuardPager {
+    host: Arc<dyn crate::supervise::Host>,
+    window: std::time::Duration,
+    clock: InstantClock,
+    state: Mutex<ShrinkPagerState>,
+}
+
+#[derive(Debug, Default)]
+struct ShrinkPagerState {
+    /// Hits seen by this pager (process lifetime). Monotonic.
+    hits: u64,
+    /// When the last notification was sent (`None` = never).
+    last_notified: Option<std::time::Instant>,
+}
+
+impl ShrinkGuardPager {
+    /// At most one OS notification per 10 minutes after the first.
+    pub const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+    /// Notification title (stable: the tray/notification history is greppable).
+    pub const TITLE: &'static str = "Vault Sync preserved a truncated note";
+
+    /// Production: the system monotonic clock and the default window.
+    pub fn new(host: Arc<dyn crate::supervise::Host>) -> Self {
+        Self::with_clock(
+            host,
+            Self::DEFAULT_WINDOW,
+            Arc::new(std::time::Instant::now),
+        )
+    }
+
+    /// Explicit window + clock (tests).
+    pub fn with_clock(
+        host: Arc<dyn crate::supervise::Host>,
+        window: std::time::Duration,
+        clock: InstantClock,
+    ) -> Self {
+        Self {
+            host,
+            window,
+            clock,
+            state: Mutex::new(ShrinkPagerState::default()),
+        }
+    }
+
+    /// Hits seen so far (process lifetime).
+    pub fn hits(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).hits
+    }
+
+    /// Record one hit and decide whether to notify. Returns the cumulative
+    /// hit count when a notification is due (first hit, or the window has
+    /// elapsed since the last one), `None` when suppressed. PURE apart from
+    /// the pager's own state - no I/O.
+    pub fn record_hit(&self) -> Option<u64> {
+        let now = (self.clock)();
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.hits = st.hits.saturating_add(1);
+        let due = match st.last_notified {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.window,
+        };
+        if due {
+            st.last_notified = Some(now);
+            Some(st.hits)
+        } else {
+            None
+        }
+    }
+
+    /// One shrink-guard hit on `path`: record it and, when due, send the OS
+    /// notification naming the latest victim, the sizes, where the local
+    /// bytes were preserved, and the cumulative count.
+    pub fn hit(&self, path: &str, local_len: usize, server_len: usize, preserved: &Path) {
+        let Some(count) = self.record_hit() else {
+            debug!(
+                path = %path,
+                "SHRINK GUARD (TKT-457a5073): notification suppressed (rate limit); event + tray counter still recorded"
+            );
+            return;
+        };
+        self.host.notify(
+            Self::TITLE,
+            &Self::body(count, path, local_len, server_len, preserved),
+        );
+    }
+
+    /// The notification body. Pure, so the wording is testable.
+    pub fn body(
+        count: u64,
+        path: &str,
+        local_len: usize,
+        server_len: usize,
+        preserved: &Path,
+    ) -> String {
+        format!(
+            "{count} truncated pull{} since start. Latest: {path} ({local_len} -> {server_len} bytes). Your local bytes were preserved BEFORE aligning to the server at: {}. Verify the server version is intentional.",
+            if count == 1 { "" } else { "s" },
+            preserved.display()
+        )
+    }
+}
+
 impl Default for MaterializerConfig {
     fn default() -> Self {
         Self {
@@ -424,6 +547,11 @@ pub struct Materializer {
     /// `refresh_conflict_count_into_tray()` may be called by a background
     /// timer to refresh `tray.conflict_unresolved`.
     tray_state: Option<SharedTrayState>,
+    /// TKT-457a5073 follow-up (review MEDIUM 1): the owner-notification pager
+    /// for shrink-guard hits. `Arc`-shared so every clone (SSE consumer,
+    /// reconcile, backfill) rate-limits against ONE window. `None` (tests,
+    /// bare constructions) = event + tray only, no OS notification.
+    shrink_pager: Option<Arc<ShrinkGuardPager>>,
     /// Echo guard (S492): records the content hash of every file this
     /// materializer writes so the file_watcher can skip re-enqueueing the
     /// resulting filesystem event (a server echo, not a user edit). Shared
@@ -485,6 +613,7 @@ impl Clone for Materializer {
             subscriber_slug: self.subscriber_slug.clone(),
             config: self.config.clone(),
             tray_state: self.tray_state.clone(),
+            shrink_pager: self.shrink_pager.clone(),
             echo_guard: self.echo_guard.clone(),
             last_conflict_refresh_ms: self.last_conflict_refresh_ms.clone(),
             shadow_store: self.shadow_store.clone(),
@@ -520,6 +649,7 @@ impl Materializer {
             subscriber_slug,
             config,
             tray_state: None,
+            shrink_pager: None,
             echo_guard: None,
             last_conflict_refresh_ms: Arc::new(AtomicI64::new(0)),
             shadow_store: None,
@@ -669,6 +799,15 @@ impl Materializer {
     /// constructors keep working with `tray_state = None`.
     pub fn with_tray_state(mut self, state: SharedTrayState) -> Self {
         self.tray_state = Some(state);
+        self
+    }
+
+    /// TKT-457a5073 follow-up (review MEDIUM 1): attach the shrink-guard
+    /// owner-notification pager (the daemon passes one built on the
+    /// supervisor's [`crate::supervise::Host`]). Builder; `None` (unset) keeps
+    /// the event + tray page only.
+    pub fn with_shrink_pager(mut self, pager: Arc<ShrinkGuardPager>) -> Self {
+        self.shrink_pager = Some(pager);
         self
     }
 
@@ -888,6 +1027,13 @@ impl Materializer {
         // frontmatter-normalized comparison (R1 idempotency basis). The stash is
         // now DIVERGENCE-driven (always preserve the loser), never policy-driven.
         let mut stash_path: Option<PathBuf> = None;
+        // TKT-457a5073 follow-up (review LOW 3): the shrink-guard PAGE is
+        // deferred until `atomic_persist` has succeeded, so the page never
+        // claims "aligned to the server" about a write that then failed. The
+        // PRESERVE still happens BEFORE the overwrite (fail-closed); only the
+        // owner-facing event/counter/notification moves after it. Holds
+        // `(local_len, server_len, preserved_path)`.
+        let mut pending_shrink_page: Option<(usize, usize, PathBuf)> = None;
         // D1 (v0.4.28): set when the Noop arm detects normalized-equal but
         // raw-unequal - fall through to the persist machinery instead of
         // returning, then report AlignedToCanonical.
@@ -1116,13 +1262,8 @@ impl Materializer {
                             &local_raw_sha,
                             change_seq,
                         )?;
-                        self.page_shrink_guard(
-                            &payload.path,
-                            local_bytes.len(),
-                            content_bytes.len(),
-                            change_seq,
-                            &preserved,
-                        );
+                        pending_shrink_page =
+                            Some((local_bytes.len(), content_bytes.len(), preserved.clone()));
                         stash_path = Some(preserved);
                     }
                 }
@@ -1472,13 +1613,8 @@ impl Materializer {
                         // includes the anti-strip ARM 2 path), so the shrink
                         // guard only PAGES here - never a second copy.
                         if shrink_hit {
-                            self.page_shrink_guard(
-                                &payload.path,
-                                local_bytes.len(),
-                                content_bytes.len(),
-                                change_seq,
-                                &written,
-                            );
+                            pending_shrink_page =
+                                Some((local_bytes.len(), content_bytes.len(), written.clone()));
                         }
                         stash_path = Some(written);
                     }
@@ -1530,6 +1666,19 @@ impl Materializer {
         // ERROR_SHARING_VIOLATION (Obsidian holding the file) and \\?\ long-path
         // via dunce. On every other platform this is a plain tempfile::persist.
         atomic_persist(tmp, &target)?;
+
+        // TKT-457a5073 follow-up (review LOW 3): the local bytes are now
+        // overwritten and the preserved copy exists, so the page is truthful.
+        // A persist failure above returned Err BEFORE this point: no event, no
+        // counter, no notification for a write that did not happen (the
+        // preserved copy stays; the retry preserves idempotently - see
+        // `preserve_shrunk_local` - and pages exactly once).
+        let shrink_paged = match pending_shrink_page.take() {
+            Some((local_len, server_len, preserved)) => {
+                self.page_shrink_guard(&payload.path, local_len, server_len, change_seq, &preserved)
+            }
+            None => false,
+        };
 
         // 8b. Restore server-authoritative timestamps. The atomic tmp+rename above
         // gives `target` a brand-new inode whose birthtime = now; macOS/Obsidian
@@ -1622,7 +1771,10 @@ impl Materializer {
         }
 
         if let Some(stash) = stash_path {
-            Ok(MaterializeOutcome::Stashed { stash_path: stash })
+            Ok(MaterializeOutcome::Stashed {
+                stash_path: stash,
+                shrink_guard: shrink_paged,
+            })
         } else if alignment_pull {
             Ok(MaterializeOutcome::AlignedToCanonical { path: target })
         } else {
@@ -1827,6 +1979,32 @@ impl Materializer {
     /// ordinary note), else / on quarantine failure the in-vault
     /// `.conflict-from-*` stash floor. Any error propagates so the caller
     /// aborts BEFORE the overwrite (local untouched).
+    ///
+    /// WHERE A SHRINK VICTIM LIVES (review LOW 5 - recovery map):
+    ///
+    /// * R3 shrink (local == last-synced, server head much smaller) - THIS
+    ///   function. With the daemon's quarantine wired
+    ///   (`MaterializerConfig::stash_quarantine_dir`, production: the app-data
+    ///   dir beside `logs/`, see `boot.rs` / `StashQuarantine::default_dir`)
+    ///   the bytes land OUT OF THE VAULT at
+    ///   `<quarantine>/blobs/<sha256(local bytes)>.md`, described by one JSONL
+    ///   line in `<quarantine>/manifest.jsonl` (`path`, `sha256`, `bytes`,
+    ///   `ts`, `server_seq`, `device`, `blob`). The `ShrinkGuardFired` health
+    ///   event / `SHRINK GUARD (TKT-457a5073)` error line and the OS
+    ///   notification carry the same blob path. Without a quarantine (or if
+    ///   its write fails) the bytes land IN THE VAULT as the sibling
+    ///   `<note>.conflict-from-<device>-<seq>.md` (ConflictStash floor).
+    /// * R4/R5 conflict (local diverged) and the anti-strip ARM 2 - the
+    ///   existing in-vault `.conflict-from-*` fork written by the always-stash
+    ///   floor in `write()` (flight recorders: quarantine). The shrink guard
+    ///   only PAGES there, it never writes a second copy.
+    ///
+    /// IDEMPOTENT ON RETRY (review LOW 3): if the overwrite that follows fails
+    /// (`atomic_persist` error) and the same pull is retried, the quarantine
+    /// write is content-addressed AND manifest-deduplicated
+    /// ([`crate::conflict_stash::StashQuarantine::write_dedup`]), and the
+    /// in-vault fallback name is deterministic in `(path, device, change_seq)`
+    /// - so a retry yields the same blob and NO duplicate manifest line.
     fn preserve_shrunk_local(
         &self,
         path: &str,
@@ -1842,13 +2020,13 @@ impl Materializer {
                 );
             } else {
                 let seq = (change_seq != 0).then_some(change_seq as i64);
-                match crate::conflict_stash::StashQuarantine::new(dir.clone()).write(
+                match crate::conflict_stash::StashQuarantine::new(dir.clone()).write_dedup(
                     path,
                     local_bytes,
                     &self.config.device_id,
                     seq,
                 ) {
-                    Ok(blob) => return Ok(blob),
+                    Ok((blob, _appended)) => return Ok(blob),
                     Err(e) => warn!(
                         path = %path,
                         quarantine = %dir.display(),
@@ -1875,7 +2053,15 @@ impl Materializer {
 
     /// TKT-457a5073: owner-visible page for a shrink-guard hit - the
     /// `error!` line with the stable `SHRINK GUARD (TKT-457a5073)` marker (via
-    /// the process-wide health event log) plus the tray counter/tooltip.
+    /// the process-wide health event log), the tray counter/tooltip, and (when
+    /// a [`ShrinkGuardPager`] is attached) the OS notification through the
+    /// supervisor's `Host::notify` path, rate-limited by the pager.
+    ///
+    /// LIVE MODE ONLY (review MEDIUM 2): in Shadow/Disabled the overwrite
+    /// landed in the shadow tree, not the vault, so paging the owner about a
+    /// "truncated note" would be a false positive - same rule as the Live-only
+    /// shadow/base_seq recording in `write()`. Preservation is NOT gated: the
+    /// shadow-tree stash is still written. Returns true iff the page fired.
     fn page_shrink_guard(
         &self,
         path: &str,
@@ -1883,7 +2069,18 @@ impl Materializer {
         server_len: usize,
         change_seq: u64,
         preserved: &Path,
-    ) {
+    ) -> bool {
+        if !matches!(self.mode, MaterializerMode::Live) {
+            debug!(
+                path = %path,
+                mode = ?self.mode,
+                local_len,
+                server_len,
+                stash = %preserved.display(),
+                "SHRINK GUARD (TKT-457a5073): shadow-tree write shrank a note; preserved, NOT paged (Live mode only)"
+            );
+            return false;
+        }
         crate::sync_health::raise_state_event(
             crate::sync_health::StateHealthEvent::ShrinkGuardFired {
                 path: path.to_string(),
@@ -1898,6 +2095,10 @@ impl Materializer {
                 w.inc_shrink_guard_fired();
             }
         }
+        if let Some(pager) = &self.shrink_pager {
+            pager.hit(path, local_len, server_len, preserved);
+        }
+        true
     }
 
     fn rel_for_stash(&self, stash_abs: &Path) -> Option<String> {
@@ -2940,7 +3141,7 @@ mod tests {
         let p = payload("02_Projects/Credentials.md", "server-canonical-secrets");
         let out = m.write(&p).unwrap();
         match out {
-            MaterializeOutcome::Stashed { stash_path } => {
+            MaterializeOutcome::Stashed { stash_path, .. } => {
                 assert!(stash_path.exists(), "stash file should exist");
                 let stash_content = std::fs::read_to_string(&stash_path).unwrap();
                 assert_eq!(stash_content, "local-secrets-version");
@@ -2968,7 +3169,7 @@ mod tests {
         let p = payload("02_Projects/Foo/normal.md", "server-canonical");
         let out = m.write(&p).unwrap();
         match out {
-            MaterializeOutcome::Stashed { stash_path } => {
+            MaterializeOutcome::Stashed { stash_path, .. } => {
                 assert!(stash_path.exists(), "stash file must exist");
                 let stash_content = std::fs::read_to_string(&stash_path).unwrap();
                 assert_eq!(stash_content, "old-local-divergent");
@@ -4248,7 +4449,7 @@ mod tests {
 
         let out = m.write_with_change_seq(&server, 4242).unwrap();
         match out {
-            MaterializeOutcome::Stashed { stash_path } => {
+            MaterializeOutcome::Stashed { stash_path, .. } => {
                 let name = stash_path
                     .file_name()
                     .unwrap()
@@ -4570,7 +4771,7 @@ mod tests {
         let p = payload("01_Inbox/fork.md", "server canonical bytes");
         let out = m.write_with_change_seq(&p, 4242).unwrap();
         let stash = match out {
-            MaterializeOutcome::Stashed { stash_path } => stash_path,
+            MaterializeOutcome::Stashed { stash_path, .. } => stash_path,
             other => panic!("expected Stashed, got {other:?}"),
         };
         let name = stash.file_name().unwrap().to_string_lossy().into_owned();
@@ -4598,7 +4799,7 @@ mod tests {
         let p = payload("01_Inbox/amb.md", "SERVER only line");
         let out = m.write_with_change_seq(&p, 7).unwrap();
         let stash = match out {
-            MaterializeOutcome::Stashed { stash_path } => stash_path,
+            MaterializeOutcome::Stashed { stash_path, .. } => stash_path,
             o => panic!("expected Stashed (preserve both), got {o:?}"),
         };
         assert_eq!(
@@ -5797,6 +5998,43 @@ mod tests {
             s.into_bytes()
         }
 
+        /// A [`crate::supervise::Host`] that records notifications (the
+        /// shrink-guard pager's only side effect) instead of acting.
+        #[derive(Default)]
+        struct RecordingHost {
+            notices: Mutex<Vec<(String, String)>>,
+        }
+
+        impl crate::supervise::Host for RecordingHost {
+            fn notify(&self, title: &str, body: &str) {
+                self.notices
+                    .lock()
+                    .unwrap()
+                    .push((title.to_string(), body.to_string()));
+            }
+            fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+            fn exit(&self, _code: i32) {}
+            fn restart(&self) {}
+        }
+
+        /// Injectable monotonic clock: the test advances it by hand.
+        #[derive(Clone)]
+        struct FakeClock(Arc<Mutex<std::time::Instant>>);
+
+        impl FakeClock {
+            fn new() -> Self {
+                Self(Arc::new(Mutex::new(std::time::Instant::now())))
+            }
+            fn advance(&self, d: std::time::Duration) {
+                let mut t = self.0.lock().unwrap();
+                *t += d;
+            }
+            fn as_clock(&self) -> InstantClock {
+                let inner = self.0.clone();
+                Arc::new(move || *inner.lock().unwrap())
+            }
+        }
+
         struct Rig {
             vaults: TempDir,
             _ws: TempDir,
@@ -5804,23 +6042,42 @@ mod tests {
             m: Materializer,
             shadow: Arc<ShadowStore>,
             tray: SharedTrayState,
+            host: Arc<RecordingHost>,
+            clock: FakeClock,
         }
 
-        /// Production-shaped rig: Live, shadow store, tray, and (optionally)
-        /// the out-of-vault quarantine boot.rs wires.
-        fn rig(mut cfg: MaterializerConfig, with_quarantine: bool) -> Rig {
+        /// Production-shaped rig: Live, shadow store, tray, the OS-notification
+        /// pager (recording host, fake clock, the 10-min default window) and
+        /// (optionally) the out-of-vault quarantine boot.rs wires.
+        fn rig(cfg: MaterializerConfig, with_quarantine: bool) -> Rig {
+            rig_in_mode(MaterializerMode::Live, cfg, with_quarantine)
+        }
+
+        fn rig_in_mode(
+            mode: MaterializerMode,
+            mut cfg: MaterializerConfig,
+            with_quarantine: bool,
+        ) -> Rig {
             let quarantine = with_quarantine.then(|| TempDir::new().unwrap());
             cfg.stash_quarantine_dir = quarantine.as_ref().map(|q| q.path().to_path_buf());
-            let (vaults, ws, m) = mk(MaterializerMode::Live, cfg);
+            let (vaults, ws, m) = mk(mode, cfg);
             let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
             let shadow = ShadowStore::load_with_vault_folders(
                 &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
                 vec![VAULT.to_string()],
             );
             let tray = make_shared_tray();
+            let host = Arc::new(RecordingHost::default());
+            let clock = FakeClock::new();
+            let pager = Arc::new(ShrinkGuardPager::with_clock(
+                host.clone(),
+                ShrinkGuardPager::DEFAULT_WINDOW,
+                clock.as_clock(),
+            ));
             let m = m
                 .with_shadow_store(shadow.clone())
-                .with_tray_state(tray.clone());
+                .with_tray_state(tray.clone())
+                .with_shrink_pager(pager);
             Rig {
                 vaults,
                 _ws: ws,
@@ -5828,7 +6085,27 @@ mod tests {
                 m,
                 shadow,
                 tray,
+                host,
+                clock,
             }
+        }
+
+        fn notices(r: &Rig) -> Vec<(String, String)> {
+            r.host.notices.lock().unwrap().clone()
+        }
+
+        fn manifest_lines_for(r: &Rig, wire: &str) -> usize {
+            let q = r.quarantine.as_ref().unwrap().path();
+            std::fs::read_to_string(q.join(crate::conflict_stash::StashQuarantine::MANIFEST))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .ok()
+                        .and_then(|v| v["path"].as_str().map(|p| p == wire))
+                        .unwrap_or(false)
+                })
+                .count()
         }
 
         /// Seed `rel` locally with `local` and record it as last-synced
@@ -5882,9 +6159,27 @@ mod tests {
                 r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4242), 4242)
                     .unwrap();
             let stash = match out {
-                MaterializeOutcome::Stashed { stash_path } => stash_path,
-                other => panic!("shrink guard must preserve local (Stashed), got {other:?}"),
+                MaterializeOutcome::Stashed {
+                    stash_path,
+                    shrink_guard: true,
+                } => stash_path,
+                other => panic!(
+                    "shrink guard must preserve local (Stashed, shrink_guard flag set), got {other:?}"
+                ),
             };
+            // Review MEDIUM 1: the owner was notified through Host::notify
+            // (first hit always notifies), naming the victim + the stash.
+            let n = notices(&r);
+            assert_eq!(n.len(), 1, "{n:?}");
+            assert_eq!(n[0].0, ShrinkGuardPager::TITLE);
+            assert!(
+                n[0].1.contains("1 truncated pull since start")
+                    && n[0].1.contains(&wire)
+                    && n[0].1.contains("18780 -> 11636 bytes")
+                    && n[0].1.contains(&stash.display().to_string()),
+                "{}",
+                n[0].1
+            );
             // Preserved BEFORE overwrite: the out-of-vault blob holds the
             // exact 18,780 local bytes.
             let q = r.quarantine.as_ref().unwrap().path();
@@ -5956,7 +6251,7 @@ mod tests {
                 r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4100), 4100)
                     .unwrap();
             let stash = match out {
-                MaterializeOutcome::Stashed { stash_path } => stash_path,
+                MaterializeOutcome::Stashed { stash_path, .. } => stash_path,
                 other => panic!("ARM 2 + shrink guard must stash, got {other:?}"),
             };
             let dir = target.parent().unwrap();
@@ -6154,6 +6449,311 @@ mod tests {
             assert!(c.shrink_guard_enabled);
             assert_eq!(c.shrink_guard_ratio, 0.7);
             assert_eq!(c.shrink_guard_min_loss_bytes, 4096);
+        }
+
+        // ---- follow-ups (Fable review of #54) ------------------------------
+
+        /// Review MEDIUM 2: SHADOW mode. The overwrite lands in the shadow
+        /// tree, not the vault, so the owner is NOT paged (no health event,
+        /// no tray increment, no notification) - exactly like the Live-only
+        /// shadow/base_seq recording. Preservation still happens: the
+        /// shadow-tree stash holds the pre-overwrite bytes.
+        #[test]
+        fn shadow_mode_preserves_in_shadow_tree_but_never_pages() {
+            let r = rig_in_mode(MaterializerMode::Shadow, default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-shadow.md";
+            let wire = format!("{VAULT}/{rel}");
+            let local = text_of_len("shadow-local", 18_780, false);
+            let server = text_of_len("shadow-server", 11_636, false);
+            let target = r.m.shadow_root().join(&wire);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, &local).unwrap();
+            r.shadow.record(&wire, &hex::encode(Sha256::digest(&local)));
+
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 5151), 5151)
+                    .unwrap();
+            let stash = match out {
+                MaterializeOutcome::Stashed { stash_path, .. } => stash_path,
+                other => panic!("shadow mode still preserves (Stashed), got {other:?}"),
+            };
+            assert!(
+                stash.starts_with(r.m.shadow_root()),
+                "preserved in the shadow tree, never the vault or quarantine: {stash:?}"
+            );
+            assert_eq!(std::fs::read(&stash).unwrap(), local);
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert!(
+                quarantine_blobs(&r).is_empty(),
+                "no quarantine write in Shadow"
+            );
+            assert!(
+                !r.vaults.path().join(&wire).exists(),
+                "shadow mode never touches the vault"
+            );
+            // NOT paged.
+            assert_eq!(fired(&r), 0, "tray counter must not move in Shadow mode");
+            assert!(
+                shrink_events_for(&wire).is_empty(),
+                "no health event in Shadow mode"
+            );
+            assert!(notices(&r).is_empty(), "no OS notification in Shadow mode");
+            // And the outcome says the guard did NOT page (flag false), so a
+            // caller logging "SHRINK GUARD" is never fed a shadow-mode hit.
+            let out2 =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 5151), 5151)
+                    .unwrap();
+            assert!(
+                !matches!(
+                    out2,
+                    MaterializeOutcome::Stashed {
+                        shrink_guard: true,
+                        ..
+                    }
+                ),
+                "{out2:?}"
+            );
+        }
+
+        /// Review LOW 4: the `Stashed` outcome carries the shrink flag -
+        /// true for a shrink-guard preserve, false for an ordinary R4/R5
+        /// divergent-edit conflict - so `sse.rs` can log a truthful line
+        /// without any change to the Stashed control flow.
+        #[test]
+        fn stashed_outcome_flags_shrink_guard_only_when_it_fired() {
+            let r = rig(default_cfg(), true);
+            // (a) an ordinary R4/R5 conflict: local diverged by a small edit,
+            // server moved too, sizes comparable -> Stashed, flag FALSE.
+            let rel = "02_Projects/Incident/tkt457-flag-conflict.md";
+            let wire = format!("{VAULT}/{rel}");
+            let base = text_of_len("base", 9_000, false);
+            let target = r.vaults.path().join(VAULT).join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            r.shadow.record(&wire, &hex::encode(Sha256::digest(&base)));
+            let mut local = base.clone();
+            local[100..110].copy_from_slice(b"LOCAL-EDIT");
+            std::fs::write(&target, &local).unwrap();
+            let mut server = base.clone();
+            server[200..211].copy_from_slice(b"SERVER-EDIT");
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 6001), 6001)
+                    .unwrap();
+            assert!(
+                matches!(
+                    out,
+                    MaterializeOutcome::Stashed {
+                        shrink_guard: false,
+                        ..
+                    }
+                ),
+                "plain conflict must not claim the shrink guard: {out:?}"
+            );
+            assert_eq!(fired(&r), 0);
+            assert!(notices(&r).is_empty());
+
+            // (b) an R3 shrink -> Stashed, flag TRUE.
+            let rel2 = "02_Projects/Incident/tkt457-flag-shrink.md";
+            let big = text_of_len("big", 18_780, false);
+            let small = text_of_len("small", 11_636, false);
+            let (wire2, _) = seed_synced(&r, rel2, &big);
+            let out2 =
+                r.m.write_with_change_seq(&payload_bytes(&wire2, &small, 6002), 6002)
+                    .unwrap();
+            assert!(
+                matches!(
+                    out2,
+                    MaterializeOutcome::Stashed {
+                        shrink_guard: true,
+                        ..
+                    }
+                ),
+                "{out2:?}"
+            );
+            assert_eq!(fired(&r), 1);
+        }
+
+        /// Review LOW 3: ORDERING. The preserve happens BEFORE the overwrite;
+        /// the page happens only AFTER a successful persist. With the note's
+        /// directory made unwritable the tmp+rename fails: local is untouched,
+        /// the quarantine blob already holds the bytes, and NOTHING is paged
+        /// (no event, no counter, no notification) for a write that did not
+        /// happen. The retry (directory writable again) preserves
+        /// idempotently - same blob, still ONE manifest line - aligns, and
+        /// pages exactly once.
+        #[cfg(unix)]
+        #[test]
+        fn persist_failure_preserves_without_paging_then_retry_pages_once_no_duplicate_manifest() {
+            use std::os::unix::fs::PermissionsExt;
+            let r = rig(default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-persist-fail.md";
+            let local = text_of_len("v18780-persist", 18_780, false);
+            let server = text_of_len("v11636-persist", 11_636, false);
+            let (wire, target) = seed_synced(&r, rel, &local);
+            let dir = target.parent().unwrap().to_path_buf();
+
+            // Make the note's directory read-only so NamedTempFile::new_in fails.
+            let writable = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if NamedTempFile::new_in(&dir).is_ok() {
+                // Running as root (permissions are not enforced): the
+                // failure cannot be induced this way; restore and bail.
+                std::fs::set_permissions(&dir, writable).unwrap();
+                eprintln!("skipping: directory permissions not enforced (root?)");
+                return;
+            }
+
+            let first =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 7001), 7001);
+            std::fs::set_permissions(&dir, writable).unwrap();
+            assert!(first.is_err(), "persist must fail: {first:?}");
+            // Local untouched (fail-closed).
+            assert_eq!(std::fs::read(&target).unwrap(), local);
+            // Preserved BEFORE the (failed) overwrite: one blob, one line.
+            let blobs = quarantine_blobs(&r);
+            assert_eq!(blobs.len(), 1, "{blobs:?}");
+            assert_eq!(std::fs::read(&blobs[0]).unwrap(), local);
+            assert_eq!(manifest_lines_for(&r, &wire), 1);
+            // NOT paged: the page would have claimed an alignment that never
+            // happened.
+            assert_eq!(fired(&r), 0, "no tray count for a failed persist");
+            assert!(
+                shrink_events_for(&wire).is_empty(),
+                "no event for a failed persist"
+            );
+            assert!(
+                notices(&r).is_empty(),
+                "no notification for a failed persist"
+            );
+
+            // Retry: the same pull again, directory writable.
+            let second =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 7001), 7001)
+                    .unwrap();
+            let stash = match second {
+                MaterializeOutcome::Stashed {
+                    stash_path,
+                    shrink_guard: true,
+                } => stash_path,
+                other => panic!("retry must preserve + align + page: {other:?}"),
+            };
+            assert_eq!(stash, blobs[0], "same content-addressed blob on retry");
+            assert_eq!(std::fs::read(&target).unwrap(), server, "aligned on retry");
+            assert_eq!(quarantine_blobs(&r).len(), 1, "no second blob");
+            assert_eq!(
+                manifest_lines_for(&r, &wire),
+                1,
+                "retry must NOT append a duplicate manifest line"
+            );
+            // Paged exactly once, after the successful persist.
+            assert_eq!(fired(&r), 1);
+            assert_eq!(shrink_events_for(&wire).len(), 1);
+            assert_eq!(notices(&r).len(), 1);
+        }
+
+        /// Review MEDIUM 1: the OS notification is rate-limited through the
+        /// materializer + pager with an injectable clock. The first hit
+        /// (0 -> 1) notifies; further hits inside the 10-min window are
+        /// suppressed (event + tray still count every one); the first hit
+        /// after the window notifies again with the CUMULATIVE count.
+        #[test]
+        fn notification_fires_on_first_hit_then_once_per_window_with_cumulative_count() {
+            let r = rig(default_cfg(), true);
+            let big = text_of_len("big", 18_780, false);
+            let small = text_of_len("small", 11_636, false);
+            let shrink = |i: u32| {
+                let rel = format!("02_Projects/Incident/tkt457-rate-{i}.md");
+                let (wire, _) = seed_synced(&r, &rel, &big);
+                let out =
+                    r.m.write_with_change_seq(
+                        &payload_bytes(&wire, &small, 8000 + i as i64),
+                        8000 + u64::from(i),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(
+                        out,
+                        MaterializeOutcome::Stashed {
+                            shrink_guard: true,
+                            ..
+                        }
+                    ),
+                    "{out:?}"
+                );
+            };
+
+            // t = 0: hits 1..=3 -> exactly ONE notification (the 0 -> 1 edge).
+            shrink(1);
+            shrink(2);
+            shrink(3);
+            assert_eq!(fired(&r), 3, "every hit counts on the tray");
+            let n = notices(&r);
+            assert_eq!(n.len(), 1, "{n:?}");
+            assert!(
+                n[0].1.starts_with("1 truncated pull since start"),
+                "{}",
+                n[0].1
+            );
+
+            // t = 9m59s: still inside the window -> suppressed.
+            r.clock
+                .advance(ShrinkGuardPager::DEFAULT_WINDOW - std::time::Duration::from_secs(1));
+            shrink(4);
+            assert_eq!(fired(&r), 4);
+            assert_eq!(notices(&r).len(), 1, "suppressed inside the window");
+
+            // t = 10m00s: window elapsed -> one more, carrying the total (5).
+            r.clock.advance(std::time::Duration::from_secs(1));
+            shrink(5);
+            assert_eq!(fired(&r), 5);
+            let n = notices(&r);
+            assert_eq!(n.len(), 2, "{n:?}");
+            assert!(
+                n[1].1.starts_with("5 truncated pulls since start"),
+                "{}",
+                n[1].1
+            );
+            assert!(n[1].1.contains("tkt457-rate-5.md"), "{}", n[1].1);
+
+            // t = 10m01s: a new window started at the second notification.
+            r.clock.advance(std::time::Duration::from_secs(1));
+            shrink(6);
+            assert_eq!(notices(&r).len(), 2);
+        }
+
+        /// The pager's decision table in isolation (no filesystem).
+        #[test]
+        fn pager_record_hit_first_then_window_edges() {
+            let host = Arc::new(RecordingHost::default());
+            let clock = FakeClock::new();
+            let w = std::time::Duration::from_secs(600);
+            let p = ShrinkGuardPager::with_clock(host.clone(), w, clock.as_clock());
+            assert_eq!(p.hits(), 0);
+            assert_eq!(p.record_hit(), Some(1), "0 -> 1 always notifies");
+            assert_eq!(p.record_hit(), None);
+            assert_eq!(p.record_hit(), None);
+            clock.advance(w - std::time::Duration::from_millis(1));
+            assert_eq!(p.record_hit(), None, "window not yet elapsed");
+            clock.advance(std::time::Duration::from_millis(1));
+            assert_eq!(p.record_hit(), Some(5), "window elapsed: cumulative count");
+            assert_eq!(p.record_hit(), None, "a fresh window started");
+            assert_eq!(p.hits(), 6);
+            // `hit` is the only path that touches the host; `record_hit` never does.
+            assert!(host.notices.lock().unwrap().is_empty());
+            p.hit("Vault/x.md", 10, 2, Path::new("/q/blobs/abc.md"));
+            assert!(
+                host.notices.lock().unwrap().is_empty(),
+                "suppressed: no notify"
+            );
+            clock.advance(w);
+            p.hit("Vault/y.md", 10, 2, Path::new("/q/blobs/def.md"));
+            let n = host.notices.lock().unwrap().clone();
+            assert_eq!(n.len(), 1);
+            assert_eq!(n[0].0, ShrinkGuardPager::TITLE);
+            assert_eq!(
+                n[0].1,
+                ShrinkGuardPager::body(8, "Vault/y.md", 10, 2, Path::new("/q/blobs/def.md"))
+            );
+            assert!(n[0].1.contains("8 truncated pulls since start"));
         }
     }
 }
