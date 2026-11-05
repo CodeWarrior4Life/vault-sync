@@ -384,7 +384,6 @@ impl StashQuarantine {
     /// Preserve `content` (the losing revision of `original_path`). Returns the
     /// blob path. `server_seq` is the server version the client had last
     /// observed for the path (`None` when unknown).
-    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
     pub fn write(
         &self,
         original_path: &str,
@@ -392,7 +391,54 @@ impl StashQuarantine {
         device_id: &str,
         server_seq: Option<i64>,
     ) -> Result<PathBuf, StashError> {
+        self.write_inner(original_path, content, device_id, server_seq, false)
+            .map(|(blob, _)| blob)
+    }
+
+    /// TKT-457a5073 follow-up (review LOW 3): [`Self::write`] with a manifest
+    /// DEDUP. If the blob for these exact bytes already exists AND the
+    /// manifest already carries a line for this `(path, sha256)`, no new line
+    /// is appended - the retry of a pull whose overwrite failed after the
+    /// preserve step yields the same blob and ONE manifest line. Returns
+    /// `(blob, appended)`. A different path with the same bytes, or the same
+    /// path with different bytes, is still a new line (the `write` rule).
+    pub fn write_dedup(
+        &self,
+        original_path: &str,
+        content: &[u8],
+        device_id: &str,
+        server_seq: Option<i64>,
+    ) -> Result<(PathBuf, bool), StashError> {
+        self.write_inner(original_path, content, device_id, server_seq, true)
+    }
+
+    /// True iff `manifest` already has a line whose `path` and `sha256` match.
+    /// Tolerant: an unreadable manifest or an unparsable line counts as "not
+    /// recorded" (a dedup miss costs one ~250-byte line, never a lost record).
+    fn manifest_has(manifest: &Path, path: &str, sha: &str) -> bool {
+        let Ok(text) = fs::read_to_string(manifest) else {
+            return false;
+        };
+        text.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| {
+                v.get("path").and_then(|p| p.as_str()) == Some(path)
+                    && v.get("sha256").and_then(|h| h.as_str()) == Some(sha)
+            })
+        })
+    }
+
+    #[allow(clippy::disallowed_methods)] // CS-2 gate 2: listed in state_io_exemptions.toml
+    fn write_inner(
+        &self,
+        original_path: &str,
+        content: &[u8],
+        device_id: &str,
+        server_seq: Option<i64>,
+        dedup_manifest: bool,
+    ) -> Result<(PathBuf, bool), StashError> {
         let sha = hex::encode(Sha256::digest(content));
+        let original_path = original_path.replace('\\', "/");
+        let original_path = original_path.as_str();
         let blobs = self.dir.join("blobs");
         let blob = blobs.join(format!("{sha}.md"));
         let manifest = self.dir.join(Self::MANIFEST);
@@ -405,15 +451,24 @@ impl StashQuarantine {
         // the blob is not rewritten - but the manifest line IS still appended
         // (review LOW: a second path, or a second loss of the same path, must
         // be recorded; lines are ~250 bytes).
-        if !fs::read(&blob).is_ok_and(|b| b == content) {
+        let blob_existed = fs::read(&blob).is_ok_and(|b| b == content);
+        if !blob_existed {
             let mut tmp = NamedTempFile::new_in(&blobs)?;
             tmp.write_all(content)?;
             tmp.flush()?;
             tmp.persist(&blob).map_err(|e| StashError::Io(e.error))?;
         }
+        if dedup_manifest && blob_existed && Self::manifest_has(&manifest, original_path, &sha) {
+            tracing::debug!(
+                original = %original_path,
+                blob = %blob.display(),
+                "quarantine: identical bytes for this path already recorded - no duplicate manifest line (TKT-457a5073 retry)"
+            );
+            return Ok((blob, false));
+        }
 
         let line = serde_json::json!({
-            "path": original_path.replace('\\', "/"),
+            "path": original_path,
             "sha256": sha,
             "bytes": content.len(),
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -442,8 +497,9 @@ impl StashQuarantine {
                 error = %e,
                 "R2: quarantine blob written but manifest line could not be appended"
             );
+            return Ok((blob, false));
         }
-        Ok(blob)
+        Ok((blob, true))
     }
 }
 
@@ -1475,6 +1531,43 @@ mod tests {
         ] {
             assert!(!is_append_only_flight_recorder(no), "{no} is NOT a recorder");
         }
+    }
+
+    /// TKT-457a5073 follow-up (review LOW 3): `write_dedup` appends ONE
+    /// manifest line per `(path, sha256)` - a retried preserve after a failed
+    /// overwrite is silent - while a different path with the same bytes, or
+    /// the same path with different bytes, is still recorded.
+    #[test]
+    fn quarantine_write_dedup_one_manifest_line_per_path_and_bytes() {
+        let q = tempdir().unwrap();
+        let quarantine = StashQuarantine::new(q.path().to_path_buf());
+        let bytes = b"- line 1\n- line 2\n";
+        let (p1, a1) = quarantine
+            .write_dedup("Vault/a.md", bytes, "link", Some(10))
+            .unwrap();
+        assert!(a1, "first write records a line");
+        let (p2, a2) = quarantine
+            .write_dedup("Vault/a.md", bytes, "link", Some(10))
+            .unwrap();
+        assert_eq!(p1, p2);
+        assert!(!a2, "retry of the same path+bytes appends nothing");
+        let (_, a3) = quarantine
+            .write_dedup("Vault/b.md", bytes, "link", Some(11))
+            .unwrap();
+        assert!(a3, "a second PATH with the same bytes is a new record");
+        let (_, a4) = quarantine
+            .write_dedup("Vault/a.md", b"- line 1\n", "link", Some(12))
+            .unwrap();
+        assert!(a4, "the same path with different bytes is a new record");
+        let manifest = fs::read_to_string(q.path().join(StashQuarantine::MANIFEST)).unwrap();
+        assert_eq!(manifest.lines().count(), 3, "{manifest}");
+        assert_eq!(fs::read_dir(q.path().join("blobs")).unwrap().count(), 2);
+        // The plain `write` keeps its one-line-per-event contract.
+        quarantine
+            .write("Vault/a.md", bytes, "link", Some(13))
+            .unwrap();
+        let manifest = fs::read_to_string(q.path().join(StashQuarantine::MANIFEST)).unwrap();
+        assert_eq!(manifest.lines().count(), 4, "{manifest}");
     }
 
     /// R2(a): recorder stashes land in the quarantine (content-addressed,
