@@ -269,7 +269,10 @@ impl DeleteBurstDetector {
         let Some(path) = self.pause_marker.clone() else {
             return false;
         };
-        if path.exists() {
+        // Fail-CLOSED (PR #51 review; upstream CS-2 C3): only a DEFINITE absence
+        // resumes. `Path::exists()` reads an unreadable marker (EACCES, I/O error)
+        // as absent, which would unlatch the valve on the next heartbeat.
+        if !matches!(path.try_exists(), Ok(false)) {
             return false;
         }
         self.events.clear();
@@ -965,6 +968,36 @@ mod tests {
             "marker removed: the operator's resume must work"
         );
         assert!(!reborn.is_paused());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_marker_never_resumes_on_the_heartbeat() {
+        // Fable review of PR #51 (MEDIUM): boot latched fail-closed on an unreadable
+        // marker, but poll_marker_resume used Path::exists(), which reads EACCES as
+        // "absent", so the next heartbeat unlatched, granted grace and replayed the
+        // ledger. Only a DEFINITE absence (try_exists == Ok(false)) may resume.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let (det, marker) = tripped_with_marker(&dir);
+        drop(det);
+        let mut reborn = daemon_burst_detector(&marker);
+        assert!(reborn.is_paused());
+        let state = marker.parent().unwrap().to_path_buf();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = marker.try_exists();
+        let resumed = reborn.poll_marker_resume();
+        let still_paused = reborn.is_paused();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        if probe.is_ok() {
+            eprintln!("skip: running with privileges that bypass mode bits");
+            return;
+        }
+        assert!(!resumed, "an unreadable marker must NOT resume propagation");
+        assert!(
+            still_paused,
+            "an unreadable marker must keep the valve latched"
+        );
     }
 
     #[cfg(unix)]
