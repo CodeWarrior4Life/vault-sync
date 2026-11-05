@@ -980,10 +980,29 @@ impl FileWatcher {
         let now = chrono::Utc::now();
         let mut events = Vec::with_capacity(paths.len());
         let mut skipped_present = 0usize;
+        // TKT-6e7fec3e: paths whose existence could not be determined (stat
+        // error: EACCES, EIO). Treated as PRESENT, so never replayed as a
+        // Delete, and RETAINED in the ledger for the next resume, so the
+        // owner's delete intent is neither executed blindly nor lost.
+        let mut retained_unknown: Vec<String> = Vec::new();
         for rel in &paths {
-            if self.vault_root.join(rel).exists() {
-                skipped_present += 1;
-                continue;
+            // Only a DEFINITE absence (try_exists == Ok(false)) may replay a
+            // Delete. Path::exists() reads any stat error as "absent".
+            match self.vault_root.join(rel).try_exists() {
+                Ok(false) => {}
+                Ok(true) => {
+                    skipped_present += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %rel,
+                        error = %e,
+                        "file_watcher: UNSTAT-ABLE ledger path treated as PRESENT on replay: NOT replayed as a delete, RETAINED in the ledger for the next resume (TKT-6e7fec3e)"
+                    );
+                    retained_unknown.push(rel.clone());
+                    continue;
+                }
             }
             events.push(PushEvent {
                 schema_version: CURRENT_SCHEMA,
@@ -1004,12 +1023,21 @@ impl FileWatcher {
                     tracing::warn!(
                         replayed = n,
                         skipped_present,
+                        retained_unstatable = retained_unknown.len(),
                         total_in_ledger = paths.len(),
                         "file_watcher: REPLAYED suppressed deletes after operator resume — these were dropped while the burst valve was latched and are now propagating"
                     );
                     // Only clear once the batch is durably appended; a failure
                     // must leave the ledger intact so the next resume retries.
-                    ledger.clear();
+                    // Unstat-able paths stay in the ledger (TKT-6e7fec3e).
+                    if retained_unknown.is_empty() {
+                        ledger.clear();
+                    } else if !ledger.replace_with(&retained_unknown) {
+                        tracing::error!(
+                            retained = retained_unknown.len(),
+                            "file_watcher: FAILED to rewrite the suppressed-delete ledger down to its unstat-able paths; ledger left as-is, so the next resume re-attempts the replayed deletes (CAS-guarded, redundant at worst)"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1040,15 +1068,28 @@ impl FileWatcher {
     }
 
     async fn handle_fs_path(&self, abs: &Path) {
-        let kind = if abs.exists() {
+        // TKT-6e7fec3e: only a DEFINITE absence (try_exists == Ok(false)) may
+        // classify as a delete. Path::exists() returns false on ANY stat error
+        // (EACCES, EIO), which turned a permissions glitch on a present file
+        // into a real delete pushed to the hub.
+        let kind = match abs.try_exists() {
             // We keep the exists-based create-vs-modify heuristic: default to
             // Modified for any path that still exists. The push_client /
             // server-side reconciler is create-modify-tolerant (PushAction::Create
             // vs Modify only differs in base_hash handling, which we leave None
             // here). The caller has already filtered to mutating event kinds.
-            WatchEventKindHint::Modified
-        } else {
-            WatchEventKindHint::Deleted
+            Ok(true) => WatchEventKindHint::Modified,
+            Ok(false) => WatchEventKindHint::Deleted,
+            Err(e) => {
+                // Unstat-able: treat as PRESENT. Its bytes cannot be read
+                // either, so there is nothing to push; skip the event loudly.
+                tracing::warn!(
+                    path = %abs.display(),
+                    error = %e,
+                    "file_watcher: UNSTAT-ABLE path treated as PRESENT: NOT classified as a delete, event skipped (TKT-6e7fec3e)"
+                );
+                return;
+            }
         };
         let Some(evt) = self.normalize_event(abs, kind) else {
             tracing::debug!("file_watcher: dropped event outside vault root: {abs:?}");
@@ -2792,5 +2833,179 @@ mod tests {
             Ok(_) => panic!("expected InotifyLimitExceeded, got Ok(WatchHandle)"),
             Err(e) => panic!("expected InotifyLimitExceeded, got {e:?}"),
         }
+    }
+
+    // ---------- TKT-6e7fec3e: an unstat-able path is PRESENT, never a delete ----------
+    //
+    // Fable review of PR #51 (pre-existing on 0.4.x): handle_fs_path and
+    // replay_suppressed_deletes used Path::exists(), which returns false on ANY
+    // stat error (EACCES, EIO). A present-but-unstat-able file was therefore
+    // classified as a DELETE (and pushed to the hub on an unlatched daemon) and
+    // replayed as a Delete on resume. Same fail-open class as the
+    // poll_marker_resume bug fixed in 8125a0a. Only a DEFINITE absence
+    // (try_exists == Ok(false)) may produce or replay a Delete. These are
+    // REAL-errno tests: the parent dir is chmod 000 so try_exists() returns
+    // Err(EACCES). Root bypasses mode bits, so they self-skip there via a probe.
+
+    /// Capture everything logged at WARN+ on this thread while the guard lives.
+    /// `#[tokio::test]` runs on a current-thread runtime, so a thread-local
+    /// default subscriber sees every event emitted across the awaits.
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<Mutex<Vec<u8>>>);
+    #[cfg(unix)]
+    impl std::io::Write for WarnCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[cfg(unix)]
+    impl WarnCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let me = self.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || me.clone())
+                .finish();
+            tracing::subscriber::set_default(sub)
+        }
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[cfg(unix)]
+    fn chmod(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unstatable_path_is_present_never_a_delete() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher(&dir, vec![], vec![]);
+        let locked = dir.path().join("01_Notes/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let abs = locked.join("note.md");
+        std::fs::write(&abs, b"still here").unwrap();
+
+        chmod(&locked, 0o000);
+        let probe = abs.try_exists();
+        let logs = WarnCapture::default();
+        {
+            let _g = logs.install();
+            w.handle_fs_path(&abs).await;
+        }
+        chmod(&locked, 0o755);
+        if probe.is_ok() {
+            eprintln!("skip: running with privileges that bypass mode bits");
+            return;
+        }
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            0,
+            "an unstat-able (EACCES) path must NOT be queued as a Delete"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("WARN")
+                && text.contains("UNSTAT-ABLE")
+                && text.contains("01_Notes/locked/note.md"),
+            "an unstat-able path must be logged at WARN, never silently skipped; got: {text}"
+        );
+        assert!(abs.exists(), "the file is untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replay_never_deletes_an_unstatable_ledger_path_and_retains_it() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        assert!(ledger.record("01_Notes/locked/note.md"));
+        assert!(ledger.record("01_Notes/gone.md"));
+        let locked = dir.path().join("01_Notes/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let present = locked.join("note.md");
+        std::fs::write(&present, b"still here").unwrap();
+        let (w, _burst) = boot_watcher(&dir, &marker, &ledger);
+
+        chmod(&locked, 0o000);
+        let probe = present.try_exists();
+        let logs = WarnCapture::default();
+        {
+            let _g = logs.install();
+            w.replay_suppressed_deletes();
+        }
+        chmod(&locked, 0o755);
+        if probe.is_ok() {
+            eprintln!("skip: running with privileges that bypass mode bits");
+            return;
+        }
+        assert_eq!(
+            queued_delete_paths(&w),
+            vec!["01_Notes/gone.md".to_string()],
+            "replay must queue the definitely-absent path ONLY, never the unstat-able one"
+        );
+        let kept: Vec<String> = ledger.paths().into_iter().collect();
+        assert_eq!(
+            kept,
+            vec!["01_Notes/locked/note.md".to_string()],
+            "the unstat-able path must STAY in the ledger for the next resume; the replayed one is cleared"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("WARN")
+                && text.contains("UNSTAT-ABLE")
+                && text.contains("01_Notes/locked/note.md"),
+            "an unstat-able ledger path must be logged at WARN; got: {text}"
+        );
+        assert!(present.exists(), "the file is untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truly_absent_path_still_deletes_and_replays() {
+        // NEGATIVE CONTROL: a definite absence (try_exists == Ok(false)) must still
+        // classify as Delete and still replay, and a fully-replayed ledger is cleared.
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        let (w, _burst) = boot_watcher(&dir, &marker, &ledger);
+
+        let f = dir.path().join("01_Notes/gone-now.md");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"body").unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert!(matches!(f.try_exists(), Ok(false)));
+        w.handle_fs_path(&f).await;
+        assert_eq!(
+            queued_delete_paths(&w),
+            vec!["01_Notes/gone-now.md".to_string()],
+            "a truly absent file must still classify as Delete"
+        );
+
+        assert!(ledger.record("01_Notes/gone-earlier.md"));
+        w.replay_suppressed_deletes();
+        // drain() reads without removing, so the earlier live delete is still listed.
+        assert_eq!(
+            queued_delete_paths(&w),
+            vec![
+                "01_Notes/gone-earlier.md".to_string(),
+                "01_Notes/gone-now.md".to_string()
+            ],
+            "a truly absent ledger path must still replay"
+        );
+        assert!(ledger.is_empty(), "a fully replayed ledger is cleared");
     }
 }
