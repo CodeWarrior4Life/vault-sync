@@ -110,6 +110,31 @@ impl DeleteLedger {
         self.paths().is_empty()
     }
 
+    /// Atomically rewrite the ledger to exactly `paths` (temp file + rename),
+    /// so a crash mid-rewrite leaves either the old or the new set, never a
+    /// truncated one. Used after a replay to RETAIN paths whose existence could
+    /// not be determined (TKT-6e7fec3e). Returns true iff the rewrite landed.
+    pub fn replace_with(&self, paths: &[String]) -> bool {
+        let mut body = String::new();
+        for p in paths {
+            if p.is_empty() || p.contains('\n') {
+                continue;
+            }
+            body.push_str(p);
+            body.push('\n');
+        }
+        let tmp = self.path.with_extension("rewrite.tmp");
+        if std::fs::write(&tmp, body).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        if std::fs::rename(&tmp, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        true
+    }
+
     /// Drop the ledger entirely (after a successful replay).
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.path);
