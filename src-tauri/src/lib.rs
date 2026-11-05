@@ -662,10 +662,21 @@ fn spawn_sse_consumer(
                 "VAULT_SYNC_APPEND_ARMS is set to an off-word: append-aware conflict arms DISABLED (pre-fix stash floor for every R4/R5 conflict)"
             );
         }
+        // TKT-457a5073: content-shrink guard kill-switch, same contract as
+        // VAULT_SYNC_APPEND_ARMS (an explicit off-word disables; unset = ON).
+        let shrink_guard_enabled = materializer::shrink_guard_enabled_from_env_value(
+            std::env::var("VAULT_SYNC_SHRINK_GUARD").ok().as_deref(),
+        );
+        if !shrink_guard_enabled {
+            tracing::warn!(
+                "VAULT_SYNC_SHRINK_GUARD is set to an off-word: content-shrink guard DISABLED (a pull that truncates a note materializes silently, pre-TKT-457a5073 behaviour)"
+            );
+        }
         let materializer_cfg = materializer::MaterializerConfig {
             device_id: cfg.subscriber_id.clone(),
             conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
             append_arms_enabled,
+            shrink_guard_enabled,
             ..Default::default()
         };
         // S492 echo guard: shared between the materializer (records its writes)
@@ -818,6 +829,16 @@ fn spawn_sse_consumer(
             materializer_cfg,
         )
         .with_tray_state(tray_state.clone())
+        // TKT-457a5073 follow-up (review MEDIUM 1): shrink-guard hits page the
+        // owner through the same OS-notification path as redflag / push-init
+        // (`notify_user`), rate-limited to one notification per 10 min after
+        // the first. Arc-shared by every materializer clone.
+        .with_shrink_pager({
+            let app_for_pager = app.clone();
+            std::sync::Arc::new(materializer::ShrinkGuardPager::new(std::sync::Arc::new(
+                move |title: &str, body: &str| notify_user(&app_for_pager, title, body),
+            )))
+        })
         .with_echo_guard(echo_guard.clone())
         .with_shadow_store(shadow.clone())
         // R3 (TKT-166e1c07): the pull leg records the observed base_seq here.
