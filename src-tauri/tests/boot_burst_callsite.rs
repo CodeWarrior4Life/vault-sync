@@ -10,7 +10,9 @@ use std::fs;
 use std::path::PathBuf;
 
 fn src(name: &str) -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(name);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -46,7 +48,10 @@ fn daemon_burst_detector_attaches_the_pause_marker() {
     let start = rf
         .find("pub fn daemon_burst_detector(")
         .expect("redflag::daemon_burst_detector must exist");
-    let body_end = rf[start..].find("\n}").map(|i| start + i).expect("fn body end");
+    let body_end = rf[start..]
+        .find("\n}")
+        .map(|i| start + i)
+        .expect("fn body end");
     assert!(
         rf[start..body_end].contains(".with_pause_marker("),
         "daemon_burst_detector must attach the pause marker (the re-latch path)"

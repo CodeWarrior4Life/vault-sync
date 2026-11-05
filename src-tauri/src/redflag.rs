@@ -960,7 +960,10 @@ mod tests {
         assert!(reborn.is_paused());
         assert!(!reborn.poll_marker_resume(), "marker present: no resume");
         fs::remove_file(&marker).unwrap();
-        assert!(reborn.poll_marker_resume(), "marker removed: the operator's resume must work");
+        assert!(
+            reborn.poll_marker_resume(),
+            "marker removed: the operator's resume must work"
+        );
         assert!(!reborn.is_paused());
     }
 
@@ -982,6 +985,9 @@ mod tests {
             eprintln!("skip: running with privileges that bypass mode bits");
             return;
         }
-        assert!(det.is_paused(), "an unreadable marker must latch (fail-closed)");
+        assert!(
+            det.is_paused(),
+            "an unreadable marker must latch (fail-closed)"
+        );
     }
 }
