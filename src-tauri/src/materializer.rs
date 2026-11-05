@@ -1955,6 +1955,16 @@ impl Materializer {
         local_raw_sha: &str,
         change_seq: u64,
     ) -> Result<PathBuf, MaterializerError> {
+        #[cfg(test)]
+        if tests::take_injected_preserve_failure() {
+            // TKT-457a5073 (0.4.x port) test seam: simulate a preserve-write
+            // failure so the fail-closed abort is provable on its own (the
+            // in-vault preserve shares the note's directory, so a filesystem
+            // fault would also fail the main write and mask the abort).
+            return Err(MaterializerError::Io(std::io::Error::other(
+                "injected preserve failure (test seam)",
+            )));
+        }
         let stash_root = match self.mode {
             MaterializerMode::Live => self.vaults_root.clone(),
             _ => self.shadow_root(),
@@ -5703,6 +5713,23 @@ mod tests {
         INJECT_PERSIST_FAILURE.with(|c| c.set(true));
     }
 
+    thread_local! {
+        /// Test seam (0.4.x port, Fable review of PR #56 HIGH): one-shot
+        /// failure injection for `preserve_shrunk_local`, so the fail-closed
+        /// abort is tested in isolation from the main write's own I/O.
+        static INJECT_PRESERVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Consumed by `preserve_shrunk_local` (cfg(test) only) before any I/O:
+    /// true at most once per `inject_preserve_failure_once`.
+    pub(super) fn take_injected_preserve_failure() -> bool {
+        INJECT_PRESERVE_FAILURE.with(|c| c.replace(false))
+    }
+
+    fn inject_preserve_failure_once() {
+        INJECT_PRESERVE_FAILURE.with(|c| c.set(true));
+    }
+
     mod shrink_guard_tkt_457a5073 {
         use super::*;
         use crate::sync_health::{shrink_guard_events, ShrinkGuardFired};
@@ -6282,14 +6309,17 @@ mod tests {
             assert_eq!(notices(&r).len(), 1);
         }
 
-        /// FAIL-CLOSED PRESERVE: if the preserve itself cannot be written
-        /// (the note's directory is read-only), the write aborts BEFORE the
-        /// overwrite - local untouched, nothing paged. Once the directory is
-        /// writable again the pull preserves, aligns and pages once.
-        #[cfg(unix)]
+        /// FAIL-CLOSED PRESERVE (Fable review of PR #56, HIGH): if the preserve
+        /// itself fails, the write ABORTS BEFORE the overwrite - Err returned,
+        /// the target still holds the local bytes, no conflict sibling, and
+        /// nothing paged. The failure is injected inside `preserve_shrunk_local`
+        /// only (cfg(test) seam), so the main write path is healthy and the
+        /// ONLY thing that can keep local intact is the preserve error
+        /// propagating. A swallowed preserve error (e.g. `.unwrap_or_else`)
+        /// would overwrite local with the server head and fail this test.
+        /// Once the fault clears, the same pull preserves, aligns, pages once.
         #[test]
         fn preserve_failure_aborts_before_overwrite_and_never_pages() {
-            use std::os::unix::fs::PermissionsExt;
             let r = rig(default_cfg());
             let rel = "02_Projects/Incident/tkt457-preserve-fail.md";
             let local = text_of_len("v18780-preserve", 18_780, false);
@@ -6297,24 +6327,23 @@ mod tests {
             let (wire, target) = seed_synced(&r, rel, &local);
             let dir = target.parent().unwrap().to_path_buf();
 
-            let writable = std::fs::metadata(&dir).unwrap().permissions();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-            if NamedTempFile::new_in(&dir).is_ok() {
-                // Running as root (permissions are not enforced): the
-                // failure cannot be induced this way; restore and bail.
-                std::fs::set_permissions(&dir, writable).unwrap();
-                eprintln!("skipping: directory permissions not enforced (root?)");
-                return;
-            }
+            inject_preserve_failure_once();
             let first =
                 r.m.write_with_change_seq(&payload_bytes(&wire, &server, 7101), 7101);
-            std::fs::set_permissions(&dir, writable).unwrap();
+            assert!(
+                !take_injected_preserve_failure(),
+                "the injection was consumed by the preserve step"
+            );
             assert!(first.is_err(), "preserve must fail closed: {first:?}");
-            assert_eq!(std::fs::read(&target).unwrap(), local, "local untouched");
-            assert!(conflict_copies(&dir).is_empty());
-            assert_eq!(fired(&r), 0);
-            assert!(shrink_events_for(&wire).is_empty());
-            assert!(notices(&r).is_empty());
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                local,
+                "local untouched: the overwrite must not run after a failed preserve"
+            );
+            assert!(conflict_copies(&dir).is_empty(), "no conflict sibling");
+            assert_eq!(fired(&r), 0, "no tray count");
+            assert!(shrink_events_for(&wire).is_empty(), "no health event");
+            assert!(notices(&r).is_empty(), "no notification");
 
             let second =
                 r.m.write_with_change_seq(&payload_bytes(&wire, &server, 7101), 7101)
