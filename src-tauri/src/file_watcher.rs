@@ -12,6 +12,8 @@
 //!    `.trash/` always drop regardless of user config (defense-in-depth).
 //! 3. **User scope_excludes** — drop if prefix-match.
 //! 4. **scope_roots** — if non-empty, require prefix-match into one of them.
+//!    (3) and (4) match the STORAGE key: `<route>/<rel>` on a routed root,
+//!    `<rel>` on the bare vault route (TKT-35f75318).
 //! 5. **Extension gate** — only allowed extensions pass; everything else
 //!    drops as `DropExtension`. Deletes bypass the extension check IFF the
 //!    path *looks* like an allowed extension (because at delete time the file
@@ -78,6 +80,18 @@ const HARDCODED_EXCLUDES: &[&str] = &[
 /// — not synced, generated + maintained per-machine.
 const HARDCODED_BASENAME_PREFIXES: &[&str] = &[".%"];
 
+/// TKT-35f75318: route-relative watcher path -> storage key, the form the
+/// server's `scope_roots` / `scope_excludes` are expressed in. Mirrors server
+/// `nexus/services/vault_sync/route_map.py::to_storage`: empty/absent route is
+/// identity (bare vault), a named route is `<route>/<rel>`. Used ONLY for the
+/// scope gate; pushed paths stay route-relative.
+pub fn storage_key_for<'a>(route: Option<&str>, rel: &'a str) -> std::borrow::Cow<'a, str> {
+    match route {
+        Some(r) if !r.is_empty() => std::borrow::Cow::Owned(format!("{r}/{rel}")),
+        _ => std::borrow::Cow::Borrowed(rel),
+    }
+}
+
 /// Default allowed text extensions (lowercase, no leading dot).
 pub const DEFAULT_ALLOWED_EXTENSIONS: &[&str] = &["md"];
 
@@ -101,6 +115,14 @@ pub struct FileWatcherConfig {
     /// memory root they must never become payload. `false` (vault mode)
     /// keeps classification byte-identical to pre-0.4.38.
     pub managed_payload_excludes: bool,
+    /// TKT-35f75318: the sync root's ROUTE (e.g. `harness-memory/Nexus`), used
+    /// ONLY to build the storage-key form `<route>/<rel>` that the
+    /// server-supplied `scope_roots` / `scope_excludes` are expressed in (the
+    /// server matches them on the CANONICAL storage key, before `to_wire`).
+    /// `None` (or empty) = the bare vault route `""`: the key is `<rel>`
+    /// verbatim, so vault-mode classification is byte-identical. Pushed paths
+    /// themselves stay route-RELATIVE; this never changes the wire path.
+    pub storage_prefix: Option<String>,
 }
 
 impl Default for FileWatcherConfig {
@@ -114,6 +136,7 @@ impl Default for FileWatcherConfig {
             scope_excludes: Vec::new(),
             debounce_ms: 500,
             managed_payload_excludes: false,
+            storage_prefix: None,
         }
     }
 }
@@ -529,9 +552,15 @@ impl FileWatcher {
             };
         }
 
+        // TKT-35f75318: server scope_roots / scope_excludes are STORAGE-key
+        // prefixes (matched server-side on the canonical key, before
+        // `to_wire`). On a routed root the key is `<route>/<rel>`
+        // (mirrors server `route_map.to_storage`); bare route = `<rel>`.
+        let scope_key = storage_key_for(self.config.storage_prefix.as_deref(), &norm);
+
         // (3) User scope_excludes.
         for ex in &self.config.scope_excludes {
-            if norm.starts_with(ex.as_str()) {
+            if scope_key.starts_with(ex.as_str()) {
                 return FilterDecision::DropExclude {
                     path: norm,
                     exclude_rule: ex.clone(),
@@ -545,7 +574,7 @@ impl FileWatcher {
                 .config
                 .scope_roots
                 .iter()
-                .any(|r| norm.starts_with(r.as_str()));
+                .any(|r| scope_key.starts_with(r.as_str()));
             if !in_scope {
                 return FilterDecision::DropOutOfScope { path: norm };
             }
@@ -1472,6 +1501,7 @@ mod tests {
             scope_excludes: scope_excludes.into_iter().map(String::from).collect(),
             debounce_ms: 500,
             managed_payload_excludes: false,
+            storage_prefix: None,
         };
         FileWatcher::new(
             dir.path().to_path_buf(),
@@ -1534,6 +1564,7 @@ mod tests {
             scope_excludes: vec![],
             debounce_ms: 500,
             managed_payload_excludes: false,
+            storage_prefix: None,
         };
         let w = FileWatcher::new(
             dir.path().to_path_buf(),
@@ -1785,6 +1816,7 @@ mod tests {
             scope_excludes: vec![],
             debounce_ms: 500,
             managed_payload_excludes: true,
+            storage_prefix: None,
         };
         FileWatcher::new(
             dir.path().to_path_buf(),
@@ -2193,6 +2225,7 @@ mod tests {
             scope_excludes: vec![],
             debounce_ms: 500,
             managed_payload_excludes: false,
+            storage_prefix: None,
         };
         let w = FileWatcher::new(
             dir.path().to_path_buf(),
@@ -2472,6 +2505,296 @@ mod tests {
         let w = make_watcher(&dir, vec![], vec![]);
         let evt = created("02_Projects/Foo/new.md");
         assert!(matches!(w.classify(&evt), FilterDecision::Allow(_)));
+    }
+
+    // ---------- TKT-35f75318: scope gate on the route-prefixed storage key ----------
+    //
+    // Server `scope_roots` / `scope_excludes` are STORAGE-key prefixes (the
+    // server matches them on the canonical key BEFORE `to_wire`); on a routed
+    // (managed) root the key is `<route>/<rel>`, while the watcher sees `<rel>`.
+
+    fn make_routed_watcher(
+        root: &Path,
+        journal_dir: &TempDir,
+        route: Option<&str>,
+        scope_roots: Vec<&str>,
+        scope_excludes: Vec<&str>,
+    ) -> FileWatcher {
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: scope_roots.into_iter().map(String::from).collect(),
+            scope_excludes: scope_excludes.into_iter().map(String::from).collect(),
+            debounce_ms: 500,
+            managed_payload_excludes: route.is_some(),
+            storage_prefix: route.map(String::from),
+        };
+        FileWatcher::new(
+            root.to_path_buf(),
+            make_journal(journal_dir),
+            make_burst(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+    }
+
+    /// (i) routed, in scope: `t4-canary.md` under route `harness-memory/Nexus`
+    /// is storage key `harness-memory/Nexus/t4-canary.md`, inside scope root
+    /// `harness-memory/` -> allowed AND queued. Red pre-fix: DropOutOfScope.
+    #[tokio::test]
+    async fn routed_root_in_scope_event_is_queued() {
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let w = make_routed_watcher(
+            dir.path(),
+            &jdir,
+            Some("harness-memory/Nexus"),
+            vec!["harness-memory/"],
+            vec![],
+        );
+        let d = w.classify(&modified("t4-canary.md"));
+        assert!(
+            matches!(d, FilterDecision::Allow(_)),
+            "routed in-scope event must be allowed, got {:?}",
+            d
+        );
+        // Wire path stays route-RELATIVE (the server prepends the route).
+        if let FilterDecision::Allow(WatchEvent::Modified { path }) = d {
+            assert_eq!(path, "t4-canary.md");
+        }
+        let abs = dir.path().join("t4-canary.md");
+        std::fs::write(&abs, b"canary body").unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            1,
+            "routed in-scope edit must be enqueued for push"
+        );
+    }
+
+    /// (ii) routed, out of scope: a scope root that does not prefix the route
+    /// still drops every event under that route.
+    #[tokio::test]
+    async fn routed_root_out_of_scope_event_drops() {
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let w = make_routed_watcher(
+            dir.path(),
+            &jdir,
+            Some("harness-memory/Nexus"),
+            vec!["other/"],
+            vec![],
+        );
+        assert!(matches!(
+            w.classify(&modified("t4-canary.md")),
+            FilterDecision::DropOutOfScope { .. }
+        ));
+        // A sibling route's prefix is not ours either.
+        let w2 = make_routed_watcher(
+            dir.path(),
+            &jdir,
+            Some("harness-memory/Nexus"),
+            vec!["harness-memory/Cutlist/"],
+            vec![],
+        );
+        assert!(matches!(
+            w2.classify(&modified("t4-canary.md")),
+            FilterDecision::DropOutOfScope { .. }
+        ));
+        let abs = dir.path().join("t4-canary.md");
+        std::fs::write(&abs, b"canary body").unwrap();
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.lock().unwrap().len(), 0);
+    }
+
+    /// Routed excludes are storage-key prefixes too (server applies them to the
+    /// same canonical key as scope_roots).
+    #[test]
+    fn routed_root_scope_excludes_match_storage_key() {
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let w = make_routed_watcher(
+            dir.path(),
+            &jdir,
+            Some("harness-memory/Nexus"),
+            vec!["harness-memory/"],
+            vec!["harness-memory/Nexus/private/"],
+        );
+        match w.classify(&modified("private/x.md")) {
+            FilterDecision::DropExclude { path, exclude_rule } => {
+                assert_eq!(path, "private/x.md");
+                assert_eq!(exclude_rule, "harness-memory/Nexus/private/");
+            }
+            other => panic!("expected DropExclude, got {:?}", other),
+        }
+        assert!(matches!(
+            w.classify(&modified("public/y.md")),
+            FilterDecision::Allow(_)
+        ));
+    }
+
+    /// (iii) bare/empty route (vault mode): unchanged — `<rel>` is matched
+    /// verbatim, for both `None` and `Some("")`.
+    #[test]
+    fn bare_route_scope_roots_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        for route in [None, Some("")] {
+            let w = make_routed_watcher(dir.path(), &jdir, route, vec!["02_Projects/"], vec![]);
+            assert!(matches!(
+                w.classify(&modified("02_Projects/x.md")),
+                FilterDecision::Allow(_)
+            ));
+            assert!(matches!(
+                w.classify(&modified("05_Personal/y.md")),
+                FilterDecision::DropOutOfScope { .. }
+            ));
+        }
+        // Vault default excludes (`harness-memory/`) still bite on bare keys.
+        let w = make_routed_watcher(dir.path(), &jdir, None, vec![], vec!["harness-memory/"]);
+        assert!(matches!(
+            w.classify(&modified("harness-memory/Nexus/a.md")),
+            FilterDecision::DropExclude { .. }
+        ));
+    }
+
+    /// (iv) symlinked sync root: the root is configured through a symlink
+    /// (`link -> real`) and the event path arrives in CANONICAL (`real/...`)
+    /// form. It must still relativize to `<rel>`, map to `<route>/<rel>`, match
+    /// and be queued.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routed_symlinked_root_canonical_event_maps_and_queues() {
+        let base = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let real = base.path().join("real");
+        let link = base.path().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = std::fs::canonicalize(&real).unwrap();
+        let abs = canon_real.join("t4-canary.md");
+        std::fs::write(&abs, b"canary via symlinked root").unwrap();
+
+        let w = make_routed_watcher(
+            &link,
+            &jdir,
+            Some("harness-memory/Nexus"),
+            vec!["harness-memory/"],
+            vec![],
+        );
+        let evt = w
+            .normalize_event(&abs, WatchEventKindHint::Modified)
+            .expect("canonical path under a symlinked root must normalize");
+        assert_eq!(
+            evt,
+            WatchEvent::Modified {
+                path: "t4-canary.md".to_string()
+            }
+        );
+        assert!(matches!(w.classify(&evt), FilterDecision::Allow(_)));
+        w.handle_fs_path(&abs).await;
+        assert_eq!(w.journal.lock().unwrap().len(), 1);
+    }
+
+    /// TKT-98da9ee3 / LSEC-G328 delete-safety: the delete-burst valve still
+    /// latches on a MANAGED (routed) root once the scope gate passes. Before
+    /// TKT-35f75318 every routed event was DropOutOfScope, so the valve was
+    /// never reached on a managed instance; restoring the scope match must not
+    /// open a path that bypasses it. Detector built exactly as boot builds it
+    /// (`redflag::daemon_burst_detector`, 20 deletes / 30 s, marker attached);
+    /// watcher built as spawn_push_pipeline builds it for a routed root
+    /// (`storage_prefix: Some(route)`, `managed_payload_excludes: true`) with
+    /// a non-empty scope gate that the route-prefixed storage key satisfies.
+    #[tokio::test]
+    async fn routed_managed_root_delete_burst_latches_valve_with_scope_gate_active() {
+        const N: usize = 25;
+        let threshold = crate::redflag::DAEMON_BURST_THRESHOLD;
+        assert_eq!(threshold, 20);
+        assert_eq!(
+            crate::redflag::DAEMON_BURST_WINDOW,
+            std::time::Duration::from_secs(30)
+        );
+        assert!(N > threshold);
+
+        let dir = TempDir::new().unwrap();
+        let jdir = TempDir::new().unwrap();
+        let state = jdir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        let burst = Arc::new(Mutex::new(crate::redflag::daemon_burst_detector(&marker)));
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec!["harness-memory/".to_string()],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: true,
+            storage_prefix: Some("harness-memory/Nexus".to_string()),
+        };
+        let w = FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(&jdir),
+            burst.clone(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_delete_ledger(ledger.clone());
+
+        // The scope gate is ACTIVE (non-empty scope_roots) and PASSES on the
+        // route-prefixed storage key; an out-of-route key would drop.
+        assert_eq!(
+            storage_key_for(Some("harness-memory/Nexus"), "m-00.md"),
+            "harness-memory/Nexus/m-00.md"
+        );
+        assert!(matches!(
+            w.classify(&deleted("m-00.md")),
+            FilterDecision::Allow(_)
+        ));
+        assert!(!burst.lock().unwrap().is_paused());
+        assert!(!marker.exists());
+
+        // N real file deletes, all inside one 30 s window.
+        let mut names: Vec<String> = (0..N).map(|i| format!("m-{i:02}.md")).collect();
+        for n in &names {
+            std::fs::write(dir.path().join(n), b"memory body").unwrap();
+        }
+        for n in &names {
+            let abs = dir.path().join(n);
+            std::fs::remove_file(&abs).unwrap();
+            w.handle_fs_path(&abs).await;
+        }
+
+        // Exactly the first `threshold` deletes are queued (the 20th trips the
+        // valve after it is allowed); NOTHING past the threshold is queued.
+        let queued = queued_delete_paths(&w);
+        names.sort();
+        assert_eq!(
+            queued,
+            names[..threshold].to_vec(),
+            "only the first {threshold} deletes may queue on a routed managed root"
+        );
+        // Valve latched and the marker written (the headless resume handle).
+        assert!(
+            burst.lock().unwrap().is_paused(),
+            "the delete-burst valve must latch on a routed managed root"
+        );
+        assert!(marker.exists(), "the pause marker must be written");
+        // Every delete past the threshold is SUPPRESSED and ledgered.
+        assert_eq!(
+            ledger.paths().into_iter().collect::<Vec<_>>(),
+            names[threshold..].to_vec(),
+            "every suppressed delete must be recorded in the ledger"
+        );
+        // A further delete while latched still does not queue (the journal
+        // is ack-based: `drain` above does not shrink `len`, so compare).
+        let before = w.journal.lock().unwrap().len();
+        let late = dir.path().join("late.md");
+        std::fs::write(&late, b"x").unwrap();
+        std::fs::remove_file(&late).unwrap();
+        w.handle_fs_path(&late).await;
+        assert_eq!(w.journal.lock().unwrap().len(), before);
+        assert!(ledger.paths().contains("late.md"));
     }
 
     // ---------- to_push_event() ----------
