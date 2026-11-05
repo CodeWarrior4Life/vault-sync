@@ -463,10 +463,21 @@ async fn run_boot(env: BootEnv) -> TaskEnd {
             "VAULT_SYNC_APPEND_ARMS is set to an off-word: append-aware conflict arms DISABLED (pre-fix stash floor for every R4/R5 conflict)"
         );
     }
+    // TKT-457a5073: content-shrink guard kill-switch, same contract as
+    // VAULT_SYNC_APPEND_ARMS (an explicit off-word disables; unset = ON).
+    let shrink_guard_enabled = materializer::shrink_guard_enabled_from_env_value(
+        std::env::var("VAULT_SYNC_SHRINK_GUARD").ok().as_deref(),
+    );
+    if !shrink_guard_enabled {
+        tracing::warn!(
+            "VAULT_SYNC_SHRINK_GUARD is set to an off-word: content-shrink guard DISABLED (a pull that truncates a note materializes silently, pre-TKT-457a5073 behaviour)"
+        );
+    }
     let materializer_cfg = materializer::MaterializerConfig {
         device_id: cfg.subscriber_id.clone(),
         conflict_policy: conflict_stash::ConflictPolicy::NewerWins,
         append_arms_enabled,
+        shrink_guard_enabled,
         // R2(a) (TKT-406f6cb3): flight-recorder conflict stashes go to the
         // app-data quarantine (beside logs/), never into the vault.
         // (BootEnv.workspace == resolve_workspace_root() in production; a
