@@ -447,6 +447,19 @@ pub enum StateHealthEvent {
         delete: usize,
         unparsed: usize,
     },
+    /// TKT-457a5073: the materializer's content-shrink guard fired - a pull
+    /// would have overwritten `path` (`local_len` bytes) with a much smaller
+    /// server head (`server_len` bytes). The local bytes were preserved at
+    /// `preserved` BEFORE the overwrite, then local was aligned to the server.
+    /// Raised as an `error!` page carrying the stable marker
+    /// `SHRINK GUARD (TKT-457a5073)`.
+    ShrinkGuardFired {
+        path: String,
+        local_len: usize,
+        server_len: usize,
+        change_seq: u64,
+        preserved: String,
+    },
 }
 
 impl StateHealthEvent {
@@ -467,6 +480,7 @@ impl StateHealthEvent {
             StateHealthEvent::SseAuthFailed { .. } => "sse_auth_failed",
             StateHealthEvent::BootAborted { .. } => "boot_aborted",
             StateHealthEvent::StrandedJournal { .. } => "stranded_journal",
+            StateHealthEvent::ShrinkGuardFired { .. } => "shrink_guard_fired",
         }
     }
 }
@@ -579,6 +593,21 @@ pub fn raise_state_event(e: StateHealthEvent) -> bool {
             delete = *delete,
             unparsed = *unparsed,
             "sync_health: stranded_journal (diagnose only; the file is left byte-identical)"
+        ),
+        StateHealthEvent::ShrinkGuardFired {
+            path,
+            local_len,
+            server_len,
+            change_seq,
+            preserved,
+        } => tracing::error!(
+            sync_health_event = e.name(),
+            path = %path,
+            local_len = *local_len,
+            server_len = *server_len,
+            change_seq = *change_seq,
+            stash = %preserved,
+            "SHRINK GUARD (TKT-457a5073): pull would TRUNCATE this note (server head much smaller than local) - local bytes PRESERVED at the stash path BEFORE aligning to the server; verify the server version is intentional"
         ),
     }
     if g.log.len() >= STATE_EVENT_CAP {

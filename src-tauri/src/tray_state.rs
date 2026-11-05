@@ -86,6 +86,10 @@ pub struct TrayState {
     pub conflict_unresolved: usize,
     /// Total post-write integrity-check failures (byte mismatch or parse fail).
     pub integrity_failures: u64,
+    /// TKT-457a5073: pulls where the content-shrink guard fired (the server
+    /// head would have dropped a large share of the local note's bytes). Each
+    /// one preserved the local bytes before aligning. Monotonic.
+    pub shrink_guard_fired: u64,
     /// True iff `<vault>/redflag.md` is present — sync is HALTED.
     pub redflag_tripped: bool,
     /// True iff the DeleteBurstDetector is currently Paused.
@@ -167,6 +171,7 @@ impl TrayState {
             events_dropped_excludes: 0,
             conflict_unresolved: 0,
             integrity_failures: 0,
+            shrink_guard_fired: 0,
             redflag_tripped: false,
             delete_burst_paused: false,
             verify_in_progress: false,
@@ -267,6 +272,11 @@ impl TrayState {
 
     pub fn set_conflict_unresolved(&mut self, n: usize) {
         self.conflict_unresolved = n;
+    }
+
+    /// TKT-457a5073: the content-shrink guard preserved + paged a pull.
+    pub fn inc_shrink_guard_fired(&mut self) {
+        self.shrink_guard_fired = self.shrink_guard_fired.saturating_add(1);
     }
 
     pub fn inc_integrity_failures(&mut self) {
