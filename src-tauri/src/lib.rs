@@ -1341,10 +1341,9 @@ fn spawn_push_pipeline(
         .parent()
         .map(|d| d.join("delete-burst-PAUSED"))
         .unwrap_or_else(|| std::path::PathBuf::from("delete-burst-PAUSED"));
-    let burst = Arc::new(std::sync::Mutex::new(
-        redflag::DeleteBurstDetector::new(20, std::time::Duration::from_secs(30))
-            .with_pause_marker(burst_marker),
-    ));
+    let burst = Arc::new(std::sync::Mutex::new(redflag::daemon_burst_detector(
+        burst_marker,
+    )));
     // S484: expose the valve so the tray "Resume delete propagation" action
     // can reset it in place (no daemon restart). Register before `burst` is
     // moved into the file watcher below.

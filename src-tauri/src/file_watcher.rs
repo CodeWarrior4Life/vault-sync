@@ -2132,6 +2132,158 @@ mod tests {
         }
     }
 
+    // ── TKT-58b50a68 (0.4.43): boot with a surviving PAUSED marker ─────────────
+    //
+    // Gate merge-bind conditions (lsec-gate, 2026-11-05): (1) STALE LEDGER: boot
+    // with the marker AND deletes already in the SUPPRESSED ledger; nothing may
+    // drain while paused, and the unpause drains exactly the ledger paths that
+    // are absent locally. (2) NEGATIVE CONTROL: no marker at boot, deletes flow.
+    // Both build the detector exactly as boot does (redflag::daemon_burst_detector).
+
+    fn boot_watcher(
+        dir: &TempDir,
+        marker: &std::path::Path,
+        ledger: &crate::delete_ledger::DeleteLedger,
+    ) -> (FileWatcher, Arc<Mutex<DeleteBurstDetector>>) {
+        let burst = Arc::new(Mutex::new(crate::redflag::daemon_burst_detector(marker)));
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".to_string()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+        };
+        let w = FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(dir),
+            burst.clone(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_delete_ledger(ledger.clone());
+        (w, burst)
+    }
+
+    fn queued_delete_paths(w: &FileWatcher) -> Vec<String> {
+        let mut j = w.journal.lock().unwrap();
+        let n = j.len();
+        let mut out: Vec<String> = j
+            .drain(n)
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| {
+                assert!(
+                    matches!(e.action, PushAction::Delete),
+                    "only deletes expected, got {:?}",
+                    e.action
+                );
+                e.path
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn boot_with_paused_marker_and_stale_ledger_suppresses_until_resume_then_replays_absent_only(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        std::fs::write(&marker, "PAUSED (survived the previous process)").unwrap();
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        // Stale ledger from before the restart: one path still gone, one restored locally.
+        assert!(ledger.record("01_Notes/stale-gone.md"));
+        assert!(ledger.record("01_Notes/stale-present.md"));
+        let present = dir.path().join("01_Notes/stale-present.md");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, b"restored by the owner").unwrap();
+
+        let (w, burst) = boot_watcher(&dir, &marker, &ledger);
+        assert!(
+            burst.lock().unwrap().is_paused(),
+            "boot must re-latch from the surviving marker"
+        );
+
+        // A fresh user delete after boot is SUPPRESSED: not queued, recorded in the ledger.
+        let fresh = dir.path().join("01_Notes/fresh.md");
+        std::fs::write(&fresh, b"body").unwrap();
+        std::fs::remove_file(&fresh).unwrap();
+        w.handle_fs_path(&fresh).await;
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            0,
+            "a delete while latched must NOT be queued"
+        );
+        assert!(
+            ledger.paths().contains("01_Notes/fresh.md"),
+            "a suppressed delete must be recorded"
+        );
+
+        // Still paused: the heartbeat's resume poll does nothing and nothing drains.
+        assert!(
+            !burst.lock().unwrap().poll_marker_resume(),
+            "marker present: no resume"
+        );
+        assert_eq!(
+            w.journal.lock().unwrap().len(),
+            0,
+            "nothing drains while paused"
+        );
+        assert_eq!(
+            ledger.paths().len(),
+            3,
+            "the ledger is kept intact while paused"
+        );
+
+        // Unpause exactly as the operator does: remove the marker; the heartbeat
+        // resumes and replays. What drains = ledger paths ABSENT locally only.
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            burst.lock().unwrap().poll_marker_resume(),
+            "marker removed: resume"
+        );
+        w.replay_suppressed_deletes();
+        assert_eq!(
+            queued_delete_paths(&w),
+            vec!["01_Notes/fresh.md".to_string(), "01_Notes/stale-gone.md".to_string()],
+            "unpause replays a Delete for every ledger path absent locally, and skips the restored one"
+        );
+        assert!(
+            present.exists(),
+            "a restored file is never deleted by the replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_without_marker_is_unlatched_and_deletes_flow() {
+        // NEGATIVE CONTROL: no marker on disk at boot, so no latch, and a user delete queues.
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("sync-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("delete-burst-PAUSED");
+        let ledger = crate::delete_ledger::DeleteLedger::new(state.join("delete-burst-SUPPRESSED"));
+        let (w, burst) = boot_watcher(&dir, &marker, &ledger);
+        assert!(
+            !burst.lock().unwrap().is_paused(),
+            "no marker: the valve must NOT be latched"
+        );
+
+        let f = dir.path().join("01_Notes/gone.md");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"body").unwrap();
+        std::fs::remove_file(&f).unwrap();
+        w.handle_fs_path(&f).await;
+        assert_eq!(
+            queued_delete_paths(&w),
+            vec!["01_Notes/gone.md".to_string()],
+            "the delete must flow"
+        );
+        assert!(ledger.is_empty(), "nothing suppressed, nothing recorded");
+    }
+
     #[test]
     fn delete_burst_not_paused_allows_delete() {
         let dir = TempDir::new().unwrap();
