@@ -183,8 +183,11 @@ pub enum MaterializeOutcome {
     /// also written to its final path.
     ///
     /// `shrink_guard` (TKT-457a5073 follow-up, review LOW 4): true iff the
-    /// content-shrink guard fired on this write - the server head was much
-    /// smaller than local, so the local bytes were preserved BEFORE aligning.
+    /// content-shrink guard PAGED on this write (Live mode only) - the server
+    /// head was much smaller than local, the local bytes were preserved BEFORE
+    /// aligning, and the owner was notified. In Shadow mode the guard still
+    /// preserves but does not page, so this is `false` there: do not branch on
+    /// it as "the guard fired".
     /// A flag, not a variant, so every caller's control flow is unchanged;
     /// `sse.rs` reads it to log a truthful line instead of "CONFLICT".
     Stashed {
@@ -6094,6 +6097,7 @@ mod tests {
             r.host.notices.lock().unwrap().clone()
         }
 
+        #[cfg(unix)] // only the unix-gated persist-failure test uses it (Windows clippy -D dead_code)
         fn manifest_lines_for(r: &Rig, wire: &str) -> usize {
             let q = r.quarantine.as_ref().unwrap().path();
             std::fs::read_to_string(q.join(crate::conflict_stash::StashQuarantine::MANIFEST))

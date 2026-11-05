@@ -415,7 +415,10 @@ impl StashQuarantine {
     /// True iff `manifest` already has a line whose `path` and `sha256` match.
     /// Tolerant: an unreadable manifest or an unparsable line counts as "not
     /// recorded" (a dedup miss costs one ~250-byte line, never a lost record).
-    fn manifest_has(manifest: &Path, path: &str, sha: &str) -> bool {
+    /// Dedup key is `(path, sha256, server_seq)`: a RETRY of the same event
+    /// (same change_seq) appends nothing, while a later genuine loss of the same
+    /// bytes at a different seq is still recorded (review of PR #55, LOW).
+    fn manifest_has(manifest: &Path, path: &str, sha: &str, server_seq: Option<i64>) -> bool {
         let Ok(text) = fs::read_to_string(manifest) else {
             return false;
         };
@@ -423,6 +426,7 @@ impl StashQuarantine {
             serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| {
                 v.get("path").and_then(|p| p.as_str()) == Some(path)
                     && v.get("sha256").and_then(|h| h.as_str()) == Some(sha)
+                    && v.get("server_seq").and_then(|s| s.as_i64()) == server_seq
             })
         })
     }
@@ -458,7 +462,10 @@ impl StashQuarantine {
             tmp.flush()?;
             tmp.persist(&blob).map_err(|e| StashError::Io(e.error))?;
         }
-        if dedup_manifest && blob_existed && Self::manifest_has(&manifest, original_path, &sha) {
+        if dedup_manifest
+            && blob_existed
+            && Self::manifest_has(&manifest, original_path, &sha, server_seq)
+        {
             tracing::debug!(
                 original = %original_path,
                 blob = %blob.display(),
@@ -1568,6 +1575,18 @@ mod tests {
             .unwrap();
         let manifest = fs::read_to_string(q.path().join(StashQuarantine::MANIFEST)).unwrap();
         assert_eq!(manifest.lines().count(), 4, "{manifest}");
+        // Review LOW (PR #55): the same path+bytes at a NEW server_seq is a new
+        // loss event and must be recorded; a retry at that same seq must not.
+        let (_, a5) = quarantine
+            .write_dedup("Vault/a.md", bytes, "link", Some(14))
+            .unwrap();
+        assert!(a5, "same path+bytes at a new server_seq is a new record");
+        let (_, a6) = quarantine
+            .write_dedup("Vault/a.md", bytes, "link", Some(14))
+            .unwrap();
+        assert!(!a6, "retry at the same server_seq appends nothing");
+        let manifest = fs::read_to_string(q.path().join(StashQuarantine::MANIFEST)).unwrap();
+        assert_eq!(manifest.lines().count(), 5, "{manifest}");
     }
 
     /// R2(a): recorder stashes land in the quarantine (content-addressed,
