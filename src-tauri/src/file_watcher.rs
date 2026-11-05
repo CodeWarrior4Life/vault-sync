@@ -2225,6 +2225,7 @@ mod tests {
             scope_excludes: vec![],
             debounce_ms: 500,
             managed_payload_excludes: false,
+            storage_prefix: None,
         };
         let w = FileWatcher::new(
             dir.path().to_path_buf(),
