@@ -85,6 +85,10 @@ pub struct TrayState {
     pub conflict_unresolved: usize,
     /// Total post-write integrity-check failures (byte mismatch or parse fail).
     pub integrity_failures: u64,
+    /// TKT-457a5073: pulls where the content-shrink guard fired (the server
+    /// head would have dropped a large share of the local note's bytes). Each
+    /// one preserved the local bytes before aligning. Monotonic.
+    pub shrink_guard_fired: u64,
     /// True iff `<vault>/redflag.md` is present — sync is HALTED.
     pub redflag_tripped: bool,
     /// True iff the DeleteBurstDetector is currently Paused.
@@ -135,6 +139,7 @@ impl TrayState {
             events_dropped_excludes: 0,
             conflict_unresolved: 0,
             integrity_failures: 0,
+            shrink_guard_fired: 0,
             redflag_tripped: false,
             delete_burst_paused: false,
             verify_in_progress: false,
@@ -213,6 +218,22 @@ impl TrayState {
         self.integrity_failures = self.integrity_failures.saturating_add(1);
     }
 
+    /// TKT-457a5073: the content-shrink guard preserved + paged a pull.
+    pub fn inc_shrink_guard_fired(&mut self) {
+        self.shrink_guard_fired = self.shrink_guard_fired.saturating_add(1);
+    }
+
+    /// TKT-457a5073 follow-up (review MEDIUM 1): the pull-side fail-loud
+    /// counters as one serializable snapshot for the LOCAL status/health
+    /// surface. NOT part of the server heartbeat (`heartbeat.rs` does not read
+    /// it; that contract is unchanged).
+    pub fn pull_health(&self) -> PullHealthCounters {
+        PullHealthCounters {
+            shrink_guard_fired: self.shrink_guard_fired,
+            integrity_failures: self.integrity_failures,
+        }
+    }
+
     pub fn set_redflag_tripped(&mut self, tripped: bool) {
         self.redflag_tripped = tripped;
     }
@@ -274,6 +295,29 @@ fn format_staleness(d: std::time::Duration) -> String {
 
 pub type SharedTrayState = Arc<RwLock<TrayState>>;
 
+/// TKT-457a5073 follow-up: the pull fail-loud counters, serializable for the
+/// LOCAL health surface. Field names are the wire names. Both fields are
+/// `#[serde(default)]` so an older snapshot still deserializes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PullHealthCounters {
+    /// Pulls where the content-shrink guard fired (local preserved, then
+    /// aligned to a much smaller server head). Monotonic since start.
+    #[serde(default)]
+    pub shrink_guard_fired: u64,
+    /// Post-write integrity-check failures. Monotonic since start.
+    #[serde(default)]
+    pub integrity_failures: u64,
+}
+
+impl PullHealthCounters {
+    /// True iff something on the pull side needs the owner's eyes: a note
+    /// was truncated by the server (its bytes are preserved) or a write did
+    /// not verify. A health surface treats this as "review", not stalled.
+    pub fn needs_review(&self) -> bool {
+        self.shrink_guard_fired > 0 || self.integrity_failures > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +328,37 @@ mod tests {
             "https://example".to_string(),
             PathBuf::from("/tmp/vault"),
         )
+    }
+
+    /// TKT-457a5073 follow-up: the pull-side snapshot is serializable with
+    /// stable wire names, round-trips, and `shrink_guard_fired` is exposed.
+    #[test]
+    fn pull_health_counters_round_trip_through_serde() {
+        let mut s = fresh();
+        assert_eq!(s.shrink_guard_fired, 0);
+        assert_eq!(s.pull_health(), PullHealthCounters::default());
+        assert!(!s.pull_health().needs_review());
+        s.inc_shrink_guard_fired();
+        s.inc_shrink_guard_fired();
+        s.inc_integrity_failures();
+        let snap = s.pull_health();
+        assert_eq!(
+            snap,
+            PullHealthCounters {
+                shrink_guard_fired: 2,
+                integrity_failures: 1,
+            }
+        );
+        assert!(snap.needs_review());
+        let json = serde_json::to_string(&snap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["shrink_guard_fired"], 2);
+        assert_eq!(v["integrity_failures"], 1);
+        let back: PullHealthCounters = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        // An older snapshot without the fields still deserializes.
+        let old: PullHealthCounters = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, PullHealthCounters::default());
     }
 
     #[test]

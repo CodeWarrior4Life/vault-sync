@@ -388,6 +388,74 @@ pub struct StallEvent {
 }
 
 // ---------------------------------------------------------------------------
+// TKT-457a5073: content-shrink guard page (0.4.x port)
+// ---------------------------------------------------------------------------
+
+/// TKT-457a5073: the materializer's content-shrink guard fired - a pull
+/// would have overwritten `path` (`local_len` bytes) with a much smaller
+/// server head (`server_len` bytes). The local bytes were preserved at
+/// `preserved` BEFORE the overwrite, then local was aligned to the server.
+///
+/// 0.4.x PORT NOTE: main (0.5.x) carries this as the
+/// `StateHealthEvent::ShrinkGuardFired` variant of its process-wide state
+/// health event log. 0.4.x has no such log, so this is a standalone record
+/// with the same fields, the same `error!` line (stable marker
+/// `SHRINK GUARD (TKT-457a5073)`, `sync_health_event = "shrink_guard_fired"`)
+/// and the same bounded in-process history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShrinkGuardFired {
+    pub path: String,
+    pub local_len: usize,
+    pub server_len: usize,
+    pub change_seq: u64,
+    pub preserved: String,
+}
+
+/// Bounded history of [`ShrinkGuardFired`] events (oldest dropped first).
+const SHRINK_EVENT_CAP: usize = 256;
+
+fn shrink_events_store() -> &'static std::sync::Mutex<std::collections::VecDeque<ShrinkGuardFired>>
+{
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<ShrinkGuardFired>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Raise the shrink-guard page: one `error!` line carrying the stable marker
+/// `SHRINK GUARD (TKT-457a5073)` and every field, plus an entry in the bounded
+/// in-process history. Never rate-limited: every hit is recorded (the OS
+/// notification is the rate-limited channel, see
+/// `materializer::ShrinkGuardPager`).
+pub fn raise_shrink_guard_fired(e: ShrinkGuardFired) {
+    tracing::error!(
+        sync_health_event = "shrink_guard_fired",
+        path = %e.path,
+        local_len = e.local_len,
+        server_len = e.server_len,
+        change_seq = e.change_seq,
+        stash = %e.preserved,
+        "SHRINK GUARD (TKT-457a5073): pull would TRUNCATE this note (server head much smaller than local) - local bytes PRESERVED at the stash path BEFORE aligning to the server; verify the server version is intentional"
+    );
+    let mut g = shrink_events_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if g.len() >= SHRINK_EVENT_CAP {
+        g.pop_front();
+    }
+    g.push_back(e);
+}
+
+/// Snapshot of the recorded shrink-guard events (oldest first).
+pub fn shrink_guard_events() -> Vec<ShrinkGuardFired> {
+    shrink_events_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
