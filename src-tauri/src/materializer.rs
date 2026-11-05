@@ -5769,4 +5769,391 @@ mod tests {
         );
     }
 
+    // ---- TKT-457a5073: content-shrink guard -------------------------------
+    mod shrink_guard_tkt_457a5073 {
+        use super::*;
+        use crate::sync_health::{state_events, StateHealthEvent};
+        use crate::sync_shadow::ShadowStore;
+
+        /// Exactly `n` bytes of distinct, line-structured text (every line
+        /// carries `tag` + its index, so two tags never share a line). With
+        /// `frontmatter` the bytes open with a YAML fence.
+        fn text_of_len(tag: &str, n: usize, frontmatter: bool) -> Vec<u8> {
+            let mut s = if frontmatter {
+                format!("---\ntitle: {tag}\ntags: [incident]\n---\n")
+            } else {
+                String::new()
+            };
+            let mut i = 0usize;
+            while s.len() < n {
+                s.push_str(&format!(
+                    "{tag} line {i}: synthetic note prose for the TKT-457a5073 replay.\n"
+                ));
+                i += 1;
+            }
+            s.truncate(n - 1);
+            s.push('\n');
+            assert_eq!(s.len(), n);
+            s.into_bytes()
+        }
+
+        struct Rig {
+            vaults: TempDir,
+            _ws: TempDir,
+            quarantine: Option<TempDir>,
+            m: Materializer,
+            shadow: Arc<ShadowStore>,
+            tray: SharedTrayState,
+        }
+
+        /// Production-shaped rig: Live, shadow store, tray, and (optionally)
+        /// the out-of-vault quarantine boot.rs wires.
+        fn rig(mut cfg: MaterializerConfig, with_quarantine: bool) -> Rig {
+            let quarantine = with_quarantine.then(|| TempDir::new().unwrap());
+            cfg.stash_quarantine_dir = quarantine.as_ref().map(|q| q.path().to_path_buf());
+            let (vaults, ws, m) = mk(MaterializerMode::Live, cfg);
+            let sdir = Box::leak(Box::new(TempDir::new().unwrap()));
+            let shadow = ShadowStore::load_with_vault_folders(
+                &crate::state_io::StateDir::for_test_file(&sdir.path().join("shadow_hashes.json")),
+                vec![VAULT.to_string()],
+            );
+            let tray = make_shared_tray();
+            let m = m
+                .with_shadow_store(shadow.clone())
+                .with_tray_state(tray.clone());
+            Rig {
+                vaults,
+                _ws: ws,
+                quarantine,
+                m,
+                shadow,
+                tray,
+            }
+        }
+
+        /// Seed `rel` locally with `local` and record it as last-synced
+        /// (local == shadow: the raw R3 PullClean basis on both incident hops).
+        fn seed_synced(r: &Rig, rel: &str, local: &[u8]) -> (String, PathBuf) {
+            let wire = format!("{VAULT}/{rel}");
+            let target = r.vaults.path().join(VAULT).join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, local).unwrap();
+            r.shadow.record(&wire, &hex::encode(Sha256::digest(local)));
+            (wire, target)
+        }
+
+        fn quarantine_blobs(r: &Rig) -> Vec<PathBuf> {
+            r.quarantine
+                .as_ref()
+                .and_then(|q| std::fs::read_dir(q.path().join("blobs")).ok())
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+
+        fn shrink_events_for(wire: &str) -> Vec<StateHealthEvent> {
+            state_events()
+                .into_iter()
+                .filter(|e| {
+                    matches!(e, StateHealthEvent::ShrinkGuardFired { path, .. } if path == wire)
+                })
+                .collect()
+        }
+
+        fn fired(r: &Rig) -> u64 {
+            r.tray.read().unwrap().shrink_guard_fired
+        }
+
+        /// INCIDENT 18:15Z SHAPE (every receiver). Local 18,780 B, no
+        /// frontmatter, local == shadow (raw R3 PullClean). Server head
+        /// 11,636 B whose content is NOT a prefix/subset of local. Pre-fix:
+        /// materialized silently, no stash, no page - the 18,780 B version
+        /// vanished fleet-wide. Fixed: local preserved in the quarantine
+        /// BEFORE the overwrite, file aligned to the server, page fired.
+        #[test]
+        fn incident_1815_shape_preserves_local_then_aligns_and_pages() {
+            let r = rig(default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-1815.md";
+            let local = text_of_len("v18780-at-1811", 18_780, false);
+            let server = text_of_len("v11636-at-1815", 11_636, false);
+            assert!(!starts_with_frontmatter(&local) && !starts_with_frontmatter(&server));
+            let (wire, target) = seed_synced(&r, rel, &local);
+
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4242), 4242)
+                    .unwrap();
+            let stash = match out {
+                MaterializeOutcome::Stashed { stash_path } => stash_path,
+                other => panic!("shrink guard must preserve local (Stashed), got {other:?}"),
+            };
+            // Preserved BEFORE overwrite: the out-of-vault blob holds the
+            // exact 18,780 local bytes.
+            let q = r.quarantine.as_ref().unwrap().path();
+            assert!(
+                stash.starts_with(q),
+                "preserved in the quarantine: {stash:?}"
+            );
+            assert_eq!(std::fs::read(&stash).unwrap(), local);
+            let manifest =
+                std::fs::read_to_string(q.join(crate::conflict_stash::StashQuarantine::MANIFEST))
+                    .unwrap();
+            assert!(manifest.contains(&wire) && manifest.contains("\"bytes\":18780"));
+            // ServerWins semantics unchanged: the file IS aligned to the server.
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert!(conflict_copies(target.parent().unwrap()).is_empty());
+            // Paged: tray counter + health event (the SHRINK GUARD error! line).
+            assert_eq!(fired(&r), 1);
+            let ev = shrink_events_for(&wire);
+            assert_eq!(ev.len(), 1, "exactly one page: {ev:?}");
+            assert_eq!(
+                ev[0],
+                StateHealthEvent::ShrinkGuardFired {
+                    path: wire.clone(),
+                    local_len: 18_780,
+                    server_len: 11_636,
+                    change_seq: 4242,
+                    preserved: stash.display().to_string(),
+                }
+            );
+        }
+
+        /// 18:15Z shape with NO quarantine wired: the in-vault stash floor
+        /// preserves local instead.
+        #[test]
+        fn incident_1815_shape_without_quarantine_uses_in_vault_stash_floor() {
+            let r = rig(default_cfg(), false);
+            let rel = "02_Projects/Incident/tkt457-1815-noq.md";
+            let local = text_of_len("v18780-at-1811", 18_780, false);
+            let server = text_of_len("v11636-at-1815", 11_636, false);
+            let (wire, target) = seed_synced(&r, rel, &local);
+
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4243), 4243)
+                    .unwrap();
+            assert!(matches!(out, MaterializeOutcome::Stashed { .. }), "{out:?}");
+            let dir = target.parent().unwrap();
+            let forks = conflict_copies(dir);
+            assert_eq!(forks.len(), 1, "{forks:?}");
+            assert_eq!(std::fs::read(dir.join(&forks[0])).unwrap(), local);
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert_eq!(fired(&r), 1);
+            assert_eq!(shrink_events_for(&wire).len(), 1);
+        }
+
+        /// INCIDENT 18:11Z SHAPE (icarus). Local 61,078 B WITH frontmatter,
+        /// local == shadow, server 18,780 B WITHOUT frontmatter. The S513
+        /// anti-strip ARM 2 stashes; the shrink guard must PAGE and must NOT
+        /// add a second copy: exactly one preserved copy in total.
+        #[test]
+        fn incident_1811_shape_exactly_one_preserved_copy_and_pages() {
+            let r = rig(default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-1811.md";
+            let local = text_of_len("v61078", 61_078, true);
+            let server = text_of_len("v18780-at-1811", 18_780, false);
+            assert!(starts_with_frontmatter(&local) && !starts_with_frontmatter(&server));
+            let (wire, target) = seed_synced(&r, rel, &local);
+
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4100), 4100)
+                    .unwrap();
+            let stash = match out {
+                MaterializeOutcome::Stashed { stash_path } => stash_path,
+                other => panic!("ARM 2 + shrink guard must stash, got {other:?}"),
+            };
+            let dir = target.parent().unwrap();
+            let forks = conflict_copies(dir);
+            let blobs = quarantine_blobs(&r);
+            assert_eq!(
+                forks.len() + blobs.len(),
+                1,
+                "exactly ONE preserved copy (forks {forks:?}, blobs {blobs:?})"
+            );
+            assert_eq!(std::fs::read(&stash).unwrap(), local);
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert_eq!(fired(&r), 1);
+            let ev = shrink_events_for(&wire);
+            assert_eq!(ev.len(), 1, "{ev:?}");
+            assert!(matches!(
+                &ev[0],
+                StateHealthEvent::ShrinkGuardFired { local_len: 61_078, server_len: 18_780, change_seq: 4100, preserved, .. }
+                    if *preserved == stash.display().to_string()
+            ));
+        }
+
+        /// NEGATIVE: an ordinary edit (small shrink) stays a clean pull.
+        #[test]
+        fn small_edit_below_threshold_is_a_clean_pull() {
+            let r = rig(default_cfg(), true);
+            // ratio ok (0.98) - loss 200 B < 4096.
+            let rel = "02_Projects/Incident/tkt457-small.md";
+            let local = text_of_len("small-edit-local", 10_000, false);
+            let server = text_of_len("small-edit-server", 9_800, false);
+            let (wire, target) = seed_synced(&r, rel, &local);
+            let out = r.m.write(&payload_bytes(&wire, &server, 1)).unwrap();
+            assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "{out:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            // big ratio but tiny absolute loss (short note) - also clean.
+            let rel2 = "02_Projects/Incident/tkt457-short.md";
+            let local2 = text_of_len("short-local", 3_000, false);
+            let server2 = text_of_len("short-server", 500, false);
+            let (wire2, _t2) = seed_synced(&r, rel2, &local2);
+            let out2 = r.m.write(&payload_bytes(&wire2, &server2, 1)).unwrap();
+            assert!(matches!(out2, MaterializeOutcome::Wrote { .. }), "{out2:?}");
+            assert!(quarantine_blobs(&r).is_empty());
+            assert!(conflict_copies(target.parent().unwrap()).is_empty());
+            assert_eq!(fired(&r), 0);
+            assert!(shrink_events_for(&wire).is_empty() && shrink_events_for(&wire2).is_empty());
+        }
+
+        /// NEGATIVE: growth (incl. the incident hops reversed) is unaffected.
+        #[test]
+        fn growth_is_unaffected() {
+            let r = rig(default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-growth.md";
+            let local = text_of_len("growth-local", 11_636, false);
+            let server = text_of_len("growth-server", 61_078, false);
+            let (wire, target) = seed_synced(&r, rel, &local);
+            let out = r.m.write(&payload_bytes(&wire, &server, 1)).unwrap();
+            assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "{out:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert!(quarantine_blobs(&r).is_empty());
+            assert_eq!(fired(&r), 0);
+            assert!(shrink_events_for(&wire).is_empty());
+        }
+
+        /// NEGATIVE: an APPEND (server = local + appended lines) is unaffected.
+        #[test]
+        fn append_pull_is_unaffected() {
+            let r = rig(default_cfg(), true);
+            let rel = "02_Projects/Incident/tkt457-append.md";
+            let local = text_of_len("append-base", 18_780, false);
+            let server = [&local[..], b"- appended line one\n- appended line two\n"].concat();
+            let (wire, target) = seed_synced(&r, rel, &local);
+            let out = r.m.write(&payload_bytes(&wire, &server, 1)).unwrap();
+            assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "{out:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert_eq!(fired(&r), 0);
+            assert!(shrink_events_for(&wire).is_empty());
+        }
+
+        /// KILL-SWITCH: `shrink_guard_enabled = false` restores the pre-fix
+        /// behaviour for the 18:15Z shape - silent clean pull, nothing
+        /// preserved, nothing paged.
+        #[test]
+        fn kill_switch_off_restores_pre_fix_silent_pull() {
+            let cfg = MaterializerConfig {
+                shrink_guard_enabled: false,
+                ..default_cfg()
+            };
+            let r = rig(cfg, true);
+            let rel = "02_Projects/Incident/tkt457-killswitch.md";
+            let local = text_of_len("v18780-at-1811", 18_780, false);
+            let server = text_of_len("v11636-at-1815", 11_636, false);
+            let (wire, target) = seed_synced(&r, rel, &local);
+            let out =
+                r.m.write_with_change_seq(&payload_bytes(&wire, &server, 4242), 4242)
+                    .unwrap();
+            assert!(matches!(out, MaterializeOutcome::Wrote { .. }), "{out:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), server);
+            assert!(quarantine_blobs(&r).is_empty());
+            assert!(conflict_copies(target.parent().unwrap()).is_empty());
+            assert_eq!(fired(&r), 0);
+            assert!(shrink_events_for(&wire).is_empty());
+        }
+
+        /// STALE-HEAD (TKT-ddff1877 APPEND ARM A) keeps precedence: the head
+        /// is a strict line-prefix of local and LARGELY smaller (the shrink
+        /// predicate is TRUE), yet nothing is overwritten so the guard never
+        /// engages: local preserved, no fork, no quarantine blob, no page.
+        #[test]
+        fn stale_head_append_arm_a_is_unchanged() {
+            let (vaults, _ws, m, shadow, bs, _journal) = mk_append(MaterializerMode::Live);
+            let tray = make_shared_tray();
+            let m = m.with_tray_state(tray.clone());
+            let rel = "02_Projects/Lattice/Pitboss/active-work.md";
+            let wire = format!("{VAULT}/{rel}");
+            let target = vaults.path().join(VAULT).join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let v_k = recorder_fixture(4, 60);
+            shadow.record(&wire, &hex::encode(Sha256::digest(&v_k)));
+            bs.record_adopted(&wire, 1000);
+            let local = [&v_k[..], format!("{APPENDED_LINK}\n").as_bytes()].concat();
+            std::fs::write(&target, &local).unwrap();
+            let stale = line_boundary_prefix(&v_k, 0.3).to_vec();
+            assert!(
+                pull_would_shrink(local.len(), stale.len(), 0.7, 4096),
+                "fixture must be a shrink by the guard's own predicate"
+            );
+            let out = m
+                .write_with_change_seq(&payload_bytes(&wire, &stale, 1001), 1001)
+                .unwrap();
+            assert_eq!(
+                out,
+                MaterializeOutcome::Skipped(SkipReason::AppendPreservedPushUp {
+                    enqueued_push: true
+                })
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), local);
+            assert!(conflict_copies(target.parent().unwrap()).is_empty());
+            assert_eq!(tray.read().unwrap().shrink_guard_fired, 0);
+            assert!(shrink_events_for(&wire).is_empty());
+        }
+
+        /// PURE predicate table: both incident hops fire at the 0.7 default;
+        /// a 0.5 ratio would MISS the 18:15Z hop (why 0.7).
+        #[test]
+        fn pull_would_shrink_table() {
+            assert!(pull_would_shrink(61_078, 18_780, 0.7, 4096), "18:11 hop");
+            assert!(pull_would_shrink(18_780, 11_636, 0.7, 4096), "18:15 hop");
+            assert!(
+                !pull_would_shrink(18_780, 11_636, 0.5, 4096),
+                "0.5 misses 18:15"
+            );
+            assert!(!pull_would_shrink(10_000, 9_800, 0.7, 4096), "small edit");
+            assert!(!pull_would_shrink(3_000, 500, 0.7, 4096), "short note");
+            assert!(!pull_would_shrink(11_636, 61_078, 0.7, 4096), "growth");
+            assert!(!pull_would_shrink(0, 0, 0.7, 4096), "empty");
+            assert!(
+                !pull_would_shrink(20_000, 14_000, 0.7, 4096),
+                "exactly 0.7 is not below"
+            );
+        }
+
+        #[test]
+        fn shrink_guard_env_value_parses_off_words_only() {
+            for on in [
+                None,
+                Some(""),
+                Some("1"),
+                Some("on"),
+                Some("true"),
+                Some("x"),
+            ] {
+                assert!(
+                    shrink_guard_enabled_from_env_value(on),
+                    "{on:?} must mean ON"
+                );
+            }
+            for off in [
+                Some("0"),
+                Some("off"),
+                Some("OFF"),
+                Some(" false "),
+                Some("Disabled"),
+                Some("no"),
+            ] {
+                assert!(
+                    !shrink_guard_enabled_from_env_value(off),
+                    "{off:?} must mean OFF"
+                );
+            }
+        }
+
+        #[test]
+        fn defaults_are_ratio_0_7_min_loss_4096_enabled() {
+            let c = MaterializerConfig::default();
+            assert!(c.shrink_guard_enabled);
+            assert_eq!(c.shrink_guard_ratio, 0.7);
+            assert_eq!(c.shrink_guard_min_loss_bytes, 4096);
+        }
+    }
 }
