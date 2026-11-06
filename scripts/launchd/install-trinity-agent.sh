@@ -109,7 +109,7 @@ daemon_pids(){
       *) continue ;;
     esac
     # P1-b: managed only with a NON-EMPTY value, matched as a whole env entry (start of line or after a space).
-    if ps -E -ww -o command= -p "$pid" 2>/dev/null | grep -qE '(^|[[:space:]])NEXUS_SYNC_CONFIG_DIR=[^[:space:]]'; then continue; fi
+    if grep -qE '(^|[[:space:]])NEXUS_SYNC_CONFIG_DIR=[^[:space:]]' <<<"$(ps -E -ww -o command= -p "$pid" 2>/dev/null)"; then continue; fi
     out="$out $pid"
   done < <(ps -axo pid=,command= 2>/dev/null | sed 's/^[[:space:]]*//')
   printf '%s' "${out# }"
@@ -133,7 +133,7 @@ receipt(){
     log "RECEIPT FAIL: pid $pid is not the pid of $DOMAIN/$LABEL (${jobpid:-none}): an unsupervised copy (pre-supervisor tray window?)"
     return 21
   fi
-  if ! printf '%s\n' "$pr" | grep -Eq '^[[:space:]]*VAULT_SYNC_SUPERVISED => 1[[:space:]]*$'; then
+  if ! grep -Eq '^[[:space:]]*VAULT_SYNC_SUPERVISED => 1[[:space:]]*$' <<<"$pr"; then
     log "RECEIPT FAIL: $DOMAIN/$LABEL environment has no VAULT_SYNC_SUPERVISED => 1"; return 22
   fi
   log "RECEIPT OK: one vault-mode daemon pid=$pid, parent launchd (ppid 1), job $DOMAIN/$LABEL, VAULT_SYNC_SUPERVISED=1"

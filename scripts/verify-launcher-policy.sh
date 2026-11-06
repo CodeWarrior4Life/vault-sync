@@ -348,7 +348,7 @@ check_systemd() {
 # ---------------------------------------------------------------------------
 plist_tags() {
   local f="$1"
-  if head -c 6 "$f" | grep -q '^bplist'; then
+  if [ "$(head -c 6 "$f" 2>/dev/null)" = bplist ]; then
     if command -v plutil >/dev/null 2>&1; then
       plutil -convert xml1 -o - "$f" || return 2
     else
@@ -486,7 +486,7 @@ check_launchd() {
   else
     disabled=$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null) || disabled=""
   fi
-  if printf '%s\n' "$disabled" | grep -Eq "\"$name\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
+  if grep -Eq "\"$name\"[[:space:]]*=>[[:space:]]*(disabled|true)" <<<"$disabled"; then
     echo "launchd $name: launchctl print-disabled lists the agent as disabled" >&2
     return 10
   fi
@@ -515,7 +515,7 @@ check_launchd() {
     if script_execs_daemon "$p1"; then return 0; fi
     return 13
   fi
-  if [ -f "$p0" ] && head -c 2 "$p0" | grep -q '^#!'; then
+  if [ -f "$p0" ] && [ "$(head -c 2 "$p0" 2>/dev/null)" = '#!' ]; then
     if script_execs_daemon "$p0"; then return 0; fi
     return 13
   fi
