@@ -18,7 +18,7 @@ jobs:
     strategy:
       matrix:
         # TKT-ebc0237d: the Linux leg is pinned to ubuntu-24.04 (ubuntu-latest is migrating to 26.04).
-        os: [windows-latest, macos-latest, macos-14, ubuntu-24.04]
+        os: [windows-latest, macos-latest, macos-15, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     # TKT-55d2b645 (PB-ADEB-TCS310): every leg here is a HOSTED runner. T-CS3-10 then judges its 100 ms sibling-stall
