@@ -701,10 +701,23 @@ pub fn build_tooltip(state: &TrayState) -> String {
     //     So we join only the issues that are actually present, and the
     //     delete-burst entry names exactly what is paused (outbound
     //     delete-propagation) plus reassures that inbound note sync is fine.
-    if state.integrity_failures > 0 || state.conflict_unresolved > 0 || state.delete_burst_paused {
+    //     TKT-457a5073: a pull the content-shrink guard caught (server head
+    //     much smaller than local; local preserved before aligning) is an
+    //     owner-visible event, never a silent one.
+    if state.integrity_failures > 0
+        || state.conflict_unresolved > 0
+        || state.delete_burst_paused
+        || state.shrink_guard_fired > 0
+    {
         let mut parts: Vec<String> = Vec::new();
         if state.integrity_failures > 0 {
             parts.push(format!("{} integrity", state.integrity_failures));
+        }
+        if state.shrink_guard_fired > 0 {
+            parts.push(format!(
+                "{} truncated pulls preserved",
+                state.shrink_guard_fired
+            ));
         }
         if state.conflict_unresolved > 0 {
             parts.push(format!("{} conflicts", state.conflict_unresolved));
@@ -952,5 +965,14 @@ mod tests {
         assert!(t.contains("last "), "got: {t}");
         // 5 seconds elapsed → "5s ago" via format_staleness.
         assert!(t.contains("s ago") || t.contains("m ago"), "got: {t}");
+    }
+
+    /// TKT-457a5073: a shrink-guard hit is an owner-visible tray issue.
+    #[test]
+    fn tooltip_names_shrink_guard_hits() {
+        let mut s = fresh();
+        s.shrink_guard_fired = 2;
+        let t = build_tooltip(&s);
+        assert!(t.contains("2 truncated pulls preserved"), "{t}");
     }
 }
