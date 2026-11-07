@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--marker", required=True)
     ap.add_argument("--marker-backup", required=True)
     ap.add_argument("--receipt", required=True)
+    ap.add_argument("--ready-file", help="r3.1: written once the start offset is fixed; the executor must wait for it before removing the marker")
     ap.add_argument("--dry-run", action="store_true", help="never run the stop or restore; report what would happen")
     a = ap.parse_args()
     stop_argv = json.loads(a.stop_cmd)
@@ -60,12 +61,16 @@ def main():
         sys.exit(f"marker backup missing: {a.marker_backup}")
 
     t0 = time.time()
-    rec = {"version": "r3", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
+    rec = {"version": "r3.1", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
            "log_glob": a.log_glob, "resumed_seen": None, "replayed_seen": None,
            "trip": None, "stopped": False, "marker_restored": False, "dry_run": a.dry_run}
     cur = newest(a.log_glob)
     pos = os.path.getsize(cur) if cur else 0   # only lines written AFTER we start
     buf = ""
+    if a.ready_file:
+        # r3.1: proof the watcher is reading BEFORE the lift; closes the start-after-append race.
+        with open(a.ready_file, "w") as rf:
+            rf.write(json.dumps({"t0": t0, "log": cur, "offset": pos}) + "\n")
 
     def trip(reason, line):
         rec["trip"] = {"reason": reason, "line": line[:400], "at": time.time()}
