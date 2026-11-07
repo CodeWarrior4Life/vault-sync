@@ -18,5 +18,6 @@ else
 fi
 [ -e "$S/delete-burst-PAUSED" ] && echo "marker PRESENT (latched)" || echo "marker absent (lifted)"
 [ -e "$S/delete-burst-SUPPRESSED" ] && echo "ledger present: $(wc -l < "$S/delete-burst-SUPPRESSED" | tr -d ' ') lines" || echo "ledger absent"
+[ -f "$B/EXPECTED.json" ] && echo "expected: $(cat "$B/EXPECTED.json")"
 [ "$bad" = 0 ] && echo "FOLLOW-UP PASS" || echo "FOLLOW-UP FAIL -> PAGE P0"
 exit $bad

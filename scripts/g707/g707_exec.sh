@@ -46,7 +46,17 @@ log "== step 1 backups -> $B"
 mkdir -m 700 -p "$B"
 cp -p "$M" "$LED" "$B/"; chmod 600 "$B"/delete-burst-*
 shasum -a 256 "$B"/delete-burst-*
+# O2 (eb97 ruling 15:2x): APFS clone (clonefile, no tmutil) of the whole sync-state dir (marker + ledger + siblings), path + size checked
+cp -c -R "$S" "$B/sync-state.clone" || die "O2: APFS clone of sync-state failed"
+n0=$(find "$S" -type f | wc -l | tr -d ' '); n1=$(find "$B/sync-state.clone" -type f | wc -l | tr -d ' ')
+k0=$(du -sk "$S" | cut -f1); k1=$(du -sk "$B/sync-state.clone" | cut -f1)
+[ "$n0" = "$n1" ] || die "O2: clone file count $n1 != source $n0"
+[ "$(sha "$B/sync-state.clone/delete-burst-PAUSED")" = "$MARKER_SHA" ] || die "O2: cloned marker sha mismatch"
+[ "$(sha "$B/sync-state.clone/delete-burst-SUPPRESSED")" = "$(sha "$LED")" ] || die "O2: cloned ledger sha mismatch (ledger moved during clone: re-run)"
+log "O2 clone $B/sync-state.clone: files $n1 (src $n0), size ${k1} KiB (src ${k0} KiB)"
 ( cd "$V" && find "$KP" -type f -name '*.md' -exec shasum -a 256 {} + ) > "$B/docket-before.sha256" || true
+# eb97 ruling (b): the expected false-trip rate goes on record, so a trip is not misread as a fault
+printf '%s\n' '{"expected_false_trip_rate_per_window":"~15% (shared log: ~12 ERROR/day + memory-instance _session_summary.md deletes)","trip_action":"marker restored + stop + re-open RE-LATCHED (no outage)","ruling":"pitboss-eb97 52d6ac81 2026-11-07 15:2x EST (b) ACCEPTED"}' > "$B/EXPECTED.json"
 log "docket md before: $(wc -l < "$B/docket-before.sha256" | tr -d ' ') files (manifest sha16 $(sha "$B/docket-before.sha256" | cut -c1-16))"
 
 log "== step 2 T-0 ledger read"
