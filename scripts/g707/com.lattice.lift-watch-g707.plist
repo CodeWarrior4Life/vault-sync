@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.lattice.lift-watch-g707</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/cyril/.cache/g707/lift_watch.py</string>
+		<string>--log-glob</string>
+		<string>/Users/cyril/Library/Application Support/Nexus/logs/daemon.log.*</string>
+		<string>--duration</string>
+		<string>1080</string>
+		<string>--resume-timeout</string>
+		<string>120</string>
+		<string>--expect-replayed</string>
+		<string>0</string>
+		<string>--stop-cmd</string>
+		<string>["/bin/bash","/Users/cyril/.cache/g707/g707_stop_relatch.sh"]</string>
+		<string>--marker</string>
+		<string>/Users/cyril/Library/Application Support/Nexus/.lattice-runtime/f2383e35-2e9d-4da2-b5ed-de8a35778fa3/sync-state/delete-burst-PAUSED</string>
+		<string>--marker-backup</string>
+		<string>/Users/cyril/.claude/backups/vault-sync/lift-g707-r2/delete-burst-PAUSED</string>
+		<string>--receipt</string>
+		<string>/Users/cyril/.claude/backups/vault-sync/lift-g707-r2/lift-watch-receipt.json</string>
+		<string>--ready-file</string>
+		<string>/Users/cyril/.claude/backups/vault-sync/lift-g707-r2/READY</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/cyril/.claude/backups/vault-sync/lift-g707-r2/lift-watch.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/cyril/.claude/backups/vault-sync/lift-g707-r2/lift-watch.err</string>
+</dict>
+</plist>
