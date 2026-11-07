@@ -56,7 +56,9 @@ log "== step 3 listing + prune (dry, then apply) + exclusion assertion"
 python3 "$G/ledger_list_pzero.py" --ledger "$LED" --vault-root "$V" --out "$B/listing-T0.tsv" --protect-prefix "$KP" 2> "$B/listing-T0.json"
 cat "$B/listing-T0.json"
 python3 "$G/ledger_prune_pzero.py" --ledger "$LED" --vault-root "$V" --expect-sha "$L0"
-OUT=$(python3 "$G/ledger_prune_pzero.py" --ledger "$LED" --vault-root "$V" --expect-sha "$L0" --apply) || { echo "$OUT"; cp -p "$B/delete-burst-SUPPRESSED" "$LED"; die "prune not OK (ledger restored from backup; rc 3 = race: re-run needs a fresh bind of $B)"; }
+set +e; OUT=$(python3 "$G/ledger_prune_pzero.py" --ledger "$LED" --vault-root "$V" --expect-sha "$L0" --apply); RC=$?; set -e
+if [ "$RC" = 3 ]; then echo "$OUT"; die "prune rc 3 (RACE: the daemon appended); ledger NOT restored, so the appended line is kept (sentinel F6). Marker NOT removed. Re-run needs a fresh bind of a new \$B"; fi
+if [ "$RC" != 0 ]; then echo "$OUT"; cp -p "$B/delete-burst-SUPPRESSED" "$LED"; die "prune rc $RC (ledger restored from backup). Marker NOT removed"; fi
 echo "$OUT"
 echo "$OUT" | python3 -c 'import json,sys;d=json.load(sys.stdin);assert d["verdict"]=="OK" and d["absent_after"]==0, d' || die "prune verdict"
 L1=$(sha "$LED"); log "post-prune ledger sha $L1"
@@ -82,4 +84,5 @@ i=0; while [ $i -lt 45 ]; do tail -n +"$((mark+1))" "$(newlog)" | grep -q 'REPLA
 tail -n +"$((mark+1))" "$(newlog)" | grep -E 'OUTBOUND DELETE PROPAGATION RESUMED|REPLAYED suppressed deletes' | cut -c1-240 || log "WARN: RESUMED/REPLAYED not yet seen (the watcher fails closed at 120 s)"
 [ -e "$LED" ] && log "ledger still present: $(wc -l < "$LED" | tr -d ' ') lines" || log "ledger cleared"
 log "watch runs 1080 s after RESUMED under launchd $LABEL; receipt -> $B/lift-watch-receipt.json"
+log "FOLLOW-UP due at T_RM+1250 s: /bin/bash $G/g707_followup.sh (sentinel F3; it pages on HELD / no receipt / main != 1)"
 echo "BACKUP_DIR=$B"

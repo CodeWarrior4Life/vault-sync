@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -37,9 +38,26 @@ RE_DELETE_PUSH = re.compile(r"push accepted path=(.*?) seq=\S* hash=\s*$")
 RE_ERROR = re.compile(r"^\S+\s+ERROR\s")
 
 
+def _mtime(f):
+    # r3.2 (G707 sentinel F1): a file can vanish between glob and stat (gzip, prune) or be a
+    # dangling symlink; never let that raise out of the watch loop.
+    try:
+        return os.path.getmtime(f)
+    except OSError:
+        return -1.0
+
+
+class _Terminated(Exception):
+    pass
+
+
+def _on_sigterm(signum, frame):
+    raise _Terminated(f"signal {signum}")
+
+
 def newest(pattern):
-    files = [f for f in glob.glob(pattern) if not f.endswith(".gz")]
-    return max(files, key=os.path.getmtime) if files else None
+    files = [(m, f) for f in glob.glob(pattern) if not f.endswith(".gz") for m in [_mtime(f)] if m >= 0]
+    return max(files)[1] if files else None
 
 
 def main():
@@ -53,6 +71,7 @@ def main():
     ap.add_argument("--marker-backup", required=True)
     ap.add_argument("--receipt", required=True)
     ap.add_argument("--ready-file", help="r3.1: written once the start offset is fixed; the executor must wait for it before removing the marker")
+    ap.add_argument("--stop-timeout", type=int, default=240, help="r3.2 (F4): seconds allowed for --stop-cmd")
     ap.add_argument("--dry-run", action="store_true", help="never run the stop or restore; report what would happen")
     a = ap.parse_args()
     stop_argv = json.loads(a.stop_cmd)
@@ -61,7 +80,7 @@ def main():
         sys.exit(f"marker backup missing: {a.marker_backup}")
 
     t0 = time.time()
-    rec = {"version": "r3.1", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
+    rec = {"version": "r3.2", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
            "log_glob": a.log_glob, "resumed_seen": None, "replayed_seen": None,
            "trip": None, "stopped": False, "marker_restored": False, "dry_run": a.dry_run}
     cur = newest(a.log_glob)
@@ -84,7 +103,7 @@ def main():
         except OSError as e:
             rec["marker_restore_err"] = str(e)
         try:
-            p = subprocess.run(stop_argv, capture_output=True, text=True, timeout=120)
+            p = subprocess.run(stop_argv, capture_output=True, text=True, timeout=a.stop_timeout)
             rec["stop_rc"] = p.returncode
             rec["stop_err"] = p.stderr[-400:]
             rec["stopped"] = p.returncode == 0
@@ -98,36 +117,44 @@ def main():
         # r3 (F3): the grace window starts at RESUME, so the watch does too.
         return (rec["resumed_seen"] + a.duration) if rec["resumed_seen"] else (t0 + a.resume_timeout)
 
-    while time.time() < end_at() and rec["trip"] is None:
-        n = newest(a.log_glob)
-        if n and n != cur:                      # rotated: drain the old file, then follow the new one
-            cur, pos = n, 0
-        if cur and os.path.exists(cur):
-            with open(cur, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(pos)
-                chunk = f.read()
-                pos = f.tell()
-            buf += chunk
-            *lines, buf = buf.split("\n")
-            for ln in lines:
-                if RE_RESUMED.search(ln) and rec["resumed_seen"] is None:
-                    rec["resumed_seen"] = time.time()
-                if RE_REPLAYED.search(ln):
-                    m = RE_REPLAYED_N.search(ln)
-                    nrep = int(m.group(1)) if m else -1
-                    rec["replayed_seen"] = nrep
-                    if nrep != a.expect_replayed:
-                        trip(f"replayed={nrep} != expected {a.expect_replayed}", ln)
+    # r3.2 (F1): any exception or SIGTERM after READY is a TRIP (marker restored, stop run),
+    # never a silent death that leaves the daemon unlatched under the grace window.
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        while time.time() < end_at() and rec["trip"] is None:
+            n = newest(a.log_glob)
+            if n and n != cur:                      # rotated: drain the old file, then follow the new one
+                cur, pos = n, 0
+            if cur and os.path.exists(cur):
+                with open(cur, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+                buf += chunk
+                *lines, buf = buf.split("\n")
+                for ln in lines:
+                    if RE_RESUMED.search(ln) and rec["resumed_seen"] is None:
+                        rec["resumed_seen"] = time.time()
+                    if RE_REPLAYED.search(ln):
+                        m = RE_REPLAYED_N.search(ln)
+                        nrep = int(m.group(1)) if m else -1
+                        rec["replayed_seen"] = nrep
+                        if nrep != a.expect_replayed:
+                            trip(f"replayed={nrep} != expected {a.expect_replayed}", ln)
+                            break
+                    m = RE_DELETE_PUSH.search(ln)
+                    if m:
+                        trip(f"outbound delete push: {m.group(1)}", ln)
                         break
-                m = RE_DELETE_PUSH.search(ln)
-                if m:
-                    trip(f"outbound delete push: {m.group(1)}", ln)
-                    break
-                if RE_ERROR.search(ln):
-                    trip("daemon ERROR line", ln)
-                    break
-        time.sleep(2)
+                    if RE_ERROR.search(ln):
+                        trip("daemon ERROR line", ln)
+                        break
+            time.sleep(2)
 
+    except BaseException as e:  # _Terminated, KeyboardInterrupt, OSError, ...
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # never interrupt the restore + stop itself
+        if rec["trip"] is None:
+            trip(f"watcher died: {e!r}", "")
     # r3 (F2): fail CLOSED when blind. Leaving the loop without ever seeing RESUMED
     # means we could not see the daemon; that is a trip, not a quiet "NO-RESUME-SEEN".
     if rec["trip"] is None and rec["resumed_seen"] is None:

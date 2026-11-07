@@ -14,6 +14,8 @@
 		<string>1080</string>
 		<string>--resume-timeout</string>
 		<string>120</string>
+		<string>--stop-timeout</string>
+		<string>240</string>
 		<string>--expect-replayed</string>
 		<string>0</string>
 		<string>--stop-cmd</string>
