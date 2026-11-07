@@ -45,7 +45,8 @@ def newest(pattern):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log-glob", required=True, help="daemon log glob; newest non-.gz file is followed (rotation-safe)")
-    ap.add_argument("--duration", type=int, default=900)
+    ap.add_argument("--duration", type=int, default=900, help="seconds of watch AFTER the RESUMED line (r3: anchored to resume, not arming)")
+    ap.add_argument("--resume-timeout", type=int, default=120, help="r3: no RESUMED within this many s of arming = BLIND = trip (fail closed)")
     ap.add_argument("--expect-replayed", type=int, default=0)
     ap.add_argument("--stop-cmd", required=True, help="JSON argv list run on a trip")
     ap.add_argument("--marker", required=True)
@@ -59,7 +60,7 @@ def main():
         sys.exit(f"marker backup missing: {a.marker_backup}")
 
     t0 = time.time()
-    rec = {"t0_epoch": t0, "duration": a.duration, "expect_replayed": a.expect_replayed,
+    rec = {"version": "r3", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
            "log_glob": a.log_glob, "resumed_seen": None, "replayed_seen": None,
            "trip": None, "stopped": False, "marker_restored": False, "dry_run": a.dry_run}
     cur = newest(a.log_glob)
@@ -68,16 +69,31 @@ def main():
 
     def trip(reason, line):
         rec["trip"] = {"reason": reason, "line": line[:400], "at": time.time()}
-        if not a.dry_run:
-            p = subprocess.run(stop_argv, capture_output=True, text=True, timeout=120)
-            rec["stopped"] = p.returncode == 0
-            rec["stop_rc"] = p.returncode
-            rec["stop_err"] = p.stderr[-400:]
+        if a.dry_run:
+            return
+        # r3 (G706 review F4): restore the marker FIRST, so a stop that fails, times out or
+        # is interrupted still leaves the next boot RE-LATCHED; then stop, inside try/finally.
+        try:
             if not os.path.exists(a.marker):
                 shutil.copy2(a.marker_backup, a.marker)
+        except OSError as e:
+            rec["marker_restore_err"] = str(e)
+        try:
+            p = subprocess.run(stop_argv, capture_output=True, text=True, timeout=120)
+            rec["stop_rc"] = p.returncode
+            rec["stop_err"] = p.stderr[-400:]
+            rec["stopped"] = p.returncode == 0
+        except Exception as e:  # TimeoutExpired, OSError, ...
+            rec["stop_err"] = f"{type(e).__name__}: {e}"
+            rec["stopped"] = False
+        finally:
             rec["marker_restored"] = os.path.exists(a.marker)
 
-    while time.time() - t0 < a.duration and rec["trip"] is None:
+    def end_at():
+        # r3 (F3): the grace window starts at RESUME, so the watch does too.
+        return (rec["resumed_seen"] + a.duration) if rec["resumed_seen"] else (t0 + a.resume_timeout)
+
+    while time.time() < end_at() and rec["trip"] is None:
         n = newest(a.log_glob)
         if n and n != cur:                      # rotated: drain the old file, then follow the new one
             cur, pos = n, 0
@@ -107,6 +123,10 @@ def main():
                     break
         time.sleep(2)
 
+    # r3 (F2): fail CLOSED when blind. Leaving the loop without ever seeing RESUMED
+    # means we could not see the daemon; that is a trip, not a quiet "NO-RESUME-SEEN".
+    if rec["trip"] is None and rec["resumed_seen"] is None:
+        trip(f"BLIND: no RESUMED line within {a.resume_timeout}s of arming (glob {a.log_glob})", "")
     rec["ended"] = time.time()
     rec["verdict"] = "TRIPPED" if rec["trip"] else ("PASS" if rec["resumed_seen"] else "NO-RESUME-SEEN")
     with open(a.receipt, "w") as f:
