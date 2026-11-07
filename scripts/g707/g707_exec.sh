@@ -48,7 +48,7 @@ cp -p "$M" "$LED" "$B/"; chmod 600 "$B"/delete-burst-*
 shasum -a 256 "$B"/delete-burst-*
 # O2 (eb97 ruling 15:2x): APFS clone (clonefile, no tmutil) of the whole sync-state dir (marker + ledger + siblings), path + size checked
 cp -c -R "$S" "$B/sync-state.clone" || die "O2: APFS clone of sync-state failed"
-n0=$(find "$S" -type f | wc -l | tr -d ' '); n1=$(find "$B/sync-state.clone" -type f | wc -l | tr -d ' ')
+n0=$(find "$S" -type f ! -name '*.tmp' | wc -l | tr -d ' '); n1=$(find "$B/sync-state.clone" -type f ! -name '*.tmp' | wc -l | tr -d ' ')   # N5: transient .tmp siblings excluded
 k0=$(du -sk "$S" | cut -f1); k1=$(du -sk "$B/sync-state.clone" | cut -f1)
 [ "$n0" = "$n1" ] || die "O2: clone file count $n1 != source $n0"
 [ "$(sha "$B/sync-state.clone/delete-burst-PAUSED")" = "$MARKER_SHA" ] || die "O2: cloned marker sha mismatch"
@@ -94,5 +94,5 @@ i=0; while [ $i -lt 45 ]; do tail -n +"$((mark+1))" "$(newlog)" | grep -q 'REPLA
 tail -n +"$((mark+1))" "$(newlog)" | grep -E 'OUTBOUND DELETE PROPAGATION RESUMED|REPLAYED suppressed deletes' | cut -c1-240 || log "WARN: RESUMED/REPLAYED not yet seen (the watcher fails closed at 120 s)"
 [ -e "$LED" ] && log "ledger still present: $(wc -l < "$LED" | tr -d ' ') lines" || log "ledger cleared"
 log "watch runs 1080 s after RESUMED under launchd $LABEL; receipt -> $B/lift-watch-receipt.json"
-log "FOLLOW-UP due at T_RM+1250 s: /bin/bash $G/g707_followup.sh (sentinel F3; it pages on HELD / no receipt / main != 1)"
+log "FOLLOW-UP due at T_RM+1320 s (it waits up to 180 s more for the receipt): /bin/bash $G/g707_followup.sh (sentinel F3; it pages on HELD / no receipt / main != 1)"
 echo "BACKUP_DIR=$B"

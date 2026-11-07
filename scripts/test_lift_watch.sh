@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Synthetic-log tests for scripts/lift_watch.py (r3.2). Usage: scripts/test_lift_watch.sh [path/to/lift_watch.py]
+# Synthetic-log tests for scripts/lift_watch.py (r3.3). Usage: scripts/test_lift_watch.sh [path/to/lift_watch.py]
 # Exit 0 only if every case gives its expected verdict. Run it in the BACKGROUND (it waits on files).
 set -u
 LW=$(readlink -f "${1:-$(dirname "$0")/lift_watch.py}")
@@ -20,4 +20,5 @@ mk; (run --duration 6 --resume-timeout 10 --stop-cmd '["true"]' --dry-run) & wai
 mk; (run --duration 6 --resume-timeout 10 --stop-cmd '["/nonexistent/stop"]') & waitready; printf '%s\n' "$RES" '2026-11-07T10:00:02Z ERROR x: boom' >> $D/daemon.log.2026-11-07; wait; check "6 ERROR trips" "TRIPPED|daemon ERROR*" $D; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert d["marker_restored"] and not d["stopped"];print("PASS 6b nonexistent stop caught, marker restored")' $D/r.json || fail=1; rm -rf $D
 mk; (run --duration 20 --resume-timeout 30 --stop-cmd "[\"sh\",\"-c\",\"test -e $D/marker && touch $D/STOPPED\"]") & WP=$!; waitready; printf '%s\n' "$RES" >> $D/daemon.log.2026-11-07; sleep 3; pkill -TERM -f -- "--receipt $D/r.json"; wait $WP; check "7 SIGTERM after READY trips (r3.2 F1)" "TRIPPED|watcher died*" $D; [ -e $D/marker ] && [ -e $D/STOPPED ] && echo "PASS 7b marker restored then stopped" || { echo "FAIL 7b"; fail=1; }; rm -rf $D
 mk; ln -s $D/nonexistent $D/daemon.log.zz-dangling; (run --duration 3 --resume-timeout 10 --stop-cmd '["true"]' --dry-run) & waitready; printf '%s\n%s\n' "$RES" "$REP0" >> $D/daemon.log.2026-11-07; wait; check "8 dangling log in glob does not kill the watch (r3.2 F1)" "PASS|" $D; rm -rf $D
+mk; (run --duration 30 --resume-timeout 30 --stop-cmd "[\"sh\",\"-c\",\"sleep 6; test -e $D/marker && touch $D/STOPPED\"]") & WP=$!; waitready; printf '%s\n' "$RES" '2026-11-07T10:00:02Z ERROR x: boom' >> $D/daemon.log.2026-11-07; sleep 4; pkill -TERM -f -- "--receipt $D/r.json"; wait $WP; check "9 SIGTERM during the stop does not kill it (r3.3 N1)" "TRIPPED|daemon ERROR*" $D; [ -e $D/STOPPED ] && echo "PASS 9b stop script ran to completion" || { echo "FAIL 9b"; fail=1; }; rm -rf $D
 exit $fail

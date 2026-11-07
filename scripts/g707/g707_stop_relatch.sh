@@ -7,7 +7,7 @@
 #   RE-LATCHED within 60 s -> re-bootstrap the two jobs, exit 0  (sync stays UP, valve latched)
 #   marker missing, a main pid surviving KILL, no RE-LATCHED, or != 1 main pid after -> stop again,
 #   write $B/HELD, exit 1 (HELD: the T_RM+1250 s follow-up pages P0)
-# Budget: worst case ~125 s, inside lift_watch r3.2 --stop-timeout 240 (sentinel F4).
+# Budget: worst case ~172 s (delta-read N2 measure), inside lift_watch --stop-timeout 240 (sentinel F4).
 set -u
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 UIDN=$(id -u)

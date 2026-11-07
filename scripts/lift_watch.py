@@ -47,7 +47,7 @@ def _mtime(f):
         return -1.0
 
 
-class _Terminated(Exception):
+class _Terminated(BaseException):  # r3.3 N1: never swallowed by an `except Exception`
     pass
 
 
@@ -80,7 +80,7 @@ def main():
         sys.exit(f"marker backup missing: {a.marker_backup}")
 
     t0 = time.time()
-    rec = {"version": "r3.2", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
+    rec = {"version": "r3.3", "t0_epoch": t0, "duration": a.duration, "resume_timeout": a.resume_timeout, "expect_replayed": a.expect_replayed,
            "log_glob": a.log_glob, "resumed_seen": None, "replayed_seen": None,
            "trip": None, "stopped": False, "marker_restored": False, "dry_run": a.dry_run}
     cur = newest(a.log_glob)
@@ -95,6 +95,9 @@ def main():
         rec["trip"] = {"reason": reason, "line": line[:400], "at": time.time()}
         if a.dry_run:
             return
+        # r3.3 (delta-read N1): once tripping, a SIGTERM/SIGINT must never interrupt the restore + stop
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         # r3 (G706 review F4): restore the marker FIRST, so a stop that fails, times out or
         # is interrupted still leaves the next boot RE-LATCHED; then stop, inside try/finally.
         try:
