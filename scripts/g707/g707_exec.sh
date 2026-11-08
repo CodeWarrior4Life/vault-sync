@@ -38,7 +38,7 @@ launchctl print "gui/$UIDN/$LABEL" >/dev/null 2>&1 && die "$LABEL already loaded
 f=$(newlog); m1=$(stat -f %m "$f"); sleep 35; m2=$(stat -f %m "$(newlog)")
 [ "$m2" -gt "$m1" ] || die "C3: daemon log mtime did not advance in 35 s"
 [ "$(grep -c 'push accepted' "$f")" -gt 0 ] || die "C3: no 'push accepted' line today"
-H=$(for g in "$LOGDIR"/daemon.log.*; do case $g in *.gz) gzcat "$g";; *) cat "$g";; esac; done | grep -c -E 'push accepted path=.* hash=$' || true)
+H=$(for g in "$LOGDIR"/daemon.log.*; do case $g in (*.gz) gzcat "$g";; (*) cat "$g";; esac; done | grep -c -E 'push accepted path=.* hash=$' || true)
 [ "$H" -gt 0 ] || die "C3: no historical empty-hash delete line (watch regex unproven)"
 log "C3 see-proofs PASS (mtime $m1->$m2; historical delete lines $H)"
 
