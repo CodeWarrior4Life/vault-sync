@@ -1257,13 +1257,20 @@ impl PushClient {
                             // TKT-674cc441: never retry with a base the server
                             // just rejected. Only on a VERIFIED head (the body
                             // hashed to the revision the 409 named).
-                            self.advance_base_after_preserve(
-                                path,
-                                &payload.sha256,
-                                &outcome,
-                                action,
-                            )
-                            .await;
+                            // Fable review F1: a 409 that names NO head
+                            // (expected_hash null, e.g. no reconcile-state row)
+                            // still verifies, but then payload.sha256 is NOT
+                            // proven to be the server's CAS value, and advancing
+                            // to it would hot-loop. Require the named head.
+                            if expected_head_hash == Some(payload.sha256.as_str()) {
+                                self.advance_base_after_preserve(
+                                    path,
+                                    &payload.sha256,
+                                    &outcome,
+                                    action,
+                                )
+                                .await;
+                            }
                         }
                         ReceiptOutcome::VerifyFailed => tracing::warn!(
                             path,
@@ -1423,21 +1430,24 @@ impl PushClient {
         if matches!(action, PushAction::Delete) || head_hash.is_empty() {
             return false;
         }
-        let enqueue_ff = match outcome {
-            MaterializeOutcome::Skipped(MatSkip::LocalEditPreserved) => true,
-            MaterializeOutcome::Skipped(MatSkip::AppendPreservedPushUp { .. }) => false,
+        match outcome {
+            MaterializeOutcome::Skipped(MatSkip::LocalEditPreserved) => {}
+            MaterializeOutcome::Skipped(MatSkip::AppendPreservedPushUp { enqueued_push }) => {
+                if let Some(sh) = &self.shadow_store {
+                    sh.record(path, head_hash);
+                }
+                tracing::info!(
+                    path,
+                    head = %head_hash,
+                    materializer_enqueued_push = *enqueued_push,
+                    "409 refetch/merge (TKT-674cc441): APPEND ARM A preserve - shadow advanced to the verified head; the compensating push is the materializer's (see materializer_enqueued_push)"
+                );
+                return false;
+            }
             _ => return false,
-        };
+        }
         if let Some(sh) = &self.shadow_store {
             sh.record(path, head_hash);
-        }
-        if !enqueue_ff {
-            tracing::info!(
-                path,
-                head = %head_hash,
-                "409 refetch/merge (TKT-674cc441): APPEND ARM A preserve - shadow advanced to the verified head (compensating push already enqueued by the materializer)"
-            );
-            return false;
         }
         let abs = self.vault_root.join(forward_slash_to_path(path));
         let local_sha = match std::fs::read(&abs) {
@@ -4718,4 +4728,57 @@ mod tests {
         );
         assert_eq!(journal.lock().await.len(), 0, "nothing enqueued without a verified head");
     }
+    /// TKT-674cc441 Fable review F1: a 409 naming NO head (expected_hash null)
+    /// still yields a Recorded receipt, but the body is not proven to be the
+    /// server's CAS value, so the base must NOT advance (else a hot loop).
+    #[tokio::test]
+    async fn causal_preserve_409_unnamed_head_does_not_advance_base() {
+        let mut srv = Server::new_async().await;
+        let path = "01_Notes/rec.md";
+        let head = "line A\nline B\n";
+        let head_sha = sha256_hex(head.as_bytes());
+        let local: &[u8] = b"line A\nline B\nline C\n";
+        let stale_shadow = sha256_hex(b"line A\n");
+        let _push_conflict = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(r#"{"expected_hash":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let note = serde_json::json!({
+            "path": path, "frontmatter": {}, "body": head, "sha256": head_sha,
+            "modified": null, "file_mtime": null, "created": null,
+            "change_seq": 1001, "enriched_body": head,
+        })
+        .to_string();
+        let _note_mock = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+        let mut watcher_evt = evt(path, local);
+        watcher_evt.base_hash = PushBase::Unknown;
+        let (jdir, journal) = make_journal_with(vec![watcher_evt]);
+        let (client, vault, bs, shadow) = make_append_client(
+            &srv.url(),
+            journal.clone(),
+            &jdir.path().join("push_journal.jsonl"),
+        )
+        .await;
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join(path), local).unwrap();
+        bs.record_adopted(path, 1001);
+        shadow.record(path, &stale_shadow);
+        let _ = client.drain_once().await;
+        assert_eq!(
+            shadow.get(path).as_deref(),
+            Some(stale_shadow.as_str()),
+            "an unnamed head never becomes the base"
+        );
+        assert_eq!(journal.lock().await.len(), 0, "nothing enqueued without a named head");
+    }
+
 }
