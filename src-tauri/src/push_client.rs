@@ -1247,12 +1247,24 @@ impl PushClient {
                     // where nothing was recorded — a false all-clear. Report the
                     // receipt result and the materialize outcome, truthfully.
                     Ok(outcome) => match &receipt {
-                        ReceiptOutcome::Recorded { seq } => tracing::info!(
-                            path,
-                            ?outcome,
-                            base_seq = seq,
-                            "409 refetch/merge: VERIFIED read-receipt recorded (retry authorised); merge outcome as shown (R1/R3)"
-                        ),
+                        ReceiptOutcome::Recorded { seq } => {
+                            tracing::info!(
+                                path,
+                                ?outcome,
+                                base_seq = seq,
+                                "409 refetch/merge: VERIFIED read-receipt recorded (retry authorised); merge outcome as shown (R1/R3)"
+                            );
+                            // TKT-674cc441: never retry with a base the server
+                            // just rejected. Only on a VERIFIED head (the body
+                            // hashed to the revision the 409 named).
+                            self.advance_base_after_preserve(
+                                path,
+                                &payload.sha256,
+                                &outcome,
+                                action,
+                            )
+                            .await;
+                        }
                         ReceiptOutcome::VerifyFailed => tracing::warn!(
                             path,
                             ?outcome,
@@ -1366,6 +1378,104 @@ impl PushClient {
             }
             None if payload.change_seq.is_none() => ReceiptOutcome::Unverifiable,
             None => ReceiptOutcome::VerifyFailed,
+        }
+    }
+
+    /// TKT-674cc441: advance the CAS base after a VERIFIED 409 refetch whose
+    /// merge PRESERVED local.
+    ///
+    /// The defect (MEASURED on link 2026-11-09): the shadow store (the CAS
+    /// `base_hash` source for watcher pushes) can lag the lineage the daemon has
+    /// already ADOPTED. The materializer then correctly judges local to descend
+    /// from the server head (R2 CAUSAL: incoming seq <= adopted, or R2 shadow ==
+    /// server) and returns `Skipped(LocalEditPreserved)`. Before this fix the 409
+    /// path recorded only the observed `base_seq`, never the shadow, so every
+    /// later push backfilled the SAME stale base and lost the CAS forever. A pure
+    /// append (server body = byte-prefix of local) push-looped as
+    /// `ConflictUnrecoverable`, and nothing carried the local edit up, because the
+    /// watcher push had already been acked.
+    ///
+    /// Fix, valid only when the caller holds a Recorded receipt (the refetched
+    /// body byte-verified against the revision the server named), so
+    /// `head_hash` IS the server's current CAS value:
+    /// * `Skipped(LocalEditPreserved)`: shadow := head, and enqueue ONE Modify
+    ///   with `KnownBase(head)`. This is the fast-forward that carries the
+    ///   preserved local bytes up.
+    /// * `Skipped(AppendPreservedPushUp)`: shadow := head only. The materializer
+    ///   already enqueued its compensating push with the same base. Advancing
+    ///   the shadow stops later watcher pushes re-sending the stale base.
+    /// * Any other outcome (local was rewritten, or a conflict copy was minted)
+    ///   and any Delete: no change.
+    ///
+    /// The materializer's decision is the ancestry judgement. This helper never
+    /// widens it: it only stops the retry from re-declaring a base the server
+    /// has just rejected. If the server moves again, the enqueued push 409s
+    /// against the NEW head and this runs again from a fresh verified receipt.
+    /// Returns true iff a fast-forward push was enqueued.
+    async fn advance_base_after_preserve(
+        &self,
+        path: &str,
+        head_hash: &str,
+        outcome: &crate::materializer::MaterializeOutcome,
+        action: PushAction,
+    ) -> bool {
+        use crate::materializer::{MaterializeOutcome, SkipReason as MatSkip};
+        if matches!(action, PushAction::Delete) || head_hash.is_empty() {
+            return false;
+        }
+        let enqueue_ff = match outcome {
+            MaterializeOutcome::Skipped(MatSkip::LocalEditPreserved) => true,
+            MaterializeOutcome::Skipped(MatSkip::AppendPreservedPushUp { .. }) => false,
+            _ => return false,
+        };
+        if let Some(sh) = &self.shadow_store {
+            sh.record(path, head_hash);
+        }
+        if !enqueue_ff {
+            tracing::info!(
+                path,
+                head = %head_hash,
+                "409 refetch/merge (TKT-674cc441): APPEND ARM A preserve - shadow advanced to the verified head (compensating push already enqueued by the materializer)"
+            );
+            return false;
+        }
+        let abs = self.vault_root.join(forward_slash_to_path(path));
+        let local_sha = match std::fs::read(&abs) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(e) => {
+                tracing::warn!(
+                    path,
+                    error = %e,
+                    "409 refetch/merge (TKT-674cc441): shadow advanced but local file unreadable - no fast-forward enqueued; next reconcile pass converges"
+                );
+                return false;
+            }
+        };
+        let evt = PushEvent {
+            schema_version: CURRENT_SCHEMA,
+            id: new_event_id(),
+            path: path.to_string(),
+            action: PushAction::Modify,
+            base_hash: PushBase::KnownBase(head_hash.to_string()),
+            content_sha: local_sha,
+            content_bytes: None,
+            queued_at: chrono::Utc::now(),
+            device_id: self.device_id.clone(),
+        };
+        let mut j = self.journal.lock().await;
+        match j.append(evt) {
+            Ok(()) => {
+                tracing::info!(
+                    path,
+                    head = %head_hash,
+                    "409 refetch/merge (TKT-674cc441): local preserved over the verified head - shadow advanced + ONE fast-forward push enqueued (CAS base = verified head)"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "409 refetch/merge (TKT-674cc441): fast-forward append failed");
+                false
+            }
         }
     }
 
@@ -4420,5 +4530,192 @@ mod tests {
             std::fs::read(vault.path().join("01_Notes/rec.md")).unwrap(),
             local
         );
+    }
+
+    /// TKT-674cc441, THE MEASURED LINK SHAPE (journalctl 2026-11-09 14:00-14:03Z,
+    /// `_sync/canary-link.md` and `Pitboss/active-work.md`): the daemon has
+    /// ADOPTED the server head (seq 1001, our own earlier accepted push), but the
+    /// shadow store lags it. A watcher push (`Unknown` base) backfills the STALE
+    /// shadow as `base_hash`; the server 409s naming the head; the refetch
+    /// verifies; the materializer goes R2 CAUSAL (incoming 1001 <= adopted 1001)
+    /// -> `Skipped(LocalEditPreserved)`, so ARM A never runs and no compensating
+    /// push exists.
+    ///
+    /// OLD CODE: the journal is empty after round 1 and the shadow is still
+    /// stale, so the local append never goes up, and every later watcher push
+    /// re-sends the stale base and 409s again (the observed infinite loop).
+    /// FIX: shadow := verified head, ONE fast-forward with CAS base = head is
+    /// pending, and round 2 is ACCEPTED with the exact local bytes.
+    #[tokio::test]
+    async fn causal_preserve_409_with_stale_shadow_advances_base_and_fast_forwards() {
+        let mut srv = Server::new_async().await;
+        let path = "01_Notes/rec.md";
+        let head = "line A\nline B\n";
+        let head_sha = sha256_hex(head.as_bytes());
+        let local: &[u8] = b"line A\nline B\nline C appended after our adopted push\n";
+        let local_sha = sha256_hex(local);
+        let stale_shadow = sha256_hex(b"line A\n");
+
+        // Push #1: the watcher push backfills the STALE shadow (proves the
+        // backfill source) with the adopted seq; the server rejects the base.
+        let push_conflict = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"base_hash":"{stale_shadow}"}}"#
+            )))
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{head_sha}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+        let note = serde_json::json!({
+            "path": path,
+            "frontmatter": {},
+            "body": head,
+            "sha256": head_sha,
+            "modified": null,
+            "file_mtime": null,
+            "created": null,
+            "change_seq": 1001,
+            "enriched_body": head,
+        })
+        .to_string();
+        let note_mock = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .expect(1)
+            .create_async()
+            .await;
+        use base64::Engine as _;
+        let local_b64 = base64::engine::general_purpose::STANDARD.encode(local);
+        let push_accept = srv
+            .mock("POST", "/api/sync/push")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""base_seq":1001"#.into()),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"base_hash":"{head_sha}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"content":"{local_b64}"}}"#)),
+            ]))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"accepted","seq":1,"content_hash":"{local_sha}","server_hash":"{local_sha}","server_seq":1002,"merged_content":null,"message":null}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut watcher_evt = evt(path, local);
+        watcher_evt.base_hash = PushBase::Unknown;
+        let (jdir, journal) = make_journal_with(vec![watcher_evt]);
+        let (client, vault, bs, shadow) = make_append_client(
+            &srv.url(),
+            journal.clone(),
+            &jdir.path().join("push_journal.jsonl"),
+        )
+        .await;
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join(path), local).unwrap();
+        bs.record_adopted(path, 1001);
+        shadow.record(path, &stale_shadow);
+
+        // Round 1: the 409 is still surfaced (R6); nothing forked or overwritten.
+        let out1 = client.drain_once().await;
+        assert_eq!(out1.len(), 1);
+        assert!(
+            matches!(
+                out1[0].1,
+                PushOutcome::Failed(FailureReason::ConflictUnrecoverable { .. })
+            ),
+            "the 409 is still surfaced, got {:?}",
+            out1[0].1
+        );
+        push_conflict.assert_async().await;
+        note_mock.assert_async().await;
+        assert!(conflict_forks_under(vault.path()).is_empty(), "no fork for a causal preserve");
+        assert_eq!(std::fs::read(vault.path().join(path)).unwrap(), local, "local intact");
+        assert_eq!(
+            bs.get_adopted(path),
+            Some(1001),
+            "the R2 CAUSAL arm ran (adopted lineage kept), not ARM A"
+        );
+        assert_eq!(
+            shadow.get(path).as_deref(),
+            Some(head_sha.as_str()),
+            "the shadow advanced to the VERIFIED head the 409 named (old code left it stale)"
+        );
+        assert_eq!(
+            journal.lock().await.len(),
+            1,
+            "exactly ONE fast-forward push is pending (old code: zero, the edit was stranded)"
+        );
+
+        // Round 2: the fast-forward carries the local bytes up and is ACCEPTED.
+        let out2 = client.drain_once().await;
+        assert_eq!(out2.len(), 1);
+        assert!(
+            matches!(out2[0].1, PushOutcome::Sent { .. }),
+            "the fast-forward must be accepted, got {:?}",
+            out2[0].1
+        );
+        push_accept.assert_async().await;
+        assert_eq!(bs.get_adopted(path), Some(1002), "converged version adopted");
+        assert_eq!(shadow.get(path).as_deref(), Some(local_sha.as_str()));
+        assert_eq!(journal.lock().await.len(), 0, "journal drained");
+        assert!(conflict_forks_under(vault.path()).is_empty());
+    }
+
+    /// TKT-674cc441 negative control: an UNVERIFIED refetch (the body does not
+    /// hash to the revision the 409 named) must NOT advance the shadow or
+    /// enqueue anything. A base is only ever advanced to a verified head.
+    #[tokio::test]
+    async fn causal_preserve_409_unverified_refetch_does_not_advance_base() {
+        let mut srv = Server::new_async().await;
+        let path = "01_Notes/rec.md";
+        let head = "line A\nline B\n";
+        let head_sha = sha256_hex(head.as_bytes());
+        let named_sha = sha256_hex(b"some OTHER revision\n");
+        let local: &[u8] = b"line A\nline B\nline C\n";
+        let stale_shadow = sha256_hex(b"line A\n");
+        let _push_conflict = srv
+            .mock("POST", "/api/sync/push")
+            .with_status(409)
+            .with_body(format!(r#"{{"expected_hash":"{named_sha}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+        let note = serde_json::json!({
+            "path": path, "frontmatter": {}, "body": head, "sha256": head_sha,
+            "modified": null, "file_mtime": null, "created": null,
+            "change_seq": 1001, "enriched_body": head,
+        })
+        .to_string();
+        let _note_mock = srv
+            .mock("GET", "/api/sync/note")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(note)
+            .create_async()
+            .await;
+        let mut watcher_evt = evt(path, local);
+        watcher_evt.base_hash = PushBase::Unknown;
+        let (jdir, journal) = make_journal_with(vec![watcher_evt]);
+        let (client, vault, bs, shadow) = make_append_client(
+            &srv.url(),
+            journal.clone(),
+            &jdir.path().join("push_journal.jsonl"),
+        )
+        .await;
+        std::fs::create_dir_all(vault.path().join("01_Notes")).unwrap();
+        std::fs::write(vault.path().join(path), local).unwrap();
+        bs.record_adopted(path, 1001);
+        shadow.record(path, &stale_shadow);
+        let _ = client.drain_once().await;
+        assert_eq!(
+            shadow.get(path).as_deref(),
+            Some(stale_shadow.as_str()),
+            "an unverified head never becomes the base"
+        );
+        assert_eq!(journal.lock().await.len(), 0, "nothing enqueued without a verified head");
     }
 }
