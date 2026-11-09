@@ -4642,8 +4642,15 @@ mod tests {
         );
         push_conflict.assert_async().await;
         note_mock.assert_async().await;
-        assert!(conflict_forks_under(vault.path()).is_empty(), "no fork for a causal preserve");
-        assert_eq!(std::fs::read(vault.path().join(path)).unwrap(), local, "local intact");
+        assert!(
+            conflict_forks_under(vault.path()).is_empty(),
+            "no fork for a causal preserve"
+        );
+        assert_eq!(
+            std::fs::read(vault.path().join(path)).unwrap(),
+            local,
+            "local intact"
+        );
         assert_eq!(
             bs.get_adopted(path),
             Some(1001),
@@ -4669,7 +4676,11 @@ mod tests {
             out2[0].1
         );
         push_accept.assert_async().await;
-        assert_eq!(bs.get_adopted(path), Some(1002), "converged version adopted");
+        assert_eq!(
+            bs.get_adopted(path),
+            Some(1002),
+            "converged version adopted"
+        );
         assert_eq!(shadow.get(path).as_deref(), Some(local_sha.as_str()));
         assert_eq!(journal.lock().await.len(), 0, "journal drained");
         assert!(conflict_forks_under(vault.path()).is_empty());
@@ -4726,7 +4737,11 @@ mod tests {
             Some(stale_shadow.as_str()),
             "an unverified head never becomes the base"
         );
-        assert_eq!(journal.lock().await.len(), 0, "nothing enqueued without a verified head");
+        assert_eq!(
+            journal.lock().await.len(),
+            0,
+            "nothing enqueued without a verified head"
+        );
     }
     /// TKT-674cc441 Fable review F1: a 409 naming NO head (expected_hash null)
     /// still yields a Recorded receipt, but the body is not proven to be the
@@ -4778,7 +4793,10 @@ mod tests {
             Some(stale_shadow.as_str()),
             "an unnamed head never becomes the base"
         );
-        assert_eq!(journal.lock().await.len(), 0, "nothing enqueued without a named head");
+        assert_eq!(
+            journal.lock().await.len(),
+            0,
+            "nothing enqueued without a named head"
+        );
     }
-
 }
