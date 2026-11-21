@@ -7,6 +7,7 @@ pub mod api_client;
 pub mod append_merge;
 pub mod auth_backoff;
 pub mod base_seq_store;
+pub mod blob_filter;
 pub mod boot;
 pub mod canonical_form;
 pub mod commands;

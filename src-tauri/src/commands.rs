@@ -108,6 +108,8 @@ pub async fn verify_repair_with(
             modify_count = report.modify_count,
             add_count = report.add_count,
             substrate_refused_count = report.substrate_refused_count,
+            nonmd_unrouted_count = report.nonmd_unrouted_count,
+            blob_note_vocab_answer = report.blob_note_vocab_answer.values().sum::<u64>(),
             elapsed_ms = report.elapsed_ms,
             "verify_repair_run: per-root complete"
         );
@@ -125,6 +127,13 @@ pub async fn verify_repair_with(
             .extend(report.delete_paths_sample);
         combined.substrate_refused_count += report.substrate_refused_count;
         combined.extension_filtered_count += report.extension_filtered_count;
+        // TKT-dfbd1580 A04-9.6 / A04-7.2: merged so the status surface sees
+        // every root's non-md drops and ignored reconcile answers.
+        combined.nonmd_unrouted_count += report.nonmd_unrouted_count;
+        for (state, n) in report.blob_note_vocab_answer {
+            let e = combined.blob_note_vocab_answer.entry(state).or_insert(0);
+            *e = e.saturating_add(n);
+        }
         combined.errors.extend(report.errors);
         combined.elapsed_ms += report.elapsed_ms;
     }

@@ -532,7 +532,13 @@ impl FileWatcher {
                 match &decision {
                     FilterDecision::Allow(_) => {}
                     FilterDecision::DropSubstrate { .. } => w.inc_events_dropped_substrate(),
-                    FilterDecision::DropExtension { .. } => w.inc_events_dropped_extension(),
+                    FilterDecision::DropExtension { path, .. } => {
+                        w.inc_events_dropped_extension();
+                        // TKT-dfbd1580 A04-9.6: counted `nonmd_unrouted`.
+                        if !crate::blob_filter::is_text_lane(path) {
+                            w.inc_events_dropped_nonmd_unrouted();
+                        }
+                    }
                     FilterDecision::DropOutOfScope { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropExclude { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropDeleteBurst { .. } => w.inc_events_filtered(),
@@ -567,11 +573,17 @@ impl FileWatcher {
             .lock()
             .map(|mut d| d.should_log(path, day))
             .unwrap_or(true);
+        // TKT-dfbd1580 A04-9.6: the rule label is unchanged for existing log
+        // consumers; a non-text-lane extension drop also carries
+        // `nonmd_unrouted=true`.
+        let nonmd_unrouted = matches!(decision, FilterDecision::DropExtension { .. })
+            && !crate::blob_filter::is_text_lane(path);
         if should {
             tracing::info!(
                 target: "vault_sync_daemon::file_watcher",
                 rule = %rule,
                 path = %path,
+                nonmd_unrouted,
                 "file_watcher: event DROPPED by filter (not pushed; logged once per path per day, counted in tray state)"
             );
         }
@@ -735,13 +747,21 @@ impl FileWatcher {
             return FilterDecision::DropChunkPseudo { path: norm };
         }
 
-        // (5) Extension gate.
+        // (5) Extension gate. TKT-dfbd1580 A04-9.6 (first-PR gate): a path
+        // that is not positively text lane (`.md` / `.canvas`) is dropped
+        // here, before the note push journal and before delete
+        // classification, whatever `allowed_extensions` says: the configured
+        // list can only NARROW the text lane, never widen it (an empty entry,
+        // a wildcard or a non-md extension in it admits nothing extra). The
+        // drop keeps the `DropExtension` shape; `classify_and_count` counts
+        // it `nonmd_unrouted` as well.
         let ext = path_extension(&norm).to_ascii_lowercase();
-        let allowed = self
-            .config
-            .allowed_extensions
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&ext));
+        let allowed = crate::blob_filter::is_text_lane(&norm)
+            && self
+                .config
+                .allowed_extensions
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&ext));
         if !allowed {
             return FilterDecision::DropExtension { path: norm, ext };
         }
@@ -3613,5 +3633,200 @@ mod tests {
             w.classify(&modified("01_Notes/Foo.md")),
             FilterDecision::Allow(_)
         ));
+    }
+
+    // ---- TKT-dfbd1580, A-04 section 9: fail-closed filter -------------------
+
+    fn make_watcher_with_exts(dir: &TempDir, exts: Vec<&str>) -> FileWatcher {
+        let cfg = FileWatcherConfig {
+            allowed_extensions: exts.into_iter().map(String::from).collect(),
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+            storage_prefix: None,
+        };
+        FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(dir),
+            make_burst(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+    }
+
+    /// A04-9.6 first-PR test: in a build without the blob client, create,
+    /// modify, rename and delete of a `.png` produce zero journal entries and
+    /// never tick the delete-burst valve; each is counted `nonmd_unrouted`.
+    /// The text lane keeps syncing beside it (A04-9.2).
+    #[tokio::test]
+    async fn a04_9_6_png_create_modify_rename_delete_produce_zero_journal_entries() {
+        let dir = TempDir::new().unwrap();
+        let tray = make_shared_tray();
+        let burst = Arc::new(Mutex::new(DeleteBurstDetector::new(
+            1,
+            Duration::from_secs(30),
+        )));
+        let cfg = FileWatcherConfig {
+            allowed_extensions: vec!["md".into(), "canvas".into()],
+            scope_roots: vec![],
+            scope_excludes: vec![],
+            debounce_ms: 500,
+            managed_payload_excludes: false,
+            storage_prefix: None,
+        };
+        let w = FileWatcher::new(
+            dir.path().to_path_buf(),
+            make_journal(&dir),
+            burst.clone(),
+            cfg,
+            "dev-test",
+        )
+        .unwrap()
+        .with_tray_state(tray.clone());
+
+        let a = dir.path().join("Operations/_attachments/a.png");
+        let b = dir.path().join("Operations/_attachments/b.png");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        // create
+        std::fs::write(&a, b"\x89PNG one").unwrap();
+        w.handle_fs_path(&a).await;
+        // modify
+        std::fs::write(&a, b"\x89PNG two").unwrap();
+        w.handle_fs_path(&a).await;
+        // rename (the watcher sees the old path vanish and the new one appear)
+        std::fs::rename(&a, &b).unwrap();
+        w.handle_fs_path(&a).await;
+        w.handle_fs_path(&b).await;
+        // delete
+        std::fs::remove_file(&b).unwrap();
+        w.handle_fs_path(&b).await;
+
+        assert_eq!(
+            w.journal.len(),
+            0,
+            "no .png event may reach the note journal"
+        );
+        assert!(
+            !burst.lock().unwrap().is_paused(),
+            "a .png delete must be dropped BEFORE delete classification (threshold 1)"
+        );
+        // The pure classifier agrees for an explicit rename pair.
+        assert!(matches!(
+            w.classify(&WatchEvent::Renamed {
+                old_path: "x/a.png".into(),
+                new_path: "x/b.png".into(),
+            }),
+            FilterDecision::DropExtension { .. }
+        ));
+        {
+            let s = tray.read().unwrap();
+            assert_eq!(s.events_dropped_nonmd_unrouted, 5, "one per event");
+            assert_eq!(s.events_dropped_extension, 5);
+            assert_eq!(s.events_filtered, 5, "nonmd_unrouted is a sub-counter");
+        }
+
+        // A04-9.2: the text lane continues.
+        let n = dir.path().join("Notes/n.md");
+        std::fs::create_dir_all(n.parent().unwrap()).unwrap();
+        std::fs::write(&n, b"note").unwrap();
+        w.handle_fs_path(&n).await;
+        assert_eq!(w.journal.len(), 1, "a .md beside it still enqueues");
+        assert_eq!(tray.read().unwrap().events_dropped_nonmd_unrouted, 5);
+    }
+
+    /// A04-9.6, no silent widening: whatever the configured extension list
+    /// says, a non-text-lane path is never Allowed (an empty entry, a
+    /// wildcard, a non-md extension, a leading-dot form). The list can only
+    /// narrow the text lane.
+    #[test]
+    fn a04_9_6_configured_extensions_cannot_widen_past_the_text_lane() {
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher_with_exts(&dir, vec!["md", "png", "", "*", ".png", "PNG", "exe"]);
+        for p in ["a.png", "b.PNG", "noext", "c.exe", "d.md.png", ".md", "e."] {
+            for evt in [
+                modified(p),
+                WatchEvent::Created { path: p.into() },
+                WatchEvent::Deleted { path: p.into() },
+            ] {
+                let d = w.classify(&evt);
+                assert!(
+                    matches!(d, FilterDecision::DropExtension { .. }),
+                    "{p:?} {evt:?} must drop, got {d:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            w.classify(&modified("ok.md")),
+            FilterDecision::Allow(_)
+        ));
+        // Narrowing still works: canvas is text lane but not configured here.
+        assert!(matches!(
+            w.classify(&modified("board.canvas")),
+            FilterDecision::DropExtension { .. }
+        ));
+    }
+
+    /// A04-9.6: `nonmd_unrouted` counts non-text-lane drops only; a text-lane
+    /// extension the config narrowed away is an ordinary extension drop.
+    #[test]
+    fn a04_9_6_nonmd_unrouted_counts_only_non_text_lane_drops() {
+        let dir = TempDir::new().unwrap();
+        let tray = make_shared_tray();
+        let w = make_watcher(&dir, vec![], vec![]).with_tray_state(tray.clone());
+        let _ = w.classify_and_count(&modified("x/board.canvas"));
+        let _ = w.classify_and_count(&modified("x/pic.jpg"));
+        let _ = w.classify_and_count(&WatchEvent::Deleted {
+            path: "x/old.pdf".into(),
+        });
+        let s = tray.read().unwrap();
+        assert_eq!(s.events_dropped_extension, 3);
+        assert_eq!(s.events_dropped_nonmd_unrouted, 2);
+        assert_eq!(s.events_filtered, 3);
+    }
+
+    /// A04-9.6: the INFO drop line names the `nonmd_unrouted` rule for a
+    /// non-text-lane path (A02-8.5 "log at INFO once per path per day").
+    #[test]
+    fn a04_9_6_nonmd_drop_logs_the_nonmd_unrouted_field() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let wr = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || wr.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let dir = TempDir::new().unwrap();
+        let w = make_watcher_with_exts(&dir, vec!["md"]);
+        tracing::subscriber::with_default(sub, || {
+            let d = w.classify(&modified("x/pic.png"));
+            w.log_drop(&d, 7);
+            let d = w.classify(&modified("x/board.canvas"));
+            w.log_drop(&d, 7);
+        });
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let png: Vec<&str> = log.lines().filter(|l| l.contains("x/pic.png")).collect();
+        assert_eq!(png.len(), 1, "{log}");
+        assert!(png[0].contains("rule=extension:png"), "{log}");
+        assert!(png[0].contains("nonmd_unrouted=true"), "{log}");
+        let canvas: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("x/board.canvas"))
+            .collect();
+        assert_eq!(canvas.len(), 1, "{log}");
+        assert!(canvas[0].contains("rule=extension:canvas"), "{log}");
+        assert!(canvas[0].contains("nonmd_unrouted=false"), "{log}");
     }
 }

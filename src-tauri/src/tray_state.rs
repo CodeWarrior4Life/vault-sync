@@ -82,6 +82,13 @@ pub struct TrayState {
     pub events_dropped_extension: u64,
     /// file_watcher events dropped by hardcoded or user exclude rules.
     pub events_dropped_excludes: u64,
+    /// TKT-dfbd1580 A04-9.6: extension drops of NON-text-lane paths (the
+    /// `nonmd_unrouted` count). A sub-counter of `events_dropped_extension`;
+    /// it does not bump `events_filtered` again.
+    pub events_dropped_nonmd_unrouted: u64,
+    /// TKT-dfbd1580 A04-9.2/9.3: the effective-filter state. Starts
+    /// `failed_closed` in every process.
+    pub blob_filter_status: crate::blob_filter::BlobFilterStatus,
     /// Number of `*.conflict-from-<dev>-<lsn>.md` files currently in the vault.
     pub conflict_unresolved: usize,
     /// Total post-write integrity-check failures (byte mismatch or parse fail).
@@ -169,6 +176,8 @@ impl TrayState {
             events_dropped_substrate: 0,
             events_dropped_extension: 0,
             events_dropped_excludes: 0,
+            events_dropped_nonmd_unrouted: 0,
+            blob_filter_status: crate::blob_filter::BlobFilterStatus::FailedClosed,
             conflict_unresolved: 0,
             integrity_failures: 0,
             shrink_guard_fired: 0,
@@ -268,6 +277,29 @@ impl TrayState {
     pub fn inc_events_dropped_excludes(&mut self) {
         self.events_dropped_excludes = self.events_dropped_excludes.saturating_add(1);
         self.inc_events_filtered();
+    }
+
+    /// TKT-dfbd1580 A04-9.6: one non-text-lane path dropped before the note
+    /// pipeline. Called alongside [`Self::inc_events_dropped_extension`],
+    /// which already bumped the filtered rollup.
+    pub fn inc_events_dropped_nonmd_unrouted(&mut self) {
+        self.events_dropped_nonmd_unrouted = self.events_dropped_nonmd_unrouted.saturating_add(1);
+    }
+
+    /// TKT-dfbd1580 A04-9.2: mirror the effective-filter state from the
+    /// gate. The only way to report `valid` is a gate that evaluated valid.
+    pub fn sync_blob_filter_status(&mut self, gate: &crate::blob_filter::BlobFilterGate) {
+        self.blob_filter_status = gate.status();
+    }
+
+    /// TKT-dfbd1580 A04-9.2: the effective-filter state and the
+    /// `nonmd_unrouted` count as one serializable snapshot for the status
+    /// surface.
+    pub fn blob_filter_health(&self) -> BlobFilterHealth {
+        BlobFilterHealth {
+            state: self.blob_filter_status,
+            nonmd_unrouted: self.events_dropped_nonmd_unrouted,
+        }
     }
 
     pub fn set_conflict_unresolved(&mut self, n: usize) {
@@ -409,6 +441,16 @@ impl PushHealthCounters {
     pub fn is_degraded(&self) -> bool {
         self.rejected_paths > 0 || self.pushes_refused_local_i3 > 0
     }
+}
+
+/// TKT-dfbd1580 A04-9.2: the non-md effective-filter state for the status
+/// surface. Field names are the wire names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFilterHealth {
+    /// `failed_closed` until a valid effective filter is held in this process.
+    pub state: crate::blob_filter::BlobFilterStatus,
+    /// Non-text-lane paths dropped before the note pipeline (A04-9.6).
+    pub nonmd_unrouted: u64,
 }
 
 /// TKT-457a5073 follow-up: the pull fail-loud counters, serializable for the
@@ -602,5 +644,35 @@ mod tests {
         assert_eq!(s.conflict_unresolved, 7);
         assert!(s.delete_burst_paused);
         assert_eq!(s.uploads_pending, 3);
+    }
+
+    /// TKT-dfbd1580 A04-9.6: `nonmd_unrouted` is a sub-counter of the
+    /// extension drop; it never bumps the filtered rollup on its own.
+    #[test]
+    fn a04_9_6_nonmd_unrouted_is_a_sub_counter() {
+        let mut s = fresh();
+        assert_eq!(s.events_dropped_nonmd_unrouted, 0);
+        s.inc_events_dropped_nonmd_unrouted();
+        assert_eq!(s.events_dropped_nonmd_unrouted, 1);
+        assert_eq!(s.events_filtered, 0);
+    }
+
+    /// TKT-dfbd1580 A04-9.2: the status snapshot reports `failed_closed`
+    /// from start (A04-9.3) with the `nonmd_unrouted` count.
+    #[test]
+    fn a04_9_2_blob_filter_health_reports_failed_closed_from_start() {
+        let mut s = fresh();
+        let h = s.blob_filter_health();
+        assert_eq!(h.state, crate::blob_filter::BlobFilterStatus::FailedClosed);
+        assert_eq!(h.nonmd_unrouted, 0);
+        s.inc_events_dropped_nonmd_unrouted();
+        let json = serde_json::to_value(s.blob_filter_health()).unwrap();
+        assert_eq!(json["state"], "failed_closed");
+        assert_eq!(json["nonmd_unrouted"], 1);
+        s.sync_blob_filter_status(&crate::blob_filter::BlobFilterGate::new());
+        assert_eq!(
+            s.blob_filter_health().state,
+            crate::blob_filter::BlobFilterStatus::FailedClosed
+        );
     }
 }
