@@ -66,13 +66,18 @@ const DUP_KEY_MARKER: &str = "nexus-sync-duplicate-object-key";
 /// further dot (`.md`) and a basename ending in a dot have no extension and
 /// are NOT text lane. Anything not positively text lane is non-text lane.
 pub fn is_text_lane(path: &str) -> bool {
-    todo!("A04-9.6 lane split: {path}")
+    let ext = basename_extension(path);
+    TEXT_LANE_EXTENSIONS.iter().any(|t| *t == ext)
 }
 
 /// The lowercase extension of the basename of `path`, or `""` when it has
 /// none (no dot, a leading-dot-only basename, or a trailing dot).
 pub fn basename_extension(path: &str) -> String {
-    todo!("basename extension: {path}")
+    let base = path.rsplit('/').next().unwrap_or("");
+    match base.rfind('.') {
+        Some(0) | None => String::new(),
+        Some(i) => base[i + 1..].to_ascii_lowercase(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +102,95 @@ pub enum Json {
 /// (order-insensitive), arrays element-wise in order.
 impl PartialEq for Json {
     fn eq(&self, other: &Self) -> bool {
-        todo!("deep equality {self:?} {other:?}")
+        match (self, other) {
+            (Json::Null, Json::Null) => true,
+            (Json::Bool(a), Json::Bool(b)) => a == b,
+            (Json::Int(a), Json::Int(b)) => a == b,
+            (Json::Float(a), Json::Float(b)) => a == b,
+            (Json::Str(a), Json::Str(b)) => a == b,
+            (Json::Arr(a), Json::Arr(b)) => a == b,
+            // Keys are unique (the strict parser refuses duplicates), so equal
+            // length plus "every key of `a` is in `b` with an equal value" is
+            // set equality.
+            (Json::Obj(a), Json::Obj(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(ka, va)| {
+                        b.iter()
+                            .find(|(kb, _)| kb == ka)
+                            .is_some_and(|(_, vb)| va == vb)
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
+struct JsonVisitor;
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Json, E> {
+        Ok(Json::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Json, E> {
+        Ok(Json::Null)
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Json, E> {
+        Ok(Json::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Json, E> {
+        Ok(Json::Int(i128::from(v)))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Json, E> {
+        Ok(Json::Int(i128::from(v)))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Json, E> {
+        Ok(Json::Float(v))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Json, E> {
+        Ok(Json::Str(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Json, E> {
+        Ok(Json::Str(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+        let mut out = Vec::new();
+        while let Some(v) = seq.next_element::<Json>()? {
+            out.push(v);
+        }
+        Ok(Json::Arr(out))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut out: Vec<(String, Json)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(k) = map.next_key::<String>()? {
+            if !seen.insert(k.clone()) {
+                return Err(de::Error::custom(DUP_KEY_MARKER));
+            }
+            let v = map.next_value::<Json>()?;
+            out.push((k, v));
+        }
+        Ok(Json::Obj(out))
+    }
+}
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(JsonVisitor)
     }
 }
 
@@ -110,13 +203,73 @@ pub enum ParseFail {
 
 /// Parse `bytes` as one JSON value, rejecting duplicate object keys.
 pub fn parse_strict(bytes: &[u8]) -> Result<Json, ParseFail> {
-    todo!("strict parse of {} bytes", bytes.len())
+    serde_json::from_slice::<Json>(bytes).map_err(|e| {
+        if e.to_string().contains(DUP_KEY_MARKER) {
+            ParseFail::DuplicateKey
+        } else {
+            ParseFail::Syntax
+        }
+    })
 }
 
 /// A04-9.1a (c): render `v` canonically. `None` when `v` holds a value the
 /// canonical form cannot express (any non-integer number).
 pub fn render_canonical(v: &Json) -> Option<String> {
-    todo!("canonical render {v:?}")
+    let mut out = String::new();
+    render_into(v, &mut out)?;
+    Some(out)
+}
+
+fn render_into(v: &Json, out: &mut String) -> Option<()> {
+    match v {
+        Json::Null => out.push_str("null"),
+        Json::Bool(true) => out.push_str("true"),
+        Json::Bool(false) => out.push_str("false"),
+        Json::Int(i) => out.push_str(&i.to_string()),
+        Json::Float(_) => return None,
+        Json::Str(s) => render_str(s, out),
+        Json::Arr(items) => {
+            out.push('[');
+            for (n, item) in items.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                render_into(item, out)?;
+            }
+            out.push(']');
+        }
+        Json::Obj(entries) => {
+            let mut sorted: Vec<&(String, Json)> = entries.iter().collect();
+            // Ascending order of the keys' UTF-8 bytes (`str` orders by bytes).
+            sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            out.push('{');
+            for (n, (k, val)) in sorted.into_iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                render_str(k, out);
+                out.push(':');
+                render_into(val, out)?;
+            }
+            out.push('}');
+        }
+    }
+    Some(())
+}
+
+/// Escape only `"`, `\` and code points below U+0020 (as lowercase
+/// `\u00xx`); everything else, non-ASCII included, is written raw.
+fn render_str(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 // ---------------------------------------------------------------------------
@@ -194,14 +347,47 @@ pub enum Check {
 impl Check {
     /// The stable label used for counters and logs.
     pub fn label(self) -> &'static str {
-        todo!("label {self:?}")
+        match self {
+            Check::NotFetchedThisProcess => "not_fetched_this_process",
+            Check::MetadataStatus => "metadata_status",
+            Check::MetadataParse => "metadata_parse",
+            Check::MetadataKeys => "metadata_keys",
+            Check::MetadataVersion => "metadata_version",
+            Check::MetadataSha => "metadata_sha",
+            Check::MetadataState => "metadata_state",
+            Check::PolicyVersionUnknown => "policy_version_unknown",
+            Check::ResolvedStatus => "resolved_status",
+            Check::ContentType => "content_type",
+            Check::Etag => "etag",
+            Check::VersionHeader => "version_header",
+            Check::BodySha => "body_sha",
+            Check::DuplicateKey => "duplicate_key",
+            Check::Parse => "parse",
+            Check::CanonicalRender => "canonical_render",
+            Check::ResolvedShape => "resolved_shape",
+            Check::RulesEquality => "rules_equality",
+            Check::GrammarUnsupported => "grammar_unsupported",
+            Check::RuleInvalid => "rule_invalid",
+        }
     }
 
     /// True iff this failure counts as `filter_representation_mismatch{check}`
     /// (A04-9.1a): the resolved route's status, headers or bytes disagree
     /// with the metadata or with the canonical form.
     pub fn is_representation_mismatch(self) -> bool {
-        todo!("is mismatch {self:?}")
+        matches!(
+            self,
+            Check::ResolvedStatus
+                | Check::ContentType
+                | Check::Etag
+                | Check::VersionHeader
+                | Check::BodySha
+                | Check::DuplicateKey
+                | Check::Parse
+                | Check::CanonicalRender
+                | Check::ResolvedShape
+                | Check::RulesEquality
+        )
     }
 }
 
@@ -245,12 +431,162 @@ pub fn evaluate(
     newest_policy_version: Option<u64>,
     grammar: Option<&dyn RuleGrammar>,
 ) -> Evaluation {
-    todo!(
-        "evaluate {} {} {newest_policy_version:?} {}",
-        metadata.status,
-        resolved.status,
-        grammar.is_some()
-    )
+    match evaluate_inner(metadata, resolved, newest_policy_version, grammar) {
+        Ok(Ok(v)) => Evaluation::Valid(v),
+        Ok(Err(r)) => Evaluation::Retry(r),
+        Err(c) => Evaluation::FailedClosed(c),
+    }
+}
+
+type Outcome = Result<Result<ValidFilter, Retry>, Check>;
+
+fn evaluate_inner(
+    metadata: &HttpReply<'_>,
+    resolved: &HttpReply<'_>,
+    newest_policy_version: Option<u64>,
+    grammar: Option<&dyn RuleGrammar>,
+) -> Outcome {
+    // A04-9.1 (a): own id, 200.
+    if metadata.status != 200 {
+        return Err(Check::MetadataStatus);
+    }
+    // A04-9.1 (b): one strict JSON object, keys exactly the five.
+    let meta = parse_strict(metadata.body).map_err(|_| Check::MetadataParse)?;
+    let Json::Obj(meta) = meta else {
+        return Err(Check::MetadataKeys);
+    };
+    if !keys_exactly(&meta, METADATA_KEYS) {
+        return Err(Check::MetadataKeys);
+    }
+    // A04-9.1 (c).
+    let version = match field(&meta, "version") {
+        Some(Json::Int(v)) if *v >= 1 => u64::try_from(*v).map_err(|_| Check::MetadataVersion)?,
+        _ => return Err(Check::MetadataVersion),
+    };
+    let sha = match field(&meta, "sha") {
+        Some(Json::Str(s)) if is_lower_hex_64(s) => s.clone(),
+        _ => return Err(Check::MetadataSha),
+    };
+    match field(&meta, "state") {
+        Some(Json::Str(s)) if s == "active" => {}
+        _ => return Err(Check::MetadataState),
+    }
+    // A04-9.1 (f): newest reported policy version, in this process.
+    let Some(newest) = newest_policy_version else {
+        return Err(Check::PolicyVersionUnknown);
+    };
+    if version > newest {
+        return Ok(Err(Retry::RereadRolloutState));
+    }
+    if version < newest {
+        return Ok(Err(Retry::RefetchMetadata));
+    }
+
+    // A04-9.1a (e): any status other than 200 is "no valid filter".
+    if resolved.status != 200 {
+        return Err(Check::ResolvedStatus);
+    }
+    // A04-9.1a (d), (g): exact headers.
+    if single_header(resolved, "content-type") != Some(RESOLVED_CONTENT_TYPE) {
+        return Err(Check::ContentType);
+    }
+    match single_header(resolved, "etag") {
+        Some(e) if is_lower_hex_64(e) && e == sha => {}
+        _ => return Err(Check::Etag),
+    }
+    match single_header(resolved, VERSION_HEADER).and_then(parse_decimal) {
+        Some(v) if v == version => {}
+        _ => return Err(Check::VersionHeader),
+    }
+    // A04-9.1 (d) / A04-9.1a (f): sha256(body) = ETag = metadata.sha.
+    if hex::encode(Sha256::digest(resolved.body)) != sha {
+        return Err(Check::BodySha);
+    }
+    // A04-9.1a (f): duplicate keys detected by the parser, then the
+    // re-render must be byte-identical to what was received.
+    let body = parse_strict(resolved.body).map_err(|e| match e {
+        ParseFail::DuplicateKey => Check::DuplicateKey,
+        ParseFail::Syntax => Check::Parse,
+    })?;
+    match render_canonical(&body) {
+        Some(r) if r.as_bytes() == resolved.body => {}
+        _ => return Err(Check::CanonicalRender),
+    }
+    // A04-9.1a (b): exactly {grammar_version >= 1, rules: array}.
+    let Json::Obj(body) = body else {
+        return Err(Check::ResolvedShape);
+    };
+    if !keys_exactly(&body, RESOLVED_KEYS) {
+        return Err(Check::ResolvedShape);
+    }
+    let grammar_version = match field(&body, "grammar_version") {
+        Some(Json::Int(g)) if *g >= 1 => *g,
+        _ => return Err(Check::ResolvedShape),
+    };
+    let rules = match field(&body, "rules") {
+        Some(Json::Arr(r)) => r.clone(),
+        _ => return Err(Check::ResolvedShape),
+    };
+    // A04-9.1a (f): body rules equal metadata rules as parsed values.
+    match field(&meta, "rules") {
+        Some(Json::Arr(m)) if *m == rules => {}
+        _ => return Err(Check::RulesEquality),
+    }
+    // A04-9.1 (e): the grammar this build implements.
+    let Some(g) = grammar else {
+        return Err(Check::GrammarUnsupported);
+    };
+    if g.grammar_version() != grammar_version {
+        return Err(Check::GrammarUnsupported);
+    }
+    if g.check_rules(&rules).is_err() {
+        return Err(Check::RuleInvalid);
+    }
+    Ok(Ok(ValidFilter {
+        version,
+        sha,
+        grammar_version,
+        rules,
+    }))
+}
+
+fn field<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    obj.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// The object's keys are exactly `want` (no more, no fewer; keys are unique).
+fn keys_exactly(obj: &[(String, Json)], want: &[&str]) -> bool {
+    obj.len() == want.len() && want.iter().all(|w| field(obj, w).is_some())
+}
+
+fn is_lower_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A header value, iff the header (case-insensitive name) is present exactly
+/// once.
+fn single_header<'a>(reply: &HttpReply<'a>, name: &str) -> Option<&'a str> {
+    let mut found = reply
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| *v);
+    let first = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Minimal decimal form only: ASCII digits, no sign, no leading zero.
+fn parse_decimal(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -294,36 +630,69 @@ impl Default for BlobFilterGate {
 impl BlobFilterGate {
     /// A04-9.3: a new process is `failed_closed` until A04-9.1 holds again.
     pub fn new() -> Self {
-        todo!("new gate")
+        Self {
+            current: None,
+            last_failure: Some(Check::NotFetchedThisProcess),
+            counters: FilterCounters::default(),
+        }
     }
 
     /// Fold one evaluation into the state. A failure drops any previously
     /// valid filter (A04-9.3: a sha mismatch is `failed_closed`); a
     /// [`Retry`] changes nothing (A04-9.1 (f): neither case alone pages).
     pub fn apply(&mut self, eval: Evaluation) -> BlobFilterStatus {
-        todo!("apply {eval:?}")
+        match eval {
+            Evaluation::Valid(f) => {
+                self.current = Some(f);
+                self.last_failure = None;
+            }
+            Evaluation::FailedClosed(check) => {
+                self.current = None;
+                self.last_failure = Some(check);
+                self.counters.failed_closed = self.counters.failed_closed.saturating_add(1);
+                if check.is_representation_mismatch() {
+                    let n = self
+                        .counters
+                        .filter_representation_mismatch
+                        .entry(check.label())
+                        .or_insert(0);
+                    *n = n.saturating_add(1);
+                }
+                tracing::warn!(
+                    target: "vault_sync_daemon::blob_filter",
+                    check = check.label(),
+                    "blob_filter: effective filter FAILED CLOSED (no blob-lane action; text lane unaffected)"
+                );
+            }
+            Evaluation::Retry(_) => {}
+        }
+        self.status()
     }
 
     pub fn status(&self) -> BlobFilterStatus {
-        todo!("status")
+        if self.current.is_some() {
+            BlobFilterStatus::Valid
+        } else {
+            BlobFilterStatus::FailedClosed
+        }
     }
 
     pub fn last_failure(&self) -> Option<Check> {
-        todo!("last failure")
+        self.last_failure
     }
 
     pub fn valid_filter(&self) -> Option<&ValidFilter> {
-        todo!("valid filter")
+        self.current.as_ref()
     }
 
     pub fn counters(&self) -> &FilterCounters {
-        todo!("counters")
+        &self.counters
     }
 
     /// A04-9.6: this build has no blob client, so no path is routed to the
     /// blob lane whatever the filter state.
     pub fn routes_blob_lane(&self) -> bool {
-        todo!("routes blob lane")
+        false
     }
 }
 

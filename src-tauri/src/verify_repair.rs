@@ -203,6 +203,16 @@ pub struct VerifyRepairReport {
     /// path's current sha equals its ledgered rejected sha.
     #[serde(default)]
     pub rejected_skipped_count: usize,
+    /// TKT-dfbd1580 A04-9.6: walked paths that are not text lane, dropped
+    /// before the manifest (and so before the note push journal) whatever
+    /// `allowed_extensions` says. Also counted in `extension_filtered_count`.
+    #[serde(default)]
+    pub nonmd_unrouted_count: usize,
+    /// TKT-dfbd1580 A04-7.2: reconcile answers for a non-text-lane path,
+    /// by state. Each caused no delete, no pull and no push
+    /// (`blob_note_vocab_answer{state}`).
+    #[serde(default)]
+    pub blob_note_vocab_answer: std::collections::BTreeMap<String, u64>,
     pub errors: Vec<(String, String)>,
     pub elapsed_ms: u64,
 
@@ -326,6 +336,30 @@ pub fn decide_direction(
     }
 }
 
+/// TKT-dfbd1580 A04-7.2: [`decide_direction`] for one reconcile item, with
+/// the lane guard. A non-text-lane path gets `None` for EVERY state: no
+/// delete, no pull, no push (`Direction::DeleteLocal` is unreachable for it).
+/// This build has no blob lane (A04-9.6), so no `lane: "blob"` answer is
+/// acted on either; the blob-client PR narrows this to items carrying
+/// `lane: "blob"` with a blob-vocabulary state.
+pub fn decide_direction_for_path(
+    path: &str,
+    state: &str,
+    local_hash: &str,
+    server_hash: Option<&str>,
+    shadow_hash: Option<&str>,
+) -> Option<Direction> {
+    if !crate::blob_filter::is_text_lane(path) {
+        return None;
+    }
+    Some(decide_direction(
+        state,
+        local_hash,
+        server_hash,
+        shadow_hash,
+    ))
+}
+
 /// AR-003 (TKT-c41c2225): classification of one server-wins pull's result for
 /// failure-honest accounting. PURE (table-tested) so the RED-cycle gate can be
 /// reasoned about without a live server.
@@ -416,6 +450,9 @@ pub struct VerifyRepair {
     /// walk, before the reconcile request and immediately before the single
     /// `append_batch`. `None` (the backstop, tests): never stops.
     live: Option<tokio::sync::watch::Receiver<crate::supervise::Liveness>>,
+    /// TKT-dfbd1580 A04-7.2: once-per-path-per-day dedup for the
+    /// `blob_note_vocab_answer` log line.
+    vocab_answer_log: std::sync::Mutex<crate::file_watcher::DropLogOnce>,
 }
 
 /// CS-3 T-CS3-16: V&R reached its park seam (between the manifest walk and
@@ -443,6 +480,9 @@ impl VerifyRepair {
             retry_ledger: None,
             rejected_ledger: None,
             live: None,
+            vocab_answer_log: std::sync::Mutex::new(crate::file_watcher::DropLogOnce::new(
+                crate::file_watcher::DROP_LOG_CAP,
+            )),
         }
     }
 
@@ -569,12 +609,36 @@ impl VerifyRepair {
                 .map(|m| m.content_hash.as_str())
                 .unwrap_or("");
             let shadow_hash = self.shadow.as_ref().and_then(|s| s.get(&delta.path));
-            let dir = decide_direction(
+            let Some(dir) = decide_direction_for_path(
+                &delta.path,
                 &delta.state,
                 local_hash,
                 server_hash,
                 shadow_hash.as_deref(),
-            );
+            ) else {
+                // TKT-dfbd1580 A04-7.2: a note-vocabulary answer for a
+                // non-text-lane path. No delete, no pull, no push; counted,
+                // logged once per path per day.
+                let n = report
+                    .blob_note_vocab_answer
+                    .entry(delta.state.clone())
+                    .or_insert(0);
+                *n = n.saturating_add(1);
+                let day = chrono::Utc::now().timestamp().div_euclid(86_400);
+                let log = self
+                    .vocab_answer_log
+                    .lock()
+                    .map(|mut d| d.should_log(&delta.path, day))
+                    .unwrap_or(true);
+                if log {
+                    tracing::warn!(
+                        path = %delta.path,
+                        state = %delta.state,
+                        "reconcile-batch: answer for a non-text-lane path IGNORED (A04-7.2 blob_note_vocab_answer; no delete, pull or push)"
+                    );
+                }
+                continue;
+            };
 
             match dir {
                 Direction::Push => {
@@ -1120,7 +1184,15 @@ impl VerifyRepair {
                 }
             }
 
-            // Extension gate.
+            // Extension gate. TKT-dfbd1580 A04-9.6: a non-text-lane path is
+            // dropped whatever `allowed_extensions` says (the configured list
+            // can only narrow the text lane; `""` would otherwise suffix-match
+            // every path).
+            if !crate::blob_filter::is_text_lane(&rel_str) {
+                report.extension_filtered_count += 1;
+                report.nonmd_unrouted_count += 1;
+                continue;
+            }
             if !ext_allowed(&rel_str, &self.config.allowed_extensions) {
                 report.extension_filtered_count += 1;
                 continue;

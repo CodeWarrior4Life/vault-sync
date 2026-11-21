@@ -532,7 +532,13 @@ impl FileWatcher {
                 match &decision {
                     FilterDecision::Allow(_) => {}
                     FilterDecision::DropSubstrate { .. } => w.inc_events_dropped_substrate(),
-                    FilterDecision::DropExtension { .. } => w.inc_events_dropped_extension(),
+                    FilterDecision::DropExtension { path, .. } => {
+                        w.inc_events_dropped_extension();
+                        // TKT-dfbd1580 A04-9.6: counted `nonmd_unrouted`.
+                        if !crate::blob_filter::is_text_lane(path) {
+                            w.inc_events_dropped_nonmd_unrouted();
+                        }
+                    }
                     FilterDecision::DropOutOfScope { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropExclude { .. } => w.inc_events_dropped_excludes(),
                     FilterDecision::DropDeleteBurst { .. } => w.inc_events_filtered(),
@@ -555,7 +561,15 @@ impl FileWatcher {
         let (rule, path): (String, &str) = match decision {
             FilterDecision::Allow(_) | FilterDecision::DropDeleteBurst { .. } => return,
             FilterDecision::DropSubstrate { path, rule } => (format!("substrate:{rule}"), path),
-            FilterDecision::DropExtension { path, ext } => (format!("extension:{ext}"), path),
+            FilterDecision::DropExtension { path, ext } => {
+                // TKT-dfbd1580 A04-9.6: name the first-PR gate for a
+                // non-text-lane path.
+                if crate::blob_filter::is_text_lane(path) {
+                    (format!("extension:{ext}"), path)
+                } else {
+                    (format!("nonmd_unrouted:{ext}"), path)
+                }
+            }
             FilterDecision::DropOutOfScope { path } => ("out_of_scope".to_string(), path),
             FilterDecision::DropChunkPseudo { path } => ("chunk_pseudo".to_string(), path),
             FilterDecision::DropExclude { path, exclude_rule } => {
@@ -735,13 +749,21 @@ impl FileWatcher {
             return FilterDecision::DropChunkPseudo { path: norm };
         }
 
-        // (5) Extension gate.
+        // (5) Extension gate. TKT-dfbd1580 A04-9.6 (first-PR gate): a path
+        // that is not positively text lane (`.md` / `.canvas`) is dropped
+        // here, before the note push journal and before delete
+        // classification, whatever `allowed_extensions` says: the configured
+        // list can only NARROW the text lane, never widen it (an empty entry,
+        // a wildcard or a non-md extension in it admits nothing extra). The
+        // drop keeps the `DropExtension` shape; `classify_and_count` counts
+        // it `nonmd_unrouted` as well.
         let ext = path_extension(&norm).to_ascii_lowercase();
-        let allowed = self
-            .config
-            .allowed_extensions
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&ext));
+        let allowed = crate::blob_filter::is_text_lane(&norm)
+            && self
+                .config
+                .allowed_extensions
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&ext));
         if !allowed {
             return FilterDecision::DropExtension { path: norm, ext };
         }
