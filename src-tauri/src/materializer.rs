@@ -2153,18 +2153,17 @@ impl Materializer {
         let now = chrono::Utc::now();
         let ts = now.format("%Y%m%dT%H%M%SZ");
         let nanos = now.timestamp_subsec_nanos();
-        let mut renamed = target.with_file_name(format!(
-            "{}.deleted-{ts}-{nanos:09}",
-            target.file_name().unwrap().to_string_lossy()
-        ));
+        // TKT-1643aae4: the tombstone name is capped at NAME_MAX (255 bytes);
+        // see tombstone_file_name.
+        let ts = ts.to_string();
+        let base_name = target.file_name().unwrap().to_string_lossy();
+        let mut renamed = target.with_file_name(tombstone_file_name(&base_name, &ts, nanos, None));
         // Defensive: if that exact name somehow already exists, append a small
         // counter so we never clobber an earlier preserved deletion.
         if renamed.exists() {
             for n in 2u32..u32::MAX {
-                let candidate = target.with_file_name(format!(
-                    "{}.deleted-{ts}-{nanos:09}-{n}",
-                    target.file_name().unwrap().to_string_lossy()
-                ));
+                let candidate =
+                    target.with_file_name(tombstone_file_name(&base_name, &ts, nanos, Some(n)));
                 if !candidate.exists() {
                     renamed = candidate;
                     break;
@@ -2192,6 +2191,50 @@ impl Materializer {
         info!(from = %target.display(), to = %renamed.display(), "soft_delete done");
         Ok(())
     }
+}
+
+/// TKT-1643aae4: Linux NAME_MAX, in BYTES. A tombstone name longer than this
+/// fails the soft-delete rename with ENAMETOOLONG (os error 36) on every retry.
+const TOMBSTONE_NAME_MAX: usize = 255;
+/// Longest tail extension (dot included) kept intact when the stem is cut.
+/// Anything longer is treated as part of the stem.
+const TOMBSTONE_MAX_EXT: usize = 16;
+
+/// TKT-1643aae4: build the soft-delete tombstone file name for `base`
+/// (`<base>.deleted-<ts>-<nanos:09>[-<n>]`), guaranteed <= 255 bytes for any
+/// sane `ts` (the 16-byte `%Y%m%dT%H%M%SZ` form used by soft_delete).
+///
+/// Names that fit are byte-for-byte the legacy format. Longer names keep the
+/// tail extension and the full suffix, and cut the stem on a UTF-8 char
+/// boundary, inserting `~<hash8>` (first 8 hex chars of sha256 of the FULL
+/// original name) so two long names sharing a prefix cannot collide:
+/// `<stem_cut>~<hash8><.ext>.deleted-<ts>-<nanos:09>[-<n>]`. Pure, no I/O.
+pub(crate) fn tombstone_file_name(
+    base: &str,
+    ts: &str,
+    nanos: u32,
+    collision: Option<u32>,
+) -> String {
+    let suffix = match collision {
+        None => format!(".deleted-{ts}-{nanos:09}"),
+        Some(n) => format!(".deleted-{ts}-{nanos:09}-{n}"),
+    };
+    if base.len() + suffix.len() <= TOMBSTONE_NAME_MAX {
+        return format!("{base}{suffix}");
+    }
+    let digest = hex::encode(Sha256::digest(base.as_bytes()));
+    let hash8 = &digest[..8];
+    // A leading dot is not an extension separator (dotfile = all stem).
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 && base.len() - i <= TOMBSTONE_MAX_EXT => base.split_at(i),
+        _ => (base, ""),
+    };
+    let fixed = suffix.len() + 1 + hash8.len() + ext.len();
+    let mut cut = TOMBSTONE_NAME_MAX.saturating_sub(fixed).min(stem.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}~{hash8}{ext}{suffix}", &stem[..cut])
 }
 
 /// D2 (S511, TKT-2dc9a17e): the unified push-vs-pull-vs-conflict verdict for a
@@ -3418,6 +3461,172 @@ mod tests {
         // no target present it is a no-op Ok (same as any missing content path).
         let (_v, _w, m) = mk(MaterializerMode::Shadow, default_cfg());
         assert!(m.soft_delete("00_VAULT.md").is_ok());
+    }
+
+    // ---- TKT-1643aae4: tombstone name capped at NAME_MAX ------------------
+
+    const TS: &str = "20261121T120000Z";
+    const NANOS: u32 = 123_456_789;
+
+    /// Today's (pre-fix) format, which short names must keep byte for byte.
+    fn legacy_tombstone(base: &str, collision: Option<u32>) -> String {
+        match collision {
+            None => format!("{base}.deleted-{TS}-{NANOS:09}"),
+            Some(n) => format!("{base}.deleted-{TS}-{NANOS:09}-{n}"),
+        }
+    }
+
+    fn assert_capped(name: &str) {
+        assert!(
+            name.len() <= 255,
+            "tombstone is {} bytes: {name}",
+            name.len()
+        );
+        assert!(name.contains(".deleted-"), "lost .deleted- marker: {name}");
+    }
+
+    #[test]
+    fn tombstone_name_short_name_unchanged() {
+        let got = tombstone_file_name("foo.md", TS, NANOS, None);
+        assert_eq!(got, "foo.md.deleted-20261121T120000Z-123456789");
+        assert_eq!(got, legacy_tombstone("foo.md", None));
+    }
+
+    #[test]
+    fn tombstone_name_exactly_at_limit_unchanged() {
+        // 35-byte suffix + 220-byte base = 255 bytes total.
+        let base = format!("{}.md", "a".repeat(217));
+        assert_eq!(base.len(), 220);
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_eq!(got.len(), 255);
+        assert_eq!(got, legacy_tombstone(&base, None));
+    }
+
+    #[test]
+    fn tombstone_name_one_byte_over_is_capped() {
+        let base = format!("{}.md", "a".repeat(218));
+        assert_eq!(base.len(), 221);
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_capped(&got);
+        assert_ne!(got, legacy_tombstone(&base, None));
+        assert!(got.contains(".md.deleted-"), "extension kept: {got}");
+        assert!(got.ends_with(&format!(".deleted-{TS}-{NANOS:09}")));
+    }
+
+    #[test]
+    fn tombstone_name_real_225_byte_case_is_capped() {
+        let base = format!("{}.md", "n".repeat(222));
+        assert_eq!(base.len(), 225);
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_capped(&got);
+        assert!(got.contains(".md.deleted-"));
+        let hash8 = &hex::encode(Sha256::digest(base.as_bytes()))[..8];
+        assert!(got.contains(&format!("~{hash8}.md.deleted-")), "{got}");
+    }
+
+    #[test]
+    fn tombstone_name_multibyte_never_splits_a_char() {
+        // 3-byte (U+20AC) and 4-byte (U+1F600) chars; 2 + 3*n + 4*n offsets
+        // make a naive byte cut land mid-char for most budgets.
+        for pad in 0..8 {
+            let stem = format!("{}{}", "x".repeat(pad), "\u{20AC}\u{1F600}".repeat(60));
+            let base = format!("{stem}.md");
+            assert!(base.len() > 255);
+            for collision in [None, Some(2), Some(999_999), Some(u32::MAX)] {
+                let got = tombstone_file_name(&base, TS, NANOS, collision);
+                assert_capped(&got);
+                assert!(got.contains(".md.deleted-"));
+                // String guarantees valid UTF-8; also round-trip the bytes.
+                assert!(std::str::from_utf8(got.as_bytes()).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn tombstone_name_shared_prefix_long_names_differ() {
+        let prefix = "p".repeat(280);
+        let a = format!("{prefix}{}.md", "a".repeat(17));
+        let b = format!("{prefix}{}.md", "b".repeat(17));
+        assert_eq!(a.len(), 300);
+        assert_eq!(b.len(), 300);
+        let ta = tombstone_file_name(&a, TS, NANOS, None);
+        let tb = tombstone_file_name(&b, TS, NANOS, None);
+        assert_capped(&ta);
+        assert_capped(&tb);
+        assert_ne!(ta, tb, "shared-prefix long names must not collide");
+    }
+
+    #[test]
+    fn tombstone_name_collision_counter_capped() {
+        let base = format!("{}.md", "c".repeat(250));
+        for n in [2u32, 999_999, u32::MAX] {
+            let got = tombstone_file_name(&base, TS, NANOS, Some(n));
+            assert_capped(&got);
+            assert!(
+                got.ends_with(&format!(".deleted-{TS}-{NANOS:09}-{n}")),
+                "{got}"
+            );
+        }
+        // Short names keep the legacy collision format exactly.
+        assert_eq!(
+            tombstone_file_name("foo.md", TS, NANOS, Some(2)),
+            legacy_tombstone("foo.md", Some(2))
+        );
+    }
+
+    #[test]
+    fn tombstone_name_without_extension_capped() {
+        let base = "z".repeat(240);
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_capped(&got);
+        let hash8 = &hex::encode(Sha256::digest(base.as_bytes()))[..8];
+        assert!(got.contains(&format!("~{hash8}.deleted-")), "{got}");
+    }
+
+    #[test]
+    fn tombstone_name_dotfile_only_capped() {
+        // A leading dot is not an extension separator: the whole name is stem.
+        let base = format!(".{}", "d".repeat(239));
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_capped(&got);
+        assert!(got.starts_with(".ddd"), "{got}");
+        // Short dotfile: unchanged.
+        assert_eq!(
+            tombstone_file_name(".obsidian", TS, NANOS, None),
+            legacy_tombstone(".obsidian", None)
+        );
+    }
+
+    /// End to end: a 225-byte note name (260-byte legacy tombstone) used to
+    /// fail the rename with ENAMETOOLONG and retry forever.
+    #[test]
+    fn soft_delete_long_name_retires_note() {
+        let (vaults, _ws, m) = mk(MaterializerMode::Live, default_cfg());
+        let name = format!("{}.md", "L".repeat(222));
+        assert_eq!(name.len(), 225);
+        let wire = format!("{VAULT}/01_Inbox/{name}");
+        let target = vaults.path().join(&wire);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "long name body").unwrap();
+
+        let res = m.soft_delete(&wire);
+        assert!(res.is_ok(), "soft_delete failed: {res:?}");
+
+        let dir = vaults.path().join(VAULT).join("01_Inbox");
+        assert!(!target.exists(), "original must be gone");
+        let tombs: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".deleted-"))
+            .collect();
+        assert_eq!(tombs.len(), 1, "exactly one tombstone: {tombs:?}");
+        assert!(tombs[0].len() <= 255);
+        assert!(tombs[0].contains(".md.deleted-"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&tombs[0])).unwrap(),
+            "long name body"
+        );
     }
 
     // ---- TKT-6222df34: delete-leg conflict stash ---------------------------
