@@ -561,15 +561,7 @@ impl FileWatcher {
         let (rule, path): (String, &str) = match decision {
             FilterDecision::Allow(_) | FilterDecision::DropDeleteBurst { .. } => return,
             FilterDecision::DropSubstrate { path, rule } => (format!("substrate:{rule}"), path),
-            FilterDecision::DropExtension { path, ext } => {
-                // TKT-dfbd1580 A04-9.6: name the first-PR gate for a
-                // non-text-lane path.
-                if crate::blob_filter::is_text_lane(path) {
-                    (format!("extension:{ext}"), path)
-                } else {
-                    (format!("nonmd_unrouted:{ext}"), path)
-                }
-            }
+            FilterDecision::DropExtension { path, ext } => (format!("extension:{ext}"), path),
             FilterDecision::DropOutOfScope { path } => ("out_of_scope".to_string(), path),
             FilterDecision::DropChunkPseudo { path } => ("chunk_pseudo".to_string(), path),
             FilterDecision::DropExclude { path, exclude_rule } => {
@@ -581,11 +573,17 @@ impl FileWatcher {
             .lock()
             .map(|mut d| d.should_log(path, day))
             .unwrap_or(true);
+        // TKT-dfbd1580 A04-9.6: the rule label is unchanged for existing log
+        // consumers; a non-text-lane extension drop also carries
+        // `nonmd_unrouted=true`.
+        let nonmd_unrouted = matches!(decision, FilterDecision::DropExtension { .. })
+            && !crate::blob_filter::is_text_lane(path);
         if should {
             tracing::info!(
                 target: "vault_sync_daemon::file_watcher",
                 rule = %rule,
                 path = %path,
+                nonmd_unrouted,
                 "file_watcher: event DROPPED by filter (not pushed; logged once per path per day, counted in tray state)"
             );
         }
@@ -3791,7 +3789,7 @@ mod tests {
     /// A04-9.6: the INFO drop line names the `nonmd_unrouted` rule for a
     /// non-text-lane path (A02-8.5 "log at INFO once per path per day").
     #[test]
-    fn a04_9_6_nonmd_drop_logs_the_nonmd_unrouted_rule() {
+    fn a04_9_6_nonmd_drop_logs_the_nonmd_unrouted_field() {
         #[derive(Clone, Default)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -3821,12 +3819,14 @@ mod tests {
         let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let png: Vec<&str> = log.lines().filter(|l| l.contains("x/pic.png")).collect();
         assert_eq!(png.len(), 1, "{log}");
-        assert!(png[0].contains("nonmd_unrouted:png"), "{log}");
+        assert!(png[0].contains("rule=extension:png"), "{log}");
+        assert!(png[0].contains("nonmd_unrouted=true"), "{log}");
         let canvas: Vec<&str> = log
             .lines()
             .filter(|l| l.contains("x/board.canvas"))
             .collect();
         assert_eq!(canvas.len(), 1, "{log}");
-        assert!(canvas[0].contains("extension:canvas"), "{log}");
+        assert!(canvas[0].contains("rule=extension:canvas"), "{log}");
+        assert!(canvas[0].contains("nonmd_unrouted=false"), "{log}");
     }
 }

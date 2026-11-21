@@ -450,9 +450,26 @@ pub struct VerifyRepair {
     /// walk, before the reconcile request and immediately before the single
     /// `append_batch`. `None` (the backstop, tests): never stops.
     live: Option<tokio::sync::watch::Receiver<crate::supervise::Liveness>>,
-    /// TKT-dfbd1580 A04-7.2: once-per-path-per-day dedup for the
-    /// `blob_note_vocab_answer` log line.
-    vocab_answer_log: std::sync::Mutex<crate::file_watcher::DropLogOnce>,
+}
+
+/// TKT-dfbd1580 A04-7.2: the once-per-path-per-day dedup set for the
+/// `blob_note_vocab_answer` log line. Process-lifetime (a `VerifyRepair` is
+/// built per pass, so a per-instance set would log every pass).
+fn vocab_answer_log() -> &'static std::sync::Mutex<crate::file_watcher::DropLogOnce> {
+    static LOG: std::sync::OnceLock<std::sync::Mutex<crate::file_watcher::DropLogOnce>> =
+        std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        std::sync::Mutex::new(crate::file_watcher::DropLogOnce::new(
+            crate::file_watcher::DROP_LOG_CAP,
+        ))
+    })
+}
+
+fn vocab_answer_should_log(path: &str, day: i64) -> bool {
+    vocab_answer_log()
+        .lock()
+        .map(|mut d| d.should_log(path, day))
+        .unwrap_or(true)
 }
 
 /// CS-3 T-CS3-16: V&R reached its park seam (between the manifest walk and
@@ -480,9 +497,6 @@ impl VerifyRepair {
             retry_ledger: None,
             rejected_ledger: None,
             live: None,
-            vocab_answer_log: std::sync::Mutex::new(crate::file_watcher::DropLogOnce::new(
-                crate::file_watcher::DROP_LOG_CAP,
-            )),
         }
     }
 
@@ -625,12 +639,7 @@ impl VerifyRepair {
                     .or_insert(0);
                 *n = n.saturating_add(1);
                 let day = chrono::Utc::now().timestamp().div_euclid(86_400);
-                let log = self
-                    .vocab_answer_log
-                    .lock()
-                    .map(|mut d| d.should_log(&delta.path, day))
-                    .unwrap_or(true);
-                if log {
+                if vocab_answer_should_log(&delta.path, day) {
                     tracing::warn!(
                         path = %delta.path,
                         state = %delta.state,
@@ -2808,5 +2817,13 @@ mod tests {
             decide_direction_for_path("n/a.canvas", "missing-on-server", "l", None, None),
             Some(Direction::Push)
         );
+    }
+
+    /// TKT-dfbd1580 A04-7.2: the log dedup outlives one `VerifyRepair`
+    /// (built per pass): every pass shares one process-wide set, whose
+    /// once-per-path-per-day logic is `DropLogOnce` (tested in file_watcher).
+    #[test]
+    fn a04_7_2_vocab_answer_log_is_process_wide() {
+        assert!(std::ptr::eq(vocab_answer_log(), vocab_answer_log()));
     }
 }

@@ -32,9 +32,12 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// A04-9.6 / A02-8.2 step 2: the text-lane extensions (lowercase, no dot).
-/// The match is case-insensitive, as the shipped watcher gate is
-/// (`file_watcher.rs` extension gate, `eq_ignore_ascii_case`).
+/// A04-9.6: the text-lane extensions (lowercase, no dot). The match is
+/// case-INsensitive, as the shipped watcher gate is (`file_watcher.rs`
+/// extension gate, `eq_ignore_ascii_case`). Recorded divergence: A02-8.2
+/// step 2 states the split case-sensitive; this PR keeps the shipped
+/// behaviour so `Foo.MD` keeps syncing, and the item-3 `classify` PR owns
+/// the ruling.
 pub const TEXT_LANE_EXTENSIONS: &[&str] = &["md", "canvas"];
 
 /// A04-9.1a (f): a version race is refetched at most this many times, then
@@ -67,7 +70,7 @@ const DUP_KEY_MARKER: &str = "nexus-sync-duplicate-object-key";
 /// are NOT text lane. Anything not positively text lane is non-text lane.
 pub fn is_text_lane(path: &str) -> bool {
     let ext = basename_extension(path);
-    TEXT_LANE_EXTENSIONS.iter().any(|t| *t == ext)
+    TEXT_LANE_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// The lowercase extension of the basename of `path`, or `""` when it has
@@ -640,6 +643,13 @@ impl BlobFilterGate {
     /// Fold one evaluation into the state. A failure drops any previously
     /// valid filter (A04-9.3: a sha mismatch is `failed_closed`); a
     /// [`Retry`] changes nothing (A04-9.1 (f): neither case alone pages).
+    ///
+    /// Contract for the fetch layer (A04-9.1a (f)): a version race (metadata
+    /// at V, resolved at V+1) evaluates to a representation mismatch
+    /// (`version_header`, `etag` or `body_sha`). The caller MUST refetch both
+    /// representations, up to [`MAX_REPRESENTATION_REFETCH`] times, BEFORE
+    /// passing such a failure here: `apply` does not know it was a race and
+    /// will clear a valid filter and count `failed_closed`.
     pub fn apply(&mut self, eval: Evaluation) -> BlobFilterStatus {
         match eval {
             Evaluation::Valid(f) => {
@@ -930,7 +940,8 @@ mod tests {
 
     #[test]
     fn a04_9_1_e_this_build_implements_no_grammar_so_nothing_is_valid() {
-        assert!(IMPLEMENTED_GRAMMAR.is_none());
+        let g = IMPLEMENTED_GRAMMAR;
+        assert!(g.is_none());
         assert_eq!(
             failed(good().run(IMPLEMENTED_GRAMMAR)),
             Check::GrammarUnsupported
@@ -1307,6 +1318,36 @@ mod tests {
         assert_eq!(gate.counters().failed_closed, 1);
     }
 
+    /// Pins the constant: this build routes nothing to the blob lane even
+    /// with a valid filter (A04-9.6). It proves no more than that constant.
+    /// A04-9.1a (f) contract pin: `apply` of a race-shaped failure (resolved
+    /// header at V+1, metadata at V) clears a valid filter and counts
+    /// failed_closed. The fetch layer must exhaust its refetches first.
+    #[test]
+    fn a04_9_1a_f_apply_of_a_version_race_failure_clears_and_counts() {
+        let mut gate = BlobFilterGate::new();
+        assert_eq!(
+            gate.apply(good().run(Some(&TestGrammar))),
+            BlobFilterStatus::Valid
+        );
+        let mut race = good();
+        race.version_header = "2".into();
+        assert_eq!(
+            gate.apply(race.run(Some(&TestGrammar))),
+            BlobFilterStatus::FailedClosed
+        );
+        assert!(gate.valid_filter().is_none());
+        assert_eq!(gate.last_failure(), Some(Check::VersionHeader));
+        assert_eq!(gate.counters().failed_closed, 1);
+        assert_eq!(
+            gate.counters()
+                .filter_representation_mismatch
+                .get("version_header")
+                .copied(),
+            Some(1)
+        );
+    }
+
     #[test]
     fn a04_9_6_a_valid_filter_still_routes_nothing_to_the_blob_lane() {
         let mut gate = BlobFilterGate::new();
@@ -1371,6 +1412,20 @@ mod tests {
             );
             assert_eq!(c.is_representation_mismatch(), expect, "{c:?}");
         }
+    }
+
+    /// A body nested deeper than the parser's recursion limit (128), with a
+    /// matching sha, ETag and version, reaches the parser and fails closed
+    /// as `parse` without a panic or a stack overflow.
+    #[test]
+    fn a04_9_no_panic_on_deep_nesting_that_reaches_the_parser() {
+        let deep = format!(
+            r#"{{"grammar_version":1,"rules":{}{}}}"#,
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        let c = with_body(&deep);
+        assert_eq!(failed(c.run(Some(&TestGrammar))), Check::Parse);
     }
 
     /// No panic on any malformed input: a sweep of hostile bodies through

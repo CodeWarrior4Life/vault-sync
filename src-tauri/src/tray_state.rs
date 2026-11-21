@@ -286,9 +286,10 @@ impl TrayState {
         self.events_dropped_nonmd_unrouted = self.events_dropped_nonmd_unrouted.saturating_add(1);
     }
 
-    /// TKT-dfbd1580 A04-9.2: record the effective-filter state.
-    pub fn set_blob_filter_status(&mut self, status: crate::blob_filter::BlobFilterStatus) {
-        self.blob_filter_status = status;
+    /// TKT-dfbd1580 A04-9.2: mirror the effective-filter state from the
+    /// gate. The only way to report `valid` is a gate that evaluated valid.
+    pub fn sync_blob_filter_status(&mut self, gate: &crate::blob_filter::BlobFilterGate) {
+        self.blob_filter_status = gate.status();
     }
 
     /// TKT-dfbd1580 A04-9.2: the effective-filter state and the
@@ -668,10 +669,10 @@ mod tests {
         let json = serde_json::to_value(s.blob_filter_health()).unwrap();
         assert_eq!(json["state"], "failed_closed");
         assert_eq!(json["nonmd_unrouted"], 1);
-        s.set_blob_filter_status(crate::blob_filter::BlobFilterStatus::Valid);
+        s.sync_blob_filter_status(&crate::blob_filter::BlobFilterGate::new());
         assert_eq!(
             s.blob_filter_health().state,
-            crate::blob_filter::BlobFilterStatus::Valid
+            crate::blob_filter::BlobFilterStatus::FailedClosed
         );
     }
 }
