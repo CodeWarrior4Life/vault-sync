@@ -603,4 +603,34 @@ mod tests {
         assert!(s.delete_burst_paused);
         assert_eq!(s.uploads_pending, 3);
     }
+
+    /// TKT-dfbd1580 A04-9.6: `nonmd_unrouted` is a sub-counter of the
+    /// extension drop; it never bumps the filtered rollup on its own.
+    #[test]
+    fn a04_9_6_nonmd_unrouted_is_a_sub_counter() {
+        let mut s = fresh();
+        assert_eq!(s.events_dropped_nonmd_unrouted, 0);
+        s.inc_events_dropped_nonmd_unrouted();
+        assert_eq!(s.events_dropped_nonmd_unrouted, 1);
+        assert_eq!(s.events_filtered, 0);
+    }
+
+    /// TKT-dfbd1580 A04-9.2: the status snapshot reports `failed_closed`
+    /// from start (A04-9.3) with the `nonmd_unrouted` count.
+    #[test]
+    fn a04_9_2_blob_filter_health_reports_failed_closed_from_start() {
+        let mut s = fresh();
+        let h = s.blob_filter_health();
+        assert_eq!(h.state, crate::blob_filter::BlobFilterStatus::FailedClosed);
+        assert_eq!(h.nonmd_unrouted, 0);
+        s.inc_events_dropped_nonmd_unrouted();
+        let json = serde_json::to_value(s.blob_filter_health()).unwrap();
+        assert_eq!(json["state"], "failed_closed");
+        assert_eq!(json["nonmd_unrouted"], 1);
+        s.set_blob_filter_status(crate::blob_filter::BlobFilterStatus::Valid);
+        assert_eq!(
+            s.blob_filter_health().state,
+            crate::blob_filter::BlobFilterStatus::Valid
+        );
+    }
 }

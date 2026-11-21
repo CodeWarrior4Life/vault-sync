@@ -2640,4 +2640,101 @@ mod tests {
         );
         assert_eq!(journal.len(), 1);
     }
+
+    // ---- TKT-dfbd1580, A-04: fail-closed filter -----------------------------
+
+    /// A04-9.6, no silent widening on the reconcile walk: a configured list
+    /// that would match everything (`""` is a suffix of every path) still
+    /// manifests only text-lane paths; the rest count `nonmd_unrouted`.
+    #[tokio::test]
+    async fn a04_9_6_manifest_config_cannot_widen_past_the_text_lane() {
+        let vault = TempDir::new().unwrap();
+        let v = vault.path();
+        write_file(v, "notes/a.md", b"alpha");
+        write_file(v, "notes/b.canvas", b"{}");
+        write_file(v, "notes/c.png", b"PNG");
+        write_file(v, "notes/noext", b"x");
+        let mut cfg = test_config();
+        cfg.allowed_extensions = vec!["".into(), ".png".into(), ".md".into(), ".canvas".into()];
+        let (vr, _j, _jd) = make_vr(v.to_path_buf(), "http://127.0.0.1:1", cfg).await;
+        let mut report = VerifyRepairReport::default();
+        let m = vr.build_local_manifest_with_report(&mut report).unwrap();
+        let mut paths: Vec<&str> = m.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["notes/a.md", "notes/b.canvas"]);
+        assert_eq!(report.nonmd_unrouted_count, 2);
+        assert_eq!(report.extension_filtered_count, 2);
+    }
+
+    /// A04-7.2 negative test: a flag-off server answering
+    /// `deleted-on-server`, `missing-on-server` and `drift` for a `.png`
+    /// causes zero deletes, pushes or pulls and three counter increments.
+    /// `Direction::DeleteLocal` is unreachable for a non-text-lane path.
+    /// Mutation control: dropping the lane check makes `drift` pull and
+    /// `deleted-on-server` soft-delete the local `.png`.
+    #[tokio::test]
+    async fn a04_7_2_note_vocabulary_answers_for_a_png_cause_no_action() {
+        let vault = TempDir::new().unwrap();
+        write_file(vault.path(), "notes/a.md", b"alpha");
+        let png = write_file(vault.path(), "att/a.png", b"PNG-a");
+        write_file(vault.path(), "att/b.png", b"PNG-b");
+        write_file(vault.path(), "att/c.png", b"PNG-c");
+        let mut srv = Server::new_async().await;
+        let _m = srv
+            .mock("POST", "/api/sync/reconcile-batch")
+            .with_status(200)
+            .with_body(
+                r#"{"deltas":[{"path":"att/a.png","state":"deleted-on-server"},{"path":"att/b.png","state":"missing-on-server"},{"path":"att/c.png","state":"drift","server_hash":"cafe"},{"path":"notes/a.md","state":"match"}]}"#,
+            )
+            .create_async()
+            .await;
+        let (vr, journal, _jd) =
+            make_vr(vault.path().to_path_buf(), &srv.url(), test_config()).await;
+        let report = vr.run().await.unwrap();
+        assert_eq!(journal.len(), 0, "no push queued");
+        assert_eq!(report.modify_count, 0, "no push decided");
+        assert_eq!(report.pulls_attempted, 0, "no pull decided");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(png.exists(), "the local .png is untouched");
+        let total: u64 = report.blob_note_vocab_answer.values().sum();
+        assert_eq!(total, 3, "{:?}", report.blob_note_vocab_answer);
+        for state in ["deleted-on-server", "missing-on-server", "drift"] {
+            assert_eq!(
+                report.blob_note_vocab_answer.get(state).copied(),
+                Some(1),
+                "{state}: {:?}",
+                report.blob_note_vocab_answer
+            );
+        }
+    }
+
+    /// A04-7.2: the pure guard. A non-text-lane path never gets a direction
+    /// other than Noop, for every state string; a text-lane path keeps the
+    /// shipped table.
+    #[test]
+    fn a04_7_2_decide_direction_for_path_never_acts_on_non_text_lane() {
+        for state in [
+            "deleted-on-server",
+            "missing-on-server",
+            "drift",
+            "match",
+            "tombstoned_on_server",
+            "missing_on_host",
+            "anything",
+        ] {
+            assert_eq!(
+                decide_direction_for_path("att/a.png", state, "l", Some("s"), Some("s")),
+                None,
+                "{state}"
+            );
+        }
+        assert_eq!(
+            decide_direction_for_path("n/a.md", "deleted-on-server", "l", None, None),
+            Some(Direction::DeleteLocal)
+        );
+        assert_eq!(
+            decide_direction_for_path("n/a.canvas", "missing-on-server", "l", None, None),
+            Some(Direction::Push)
+        );
+    }
 }
