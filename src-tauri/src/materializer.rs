@@ -2295,8 +2295,11 @@ const TOMBSTONE_MAX_EXT: usize = 16;
 /// Names that fit are byte-for-byte the legacy format. Longer names keep the
 /// tail extension and the full suffix, and cut the stem on a UTF-8 char
 /// boundary, inserting `~<hash8>` (first 8 hex chars of sha256 of the FULL
-/// original name) so two long names sharing a prefix cannot collide:
-/// `<stem_cut>~<hash8><.ext>.deleted-<ts>-<nanos:09>[-<n>]`. Pure, no I/O.
+/// original name): `<stem_cut>~<hash8><.ext>.deleted-<ts>-<nanos:09>[-<n>]`.
+/// Two different long names map to the same tombstone only if they share the
+/// directory, the kept stem prefix, the extension, the second and nanosecond
+/// AND the 32-bit hash8; that residual case is covered by soft_delete's
+/// existing `exists()` counter loop, which never overwrites. Pure, no I/O.
 pub(crate) fn tombstone_file_name(
     base: &str,
     ts: &str,
@@ -3683,13 +3686,39 @@ mod tests {
         }
     }
 
-    fn assert_capped(name: &str) {
+    /// The exact suffix soft_delete must keep intact, from TS, NANOS and the
+    /// collision counter.
+    fn expected_suffix(collision: Option<u32>) -> String {
+        match collision {
+            None => format!(".deleted-{TS}-{NANOS:09}"),
+            Some(n) => format!(".deleted-{TS}-{NANOS:09}-{n}"),
+        }
+    }
+
+    fn assert_capped(name: &str, collision: Option<u32>) {
         assert!(
             name.len() <= 255,
             "tombstone is {} bytes: {name}",
             name.len()
         );
-        assert!(name.contains(".deleted-"), "lost .deleted- marker: {name}");
+        let suffix = expected_suffix(collision);
+        assert!(name.ends_with(&suffix), "lost suffix {suffix}: {name}");
+    }
+
+    /// Long path: capped AND keeps as much stem as fits. A cut can fall at
+    /// most 3 bytes short of 255 (inside a 4-byte char), so >= 252 pins the
+    /// kept stem length (a `cut - 50` style regression fails here).
+    fn assert_truncated(name: &str, collision: Option<u32>) {
+        assert_capped(name, collision);
+        assert!(
+            name.len() >= 252,
+            "too much stem dropped: {} bytes: {name}",
+            name.len()
+        );
+    }
+
+    fn hash8_of(base: &str) -> String {
+        hex::encode(Sha256::digest(base.as_bytes()))[..8].to_string()
     }
 
     #[test]
@@ -3714,10 +3743,10 @@ mod tests {
         let base = format!("{}.md", "a".repeat(218));
         assert_eq!(base.len(), 221);
         let got = tombstone_file_name(&base, TS, NANOS, None);
-        assert_capped(&got);
+        assert_truncated(&got, None);
+        assert_eq!(got.len(), 255, "ASCII stem fills the budget exactly");
         assert_ne!(got, legacy_tombstone(&base, None));
         assert!(got.contains(".md.deleted-"), "extension kept: {got}");
-        assert!(got.ends_with(&format!(".deleted-{TS}-{NANOS:09}")));
     }
 
     #[test]
@@ -3725,9 +3754,8 @@ mod tests {
         let base = format!("{}.md", "n".repeat(222));
         assert_eq!(base.len(), 225);
         let got = tombstone_file_name(&base, TS, NANOS, None);
-        assert_capped(&got);
-        assert!(got.contains(".md.deleted-"));
-        let hash8 = &hex::encode(Sha256::digest(base.as_bytes()))[..8];
+        assert_truncated(&got, None);
+        let hash8 = hash8_of(&base);
         assert!(got.contains(&format!("~{hash8}.md.deleted-")), "{got}");
     }
 
@@ -3741,10 +3769,13 @@ mod tests {
             assert!(base.len() > 255);
             for collision in [None, Some(2), Some(999_999), Some(u32::MAX)] {
                 let got = tombstone_file_name(&base, TS, NANOS, collision);
-                assert_capped(&got);
+                assert_truncated(&got, collision);
                 assert!(got.contains(".md.deleted-"));
-                // String guarantees valid UTF-8; also round-trip the bytes.
-                assert!(std::str::from_utf8(got.as_bytes()).is_ok());
+                // The kept stem is a true char-boundary prefix of the
+                // original stem (base holds no '~').
+                let kept = got.split('~').next().unwrap();
+                assert!(stem.starts_with(kept), "kept stem not a prefix: {got}");
+                assert!(!kept.is_empty());
             }
         }
     }
@@ -3758,8 +3789,8 @@ mod tests {
         assert_eq!(b.len(), 300);
         let ta = tombstone_file_name(&a, TS, NANOS, None);
         let tb = tombstone_file_name(&b, TS, NANOS, None);
-        assert_capped(&ta);
-        assert_capped(&tb);
+        assert_truncated(&ta, None);
+        assert_truncated(&tb, None);
         assert_ne!(ta, tb, "shared-prefix long names must not collide");
     }
 
@@ -3768,11 +3799,8 @@ mod tests {
         let base = format!("{}.md", "c".repeat(250));
         for n in [2u32, 999_999, u32::MAX] {
             let got = tombstone_file_name(&base, TS, NANOS, Some(n));
-            assert_capped(&got);
-            assert!(
-                got.ends_with(&format!(".deleted-{TS}-{NANOS:09}-{n}")),
-                "{got}"
-            );
+            assert_truncated(&got, Some(n));
+            assert!(got.contains(".md.deleted-"), "{got}");
         }
         // Short names keep the legacy collision format exactly.
         assert_eq!(
@@ -3785,8 +3813,8 @@ mod tests {
     fn tombstone_name_without_extension_capped() {
         let base = "z".repeat(240);
         let got = tombstone_file_name(&base, TS, NANOS, None);
-        assert_capped(&got);
-        let hash8 = &hex::encode(Sha256::digest(base.as_bytes()))[..8];
+        assert_truncated(&got, None);
+        let hash8 = hash8_of(&base);
         assert!(got.contains(&format!("~{hash8}.deleted-")), "{got}");
     }
 
@@ -3795,13 +3823,59 @@ mod tests {
         // A leading dot is not an extension separator: the whole name is stem.
         let base = format!(".{}", "d".repeat(239));
         let got = tombstone_file_name(&base, TS, NANOS, None);
-        assert_capped(&got);
+        assert_truncated(&got, None);
         assert!(got.starts_with(".ddd"), "{got}");
+        let hash8 = hash8_of(&base);
+        assert!(got.contains(&format!("~{hash8}.deleted-")), "{got}");
         // Short dotfile: unchanged.
         assert_eq!(
             tombstone_file_name(".obsidian", TS, NANOS, None),
             legacy_tombstone(".obsidian", None)
         );
+    }
+
+    #[test]
+    fn tombstone_name_long_extension_folded_into_stem() {
+        // A 21-byte "extension" exceeds TOMBSTONE_MAX_EXT (16), so it is not
+        // kept intact; the whole name is stem and is cut from the tail.
+        let ext = ".averyveryverylongext";
+        assert_eq!(ext.len(), 21);
+        let base = format!("{}{ext}", "s".repeat(230));
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_truncated(&got, None);
+        assert!(got.starts_with("sss"), "{got}");
+        let hash8 = hash8_of(&base);
+        assert!(got.contains(&format!("~{hash8}.deleted-")), "{got}");
+        assert!(!got.contains(ext), "long ext must not be kept: {got}");
+    }
+
+    #[test]
+    fn tombstone_name_only_dots_capped() {
+        // The last dot is a 1-byte "extension"; the remaining dots are stem.
+        let base = ".".repeat(240);
+        let got = tombstone_file_name(&base, TS, NANOS, None);
+        assert_truncated(&got, None);
+        assert_eq!(got.len(), 255);
+        let hash8 = hash8_of(&base);
+        assert!(got.contains(&format!("~{hash8}..deleted-")), "{got}");
+        assert!(got.starts_with("..."), "{got}");
+    }
+
+    #[test]
+    fn tombstone_name_fits_plain_but_truncates_with_counter() {
+        // 210..=220 bytes: the plain 35-byte suffix fits, the 46-byte
+        // `-4294967295` counter suffix does not.
+        for len in 210..=220usize {
+            let base = format!("{}.md", "k".repeat(len - 3));
+            assert_eq!(base.len(), len);
+            let plain = tombstone_file_name(&base, TS, NANOS, None);
+            assert_eq!(plain, legacy_tombstone(&base, None), "len {len}");
+            let got = tombstone_file_name(&base, TS, NANOS, Some(u32::MAX));
+            assert_ne!(got, legacy_tombstone(&base, Some(u32::MAX)), "len {len}");
+            assert_truncated(&got, Some(u32::MAX));
+            let hash8 = hash8_of(&base);
+            assert!(got.contains(&format!("~{hash8}.md.deleted-")), "{got}");
+        }
     }
 
     /// End to end: a 225-byte note name (260-byte legacy tombstone) used to
